@@ -356,6 +356,26 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--serve flags", () => {
+		test("parses a local serve request", () => {
+			expect(parseArgs(["--serve"])).toMatchObject({ serve: true });
+		});
+
+		test("parses serve bind options", () => {
+			expect(parseArgs(["--serve", "--serve-port", "4174", "--serve-host", "127.0.0.1"])).toMatchObject({
+				serve: true,
+				servePort: 4174,
+				serveHost: "127.0.0.1",
+			});
+		});
+
+		test("rejects an invalid serve port", () => {
+			expect(parseArgs(["--serve-port", "0"]).diagnostics).toEqual([
+				{ type: "error", message: "--serve-port must be an integer between 1 and 65535" },
+			]);
+		});
+	});
+
 	describe("--offline flag", () => {
 		test("parses --offline flag", () => {
 			const result = parseArgs(["--offline"]);
