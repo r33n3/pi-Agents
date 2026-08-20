@@ -49,6 +49,12 @@ export interface Args {
 	offline?: boolean;
 	tuiMode?: TuiMode;
 	verbose?: boolean;
+	/** Start the local web control plane for this Pi session. */
+	serve?: boolean;
+	/** Explicit TCP port used by --serve. Omit it to select the first available port from 4173. */
+	servePort?: number;
+	/** Explicit bind address for --serve. Defaults to 127.0.0.1. */
+	serveHost?: string;
 	projectTrustOverride?: boolean;
 	messages: string[];
 	fileArgs: string[];
@@ -207,6 +213,32 @@ export function parseArgs(args: string[]): Args {
 			}
 		} else if (arg === "--verbose") {
 			result.verbose = true;
+		} else if (arg === "--serve") {
+			result.serve = true;
+		} else if (arg === "--serve-port") {
+			const value = args[i + 1];
+			if (value === undefined || value.startsWith("-")) {
+				result.diagnostics.push({ type: "error", message: "--serve-port requires a TCP port" });
+			} else {
+				i++;
+				const port = Number(value);
+				if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+					result.diagnostics.push({
+						type: "error",
+						message: "--serve-port must be an integer between 1 and 65535",
+					});
+				} else {
+					result.servePort = port;
+				}
+			}
+		} else if (arg === "--serve-host") {
+			const host = args[i + 1];
+			if (host === undefined || host.startsWith("-")) {
+				result.diagnostics.push({ type: "error", message: "--serve-host requires an address" });
+			} else {
+				i++;
+				result.serveHost = host;
+			}
 		} else if (arg === "--approve" || arg === "-a") {
 			result.projectTrustOverride = true;
 		} else if (arg === "--no-approve" || arg === "-na") {
@@ -303,7 +335,10 @@ ${chalk.bold("Options:")}
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
-  --tui-mode <mode>              TUI mode: regular (default) or fullscreen
+	--serve                        Start the local web control plane for this session
+	--serve-port <port>             Require this TCP port (default: first available from 4173)
+	--serve-host <address>          Bind address for --serve (default: 127.0.0.1)
+	--tui-mode <mode>              TUI mode: regular (default) or fullscreen
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)

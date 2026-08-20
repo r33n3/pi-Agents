@@ -12,6 +12,28 @@ foreach ($arg in $args) {
 	}
 }
 
+$localEnvPath = Join-Path $scriptDir ".env.local"
+if (-not $noEnv -and (Test-Path -LiteralPath $localEnvPath)) {
+	foreach ($line in Get-Content -LiteralPath $localEnvPath) {
+		if ($line -notmatch '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$') {
+			continue
+		}
+		$name = $Matches[1]
+		$value = $Matches[2].Trim()
+		if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+			$value = $value.Substring(1, $value.Length - 2)
+		}
+		[Environment]::SetEnvironmentVariable($name, $value, "Process")
+	}
+
+	if (-not $env:OPENAI_API_KEY -and $env:OPENAI_PLATFORM_API) {
+		$env:OPENAI_API_KEY = $env:OPENAI_PLATFORM_API
+	}
+	if (-not $env:ANTHROPIC_API_KEY -and $env:ANTHROPIC_PLATFORM_API) {
+		$env:ANTHROPIC_API_KEY = $env:ANTHROPIC_PLATFORM_API
+	}
+}
+
 if ($noEnv) {
 	$envVarsToUnset = @(
 		"ANTHROPIC_API_KEY",
@@ -49,6 +71,8 @@ if ($noEnv) {
 		"AZURE_OPENAI_API_KEY",
 		"AZURE_OPENAI_BASE_URL",
 		"AZURE_OPENAI_RESOURCE_NAME"
+		"OPENAI_PLATFORM_API"
+		"ANTHROPIC_PLATFORM_API"
 	)
 
 	foreach ($name in $envVarsToUnset) {

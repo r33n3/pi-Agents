@@ -1,0 +1,14 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"lib": ["ES2023", "DOM", "DOM.Iterable"],
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"noEmit": true,
+		"paths": {
+			"@earendil-works/pi-client": ["../client/src/index.ts"],
+			"@earendil-works/pi-protocol": ["../protocol/src/index.ts"]
+		}
+	},
+	"include": ["src/core/serve/browser/**/*.ts"]
+}

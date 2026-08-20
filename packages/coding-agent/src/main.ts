@@ -5,8 +5,11 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { randomBytes } from "node:crypto";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
+import { PiServer } from "@earendil-works/pi-server";
 import chalk from "chalk";
 import { type Args, type Mode, normalizeSessionName, parseArgs, printHelp } from "./cli/args.ts";
 import {
@@ -42,13 +45,25 @@ import {
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.ts";
 import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
-import type { InlineExtension } from "./core/extensions/types.ts";
+import type { InlineExtension, ToolDefinition } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
 import { ModelRuntime } from "./core/model-runtime.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
-import type { CreateAgentSessionOptions } from "./core/sdk.ts";
+import { type CreateAgentSessionOptions, createAgentSession } from "./core/sdk.ts";
+import { AgentSessionExecutor } from "./core/serve/agent-executor.ts";
+import { AgentRegistry } from "./core/serve/agent-registry.ts";
+import { AgentRoutineScheduler } from "./core/serve/agent-routine-scheduler.ts";
+import { AgentRunManager } from "./core/serve/agent-run-manager.ts";
+import { CurrentSessionService } from "./core/serve/current-session-service.ts";
+import {
+	type ExternalConnectionDefinition,
+	ExternalConnectionManager,
+} from "./core/serve/external-connection-manager.ts";
+import { createScopedAgentTools } from "./core/serve/scoped-agent-tools.ts";
+import { createServePage } from "./core/serve/serve-page.ts";
+import { WebSocketListener } from "./core/serve/websocket-listener.ts";
 import {
 	formatMissingSessionCwdPrompt,
 	getMissingSessionCwdIssue,
@@ -911,6 +926,207 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(1);
 	}
 
+	let serveServer: PiServer | undefined;
+	let agentRunManager: AgentRunManager | undefined;
+	let agentRoutineScheduler: AgentRoutineScheduler | undefined;
+	let externalConnectionManager: ExternalConnectionManager | undefined;
+	let externalSessionExecutor: AgentSessionExecutor | undefined;
+	if (parsed.serve) {
+		if (appMode !== "interactive") {
+			console.error(chalk.red("Error: --serve requires interactive mode"));
+			process.exit(1);
+		}
+		const host = parsed.serveHost ?? "127.0.0.1";
+		const requestedPort = parsed.servePort ?? 4173;
+		const token = randomBytes(32).toString("base64url");
+		const agentRegistry = new AgentRegistry(join(agentDir, "serve"), {
+			catalogDirectory: join(agentDir, "agents"),
+			personaDirectory: join(agentDir, "personas"),
+			defaultWorkspace: session.sessionManager.getCwd(),
+		});
+		await agentRegistry.initialize();
+		const createExecutionSession = async (context: Parameters<AgentSessionExecutor["start"]>[0]) => {
+			const requestedModel = context.definition.model;
+			const agentModel = requestedModel
+				? modelRuntime.getModel(requestedModel.provider, requestedModel.id)
+				: session.model;
+			if (!agentModel) {
+				throw new Error(
+					requestedModel
+						? `Agent model ${requestedModel.provider}/${requestedModel.id} is unavailable`
+						: "No model is available for the agent run",
+				);
+			}
+			const isolated = context.definition.executor === "harness";
+			const scopedTools = isolated ? createScopedAgentTools(context.definition, context.workspace) : [];
+			const toolNames = isolated
+				? scopedTools.map((tool) => tool.name)
+				: context.definition.tools.map((tool) => (tool === "list" ? "ls" : tool));
+			const created = await createAgentSession({
+				cwd: context.workspace,
+				agentDir,
+				modelRuntime,
+				model: agentModel,
+				tools: toolNames,
+				customTools: isolated ? (scopedTools as unknown as ToolDefinition[]) : undefined,
+				sessionManager: SessionManager.inMemory(context.workspace),
+			});
+			return created.session;
+		};
+		const executor = new AgentSessionExecutor(createExecutionSession);
+		agentRunManager = new AgentRunManager(agentRegistry, executor, join(agentDir, "serve", "runs"));
+		await agentRunManager.initialize();
+		agentRoutineScheduler = new AgentRoutineScheduler(agentRegistry, agentRunManager);
+		await agentRoutineScheduler.start();
+		const availableModels = modelRuntime
+			.getAvailableSnapshot()
+			.map((model) => ({ provider: model.provider, id: model.id, name: model.name }));
+		const openAiModels = availableModels.filter((model) => model.provider === "openai");
+		const luna = { provider: "openai", id: "gpt-5.6-luna" };
+		const sonnet = { provider: "anthropic", id: "claude-sonnet-5" };
+		const claudeModels = availableModels.filter((model) => model.provider === "anthropic");
+		if (!claudeModels.some((model) => model.id === sonnet.id)) {
+			claudeModels.unshift({ ...sonnet, name: "Claude Sonnet 5" });
+		}
+		const hermesModels = [...availableModels];
+		if (!hermesModels.some((model) => model.provider === "ollama" && model.id === "qwen3.6:latest")) {
+			hermesModels.push({ provider: "ollama", id: "qwen3.6:latest", name: "Qwen 3.6 (Hermes local)" });
+		}
+		const externalConnections: ExternalConnectionDefinition[] = [
+			{
+				id: "claude-code",
+				name: "Claude Code ACP",
+				description: "Delegate a task to Claude Code through the loaded ACP extension.",
+				inputLabel: "Task",
+				available: session.getToolDefinition("claude_code") !== undefined,
+				warning: "Claude Code actions are auto-approved. The selected Claude model is used by the ACP session.",
+				defaultModel: sonnet,
+				models: claudeModels,
+			},
+			{
+				id: "openai",
+				name: "OpenAI Agent",
+				description: "Run a separate Pi SDK agent while the main Pi session remains available.",
+				inputLabel: "Task",
+				available: openAiModels.some((model) => model.id === luna.id),
+				warning: "This agent can use file and shell tools in the selected working directory.",
+				defaultModel: luna,
+				models: openAiModels,
+			},
+			{
+				id: "hermes",
+				name: "Hermes Agent",
+				description: "Delegate a goal to Hermes one-shot mode with its memory, skills, and tools.",
+				inputLabel: "Goal",
+				available:
+					session.getToolDefinition("hermes_agent") !== undefined &&
+					openAiModels.some((model) => model.id === luna.id),
+				warning:
+					"GPT-5.6 Luna dispatches the request. Hermes uses the selected target model and bypasses interactive approvals.",
+				defaultModel: luna,
+				models: hermesModels,
+			},
+		];
+		externalSessionExecutor = new AgentSessionExecutor(createExecutionSession);
+		externalConnectionManager = new ExternalConnectionManager(
+			externalConnections,
+			async (request) => {
+				const isClaude = request.connection.id === "claude-code";
+				const isHermes = request.connection.id === "hermes";
+				return externalSessionExecutor!.start({
+					runId: request.runId,
+					workspace: request.cwd,
+					prompt: isClaude
+						? `Call claude_code immediately with this exact task, working directory, and model. Return its result without replacing it with your own work.\n\nTask: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}`
+						: isHermes
+							? `Call hermes_agent immediately with this exact goal, working directory, and model. Return its result without replacing it with your own work.\n\nGoal: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}`
+							: request.prompt,
+					definition: {
+						id: `external-${request.connection.id}`,
+						source: "managed",
+						name: request.connection.name,
+						description: request.connection.description,
+						model: isClaude ? undefined : isHermes ? luna : request.model,
+						tools: isClaude
+							? ["claude_code"]
+							: isHermes
+								? ["hermes_agent"]
+								: ["read", "grep", "find", "ls", "bash", "write", "edit"],
+						memory: "none",
+						persona: isClaude
+							? "Delegate through the claude_code tool immediately and report its returned data."
+							: isHermes
+								? "Delegate through the hermes_agent tool immediately and report its returned data."
+								: "Complete the delegated task independently and return a concise result.",
+						workspace: request.cwd,
+						executor: "session",
+						permissionPolicy: "workspace-write",
+						schedules: [],
+					},
+				});
+			},
+			join(agentDir, "serve", "external-runs"),
+			session.sessionManager.getCwd(),
+		);
+		await externalConnectionManager.initialize();
+		const currentSessionService = new CurrentSessionService(session, Date.now(), async (options) => {
+			const requestedModel = options.model;
+			const hostedModel = requestedModel
+				? modelRuntime.getModel(requestedModel.provider, requestedModel.id)
+				: session.model;
+			if (!hostedModel) throw new Error("No model is available for the browser helper session");
+			const hostedCwd = options.cwd ?? session.sessionManager.getCwd();
+			const hostedSessionManager = SessionManager.inMemory(hostedCwd, { id: options.id });
+			if (options.name) hostedSessionManager.appendSessionInfo(options.name);
+			return (
+				await createAgentSession({
+					cwd: hostedCwd,
+					agentDir,
+					modelRuntime,
+					model: hostedModel,
+					thinkingLevel: options.thinkingLevel,
+					tools: [],
+					sessionManager: hostedSessionManager,
+				})
+			).session;
+		});
+		const listener = new WebSocketListener({
+			host,
+			port: requestedPort,
+			token,
+			autoIncrementPort: parsed.servePort === undefined,
+			onHttpRequest: createServePage(
+				token,
+				agentRegistry,
+				agentRunManager,
+				agentRoutineScheduler,
+				externalConnectionManager,
+			),
+		});
+		serveServer = new PiServer(currentSessionService, {
+			listeners: [listener],
+			onError: (error) => console.error(chalk.red(`Serve error: ${error.message}`)),
+		});
+		await serveServer.start();
+		const boundPort = listener.port;
+		const listenerAddress = listener.address;
+		if (boundPort === undefined || listenerAddress === undefined) throw new Error("Serve listener did not bind");
+		if (boundPort !== requestedPort) {
+			const message = `Port ${requestedPort} was in use; Pi selected ${boundPort}`;
+			console.error(message);
+			startupDiagnostics.push({ type: "info", message });
+		}
+		if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
+			console.error(chalk.yellow(`Warning: --serve is binding outside localhost at ${host}:${boundPort}`));
+		}
+		const serveUrl = new URL(listenerAddress);
+		serveUrl.protocol = serveUrl.protocol === "wss:" ? "https:" : "http:";
+		serveUrl.pathname = "/";
+		serveUrl.searchParams.set("token", token);
+		console.error(`Pi web control: ${serveUrl.href}`);
+		startupDiagnostics.push({ type: "info", message: `Pi web control: ${serveUrl.href}` });
+	}
+
 	// RPC refreshes catalogs here in the background; interactive mode starts its refresh after TUI initialization.
 	if (!offlineMode && appMode === "rpc") {
 		const controller = new AbortController();
@@ -952,11 +1168,24 @@ export async function main(args: string[], options?: MainOptions) {
 			if (process.stderr.writableLength > 0) {
 				await new Promise<void>((resolve) => process.stderr.once("drain", resolve));
 			}
+			await serveServer?.close();
+			await agentRoutineScheduler?.dispose();
+			await agentRunManager?.dispose();
+			await externalConnectionManager?.dispose();
+			await externalSessionExecutor?.dispose();
 			return;
 		}
 
 		printTimings();
-		await interactiveMode.run();
+		try {
+			await interactiveMode.run();
+		} finally {
+			await serveServer?.close();
+			await agentRoutineScheduler?.dispose();
+			await agentRunManager?.dispose();
+			await externalConnectionManager?.dispose();
+			await externalSessionExecutor?.dispose();
+		}
 	} else {
 		printTimings();
 		const exitCode = await runPrintMode(runtime, {
