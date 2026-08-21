@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import type { ModelRef } from "@earendil-works/pi-protocol";
 import type { AgentExecution, AgentExecutor } from "./agent-executor.ts";
 import type { AgentRegistry } from "./agent-registry.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
@@ -19,6 +20,7 @@ export interface AgentRunRecord {
 	finishedAt?: number;
 	artifactDirectory: string;
 	error?: string;
+	model?: ModelRef;
 }
 
 interface ActiveRun {
@@ -89,7 +91,12 @@ export class AgentRunManager implements AsyncDisposable {
 		}
 	}
 
-	async start(agentId: string, prompt: string, source: AgentRunSource = "manual"): Promise<AgentRunRecord> {
+	async start(
+		agentId: string,
+		prompt: string,
+		source: AgentRunSource = "manual",
+		model?: ModelRef,
+	): Promise<AgentRunRecord> {
 		return this.#queue.run(async () => {
 			if (this.#disposed) throw new Error("Agent run manager is disposed");
 			if (prompt.trim() === "") throw new Error("Agent run prompt is required");
@@ -106,13 +113,14 @@ export class AgentRunManager implements AsyncDisposable {
 				status: "starting",
 				createdAt: Date.now(),
 				artifactDirectory,
+				model,
 			};
 			this.#records.set(runId, record);
 			await this.#persistRecord(record);
 			try {
 				const execution = await this.#executor.start({
 					runId,
-					definition,
+					definition: model ? { ...definition, model } : definition,
 					workspace: this.#registry.workspacePath(definition),
 					prompt: record.prompt,
 				});
@@ -141,6 +149,14 @@ export class AgentRunManager implements AsyncDisposable {
 		await active.execution.abort();
 		await active.completion;
 		return { ...active.record };
+	}
+
+	async waitForCompletion(runId: string): Promise<AgentRunRecord> {
+		const active = this.#activeByRun.get(runId);
+		if (active?.completion) await active.completion;
+		const record = this.#records.get(runId);
+		if (!record) throw new Error(`Run ${runId} was not found`);
+		return { ...record };
 	}
 
 	async dispose(): Promise<void> {
@@ -209,7 +225,15 @@ function parseRunRecord(value: unknown, artifactDirectory: string): AgentRunReco
 		finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : undefined,
 		artifactDirectory,
 		error: typeof record.error === "string" ? record.error : undefined,
+		model: record.model === undefined ? undefined : modelRef(record.model),
 	};
+}
+
+function modelRef(value: unknown): ModelRef {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Invalid run model");
+	const model = value as Record<string, unknown>;
+	if (typeof model.provider !== "string" || typeof model.id !== "string") throw new Error("Invalid run model");
+	return { provider: model.provider, id: model.id };
 }
 
 function isRunStatus(value: unknown): value is AgentRunStatus {

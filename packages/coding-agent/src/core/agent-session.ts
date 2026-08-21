@@ -931,6 +931,22 @@ export class AgentSession {
 	}
 
 	/**
+	 * Add SDK-owned tools after session construction.
+	 *
+	 * This is used by long-lived hosts that own a capability whose lifecycle starts
+	 * after the base Pi session is created. The normal allowlist still applies.
+	 */
+	registerCustomTools(tools: ToolDefinition[]): void {
+		for (const tool of tools) {
+			if (this._customTools.some((existing) => existing.name === tool.name)) {
+				throw new Error(`Custom tool ${tool.name} is already registered`);
+			}
+		}
+		this._customTools.push(...tools);
+		this._refreshToolRegistry();
+	}
+
+	/**
 	 * Set active tools by name.
 	 * Only tools in the registry can be enabled. Unknown tool names are ignored.
 	 * Also rebuilds the system prompt to reflect the new tool set.

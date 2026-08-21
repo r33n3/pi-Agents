@@ -35,6 +35,10 @@ export interface WebSocketListenerOptions {
 	token: string;
 	autoIncrementPort?: boolean;
 	onHttpRequest?: (request: IncomingMessage, response: ServerResponse) => void;
+	auxiliary?: {
+		path: string;
+		onConnection(socket: WebSocket): void;
+	};
 }
 
 class WebSocketConnection implements ByteConnection {
@@ -77,6 +81,7 @@ export class WebSocketListener implements PiServerListener {
 	private readonly options: WebSocketListenerOptions;
 	private server: Server | undefined;
 	private sockets: WebSocketServer | undefined;
+	private auxiliarySockets: WebSocketServer | undefined;
 	private accept: ByteConnectionAcceptor | undefined;
 	private boundAddress: string | undefined;
 	private boundPort: number | undefined;
@@ -111,9 +116,33 @@ export class WebSocketListener implements PiServerListener {
 				this.options.port,
 				this.options.autoIncrementPort === true,
 			);
-			const sockets = new WebSocketServer({ server, path: "/pi", maxPayload: MAX_FRAME_BYTES });
+			const sockets = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
 			sockets.on("connection", (socket, request) => this.acceptSocket(socket, request.url));
 			this.sockets = sockets;
+			if (this.options.auxiliary) {
+				const auxiliarySockets = new WebSocketServer({
+					noServer: true,
+					maxPayload: MAX_FRAME_BYTES,
+				});
+				auxiliarySockets.on("connection", (socket, request) => this.acceptAuxiliarySocket(socket, request.url));
+				this.auxiliarySockets = auxiliarySockets;
+			}
+			server.on("upgrade", (request, socket, head) => {
+				const path = new URL(request.url ?? "/", "http://localhost").pathname;
+				const target =
+					path === "/pi"
+						? this.sockets
+						: path === this.options.auxiliary?.path
+							? this.auxiliarySockets
+							: undefined;
+				if (!target) {
+					socket.destroy();
+					return;
+				}
+				target.handleUpgrade(request, socket, head, (webSocket) => {
+					target.emit("connection", webSocket, request);
+				});
+			});
 			this.boundPort = port;
 			const urlHost = this.options.host.includes(":") ? `[${this.options.host}]` : this.options.host;
 			this.boundAddress = `ws://${urlHost}:${port}/pi`;
@@ -128,9 +157,12 @@ export class WebSocketListener implements PiServerListener {
 		this.boundAddress = undefined;
 		this.boundPort = undefined;
 		for (const socket of this.sockets?.clients ?? []) socket.terminate();
+		for (const socket of this.auxiliarySockets?.clients ?? []) socket.terminate();
 		await new Promise<void>((resolve) => this.sockets?.close(() => resolve()) ?? resolve());
+		await new Promise<void>((resolve) => this.auxiliarySockets?.close(() => resolve()) ?? resolve());
 		await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve());
 		this.sockets = undefined;
+		this.auxiliarySockets = undefined;
 		this.server = undefined;
 	}
 
@@ -165,6 +197,19 @@ export class WebSocketListener implements PiServerListener {
 			connection.markClosed();
 			handler.onClose();
 		});
+	}
+
+	private acceptAuxiliarySocket(socket: WebSocket, requestUrl: string | undefined): void {
+		const token = new URL(requestUrl ?? "/", "http://localhost").searchParams.get("token");
+		if (!matchesCapabilityToken(this.options.token, token)) {
+			socket.close(1008, "Unauthorized");
+			return;
+		}
+		if ((this.auxiliarySockets?.clients.size ?? 0) > MAX_CONNECTIONS) {
+			socket.close(1013, "Connection limit reached");
+			return;
+		}
+		this.options.auxiliary?.onConnection(socket);
 	}
 }
 

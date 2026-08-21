@@ -1,0 +1,453 @@
+import { randomBytes } from "node:crypto";
+import { join } from "node:path";
+import { PiServer } from "@earendil-works/pi-server";
+import type { AgentSession } from "../agent-session.ts";
+import type { ToolDefinition } from "../extensions/types.ts";
+import { DefaultResourceLoader } from "../resource-loader.ts";
+import { createAgentSession } from "../sdk.ts";
+import { SessionManager } from "../session-manager.ts";
+import { AgentSessionExecutor } from "./agent-executor.ts";
+import { type AgentDefinition, AgentRegistry } from "./agent-registry.ts";
+import { AgentRoutineScheduler } from "./agent-routine-scheduler.ts";
+import { AgentRunManager } from "./agent-run-manager.ts";
+import { BrowserArtifactStore } from "./browser-artifact-store.ts";
+import { BrowserConsoleService } from "./browser-console-service.ts";
+import { BrowserProfileStore } from "./browser-profile-store.ts";
+import { type BrowserOwner, BrowserSessionManager } from "./browser-session-manager.ts";
+import { BrowserStreamServer } from "./browser-stream-server.ts";
+import { createBrowserTools } from "./browser-tools.ts";
+import { CapabilityCatalog } from "./capability-catalog.ts";
+import { CurrentSessionService } from "./current-session-service.ts";
+import { type ExternalConnectionDefinition, ExternalConnectionManager } from "./external-connection-manager.ts";
+import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
+import { RoutineRegistry } from "./routine-registry.ts";
+import { createScopedAgentTools } from "./scoped-agent-tools.ts";
+import { ServeAttachmentStore } from "./serve-attachment-store.ts";
+import { createServePage } from "./serve-page.ts";
+import { WebSocketListener } from "./websocket-listener.ts";
+import { WorkspacePreviewServer } from "./workspace-preview-server.ts";
+
+export interface ServeHostOptions {
+	agentDir: string;
+	session: AgentSession;
+	host?: string;
+	port?: number;
+	autoIncrementPort?: boolean;
+	onError?: (error: Error) => void;
+}
+
+export interface ServeHostDiagnostic {
+	type: "info";
+	message: string;
+}
+
+export interface ServeHostStartResult {
+	url: string;
+	port: number;
+	diagnostics: ServeHostDiagnostic[];
+}
+
+/** Owns all services and cleanup associated with one `pi --serve` listener. */
+export class ServeHost implements AsyncDisposable {
+	readonly #options: ServeHostOptions;
+	#server: PiServer | undefined;
+	#agentRunManager: AgentRunManager | undefined;
+	#agentRoutineScheduler: AgentRoutineScheduler | undefined;
+	#externalConnectionManager: ExternalConnectionManager | undefined;
+	#externalSessionExecutor: AgentSessionExecutor | undefined;
+	#attachmentStore: ServeAttachmentStore | undefined;
+	#browserSessionManager: BrowserSessionManager | undefined;
+	#workspacePreviewServer: WorkspacePreviewServer | undefined;
+	#startAttempted = false;
+	#closePromise: Promise<void> | undefined;
+
+	constructor(options: ServeHostOptions) {
+		this.#options = options;
+	}
+
+	async start(): Promise<ServeHostStartResult> {
+		if (this.#startAttempted) throw new Error("Serve host has already been started");
+		if (this.#closePromise) throw new Error("Serve host is closed");
+		this.#startAttempted = true;
+		try {
+			return await this.#start();
+		} catch (error) {
+			await this.close().catch(() => {});
+			throw error;
+		}
+	}
+
+	close(): Promise<void> {
+		this.#closePromise ??= this.#close();
+		return this.#closePromise;
+	}
+
+	[Symbol.asyncDispose](): Promise<void> {
+		return this.close();
+	}
+
+	async #start(): Promise<ServeHostStartResult> {
+		const { agentDir, session } = this.#options;
+		const modelRuntime = session.modelRuntime;
+		const host = this.#options.host ?? "127.0.0.1";
+		const requestedPort = this.#options.port ?? 4173;
+		const token = randomBytes(32).toString("base64url");
+		const serveRoot = join(agentDir, "serve");
+		const browserDriver = new PlaywrightBrowserDriver();
+		this.#workspacePreviewServer = new WorkspacePreviewServer();
+		this.#browserSessionManager = new BrowserSessionManager(
+			browserDriver,
+			new BrowserProfileStore(join(serveRoot, "browser")),
+			4,
+			new BrowserArtifactStore(join(serveRoot, "browser")),
+		);
+		const browserConsole = new BrowserConsoleService(this.#browserSessionManager, () =>
+			browserDriver.installationStatus(),
+		);
+		const browserStream = new BrowserStreamServer(browserConsole);
+		session.registerCustomTools(
+			createBrowserTools(this.#browserSessionManager, {
+				owner: { kind: "pi-session", id: session.sessionId },
+				workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
+				access: "loopback",
+				workspacePreview: this.#workspacePreviewServer,
+			}),
+		);
+		const agentRegistry = new AgentRegistry(serveRoot, {
+			catalogDirectory: join(agentDir, "agents"),
+			personaDirectory: join(agentDir, "personas"),
+			defaultWorkspace: session.sessionManager.getCwd(),
+		});
+		await agentRegistry.initialize();
+
+		const createConfiguredAgentSession = async (
+			definition: AgentDefinition,
+			workspace: string,
+			agentSessionManager = SessionManager.inMemory(workspace),
+			browserOwner?: BrowserOwner,
+		) => {
+			const requestedModel = definition.model;
+			const agentModel = requestedModel
+				? modelRuntime.getModel(requestedModel.provider, requestedModel.id)
+				: session.model;
+			if (!agentModel) {
+				throw new Error(
+					requestedModel
+						? `Agent model ${requestedModel.provider}/${requestedModel.id} is unavailable`
+						: "No model is available for the agent run",
+				);
+			}
+			const isolated = definition.executor === "harness";
+			const scopedTools = isolated ? createScopedAgentTools(definition, workspace) : [];
+			const browserTools =
+				definition.browser?.access && definition.browser.access !== "disabled" && browserOwner
+					? createBrowserTools(this.#browserSessionManager!, {
+							owner: browserOwner,
+							workspace: { id: definition.id, root: workspace },
+							access: definition.browser.access,
+							profile: definition.browser.profile,
+							workspacePreview: this.#workspacePreviewServer,
+						})
+					: [];
+			const customTools = [...scopedTools, ...browserTools] as ToolDefinition[];
+			const toolNames = isolated
+				? customTools.map((tool) => tool.name)
+				: definition.tools.flatMap((tool) =>
+						tool === "browser"
+							? browserTools.map((browserTool) => browserTool.name)
+							: [tool === "list" ? "ls" : tool],
+					);
+			const resourceLoader = new DefaultResourceLoader({
+				cwd: workspace,
+				agentDir,
+				systemPromptOverride: (base) =>
+					[
+						base,
+						`You are the locally deployed agent "${definition.name}".`,
+						`Persona: ${definition.persona}`,
+						`Mission: ${definition.description}`,
+						"Continue the conversation as this agent and operate only through the provided tools.",
+					]
+						.filter((entry): entry is string => entry !== undefined && entry.length > 0)
+						.join("\n\n"),
+			});
+			await resourceLoader.reload();
+			const created = await createAgentSession({
+				cwd: workspace,
+				agentDir,
+				modelRuntime,
+				model: agentModel,
+				tools: toolNames,
+				customTools: customTools.length > 0 ? customTools : undefined,
+				resourceLoader,
+				sessionManager: agentSessionManager,
+			});
+			return created.session;
+		};
+		const createExecutionSession = async (context: Parameters<AgentSessionExecutor["start"]>[0]) =>
+			createConfiguredAgentSession(context.definition, context.workspace, undefined, {
+				kind: "agent-run",
+				id: context.runId,
+			});
+		const executor = new AgentSessionExecutor(createExecutionSession);
+		this.#agentRunManager = new AgentRunManager(agentRegistry, executor, join(serveRoot, "runs"));
+		await this.#agentRunManager.initialize();
+
+		const availableModels = modelRuntime
+			.getAvailableSnapshot()
+			.map((model) => ({ provider: model.provider, id: model.id, name: model.name }));
+		const openAiModels = availableModels.filter((model) => model.provider === "openai");
+		const luna = { provider: "openai", id: "gpt-5.6-luna" };
+		const sonnet = { provider: "anthropic", id: "claude-sonnet-5" };
+		const claudeModels = availableModels.filter((model) => model.provider === "anthropic");
+		if (!claudeModels.some((model) => model.id === sonnet.id)) {
+			claudeModels.unshift({ ...sonnet, name: "Claude Sonnet 5" });
+		}
+		const hermesModels = [...availableModels];
+		if (!hermesModels.some((model) => model.provider === "ollama" && model.id === "qwen3.6:latest")) {
+			hermesModels.push({ provider: "ollama", id: "qwen3.6:latest", name: "Qwen 3.6 (Hermes local)" });
+		}
+		const externalConnections: ExternalConnectionDefinition[] = [
+			{
+				id: "claude-code",
+				name: "Claude Code ACP",
+				description: "Delegate a task to Claude Code through the loaded ACP extension.",
+				inputLabel: "Task",
+				available: session.getToolDefinition("claude_code") !== undefined,
+				warning: "Claude Code actions are auto-approved. The selected Claude model is used by the ACP session.",
+				defaultModel: sonnet,
+				models: claudeModels,
+			},
+			{
+				id: "openai",
+				name: "OpenAI Agent",
+				description: "Run a separate Pi SDK agent while the main Pi session remains available.",
+				inputLabel: "Task",
+				available: openAiModels.some((model) => model.id === luna.id),
+				warning: "This agent can use file and shell tools in the selected working directory.",
+				defaultModel: luna,
+				models: openAiModels,
+			},
+			{
+				id: "hermes",
+				name: "Hermes Agent",
+				description: "Delegate a goal to Hermes one-shot mode with its memory, skills, and tools.",
+				inputLabel: "Goal",
+				available:
+					session.getToolDefinition("hermes_agent") !== undefined &&
+					openAiModels.some((model) => model.id === luna.id),
+				warning:
+					"GPT-5.6 Luna dispatches the request. Hermes uses the selected target model and bypasses interactive approvals.",
+				defaultModel: luna,
+				models: hermesModels,
+			},
+		];
+		this.#externalSessionExecutor = new AgentSessionExecutor(createExecutionSession);
+		this.#externalConnectionManager = new ExternalConnectionManager(
+			externalConnections,
+			async (request) => {
+				const isClaude = request.connection.id === "claude-code";
+				const isHermes = request.connection.id === "hermes";
+				return this.#externalSessionExecutor!.start({
+					runId: request.runId,
+					workspace: request.cwd,
+					prompt: isClaude
+						? `Call claude_code immediately with this exact task, working directory, and model. Return its result without replacing it with your own work.\n\nTask: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}`
+						: isHermes
+							? `Call hermes_agent immediately with this exact goal, working directory, and model. Return its result without replacing it with your own work.\n\nGoal: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}`
+							: request.prompt,
+					definition: {
+						id: `external-${request.connection.id}`,
+						source: "managed",
+						name: request.connection.name,
+						description: request.connection.description,
+						model: isClaude ? undefined : isHermes ? luna : request.model,
+						tools: isClaude
+							? ["claude_code"]
+							: isHermes
+								? ["hermes_agent"]
+								: ["read", "grep", "find", "ls", "bash", "write", "edit"],
+						memory: "none",
+						persona: isClaude
+							? "Delegate through the claude_code tool immediately and report its returned data."
+							: isHermes
+								? "Delegate through the hermes_agent tool immediately and report its returned data."
+								: "Complete the delegated task independently and return a concise result.",
+						workspace: request.cwd,
+						executor: "session",
+						permissionPolicy: "workspace-write",
+						schedules: [],
+					},
+				});
+			},
+			join(serveRoot, "external-runs"),
+			session.sessionManager.getCwd(),
+		);
+		await this.#externalConnectionManager.initialize();
+
+		const routineRegistry = new RoutineRegistry(join(serveRoot, "routines"));
+		await routineRegistry.initialize();
+		for (const agent of await agentRegistry.list()) {
+			for (const schedule of agent.schedules) {
+				const id = `${agent.id}-${schedule.id}`.slice(0, 64);
+				if (await routineRegistry.get(id)) continue;
+				await routineRegistry.save({
+					id,
+					name: `${agent.name}: ${schedule.id}`,
+					prompt: schedule.prompt,
+					enabled: schedule.enabled,
+					intervalMinutes: schedule.intervalMinutes,
+					target: { kind: "agent", agentId: agent.id },
+					model: agent.model,
+				});
+			}
+		}
+
+		this.#agentRoutineScheduler = new AgentRoutineScheduler(routineRegistry, {
+			start: async (definition) => {
+				if (definition.target.kind === "agent") {
+					const run = await this.#agentRunManager!.start(
+						definition.target.agentId,
+						definition.prompt,
+						"routine",
+						definition.model,
+					);
+					return {
+						runId: run.id,
+						completion: this.#agentRunManager!.waitForCompletion(run.id).then((completed) =>
+							completed.status === "succeeded"
+								? {}
+								: { error: completed.error ?? `Agent run ${completed.status}` },
+						),
+					};
+				}
+				const connectionId = definition.target.kind === "acp" ? definition.target.connectionId : "openai";
+				const prompt =
+					definition.target.kind === "skill"
+						? `Use the $${definition.target.skillName} skill to complete this routine.\n\n${definition.prompt}`
+						: definition.prompt;
+				const run = await this.#externalConnectionManager!.start({
+					connectionId,
+					prompt,
+					cwd: definition.cwd,
+					model: definition.model,
+				});
+				return {
+					runId: run.id,
+					completion: this.#externalConnectionManager!.waitForCompletion(run.id).then((completed) =>
+						completed.status === "succeeded"
+							? {}
+							: { error: completed.error ?? `Delegated run ${completed.status}` },
+					),
+				};
+			},
+		});
+		await this.#agentRoutineScheduler.start();
+
+		const currentSessionService = new CurrentSessionService(session, Date.now(), async (options) => {
+			const agentId = options.name?.startsWith("agent:") ? options.name.slice("agent:".length) : undefined;
+			if (agentId) {
+				const definition = await agentRegistry.get(agentId);
+				if (!definition) throw new Error(`Agent ${agentId} was not found`);
+				const workspace = agentRegistry.workspacePath(definition);
+				const agentSessionManager = SessionManager.inMemory(workspace, { id: options.id });
+				agentSessionManager.appendSessionInfo(`agent:${definition.id}`);
+				return createConfiguredAgentSession(definition, workspace, agentSessionManager, {
+					kind: "pi-session",
+					id: options.id,
+				});
+			}
+			const requestedModel = options.model;
+			const hostedModel = requestedModel
+				? modelRuntime.getModel(requestedModel.provider, requestedModel.id)
+				: session.model;
+			if (!hostedModel) throw new Error("No model is available for the browser helper session");
+			const hostedCwd = options.cwd ?? session.sessionManager.getCwd();
+			const hostedSessionManager = SessionManager.inMemory(hostedCwd, { id: options.id });
+			if (options.name) hostedSessionManager.appendSessionInfo(options.name);
+			const browserTools = createBrowserTools(this.#browserSessionManager!, {
+				owner: { kind: "pi-session", id: options.id },
+				workspace: { id: options.id, root: hostedCwd },
+				access: "loopback",
+				workspacePreview: this.#workspacePreviewServer,
+			});
+			return (
+				await createAgentSession({
+					cwd: hostedCwd,
+					agentDir,
+					modelRuntime,
+					model: hostedModel,
+					thinkingLevel: options.thinkingLevel,
+					customTools: browserTools,
+					sessionManager: hostedSessionManager,
+				})
+			).session;
+		});
+		this.#attachmentStore = new ServeAttachmentStore();
+		const capabilityCatalog = new CapabilityCatalog(session, this.#externalConnectionManager, browserConsole);
+		const listener = new WebSocketListener({
+			host,
+			port: requestedPort,
+			token,
+			autoIncrementPort: this.#options.autoIncrementPort,
+			onHttpRequest: createServePage(
+				token,
+				agentRegistry,
+				this.#agentRunManager,
+				this.#agentRoutineScheduler,
+				this.#externalConnectionManager,
+				routineRegistry,
+				currentSessionService,
+				this.#attachmentStore,
+				capabilityCatalog,
+				browserConsole,
+			),
+			auxiliary: {
+				path: "/browser-stream",
+				onConnection: (socket) => browserStream.accept(socket),
+			},
+		});
+		this.#server = new PiServer(currentSessionService, {
+			listeners: [listener],
+			onError: this.#options.onError,
+		});
+		await this.#server.start();
+		const boundPort = listener.port;
+		const listenerAddress = listener.address;
+		if (boundPort === undefined || listenerAddress === undefined) throw new Error("Serve listener did not bind");
+
+		const diagnostics: ServeHostDiagnostic[] = [];
+		if (requestedPort !== 0 && boundPort !== requestedPort) {
+			diagnostics.push({ type: "info", message: `Port ${requestedPort} was in use; Pi selected ${boundPort}` });
+		}
+		const serveUrl = new URL(listenerAddress);
+		serveUrl.protocol = serveUrl.protocol === "wss:" ? "https:" : "http:";
+		serveUrl.pathname = "/";
+		serveUrl.searchParams.set("token", token);
+		diagnostics.push({ type: "info", message: `Pi web control: ${serveUrl.href}` });
+		return { url: serveUrl.href, port: boundPort, diagnostics };
+	}
+
+	async #close(): Promise<void> {
+		const disposals: Array<() => Promise<void>> = [
+			() => this.#server?.close() ?? Promise.resolve(),
+			() => this.#agentRoutineScheduler?.dispose() ?? Promise.resolve(),
+			() => this.#agentRunManager?.dispose() ?? Promise.resolve(),
+			() => this.#externalConnectionManager?.dispose() ?? Promise.resolve(),
+			() => this.#externalSessionExecutor?.dispose() ?? Promise.resolve(),
+			() => this.#attachmentStore?.dispose() ?? Promise.resolve(),
+			() => this.#browserSessionManager?.dispose() ?? Promise.resolve(),
+			() => this.#workspacePreviewServer?.close() ?? Promise.resolve(),
+		];
+		const errors: unknown[] = [];
+		for (const dispose of disposals) {
+			try {
+				await dispose();
+			} catch (error) {
+				errors.push(error);
+			}
+		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "Failed to close serve host");
+	}
+}

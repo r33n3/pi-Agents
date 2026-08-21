@@ -3,12 +3,19 @@ import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import type { ModelRef } from "@earendil-works/pi-protocol";
 import { parseFrontmatter } from "../../utils/frontmatter.ts";
+import type { BrowserAccess } from "./browser-policy.ts";
+import type { BrowserProfile } from "./browser-profile-store.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
 export type AgentExecutorKind = "session" | "harness";
 export type AgentMemoryKind = "none" | "notes";
 export type AgentPermissionPolicy = "read-only" | "workspace-write";
 export type AgentDefinitionSource = "managed" | "pi-agent";
+
+export interface AgentBrowserPolicy {
+	access: BrowserAccess;
+	profile: BrowserProfile;
+}
 
 export interface AgentRoutineDefinition {
 	id: string;
@@ -31,6 +38,7 @@ export interface AgentDefinition {
 	executor: AgentExecutorKind;
 	permissionPolicy: AgentPermissionPolicy;
 	schedules: AgentRoutineDefinition[];
+	browser?: AgentBrowserPolicy;
 }
 
 export type AgentDefinitionInput = Omit<AgentDefinition, "id" | "personaId" | "source" | "workspace"> & {
@@ -175,6 +183,7 @@ export class AgentRegistry {
 				? "workspace-write"
 				: "read-only",
 			schedules: [],
+			browser: { access: "disabled", profile: { kind: "ephemeral" } },
 		};
 	}
 }
@@ -187,11 +196,15 @@ function normalizeDefinition(value: unknown): AgentDefinition {
 	const workspace = input.workspace === undefined ? `workspaces/${id}` : requiredString(input.workspace, "workspace");
 	if (isAbsolute(workspace)) throw new Error("Agent workspace must be relative to the registry root");
 	const tools = stringArray(input.tools, "tools");
-	const unsupportedTool = tools.find((tool) => !["read", "list", "write"].includes(tool));
+	const unsupportedTool = tools.find((tool) => !["read", "list", "write", "browser"].includes(tool));
 	if (unsupportedTool) throw new Error(`Unsupported isolated agent tool: ${unsupportedTool}`);
 	const permissionPolicy = oneOf(input.permissionPolicy, ["read-only", "workspace-write"], "permissionPolicy");
 	if (permissionPolicy === "read-only" && tools.includes("write")) {
 		throw new Error("read-only agents cannot enable the write tool");
+	}
+	const browser = normalizeBrowserPolicy(input.browser);
+	if (tools.includes("browser") !== (browser.access !== "disabled")) {
+		throw new Error("browser tool and browser access policy must be enabled together");
 	}
 	return {
 		id,
@@ -206,7 +219,18 @@ function normalizeDefinition(value: unknown): AgentDefinition {
 		executor: oneOf(input.executor, ["session", "harness"], "executor"),
 		permissionPolicy,
 		schedules: normalizeSchedules(input.schedules),
+		browser,
 	};
+}
+
+function normalizeBrowserPolicy(value: unknown): AgentBrowserPolicy {
+	if (value === undefined) return { access: "disabled", profile: { kind: "ephemeral" } };
+	const input = record(value, "browser");
+	const access = oneOf(input.access, ["disabled", "loopback", "public-web", "private-network"], "browser.access");
+	const profileInput = record(input.profile, "browser.profile");
+	const kind = oneOf(profileInput.kind, ["ephemeral", "named"], "browser.profile.kind");
+	if (kind === "ephemeral") return { access, profile: { kind } };
+	return { access, profile: { kind, id: requiredString(profileInput.id, "browser.profile.id") } };
 }
 
 function parseCatalogModel(value: unknown): ModelRef | undefined {

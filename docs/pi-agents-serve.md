@@ -25,6 +25,10 @@ strict. The default bind address is `127.0.0.1`; an explicit non-loopback
   during a turn. Enter sends; Shift+Enter inserts a newline.
 - New Agent opens Builder with separate Chat and Settings tabs. The chat uses
   an isolated helper session while Settings owns the persisted definition.
+- Preview replaces Overview and, when the managed-browser milestone is
+  installed, shows the same Chromium page controlled by the user and agent.
+  See the [managed-browser specification](pi-browser-preview-spec.md) for the
+  implementation contract.
 - Activity launches and aborts local agents. Completed results link to their
   persisted artifact.
 - Routines show enabled interval schedules and their next/last run state.

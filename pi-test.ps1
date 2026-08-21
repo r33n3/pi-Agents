@@ -35,6 +35,7 @@ if (-not $noEnv -and (Test-Path -LiteralPath $localEnvPath)) {
 }
 
 if ($noEnv) {
+	$env:PI_DISABLE_LOCAL_TOOL_ENV = "1"
 	$envVarsToUnset = @(
 		"ANTHROPIC_API_KEY",
 		"ANTHROPIC_OAUTH_TOKEN",
@@ -70,9 +71,14 @@ if ($noEnv) {
 		"AWS_WEB_IDENTITY_TOKEN_FILE",
 		"AZURE_OPENAI_API_KEY",
 		"AZURE_OPENAI_BASE_URL",
-		"AZURE_OPENAI_RESOURCE_NAME"
-		"OPENAI_PLATFORM_API"
-		"ANTHROPIC_PLATFORM_API"
+		"AZURE_OPENAI_RESOURCE_NAME",
+		"OPENAI_PLATFORM_API",
+		"ANTHROPIC_PLATFORM_API",
+		"APIFY_API_KEY",
+		"CURRENTS_NEW_API_KEY",
+		"FINNHUB_API_KEY",
+		"FIRECRAWL_API_KEY",
+		"TIINGO_API_KEY"
 	)
 
 	foreach ($name in $envVarsToUnset) {

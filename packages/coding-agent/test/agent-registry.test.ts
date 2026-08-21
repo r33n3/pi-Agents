@@ -57,6 +57,28 @@ describe("AgentRegistry", () => {
 		expect(await agents.get("writer")).toMatchObject({ description: "Writes concise reports" });
 	});
 
+	test("requires an explicit policy when an agent enables browser tools", async () => {
+		const { registry: agents } = await registry();
+		const input = {
+			id: "browser-agent",
+			name: "Browser Agent",
+			description: "Uses a managed browser",
+			tools: ["browser"],
+			memory: "none" as const,
+			persona: "Browser-aware",
+			executor: "session" as const,
+			permissionPolicy: "read-only" as const,
+			schedules: [],
+		};
+		await expect(agents.save(input)).rejects.toThrow("browser tool and browser access policy");
+		await expect(
+			agents.save({
+				...input,
+				browser: { access: "public-web", profile: { kind: "named", id: "research" } },
+			}),
+		).resolves.toMatchObject({ browser: { access: "public-web", profile: { kind: "named", id: "research" } } });
+	});
+
 	test("rejects workspaces outside the registry", async () => {
 		const { registry: agents } = await registry();
 		await expect(

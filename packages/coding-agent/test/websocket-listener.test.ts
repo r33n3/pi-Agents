@@ -42,6 +42,28 @@ describe("WebSocketListener", () => {
 		expect(code).toBe(1003);
 	});
 
+	test("gates an auxiliary WebSocket on the same capability token", async () => {
+		await listener.close();
+		listener = new WebSocketListener({
+			host: "127.0.0.1",
+			port: 0,
+			token: "secret-token",
+			auxiliary: { path: "/browser-stream", onConnection: (socket) => socket.send("ready") },
+		});
+		await listener.start(() => ({ onData: () => {}, onClose: () => {}, onError: () => {} }));
+		const origin = new URL(listener.address!);
+		origin.pathname = "/browser-stream";
+		origin.searchParams.set("token", "secret-token");
+		const authorized = await connect(origin.href);
+		await expect.poll(() => authorized.readyState).toBe(WebSocket.OPEN);
+		const unauthorizedUrl = new URL(origin);
+		unauthorizedUrl.searchParams.set("token", "wrong");
+		const unauthorized = await connect(unauthorizedUrl.href);
+		const code = await new Promise<number>((resolve) => unauthorized.once("close", resolve));
+		expect(code).toBe(1008);
+		authorized.close();
+	});
+
 	test("selects the next port when automatic selection is enabled", async () => {
 		const blocker = createServer();
 		await listenHttp(blocker);

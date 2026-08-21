@@ -14,8 +14,10 @@ The browser console has three stable areas:
    explicitly supplied local Pi capability URL; no discovery is performed.
 2. **Center** — tabbed live Pi sessions, readable conversation scrolling, and
    a composer whose send arrow becomes a red stop control during a turn.
-3. **Right workspace** — selected-agent tabs: Overview, Activity, Routines,
-   and Builder. Builder separates its conversational Chat from Settings.
+3. **Right workspace** — selected-agent tabs: Preview, Activity, Routines,
+   Capabilities, and Builder. Builder separates its conversational Chat from
+   Settings. Preview follows the
+   [managed-browser design](pi-browser-preview-spec.md).
 
 Both sidebars are resizable, and the left rail uses a faded calligraphic π
 watermark instead of a product-title block.
@@ -46,6 +48,7 @@ CLI --serve
       ├─ WebSocket/HTTP listener → browser PiClient
       ├─ AgentRegistry → persisted AgentDefinition records
       ├─ AgentRunManager → state, events, artifacts, queue
+      ├─ BrowserSessionManager → managed Chromium, workspace binding, shared control, evidence
       └─ AgentExecutor
           ├─ session executor (fresh trusted local Pi session)
           └─ harness executor (fresh workspace-confined AgentSession)
@@ -55,6 +58,8 @@ CLI --serve
 delivery. `AgentRunManager` owns run state and serialization. Executors own
 only launch/abort/event collection. The browser consumes protocol snapshots and
 agent-run events; it does not inspect Pi internals or infer process state.
+Each browser session carries the owning local project workspace id and root,
+which is the compatibility seam for the later terminal/file/container runtime.
 
 ## Agent definition
 
@@ -62,8 +67,11 @@ Persist one definition per agent:
 
 ```text
 id, name, description, model, tools, memory, persona,
-workspace, executor, permissionPolicy, schedules
+workspace, executor, permissionPolicy, schedules, browser
 ```
+
+`browser` is optional and defaults to disabled. When enabled it declares the
+agent's navigation scope and ephemeral or named managed Chromium profile.
 
 Runtime state is separate and ephemeral/persisted by run: status, timestamps,
 exit status, transcript pointer, tool activity, and artifact manifest.
@@ -89,7 +97,7 @@ model.
    active-session protocol adapter, and server lifecycle.
 2. **Live browser client**: bundled PiClient transport, attach current session,
    transcript/model/steer/abort controls, reconnect and clear error state.
-3. **Agent workspace**: registry, sidebar, Overview/Activity/Routines/
+3. **Agent workspace**: registry, sidebar, Preview/Activity/Routines/
    Configure tabs, and existing conversational builder migration.
 4. **Local execution**: run manager, session executor, isolated harness,
    artifact manifest, cancellation, and cleanup.
@@ -98,6 +106,10 @@ model.
 6. **Hardening**: LAN warning policy, process-lifetime token rotation, request
    and connection limits, protocol/agent concurrency tests, path validation,
    and documentation.
+7. **Managed browser**: replace Overview with Preview, add isolated Chromium
+   sessions, semantic browser tools, shared user/agent control, browser
+   evidence, and browser-specific LAN policy. See the
+   [managed-browser specification](pi-browser-preview-spec.md).
 
 ## Acceptance criteria
 
@@ -116,7 +128,9 @@ model.
 
 ## Deliberate non-goals for v1
 
-- Remote cloud control, multi-user collaboration, and remote-desktop streaming.
+- Remote cloud control and multi-user collaboration.
+- Full remote-desktop or arbitrary desktop-application streaming. The managed
+  browser streams only its owned Chromium page.
 - Arbitrary LAN discovery or unauthenticated pairing.
 - Distributed executors across machines.
 

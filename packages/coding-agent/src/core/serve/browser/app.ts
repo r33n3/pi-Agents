@@ -6,6 +6,7 @@ import type {
 	ThinkingLevel,
 	TranscriptItem,
 } from "@earendil-works/pi-protocol";
+import { installThemedSelect } from "./themed-select.ts";
 import { createBrowserWebSocketTransport } from "./websocket-transport.ts";
 
 const status = element("status");
@@ -13,6 +14,9 @@ const transcript = element("transcript");
 const form = requiredElement<HTMLFormElement>("composer");
 const input = requiredElement<HTMLTextAreaElement>("prompt");
 const send = requiredElement<HTMLButtonElement>("composer-action");
+const attachmentInput = requiredElement<HTMLInputElement>("attachment-input");
+const attachmentButton = requiredElement<HTMLButtonElement>("attachment-button");
+const attachmentList = element("attachment-list");
 const model = requiredElement<HTMLSelectElement>("model");
 const agentModel = requiredElement<HTMLSelectElement>("agent-model");
 const thinking = requiredElement<HTMLSelectElement>("thinking");
@@ -24,9 +28,15 @@ const runForm = requiredElement<HTMLFormElement>("run-form");
 const runAgent = requiredElement<HTMLSelectElement>("run-agent");
 const runList = element("run-list");
 const routineList = element("routine-list");
+const routineEditor = createRoutineEditor();
 const builderChat = element("builder-chat");
 const builderChatForm = requiredElement<HTMLFormElement>("builder-chat-form");
 const builderPrompt = requiredElement<HTMLTextAreaElement>("builder-prompt");
+const builderSubmit = (() => {
+	const value = builderChatForm.querySelector<HTMLButtonElement>('button[type="submit"]');
+	if (!value) throw new Error("Missing builder chat submit button");
+	return value;
+})();
 const sessionTabs = element("session-tabs");
 const connectionList = element("connection-list");
 const connectionForm = requiredElement<HTMLFormElement>("connection-form");
@@ -36,6 +46,23 @@ const externalConnectionList = element("external-connection-list");
 const externalRunForm = requiredElement<HTMLFormElement>("external-run-form");
 const externalRunList = element("external-run-list");
 const externalModel = requiredElement<HTMLSelectElement>("external-model");
+const previewStatus = element("preview-status");
+const previewSession = element("preview-session");
+const previewImage = requiredElement<HTMLImageElement>("preview-image");
+const previewForm = requiredElement<HTMLFormElement>("preview-form");
+const previewAddress = requiredElement<HTMLInputElement>("preview-address");
+const previewBack = requiredElement<HTMLButtonElement>("preview-back");
+const previewForward = requiredElement<HTMLButtonElement>("preview-forward");
+const previewReload = requiredElement<HTMLButtonElement>("preview-reload");
+const previewControl = requiredElement<HTMLButtonElement>("preview-control");
+const previewTypeForm = requiredElement<HTMLFormElement>("preview-type-form");
+const previewType = requiredElement<HTMLInputElement>("preview-type");
+const previewConsole = element("preview-console");
+const previewNetwork = element("preview-network");
+const modelPicker = installThemedSelect(model);
+const agentModelPicker = installThemedSelect(agentModel);
+const externalModelPicker = installThemedSelect(externalModel);
+const routineModelPicker = installThemedSelect(routineEditor.model);
 const capabilityToken = new URL(location.href).searchParams.get("token");
 
 let client: PiClient | undefined;
@@ -43,8 +70,43 @@ let session: PiSessionHandle | undefined;
 let unsubscribeSession: Unsubscribe | undefined;
 let builderSession: PiSessionHandle | undefined;
 let unsubscribeBuilder: Unsubscribe | undefined;
+let activeSidebarAgent: AgentSummary | undefined;
 let activeTargetKey: string | undefined;
+let activePreviewSessionId: string | undefined;
+let activePreviewSession: BrowserSessionSummary | undefined;
+let previewStream: WebSocket | undefined;
+let previewStreamSessionId: string | undefined;
+let previewFrameUrl: string | undefined;
 let selectedExternalConnectionId: string | undefined;
+let availableModels: ModelMetadata[] = [];
+let agents: AgentSummary[] = [];
+const attachmentsBySession = new Map<string, AttachmentSummary[]>();
+
+interface AttachmentSummary {
+	id: string;
+	name: string;
+	mimeType: string;
+	size: number;
+}
+
+interface CapabilityEntry {
+	id: string;
+	name: string;
+	description: string;
+	status: "active" | "available" | "unavailable";
+	scope: string;
+	source?: string;
+	path?: string;
+}
+
+interface CapabilitySnapshot {
+	tools: CapabilityEntry[];
+	skills: CapabilityEntry[];
+	extensions: CapabilityEntry[];
+	mcpServers: CapabilityEntry[];
+	acpConnections: CapabilityEntry[];
+	modelProviders: CapabilityEntry[];
+}
 
 interface ConnectionEntry {
 	id: string;
@@ -80,6 +142,32 @@ interface ExternalRunSummary {
 	status: string;
 	createdAt: number;
 	error?: string;
+}
+
+interface BrowserConsoleStatus {
+	browser: "chromium";
+	installed: boolean;
+	executablePath: string;
+	sessionCount: number;
+}
+
+interface BrowserSessionSummary {
+	id: string;
+	owner: { kind: "pi-session" | "agent-run" | "external-run"; id: string };
+	status: "starting" | "ready" | "navigating" | "failed" | "closed";
+	url?: string;
+	title?: string;
+	updatedAt: number;
+	lastError?: string;
+	controlOwner: "agent" | "user";
+	viewport: { width: number; height: number; deviceScaleFactor: number };
+	canGoBack: boolean;
+	canGoForward: boolean;
+}
+
+interface BrowserDiagnostics {
+	console: Array<{ type: string; text: string; timestamp: number }>;
+	networkFailures: Array<{ url: string; method: string; reason: string; timestamp: number }>;
 }
 
 let externalConnections: ExternalConnectionSummary[] = [];
@@ -124,6 +212,131 @@ function requiredElement<T extends HTMLElement>(id: string): T {
 	return element(id) as T;
 }
 
+function createRoutineEditor(): {
+	form: HTMLFormElement;
+	id: HTMLInputElement;
+	name: HTMLInputElement;
+	targetKind: HTMLSelectElement;
+	agent: HTMLSelectElement;
+	acp: HTMLSelectElement;
+	skill: HTMLInputElement;
+	prompt: HTMLTextAreaElement;
+	cwd: HTMLInputElement;
+	model: HTMLSelectElement;
+	interval: HTMLInputElement;
+	enabled: HTMLInputElement;
+	agentLabel: HTMLLabelElement;
+	acpLabel: HTMLLabelElement;
+	skillLabel: HTMLLabelElement;
+	cwdLabel: HTMLLabelElement;
+	deleteButton: HTMLButtonElement;
+	runButton: HTMLButtonElement;
+	clearButton: HTMLButtonElement;
+} {
+	const panel = element("routines");
+	const card = document.createElement("div");
+	card.className = "card";
+	const title = document.createElement("strong");
+	title.id = "routine-editor-title";
+	title.textContent = "New routine";
+	const form = document.createElement("form");
+	form.id = "routine-editor";
+	const id = document.createElement("input");
+	id.type = "hidden";
+	const name = document.createElement("input");
+	name.required = true;
+	const targetKind = document.createElement("select");
+	for (const [value, label] of [
+		["agent", "Local agent"],
+		["acp", "ACP target"],
+		["skill", "Skill"],
+	] as const) {
+		const option = document.createElement("option");
+		option.value = value;
+		option.textContent = label;
+		targetKind.append(option);
+	}
+	const agent = document.createElement("select");
+	const acp = document.createElement("select");
+	const skill = document.createElement("input");
+	skill.placeholder = "skill-name";
+	const prompt = document.createElement("textarea");
+	prompt.required = true;
+	const cwd = document.createElement("input");
+	const model = document.createElement("select");
+	const interval = document.createElement("input");
+	interval.type = "number";
+	interval.min = "1";
+	interval.value = "60";
+	interval.required = true;
+	const enabled = document.createElement("input");
+	enabled.type = "checkbox";
+	const label = (text: string, control: HTMLElement) => {
+		const wrapper = document.createElement("label");
+		wrapper.append(text, control);
+		return wrapper;
+	};
+	const agentLabel = label("Agent", agent);
+	const acpLabel = label("ACP target", acp);
+	const skillLabel = label("Skill name", skill);
+	const cwdLabel = label("Working directory", cwd);
+	const enabledLabel = label("Active", enabled);
+	const actions = document.createElement("div");
+	actions.className = "routine-actions";
+	const save = document.createElement("button");
+	save.type = "submit";
+	save.className = "primary";
+	save.textContent = "Save";
+	const runButton = document.createElement("button");
+	runButton.type = "button";
+	runButton.textContent = "Run now";
+	const clearButton = document.createElement("button");
+	clearButton.type = "button";
+	clearButton.textContent = "New";
+	const deleteButton = document.createElement("button");
+	deleteButton.type = "button";
+	deleteButton.className = "danger";
+	deleteButton.textContent = "Delete";
+	actions.append(save, runButton, clearButton, deleteButton);
+	form.append(
+		id,
+		label("Name", name),
+		label("Run with", targetKind),
+		agentLabel,
+		acpLabel,
+		skillLabel,
+		label("Instructions", prompt),
+		cwdLabel,
+		label("Model", model),
+		label("Run every (minutes)", interval),
+		enabledLabel,
+		actions,
+	);
+	card.append(title, form);
+	panel.insertBefore(card, routineList);
+	return {
+		form,
+		id,
+		name,
+		targetKind,
+		agent,
+		acp,
+		skill,
+		prompt,
+		cwd,
+		model,
+		interval,
+		enabled,
+		agentLabel,
+		acpLabel,
+		skillLabel,
+		cwdLabel,
+		deleteButton,
+		runButton,
+		clearButton,
+	};
+}
+
 function setStatus(message: string, error = false): void {
 	status.textContent = message;
 	status.classList.toggle("error", error);
@@ -136,6 +349,8 @@ function setBusy(snapshot: SessionSnapshot): void {
 	send.setAttribute("aria-label", busy ? "Stop response" : "Send message");
 	model.disabled = busy;
 	thinking.disabled = busy;
+	attachmentButton.disabled = busy || !activeConnectionIsPrimary();
+	attachmentInput.disabled = busy || !activeConnectionIsPrimary();
 }
 
 function render(snapshot: SessionSnapshot): void {
@@ -144,6 +359,7 @@ function render(snapshot: SessionSnapshot): void {
 	transcript.replaceChildren(...snapshot.transcript.map(renderItem));
 	setBusy(snapshot);
 	model.value = `${snapshot.model.provider}/${snapshot.model.id}`;
+	modelPicker.refresh();
 	thinking.value = snapshot.thinkingLevel;
 	transcript.scrollTop = nearBottom ? transcript.scrollHeight : previousScrollTop;
 }
@@ -181,6 +397,7 @@ function appendText(parent: HTMLElement, text: string, className?: string): void
 }
 
 function populateModels(models: readonly ModelMetadata[], includeAgentModels = false): void {
+	availableModels = [...models];
 	const options = models.map((entry) => {
 		const option = document.createElement("option");
 		option.value = `${entry.provider}/${entry.id}`;
@@ -188,6 +405,7 @@ function populateModels(models: readonly ModelMetadata[], includeAgentModels = f
 		return option;
 	});
 	model.replaceChildren(...options);
+	modelPicker.refresh();
 	if (!includeAgentModels) return;
 	const inherit = document.createElement("option");
 	inherit.value = "";
@@ -201,6 +419,8 @@ function populateModels(models: readonly ModelMetadata[], includeAgentModels = f
 			return option;
 		}),
 	);
+	agentModelPicker.refresh();
+	refreshRoutineEditorOptions();
 }
 
 function socketUrl(controlUrl: string): { label: string; url: string } {
@@ -247,7 +467,9 @@ async function addConnection(controlUrl: string, primary = false): Promise<Conne
 function sessionTargets(): SessionTarget[] {
 	return [...connections.values()].flatMap((entry) =>
 		entry.sessions
-			.filter((metadata) => !metadata.sessionName?.startsWith("builder:"))
+			.filter(
+				(metadata) => !metadata.sessionName?.startsWith("builder:") && !metadata.sessionName?.startsWith("agent:"),
+			)
 			.map((metadata) => ({
 				key: `${entry.id}:${metadata.id}`,
 				connectionId: entry.id,
@@ -346,7 +568,443 @@ async function switchSession(target: SessionTarget): Promise<void> {
 	unsubscribeSession = session.subscribe(render);
 	if (session.snapshot) render(session.snapshot);
 	renderSessionNavigation();
+	renderAttachments();
+	void loadPreview().catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
 	setStatus(`Connected to ${entry.label}`);
+}
+
+function setPreviewMessage(message: string, error = false): void {
+	previewStatus.textContent = message;
+	previewStatus.classList.toggle("error", error);
+}
+
+function setPreviewControls(browserSession: BrowserSessionSummary | undefined): void {
+	const sessionId = browserSession?.id;
+	const userControls = browserSession?.controlOwner === "user";
+	activePreviewSessionId = sessionId;
+	activePreviewSession = browserSession;
+	previewAddress.value = browserSession?.url ?? "";
+	previewAddress.disabled = !userControls;
+	previewBack.disabled = !userControls || !browserSession?.canGoBack;
+	previewForward.disabled = !userControls || !browserSession?.canGoForward;
+	previewReload.disabled = !userControls || !browserSession?.url;
+	previewType.disabled = !userControls;
+	previewControl.disabled = sessionId === undefined;
+	previewControl.textContent = userControls ? "Return to agent" : "Take control";
+}
+
+function ensurePreviewStream(sessionId: string): boolean {
+	if (!capabilityToken) return false;
+	if (!previewStream || previewStream.readyState >= WebSocket.CLOSING) {
+		const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+		previewStream = new WebSocket(
+			`${protocol}//${location.host}/browser-stream?token=${encodeURIComponent(capabilityToken)}`,
+		);
+		previewStream.binaryType = "arraybuffer";
+		previewStream.addEventListener("open", () => subscribePreviewStream());
+		previewStream.addEventListener("message", handlePreviewStreamMessage);
+		previewStream.addEventListener("close", () => {
+			previewStream = undefined;
+			previewStreamSessionId = undefined;
+		});
+	}
+	if (previewStream.readyState === WebSocket.OPEN && previewStreamSessionId !== sessionId) {
+		previewStreamSessionId = sessionId;
+		previewStream.send(JSON.stringify({ type: "subscribe", sessionId }));
+	}
+	return previewStream.readyState === WebSocket.OPEN;
+}
+
+function subscribePreviewStream(): void {
+	if (!previewStream || previewStream.readyState !== WebSocket.OPEN || !activePreviewSessionId) return;
+	previewStreamSessionId = activePreviewSessionId;
+	previewStream.send(JSON.stringify({ type: "subscribe", sessionId: activePreviewSessionId }));
+}
+
+function handlePreviewStreamMessage(event: MessageEvent): void {
+	if (typeof event.data === "string") {
+		const value: unknown = JSON.parse(event.data);
+		if (typeof value === "object" && value !== null && "type" in value && value.type === "error") {
+			setPreviewMessage(
+				"message" in value && typeof value.message === "string" ? value.message : "Browser stream failed",
+				true,
+			);
+		}
+		return;
+	}
+	if (!(event.data instanceof ArrayBuffer)) return;
+	const packet = new Uint8Array(event.data);
+	if (packet.byteLength < 6 || packet[0] !== 1) return;
+	const metadataLength = new DataView(packet.buffer, packet.byteOffset, packet.byteLength).getUint32(1);
+	if (metadataLength < 2 || 5 + metadataLength >= packet.byteLength) return;
+	const metadata: unknown = JSON.parse(new TextDecoder().decode(packet.subarray(5, 5 + metadataLength)));
+	if (
+		typeof metadata !== "object" ||
+		metadata === null ||
+		!("sessionId" in metadata) ||
+		metadata.sessionId !== activePreviewSessionId
+	)
+		return;
+	const nextUrl = URL.createObjectURL(new Blob([packet.subarray(5 + metadataLength)], { type: "image/jpeg" }));
+	previewImage.src = nextUrl;
+	if (previewFrameUrl) URL.revokeObjectURL(previewFrameUrl);
+	previewFrameUrl = nextUrl;
+}
+
+async function loadPreview(): Promise<void> {
+	if (!capabilityToken) return;
+	if (!session || !activeConnectionIsPrimary()) {
+		previewSession.textContent = "No local Pi session selected";
+		previewImage.removeAttribute("src");
+		setPreviewControls(undefined);
+		setPreviewMessage("Preview is available for sessions hosted by this Pi console.");
+		previewStream?.close();
+		return;
+	}
+	const statusResponse = await fetch(`/browser/status?token=${encodeURIComponent(capabilityToken)}`);
+	if (!statusResponse.ok) throw new Error(await responseError(statusResponse, "Could not load browser status"));
+	const browserStatus: unknown = await statusResponse.json();
+	if (!isBrowserConsoleStatus(browserStatus)) throw new Error("Browser status response is invalid");
+	if (!browserStatus.installed) {
+		previewSession.textContent = "Managed Chromium is not installed";
+		previewImage.removeAttribute("src");
+		setPreviewControls(undefined);
+		setPreviewMessage("Run `pi browser install chromium`, then ask Pi to open a local URL.");
+		return;
+	}
+	const sessionsResponse = await fetch(
+		`/browser/sessions?token=${encodeURIComponent(capabilityToken)}&ownerKind=pi-session&ownerId=${encodeURIComponent(session.id)}`,
+	);
+	if (!sessionsResponse.ok) throw new Error(await responseError(sessionsResponse, "Could not load browser sessions"));
+	const payload: unknown = await sessionsResponse.json();
+	if (!isBrowserSessionList(payload)) throw new Error("Browser session response is invalid");
+	const browserSession = payload.sessions
+		.filter((entry) => entry.status !== "closed")
+		.sort((left, right) => right.updatedAt - left.updatedAt)[0];
+	if (!browserSession) {
+		previewSession.textContent = "No browser session for this Pi chat";
+		previewImage.removeAttribute("src");
+		setPreviewControls(undefined);
+		setPreviewMessage("Ask Pi to use browser_open with a permitted local URL.");
+		previewStream?.close();
+		return;
+	}
+	previewSession.textContent = [browserSession.title ?? "Untitled page", browserSession.url ?? browserSession.status]
+		.filter(Boolean)
+		.join(" · ");
+	setPreviewControls(browserSession);
+	if (browserSession.status === "failed") {
+		previewImage.removeAttribute("src");
+		setPreviewMessage(browserSession.lastError ?? "Browser session failed", true);
+		return;
+	}
+	if (!ensurePreviewStream(browserSession.id)) {
+		previewImage.src = `/browser/sessions/${encodeURIComponent(browserSession.id)}/screenshot?token=${encodeURIComponent(capabilityToken)}&at=${browserSession.updatedAt}`;
+	}
+	setPreviewMessage(`${browserSession.status} · managed Chromium · live`);
+	if (document.querySelector("[data-preview-tab].active")?.getAttribute("data-preview-tab") !== "page") {
+		void loadPreviewDiagnostics();
+	}
+}
+
+async function loadPreviewDiagnostics(): Promise<void> {
+	if (!capabilityToken || !activePreviewSessionId) {
+		previewConsole.replaceChildren();
+		previewNetwork.replaceChildren();
+		return;
+	}
+	const response = await fetch(
+		`/browser/sessions/${encodeURIComponent(activePreviewSessionId)}/diagnostics?token=${encodeURIComponent(capabilityToken)}`,
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load browser diagnostics"));
+	const diagnostics: unknown = await response.json();
+	if (!isBrowserDiagnostics(diagnostics)) throw new Error("Browser diagnostics response is invalid");
+	previewConsole.replaceChildren(
+		...diagnostics.console.map((entry) => diagnosticRow(`${entry.type} · ${entry.text}`, entry.timestamp)),
+	);
+	previewNetwork.replaceChildren(
+		...diagnostics.networkFailures.map((entry) =>
+			diagnosticRow(`${entry.method} ${entry.url}\n${entry.reason}`, entry.timestamp),
+		),
+	);
+	if (diagnostics.console.length === 0) appendText(previewConsole, "No console entries", "muted");
+	if (diagnostics.networkFailures.length === 0) appendText(previewNetwork, "No failed requests", "muted");
+}
+
+function diagnosticRow(text: string, timestamp: number): HTMLElement {
+	const row = document.createElement("div");
+	row.className = "preview-diagnostic";
+	appendText(row, new Date(timestamp).toLocaleTimeString(), "muted");
+	appendText(row, text);
+	return row;
+}
+
+function isBrowserDiagnostics(value: unknown): value is BrowserDiagnostics {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"console" in value &&
+		Array.isArray(value.console) &&
+		"networkFailures" in value &&
+		Array.isArray(value.networkFailures)
+	);
+}
+
+async function navigatePreview(url: string): Promise<void> {
+	if (!capabilityToken || !activePreviewSessionId) return;
+	const response = await fetch(
+		`/browser/sessions/${encodeURIComponent(activePreviewSessionId)}/navigate?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ url }),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not navigate managed browser"));
+	setPreviewMessage("Navigating managed browser…");
+	await loadPreview();
+}
+
+async function previewAction(action: "back" | "forward" | "reload"): Promise<void> {
+	if (!capabilityToken || !activePreviewSessionId) return;
+	const response = await fetch(
+		`/browser/sessions/${encodeURIComponent(activePreviewSessionId)}/${action}?token=${encodeURIComponent(capabilityToken)}`,
+		{ method: "POST" },
+	);
+	if (!response.ok) throw new Error(await responseError(response, `Could not ${action} managed browser`));
+	await loadPreview();
+}
+
+async function setPreviewControl(controlOwner: "agent" | "user"): Promise<void> {
+	if (!capabilityToken || !activePreviewSessionId) return;
+	const response = await fetch(
+		`/browser/sessions/${encodeURIComponent(activePreviewSessionId)}/control?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ controlOwner }),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not change browser control"));
+	await loadPreview();
+}
+
+async function sendPreviewInput(input: Record<string, unknown>): Promise<void> {
+	if (!capabilityToken || !activePreviewSessionId) return;
+	if (previewStream?.readyState === WebSocket.OPEN && previewStreamSessionId === activePreviewSessionId) {
+		previewStream.send(
+			JSON.stringify({ type: "input", sessionId: activePreviewSessionId, requestId: crypto.randomUUID(), input }),
+		);
+		return;
+	}
+	const response = await fetch(
+		`/browser/sessions/${encodeURIComponent(activePreviewSessionId)}/input?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(input),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not send browser input"));
+	await loadPreview();
+}
+
+function isBrowserConsoleStatus(value: unknown): value is BrowserConsoleStatus {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"browser" in value &&
+		value.browser === "chromium" &&
+		"installed" in value &&
+		typeof value.installed === "boolean" &&
+		"sessionCount" in value &&
+		typeof value.sessionCount === "number"
+	);
+}
+
+function isBrowserSessionList(value: unknown): value is { sessions: BrowserSessionSummary[] } {
+	if (typeof value !== "object" || value === null || !("sessions" in value) || !Array.isArray(value.sessions)) {
+		return false;
+	}
+	return value.sessions.every((entry) => {
+		return (
+			typeof entry === "object" &&
+			entry !== null &&
+			"id" in entry &&
+			typeof entry.id === "string" &&
+			"status" in entry &&
+			typeof entry.status === "string" &&
+			"updatedAt" in entry &&
+			typeof entry.updatedAt === "number" &&
+			"controlOwner" in entry &&
+			(entry.controlOwner === "agent" || entry.controlOwner === "user") &&
+			"viewport" in entry &&
+			typeof entry.viewport === "object" &&
+			entry.viewport !== null &&
+			"width" in entry.viewport &&
+			typeof entry.viewport.width === "number" &&
+			"height" in entry.viewport &&
+			typeof entry.viewport.height === "number" &&
+			"canGoBack" in entry &&
+			typeof entry.canGoBack === "boolean" &&
+			"canGoForward" in entry &&
+			typeof entry.canGoForward === "boolean"
+		);
+	});
+}
+
+function activeConnectionIsPrimary(): boolean {
+	const target = sessionTargets().find((candidate) => candidate.key === activeTargetKey);
+	return target ? connections.get(target.connectionId)?.primary === true : false;
+}
+
+function activeAttachments(): AttachmentSummary[] {
+	if (!session) return [];
+	let values = attachmentsBySession.get(session.id);
+	if (!values) {
+		values = [];
+		attachmentsBySession.set(session.id, values);
+	}
+	return values;
+}
+
+function renderAttachments(): void {
+	const local = activeConnectionIsPrimary();
+	attachmentButton.disabled = !local;
+	attachmentButton.title = local ? "Attach files" : "Attachments require a session hosted by this Pi console";
+	attachmentList.replaceChildren(
+		...activeAttachments().map((attachment) => {
+			const chip = document.createElement("div");
+			chip.className = "attachment-chip";
+			const preview = document.createElement("a");
+			preview.href = `/attachments/${encodeURIComponent(attachment.id)}?token=${encodeURIComponent(capabilityToken ?? "")}`;
+			preview.target = "_blank";
+			preview.rel = "noreferrer";
+			preview.textContent = attachment.name;
+			preview.title = "Preview or download attachment";
+			const size = document.createElement("span");
+			size.textContent = formatBytes(attachment.size);
+			const rename = document.createElement("button");
+			rename.type = "button";
+			rename.textContent = "Rename";
+			rename.addEventListener("click", () => {
+				void renameAttachment(attachment).catch((error: unknown) =>
+					setStatus(error instanceof Error ? error.message : String(error), true),
+				);
+			});
+			const remove = document.createElement("button");
+			remove.type = "button";
+			remove.setAttribute("aria-label", `Remove ${attachment.name}`);
+			remove.textContent = "×";
+			remove.addEventListener("click", () => {
+				void removeAttachment(attachment).catch((error: unknown) =>
+					setStatus(error instanceof Error ? error.message : String(error), true),
+				);
+			});
+			chip.append(preview, size, rename, remove);
+			return chip;
+		}),
+	);
+}
+
+async function uploadFiles(files: Iterable<File>): Promise<void> {
+	if (!session || !activeConnectionIsPrimary()) {
+		setStatus("Attachments require a session hosted by this Pi console", true);
+		return;
+	}
+	const current = activeAttachments();
+	for (const file of files) {
+		if (current.length >= 8) throw new Error("A prompt can include at most 8 attachments");
+		if (file.size > 10 * 1024 * 1024) throw new Error(`${file.name} exceeds 10 MiB`);
+		setStatus(`Uploading ${file.name}…`);
+		const response = await fetch(`/attachments?token=${encodeURIComponent(capabilityToken ?? "")}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				sessionId: session.id,
+				name: file.name || `attachment-${Date.now()}`,
+				mimeType: file.type || "application/octet-stream",
+				data: arrayBufferToBase64(await file.arrayBuffer()),
+			}),
+		});
+		if (!response.ok) throw new Error(await responseError(response, `Could not upload ${file.name}`));
+		const payload: unknown = await response.json();
+		if (!isAttachmentSummary(payload)) throw new Error("Attachment service returned an invalid response");
+		current.push(payload);
+		renderAttachments();
+	}
+	setStatus(`${current.length} attachment${current.length === 1 ? "" : "s"} ready`);
+}
+
+async function renameAttachment(attachment: AttachmentSummary): Promise<void> {
+	const name = window.prompt("Attachment name", attachment.name)?.trim();
+	if (!name || name === attachment.name) return;
+	const response = await fetch(
+		`/attachments/${encodeURIComponent(attachment.id)}?token=${encodeURIComponent(capabilityToken ?? "")}`,
+		{ method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) },
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not rename attachment"));
+	const payload: unknown = await response.json();
+	if (!isAttachmentSummary(payload)) throw new Error("Attachment service returned an invalid response");
+	Object.assign(attachment, payload);
+	renderAttachments();
+}
+
+async function removeAttachment(attachment: AttachmentSummary): Promise<void> {
+	const response = await fetch(
+		`/attachments/${encodeURIComponent(attachment.id)}?token=${encodeURIComponent(capabilityToken ?? "")}`,
+		{ method: "DELETE" },
+	);
+	if (!response.ok && response.status !== 404)
+		throw new Error(await responseError(response, "Could not remove attachment"));
+	if (session)
+		attachmentsBySession.set(
+			session.id,
+			activeAttachments().filter((entry) => entry.id !== attachment.id),
+		);
+	renderAttachments();
+}
+
+function isAttachmentSummary(value: unknown): value is AttachmentSummary {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"id" in value &&
+		typeof value.id === "string" &&
+		"name" in value &&
+		typeof value.name === "string" &&
+		"mimeType" in value &&
+		typeof value.mimeType === "string" &&
+		"size" in value &&
+		typeof value.size === "number"
+	);
+}
+
+function arrayBufferToBase64(value: ArrayBuffer): string {
+	const bytes = new Uint8Array(value);
+	let binary = "";
+	for (let offset = 0; offset < bytes.length; offset += 32_768) {
+		binary += String.fromCharCode(...bytes.subarray(offset, offset + 32_768));
+	}
+	return btoa(binary);
+}
+
+function formatBytes(value: number): string {
+	if (value < 1024) return `${value} B`;
+	if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
+	return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function responseError(response: Response, fallback: string): Promise<string> {
+	try {
+		const value: unknown = await response.json();
+		if (typeof value === "object" && value !== null && "error" in value && typeof value.error === "string") {
+			return value.error;
+		}
+	} catch {}
+	return `${fallback}: HTTP ${response.status}`;
 }
 
 async function removeConnection(id: string): Promise<void> {
@@ -373,10 +1031,66 @@ async function connect(): Promise<void> {
 	await Promise.all([
 		loadAgents().catch(() => {}),
 		loadRoutines().catch(() => {}),
+		loadCapabilities().catch(() => {}),
 		loadExternalConnections().catch((error: unknown) =>
 			setStatus(error instanceof Error ? error.message : String(error), true),
 		),
 	]);
+}
+
+async function loadCapabilities(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/capabilities.json?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) throw new Error(`Could not load capabilities: HTTP ${response.status}`);
+	const payload: unknown = await response.json();
+	if (!isCapabilitySnapshot(payload)) throw new Error("Capability catalog returned an invalid response");
+	const groups: Array<[string, CapabilityEntry[]]> = [
+		["Tools", payload.tools],
+		["Skills", payload.skills],
+		["Extensions", payload.extensions],
+		["MCP servers", payload.mcpServers],
+		["ACP connectors", payload.acpConnections],
+		["Model providers", payload.modelProviders],
+	];
+	element("capability-list").replaceChildren(
+		...groups.map(([label, entries]) => {
+			const section = document.createElement("section");
+			section.className = "capability-section";
+			const heading = document.createElement("h3");
+			heading.textContent = `${label} · ${entries.length}`;
+			section.append(heading);
+			if (entries.length === 0) {
+				appendText(section, `No ${label.toLowerCase()} configured`, "muted");
+				return section;
+			}
+			for (const entry of entries) {
+				const card = document.createElement("div");
+				card.className = "card capability-card";
+				const title = document.createElement("strong");
+				const name = document.createElement("span");
+				name.textContent = entry.name;
+				const state = document.createElement("span");
+				state.className = "capability-status";
+				state.textContent = entry.status;
+				title.append(name, state);
+				appendText(card, entry.description, "muted");
+				const meta = document.createElement("div");
+				meta.className = "capability-meta";
+				meta.textContent = [entry.scope, entry.source, entry.path].filter(Boolean).join(" · ");
+				card.prepend(title);
+				card.append(meta);
+				section.append(card);
+			}
+			return section;
+		}),
+	);
+}
+
+function isCapabilitySnapshot(value: unknown): value is CapabilitySnapshot {
+	if (typeof value !== "object" || value === null) return false;
+	return ["tools", "skills", "extensions", "mcpServers", "acpConnections", "modelProviders"].every(
+		(key) => key in value && Array.isArray(value[key as keyof typeof value]),
+	);
 }
 
 interface AgentSummary {
@@ -391,6 +1105,7 @@ interface AgentSummary {
 	executor: "session" | "harness";
 	permissionPolicy: "read-only" | "workspace-write";
 	model?: { provider: string; id: string };
+	browser?: { access: "disabled" | "loopback" | "public-web" | "private-network"; profile: { kind: "ephemeral" } };
 	schedules: Array<{ id: string; prompt: string; intervalMinutes: number; enabled: boolean }>;
 }
 
@@ -400,6 +1115,7 @@ async function loadAgents(): Promise<void> {
 	if (!response.ok) throw new Error(`Could not load agents: HTTP ${response.status}`);
 	const payload: unknown = await response.json();
 	if (!isAgentList(payload)) throw new Error("Agent registry returned an invalid response");
+	agents = payload.agents;
 	agentList.replaceChildren(
 		...payload.agents.map((agent) => {
 			const button = document.createElement("button");
@@ -438,6 +1154,7 @@ async function loadAgents(): Promise<void> {
 		}),
 	);
 	if (payload.agents.some((agent) => agent.id === selectedAgent)) runAgent.value = selectedAgent;
+	refreshRoutineEditorOptions();
 }
 
 function isAgentList(value: unknown): value is { agents: AgentSummary[] } {
@@ -487,6 +1204,7 @@ async function loadExternalConnections(): Promise<void> {
 	const payload: unknown = await response.json();
 	if (!isExternalConnectionList(payload)) throw new Error("External connection catalog returned an invalid response");
 	externalConnections = payload.connections;
+	refreshRoutineEditorOptions();
 	externalConnectionList.replaceChildren(
 		...externalConnections.map((connection) => {
 			const button = document.createElement("button");
@@ -494,6 +1212,25 @@ async function loadExternalConnections(): Promise<void> {
 			button.className = "nav-item external-connection-entry";
 			button.classList.toggle("active", connection.id === selectedExternalConnectionId);
 			button.disabled = !connection.available;
+			const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+			icon.classList.add("external-connection-icon");
+			icon.dataset.provider = connection.id;
+			icon.setAttribute("viewBox", "0 0 24 24");
+			icon.setAttribute("aria-hidden", "true");
+			const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+			use.setAttribute(
+				"href",
+				connection.id === "claude-code"
+					? "#external-icon-anthropic"
+					: connection.id === "openai"
+						? "#external-icon-openai"
+						: connection.id === "hermes"
+							? "#external-icon-hermes"
+							: "#external-icon-pi",
+			);
+			icon.append(use);
+			const copy = document.createElement("div");
+			copy.className = "external-connection-copy";
 			const name = document.createElement("strong");
 			name.textContent = connection.name;
 			const state = document.createElement("span");
@@ -501,7 +1238,8 @@ async function loadExternalConnections(): Promise<void> {
 			state.textContent = connection.available
 				? `${connection.defaultModel.provider}/${connection.defaultModel.id}`
 				: "Unavailable";
-			button.append(name, state);
+			copy.append(name, state);
+			button.append(icon, copy);
 			button.title = connection.description;
 			button.addEventListener("click", () => openExternalConnection(connection));
 			return button;
@@ -551,6 +1289,7 @@ function openExternalConnection(connection: ExternalConnectionSummary): void {
 		}),
 	);
 	externalModel.value = `${connection.defaultModel.provider}/${connection.defaultModel.id}`;
+	externalModelPicker.refresh();
 	document.querySelector<HTMLElement>('[data-tab="external"]')?.classList.remove("hidden");
 	activateTab("external");
 	void loadExternalConnections().catch(() => {});
@@ -643,6 +1382,7 @@ function installPanelResizer(
 }
 
 async function openAgent(agent?: AgentSummary): Promise<void> {
+	activeSidebarAgent = agent;
 	agentForm.reset();
 	const catalogAgent = agent?.source === "pi-agent";
 	for (const control of agentForm.querySelectorAll<
@@ -658,28 +1398,38 @@ async function openAgent(agent?: AgentSummary): Promise<void> {
 	requiredElement<HTMLSelectElement>("agent-memory").value = agent?.memory ?? "none";
 	requiredElement<HTMLSelectElement>("agent-executor").value = agent?.executor ?? "harness";
 	requiredElement<HTMLSelectElement>("agent-permissions").value = agent?.permissionPolicy ?? "read-only";
+	requiredElement<HTMLSelectElement>("agent-browser-access").value = agent?.browser?.access ?? "disabled";
 	agentModel.value = agent?.model ? `${agent.model.provider}/${agent.model.id}` : "";
-	const routine = agent?.schedules[0];
-	requiredElement<HTMLInputElement>("routine-id").value = routine?.id ?? "routine";
-	requiredElement<HTMLInputElement>("routine-interval").value = String(routine?.intervalMinutes ?? 60);
-	requiredElement<HTMLTextAreaElement>("routine-prompt").value = routine?.prompt ?? "";
-	requiredElement<HTMLInputElement>("routine-enabled").checked = routine?.enabled ?? false;
+	agentModelPicker.refresh();
 	element("builder-title").textContent = agent
 		? catalogAgent
 			? `${agent.name} · Pi agent catalog`
-			: `Configure ${agent.name}`
+			: agent.name
 		: "Build a new agent";
+	const configureTab = document.querySelector<HTMLElement>('[data-tab="configure"]');
+	if (configureTab) configureTab.textContent = agent ? "Agent" : "Builder";
+	builderPrompt.placeholder = agent ? `Message ${agent.name}…` : "Describe the agent you want to build";
+	builderChatForm.classList.toggle("agent-chat-composer", agent !== undefined);
+	builderSubmit.textContent = agent ? "↑" : "Ask builder";
+	builderSubmit.setAttribute("aria-label", agent ? `Send message to ${agent.name}` : "Ask builder");
 	activateTab("configure");
 	activateBuilderTab("builder-chat-panel");
 	unsubscribeBuilder?.();
 	await builderSession?.dispose().catch(() => {});
 	builderChat.replaceChildren();
 	if (!client) return;
-	builderSession = await client.createSession({ name: `builder:${agent?.id ?? "new"}` });
+	builderSession = await client.createSession({ name: agent ? `agent:${agent.id}` : "builder:new" });
 	unsubscribeBuilder = builderSession.subscribe((snapshot) => {
 		builderChat.replaceChildren(...snapshot.transcript.map(renderItem));
 		builderChat.scrollTop = builderChat.scrollHeight;
-		builderPrompt.disabled = snapshot.phase !== "idle";
+		const busy = snapshot.phase !== "idle";
+		builderPrompt.disabled = busy;
+		builderSubmit.classList.toggle("is-stopping", busy && activeSidebarAgent !== undefined);
+		builderSubmit.textContent = activeSidebarAgent ? (busy ? "■" : "↑") : "Ask builder";
+		builderSubmit.setAttribute(
+			"aria-label",
+			activeSidebarAgent ? (busy ? "Stop response" : `Send message to ${agent?.name ?? "agent"}`) : "Ask builder",
+		);
 	});
 }
 
@@ -879,12 +1629,131 @@ async function abortExternalRun(runId: string): Promise<void> {
 }
 
 interface RoutineSummary {
-	agentId: string;
-	routineId: string;
+	id: string;
+	name: string;
 	prompt: string;
+	enabled: boolean;
 	intervalMinutes: number;
-	nextRunAt: number;
+	target:
+		| { kind: "agent"; agentId: string }
+		| { kind: "acp"; connectionId: string }
+		| { kind: "skill"; skillName: string };
+	model?: { provider: string; id: string };
+	cwd?: string;
+	nextRunAt?: number;
+	lastRunAt?: number;
+	lastRunId?: string;
+	activeRunId?: string;
 	lastError?: string;
+}
+
+let routines: RoutineSummary[] = [];
+
+function routineTargetLabel(routine: RoutineSummary): string {
+	switch (routine.target.kind) {
+		case "agent": {
+			const agentId = routine.target.agentId;
+			return `Agent · ${agents.find((agent) => agent.id === agentId)?.name ?? agentId}`;
+		}
+		case "acp": {
+			const connectionId = routine.target.connectionId;
+			return `ACP · ${externalConnections.find((entry) => entry.id === connectionId)?.name ?? connectionId}`;
+		}
+		case "skill":
+			return `Skill · $${routine.target.skillName}`;
+	}
+}
+
+function refreshRoutineEditorOptions(): void {
+	const selectedAgent = routineEditor.agent.value;
+	const selectedAcp = routineEditor.acp.value;
+	routineEditor.agent.replaceChildren(
+		...agents.map((entry) => {
+			const option = document.createElement("option");
+			option.value = entry.id;
+			option.textContent = entry.name;
+			return option;
+		}),
+	);
+	if (agents.some((entry) => entry.id === selectedAgent)) routineEditor.agent.value = selectedAgent;
+	routineEditor.acp.replaceChildren(
+		...externalConnections.map((entry) => {
+			const option = document.createElement("option");
+			option.value = entry.id;
+			option.textContent = entry.name;
+			option.disabled = !entry.available;
+			return option;
+		}),
+	);
+	if (externalConnections.some((entry) => entry.id === selectedAcp)) routineEditor.acp.value = selectedAcp;
+	refreshRoutineModels();
+}
+
+function refreshRoutineModels(selected = routineEditor.model.value): void {
+	const inherit = document.createElement("option");
+	inherit.value = "";
+	inherit.textContent = "Use target default";
+	const targetModels =
+		routineEditor.targetKind.value === "acp"
+			? (externalConnections.find((entry) => entry.id === routineEditor.acp.value)?.models ?? [])
+			: availableModels;
+	routineEditor.model.replaceChildren(
+		inherit,
+		...targetModels.map((entry) => {
+			const option = document.createElement("option");
+			option.value = `${entry.provider}/${entry.id}`;
+			option.textContent = `${entry.provider} / ${entry.name}`;
+			return option;
+		}),
+	);
+	if ([...routineEditor.model.options].some((option) => option.value === selected)) {
+		routineEditor.model.value = selected;
+	}
+	routineModelPicker.refresh();
+}
+
+function updateRoutineTargetFields(): void {
+	const kind = routineEditor.targetKind.value;
+	routineEditor.agentLabel.classList.toggle("hidden", kind !== "agent");
+	routineEditor.acpLabel.classList.toggle("hidden", kind !== "acp");
+	routineEditor.skillLabel.classList.toggle("hidden", kind !== "skill");
+	routineEditor.cwdLabel.classList.toggle("hidden", kind === "agent");
+	refreshRoutineModels("");
+}
+
+function clearRoutineEditor(): void {
+	routineEditor.form.reset();
+	routineEditor.id.value = "";
+	routineEditor.interval.value = "60";
+	routineEditor.deleteButton.disabled = true;
+	routineEditor.runButton.disabled = true;
+	element("routine-editor-title").textContent = "New routine";
+	routineList.querySelectorAll(".routine-card").forEach((card) => {
+		card.classList.remove("active");
+	});
+	updateRoutineTargetFields();
+}
+
+function editRoutine(routine: RoutineSummary): void {
+	routineEditor.id.value = routine.id;
+	routineEditor.name.value = routine.name;
+	routineEditor.prompt.value = routine.prompt;
+	routineEditor.enabled.checked = routine.enabled;
+	routineEditor.interval.value = String(routine.intervalMinutes);
+	routineEditor.targetKind.value = routine.target.kind;
+	if (routine.target.kind === "agent") routineEditor.agent.value = routine.target.agentId;
+	else if (routine.target.kind === "acp") routineEditor.acp.value = routine.target.connectionId;
+	else routineEditor.skill.value = routine.target.skillName;
+	routineEditor.cwd.value = routine.cwd ?? session?.snapshot?.cwd ?? "";
+	updateRoutineTargetFields();
+	routineEditor.model.value = routine.model ? `${routine.model.provider}/${routine.model.id}` : "";
+	routineModelPicker.refresh();
+	routineEditor.deleteButton.disabled = false;
+	routineEditor.runButton.disabled = routine.activeRunId !== undefined;
+	element("routine-editor-title").textContent = routine.name;
+	routineList.querySelectorAll<HTMLElement>(".routine-card").forEach((card) => {
+		card.classList.toggle("active", card.dataset.routineId === routine.id);
+	});
 }
 
 async function loadRoutines(): Promise<void> {
@@ -892,44 +1761,63 @@ async function loadRoutines(): Promise<void> {
 	const response = await fetch(`/routines.json?token=${encodeURIComponent(capabilityToken)}`);
 	if (!response.ok) return;
 	const payload: unknown = await response.json();
-	if (!isRoutineList(payload)) return;
+	if (!isRoutineList(payload)) throw new Error("Routine service returned an invalid response");
+	routines = payload.routines;
 	routineList.replaceChildren(
 		...payload.routines.map((routine) => {
 			const card = document.createElement("div");
-			card.className = "card";
-			appendText(card, `${routine.agentId} · ${routine.routineId}`);
+			card.className = "card routine-card";
+			card.dataset.routineId = routine.id;
+			const state = document.createElement("div");
+			state.className = "routine-state";
+			appendText(state, routine.name);
+			appendText(state, routine.activeRunId ? "Running" : routine.enabled ? "Active" : "Paused", "routine-target");
+			card.append(state);
+			appendText(card, routineTargetLabel(routine), "routine-target");
 			appendText(
 				card,
-				`Every ${routine.intervalMinutes} minutes · next ${new Date(routine.nextRunAt).toLocaleString()}`,
+				routine.nextRunAt
+					? `Every ${routine.intervalMinutes} minutes · next ${new Date(routine.nextRunAt).toLocaleString()}`
+					: `Every ${routine.intervalMinutes} minutes`,
 				"muted",
 			);
 			appendText(card, routine.prompt, "muted");
 			if (routine.lastError) appendText(card, routine.lastError, "run-error");
+			card.addEventListener("click", () => editRoutine(routine));
 			return card;
 		}),
 	);
+	const selected = routines.find((routine) => routine.id === routineEditor.id.value);
+	if (selected) editRoutine(selected);
 }
 
 function isRoutineList(value: unknown): value is { routines: RoutineSummary[] } {
 	if (typeof value !== "object" || value === null || !("routines" in value) || !Array.isArray(value.routines)) {
 		return false;
 	}
-	return value.routines.every(
-		(entry) =>
-			typeof entry === "object" &&
-			entry !== null &&
-			"agentId" in entry &&
-			typeof entry.agentId === "string" &&
-			"routineId" in entry &&
-			typeof entry.routineId === "string" &&
-			"prompt" in entry &&
-			typeof entry.prompt === "string" &&
-			"intervalMinutes" in entry &&
-			typeof entry.intervalMinutes === "number" &&
-			"nextRunAt" in entry &&
-			typeof entry.nextRunAt === "number" &&
-			(!("lastError" in entry) || entry.lastError === undefined || typeof entry.lastError === "string"),
-	);
+	return value.routines.every((entry) => {
+		if (
+			typeof entry !== "object" ||
+			entry === null ||
+			!("id" in entry) ||
+			typeof entry.id !== "string" ||
+			!("name" in entry) ||
+			typeof entry.name !== "string" ||
+			!("prompt" in entry) ||
+			typeof entry.prompt !== "string" ||
+			!("enabled" in entry) ||
+			typeof entry.enabled !== "boolean" ||
+			!("intervalMinutes" in entry) ||
+			typeof entry.intervalMinutes !== "number" ||
+			!("target" in entry) ||
+			typeof entry.target !== "object" ||
+			entry.target === null ||
+			!("kind" in entry.target)
+		) {
+			return false;
+		}
+		return entry.target.kind === "agent" || entry.target.kind === "acp" || entry.target.kind === "skill";
+	});
 }
 
 async function reconnect(entry: ConnectionEntry): Promise<void> {
@@ -961,21 +1849,138 @@ async function reconnect(entry: ConnectionEntry): Promise<void> {
 
 form.addEventListener("submit", (event) => {
 	event.preventDefault();
+	void submitComposer().catch((error: unknown) =>
+		setStatus(error instanceof Error ? error.message : String(error), true),
+	);
+});
+
+async function submitComposer(): Promise<void> {
 	if (!session) return;
 	if (session.snapshot?.phase !== "idle") {
-		void session.abort().catch((error: unknown) => setStatus(String(error), true));
+		await session.abort();
 		return;
 	}
 	const text = input.value.trim();
-	if (!text) return;
+	const attachments = [...activeAttachments()];
+	if (!text && attachments.length === 0) return;
+	if (attachments.length > 0) {
+		if (!activeConnectionIsPrimary()) throw new Error("Attachments require a session hosted by this Pi console");
+		const response = await fetch(`/session-prompts?token=${encodeURIComponent(capabilityToken ?? "")}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ sessionId: session.id, text, attachmentIds: attachments.map((entry) => entry.id) }),
+		});
+		if (!response.ok) throw new Error(await responseError(response, "Could not send attachment prompt"));
+		attachmentsBySession.set(session.id, []);
+		renderAttachments();
+	} else {
+		await session.prompt(text);
+	}
 	input.value = "";
 	resizeComposer();
-	void session
-		.prompt(text)
-		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
-});
+}
 
 input.addEventListener("input", resizeComposer);
+attachmentButton.addEventListener("click", () => attachmentInput.click());
+attachmentInput.addEventListener("change", () => {
+	const files = [...(attachmentInput.files ?? [])];
+	attachmentInput.value = "";
+	if (files.length === 0) return;
+	void uploadFiles(files).catch((error: unknown) =>
+		setStatus(error instanceof Error ? error.message : String(error), true),
+	);
+});
+previewForm.addEventListener("submit", (event) => {
+	event.preventDefault();
+	const url = previewAddress.value.trim();
+	if (!url) return;
+	void navigatePreview(url).catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
+});
+previewReload.addEventListener("click", () => {
+	void previewAction("reload").catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
+});
+previewBack.addEventListener("click", () => {
+	void previewAction("back").catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
+});
+previewForward.addEventListener("click", () => {
+	void previewAction("forward").catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
+});
+previewControl.addEventListener("click", () => {
+	void setPreviewControl(activePreviewSession?.controlOwner === "user" ? "agent" : "user").catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
+});
+previewTypeForm.addEventListener("submit", (event) => {
+	event.preventDefault();
+	const text = previewType.value;
+	if (!text) return;
+	void sendPreviewInput({ kind: "type", text })
+		.then(() => {
+			previewType.value = "";
+		})
+		.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
+});
+previewImage.addEventListener("click", (event) => {
+	if (activePreviewSession?.controlOwner !== "user") return;
+	const bounds = previewImage.getBoundingClientRect();
+	if (bounds.width === 0 || bounds.height === 0) return;
+	const x = ((event.clientX - bounds.left) / bounds.width) * activePreviewSession.viewport.width;
+	const y = ((event.clientY - bounds.top) / bounds.height) * activePreviewSession.viewport.height;
+	void sendPreviewInput({ kind: "click", x, y }).catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
+});
+previewImage.addEventListener(
+	"wheel",
+	(event) => {
+		if (activePreviewSession?.controlOwner !== "user") return;
+		event.preventDefault();
+		void sendPreviewInput({ kind: "scroll", deltaX: event.deltaX, deltaY: event.deltaY }).catch((error: unknown) =>
+			setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+		);
+	},
+	{ passive: false },
+);
+input.addEventListener("paste", (event) => {
+	const files = [...(event.clipboardData?.files ?? [])];
+	if (files.length > 0) {
+		event.preventDefault();
+		void uploadFiles(files).catch((error: unknown) =>
+			setStatus(error instanceof Error ? error.message : String(error), true),
+		);
+		return;
+	}
+	const text = event.clipboardData?.getData("text/plain") ?? "";
+	if (text.length <= 12_000 && text.split(/\r?\n/).length <= 200) return;
+	event.preventDefault();
+	const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+	void uploadFiles([new File([text], `paste-${timestamp}.md`, { type: "text/markdown" })]).catch((error: unknown) =>
+		setStatus(error instanceof Error ? error.message : String(error), true),
+	);
+});
+form.addEventListener("dragover", (event) => {
+	if (!event.dataTransfer?.types.includes("Files")) return;
+	event.preventDefault();
+	form.classList.add("composer-drop");
+});
+form.addEventListener("dragleave", () => form.classList.remove("composer-drop"));
+form.addEventListener("drop", (event) => {
+	form.classList.remove("composer-drop");
+	const files = event.dataTransfer?.files;
+	if (!files || files.length === 0) return;
+	event.preventDefault();
+	void uploadFiles(files).catch((error: unknown) =>
+		setStatus(error instanceof Error ? error.message : String(error), true),
+	);
+});
 input.addEventListener("keydown", (event) => {
 	if (event.key !== "Enter" || event.shiftKey || event.isComposing || session?.snapshot?.phase !== "idle") return;
 	event.preventDefault();
@@ -1000,7 +2005,18 @@ thinking.addEventListener("change", () => {
 
 for (const button of document.querySelectorAll<HTMLButtonElement>("[data-tab]")) {
 	button.addEventListener("click", () => {
-		activateTab(button.dataset.tab ?? "overview");
+		const tab = button.dataset.tab ?? "overview";
+		activateTab(tab);
+		if (tab === "capabilities") {
+			void loadCapabilities().catch((error: unknown) =>
+				setStatus(error instanceof Error ? error.message : String(error), true),
+			);
+		}
+		if (tab === "preview") {
+			void loadPreview().catch((error: unknown) =>
+				setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+			);
+		}
 	});
 }
 
@@ -1018,6 +2034,23 @@ for (const button of document.querySelectorAll<HTMLButtonElement>("[data-rail-ta
 
 for (const button of document.querySelectorAll<HTMLButtonElement>("[data-builder-tab]")) {
 	button.addEventListener("click", () => activateBuilderTab(button.dataset.builderTab ?? "builder-chat-panel"));
+}
+
+for (const button of document.querySelectorAll<HTMLButtonElement>("[data-preview-tab]")) {
+	button.addEventListener("click", () => {
+		const tab = button.dataset.previewTab ?? "page";
+		document.querySelectorAll("[data-preview-tab]").forEach((entry) => {
+			entry.classList.toggle("active", entry.getAttribute("data-preview-tab") === tab);
+		});
+		document.querySelectorAll("[data-preview-panel]").forEach((entry) => {
+			entry.classList.toggle("hidden", entry.getAttribute("data-preview-panel") !== tab);
+		});
+		if (tab !== "page") {
+			void loadPreviewDiagnostics().catch((error: unknown) =>
+				setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+			);
+		}
+	});
 }
 
 newAgent.addEventListener("click", () => {
@@ -1063,6 +2096,10 @@ agentForm.addEventListener("submit", (event) => {
 		persona: value("agent-persona"),
 		executor: value("agent-executor"),
 		permissionPolicy: value("agent-permissions"),
+		browser: {
+			access: value("agent-browser-access"),
+			profile: { kind: "ephemeral" },
+		},
 		model:
 			modelSeparator > 0
 				? {
@@ -1070,16 +2107,7 @@ agentForm.addEventListener("submit", (event) => {
 						id: selectedModel.slice(modelSeparator + 1),
 					}
 				: undefined,
-		schedules: value("routine-prompt").trim()
-			? [
-					{
-						id: value("routine-id"),
-						prompt: value("routine-prompt"),
-						intervalMinutes: Number(value("routine-interval")),
-						enabled: requiredElement<HTMLInputElement>("routine-enabled").checked,
-					},
-				]
-			: [],
+		schedules: activeSidebarAgent?.schedules ?? [],
 	};
 	const path = id ? `/agents/${encodeURIComponent(id)}` : "/agents";
 	void fetch(`${path}?token=${encodeURIComponent(capabilityToken)}`, {
@@ -1109,17 +2137,26 @@ agentForm.addEventListener("submit", (event) => {
 
 builderChatForm.addEventListener("submit", (event) => {
 	event.preventDefault();
+	if (activeSidebarAgent && builderSession?.snapshot && builderSession.snapshot.phase !== "idle") {
+		void builderSession.abort().catch((error: unknown) => {
+			setStatus(error instanceof Error ? error.message : String(error), true);
+		});
+		return;
+	}
 	const prompt = builderPrompt.value.trim();
-	if (!prompt || !builderSession) return;
+	const chatSession = builderSession;
+	if (!prompt || !chatSession) return;
 	builderPrompt.value = "";
-	const formContext = [
-		`You are helping configure a local Pi agent. Ask concise questions and recommend values for the visible form.`,
-		`Current name: ${requiredElement<HTMLInputElement>("agent-name").value || "not set"}`,
-		`Current description: ${requiredElement<HTMLTextAreaElement>("agent-description").value || "not set"}`,
-		`Current persona: ${requiredElement<HTMLTextAreaElement>("agent-persona").value || "not set"}`,
-		`User: ${prompt}`,
-	].join("\n");
-	void builderSession.prompt(formContext).catch((error: unknown) => {
+	const message = activeSidebarAgent
+		? prompt
+		: [
+				`You are helping configure a local Pi agent. Ask concise questions and recommend values for the visible form.`,
+				`Current name: ${requiredElement<HTMLInputElement>("agent-name").value || "not set"}`,
+				`Current description: ${requiredElement<HTMLTextAreaElement>("agent-description").value || "not set"}`,
+				`Current persona: ${requiredElement<HTMLTextAreaElement>("agent-persona").value || "not set"}`,
+				`User: ${prompt}`,
+			].join("\n");
+	void chatSession.prompt(message).catch((error: unknown) => {
 		setStatus(error instanceof Error ? error.message : String(error), true);
 	});
 });
@@ -1180,14 +2217,111 @@ externalRunForm.addEventListener("submit", (event) => {
 		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
 });
 
+routineEditor.targetKind.addEventListener("change", updateRoutineTargetFields);
+routineEditor.acp.addEventListener("change", () => refreshRoutineModels(""));
+routineEditor.clearButton.addEventListener("click", clearRoutineEditor);
+
+routineEditor.form.addEventListener("submit", (event) => {
+	event.preventDefault();
+	if (!capabilityToken) return;
+	const kind = routineEditor.targetKind.value;
+	const target =
+		kind === "agent"
+			? { kind: "agent" as const, agentId: routineEditor.agent.value }
+			: kind === "acp"
+				? { kind: "acp" as const, connectionId: routineEditor.acp.value }
+				: { kind: "skill" as const, skillName: routineEditor.skill.value.trim() };
+	const separator = routineEditor.model.value.indexOf("/");
+	const definition = {
+		name: routineEditor.name.value,
+		prompt: routineEditor.prompt.value,
+		enabled: routineEditor.enabled.checked,
+		intervalMinutes: Number(routineEditor.interval.value),
+		target,
+		model:
+			separator > 0
+				? {
+						provider: routineEditor.model.value.slice(0, separator),
+						id: routineEditor.model.value.slice(separator + 1),
+					}
+				: undefined,
+		cwd: kind === "agent" ? undefined : routineEditor.cwd.value.trim() || undefined,
+	};
+	const id = routineEditor.id.value;
+	void fetch(
+		`${id ? `/routines/${encodeURIComponent(id)}` : "/routines"}?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: id ? "PUT" : "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(definition),
+		},
+	)
+		.then(async (response) => {
+			if (!response.ok) {
+				const payload: unknown = await response.json();
+				throw new Error(
+					typeof payload === "object" &&
+						payload !== null &&
+						"error" in payload &&
+						typeof payload.error === "string"
+						? payload.error
+						: `Could not save routine: HTTP ${response.status}`,
+				);
+			}
+			const saved: unknown = await response.json();
+			await loadRoutines();
+			if (typeof saved === "object" && saved !== null && "id" in saved && typeof saved.id === "string") {
+				const routine = routines.find((entry) => entry.id === saved.id);
+				if (routine) editRoutine(routine);
+			}
+			setStatus("Routine saved");
+		})
+		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+});
+
+routineEditor.runButton.addEventListener("click", () => {
+	if (!capabilityToken || !routineEditor.id.value) return;
+	void fetch(
+		`/routines/${encodeURIComponent(routineEditor.id.value)}/run?token=${encodeURIComponent(capabilityToken)}`,
+		{ method: "POST" },
+	)
+		.then(async (response) => {
+			if (!response.ok) throw new Error(`Could not start routine: HTTP ${response.status}`);
+			await loadRoutines();
+			setStatus("Routine started");
+		})
+		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+});
+
+routineEditor.deleteButton.addEventListener("click", () => {
+	const id = routineEditor.id.value;
+	if (!capabilityToken || !id || !window.confirm(`Delete routine "${routineEditor.name.value}"?`)) return;
+	void fetch(`/routines/${encodeURIComponent(id)}?token=${encodeURIComponent(capabilityToken)}`, { method: "DELETE" })
+		.then(async (response) => {
+			if (!response.ok) throw new Error(`Could not delete routine: HTTP ${response.status}`);
+			clearRoutineEditor();
+			await loadRoutines();
+			setStatus("Routine deleted");
+		})
+		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+});
+
 window.setInterval(() => {
 	void loadRuns().catch(() => {});
 	void loadRoutines().catch(() => {});
 	void loadExternalRuns().catch(() => {});
+	if (document.querySelector('[data-tab="preview"]')?.classList.contains("active")) void loadPreview().catch(() => {});
 }, 1500);
 void loadRuns().catch(() => {});
 
 installPanelResizer("left-resizer", "--rail-width", "pi-serve-rail-width", 1, 190, 420);
 installPanelResizer("right-resizer", "--details-width", "pi-serve-details-width", -1, 280, 560);
+for (const id of ["routine-id", "routine-interval", "routine-prompt", "routine-enabled"]) {
+	document.getElementById(id)?.closest("label")?.remove();
+}
+for (const heading of agentForm.querySelectorAll<HTMLElement>(".section-title")) {
+	if (heading.textContent === "Optional routine") heading.remove();
+}
 resizeComposer();
+clearRoutineEditor();
 void connect().catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
