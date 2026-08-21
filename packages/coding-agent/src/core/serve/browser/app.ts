@@ -1296,41 +1296,52 @@ async function loadCapabilities(): Promise<void> {
 	if (!response.ok) throw new Error(`Could not load capabilities: HTTP ${response.status}`);
 	const payload: unknown = await response.json();
 	if (!isCapabilitySnapshot(payload)) throw new Error("Capability catalog returned an invalid response");
-	const groups: Array<[string, CapabilityEntry[]]> = [
-		["Tools", payload.tools],
-		["Skills", payload.skills],
-		["Extensions", payload.extensions],
-		["MCP servers", payload.mcpServers],
-		["ACP connectors", payload.acpConnections],
-		["Model providers", payload.modelProviders],
+	const groups: Array<["local" | "remote", string, CapabilityEntry[], boolean]> = [
+		["local", "Tools", payload.tools, true],
+		["local", "Skills", payload.skills, false],
+		["local", "Extensions", payload.extensions, false],
+		["remote", "MCP servers", payload.mcpServers, true],
+		["remote", "ACP connectors", payload.acpConnections, false],
+		["remote", "Model providers", payload.modelProviders, false],
 	];
 	element("capability-list").replaceChildren(
-		...groups.map(([label, entries]) => {
-			const section = document.createElement("section");
+		...groups.map(([location, label, entries, open]) => {
+			const section = document.createElement("details");
 			section.className = "capability-section";
-			const heading = document.createElement("h3");
-			heading.textContent = `${label} · ${entries.length}`;
+			section.open = open;
+			const heading = document.createElement("summary");
+			const headingLabel = document.createElement("strong");
+			headingLabel.textContent = label;
+			const locationLabel = document.createElement("span");
+			locationLabel.className = `capability-location ${location}`;
+			locationLabel.textContent = location;
+			const count = document.createElement("span");
+			count.className = "capability-count";
+			count.textContent = String(entries.length);
+			heading.append(headingLabel, locationLabel, count);
 			section.append(heading);
 			if (entries.length === 0) {
 				appendText(section, `No ${label.toLowerCase()} configured`, "muted");
 				return section;
 			}
-			for (const entry of entries) {
-				const card = document.createElement("div");
+			for (const entry of [...entries].sort((left, right) => left.name.localeCompare(right.name))) {
+				const card = document.createElement("details");
 				card.className = "card capability-card";
-				const title = document.createElement("strong");
+				const title = document.createElement("summary");
 				const name = document.createElement("span");
 				name.textContent = entry.name;
 				const state = document.createElement("span");
 				state.className = "capability-status";
 				state.textContent = entry.status;
 				title.append(name, state);
-				appendText(card, entry.description, "muted");
+				const body = document.createElement("div");
+				body.className = "capability-body";
+				appendText(body, entry.description, "muted");
 				const meta = document.createElement("div");
 				meta.className = "capability-meta";
 				meta.textContent = [entry.scope, entry.source, entry.path].filter(Boolean).join(" · ");
-				card.prepend(title);
-				card.append(meta);
+				body.append(meta);
+				card.append(title, body);
 				section.append(card);
 			}
 			return section;

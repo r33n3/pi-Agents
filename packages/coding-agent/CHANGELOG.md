@@ -8,6 +8,7 @@
 - Added expandable web-console tool activity that keeps completed actions compact while exposing full input and output on demand.
 - Added five-entry, per-session web-console prompt history with Up/Down navigation and immediate composer clearing on send.
 - Added icon-based browser diagnostics and opt-in walkthrough recording that sends redacted interaction steps to Pi for semantic review.
+- Added compact, collapsible local and remote capability panels with expandable descriptions and metadata.
 
 ### Fixed
 
