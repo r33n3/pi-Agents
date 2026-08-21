@@ -175,6 +175,7 @@ let externalConnections: ExternalConnectionSummary[] = [];
 const connections = new Map<string, ConnectionEntry>();
 const reconnecting = new Set<string>();
 const sessionAliases = readSessionAliases();
+const expandedToolActivity = new Map<string, boolean>();
 
 function readSessionAliases(): Record<string, string> {
 	try {
@@ -367,18 +368,15 @@ function render(snapshot: SessionSnapshot): void {
 function renderItem(item: TranscriptItem): HTMLElement {
 	const article = document.createElement("article");
 	article.className = `message ${item.role}`;
+	if (item.role === "tool") {
+		article.classList.add(`tool-${item.status}`);
+		article.append(renderToolActivity(item));
+		return article;
+	}
 	const label = document.createElement("div");
 	label.className = "message-label";
 	label.textContent = item.role === "assistant" ? "π" : item.role;
 	article.append(label);
-
-	if (item.role === "tool") {
-		appendText(article, `${item.toolName} · ${item.status}`);
-		for (const content of item.content) {
-			if (content.type === "text") appendText(article, content.text);
-		}
-		return article;
-	}
 
 	for (const content of item.content) {
 		if (content.type === "text") appendText(article, content.text);
@@ -387,6 +385,70 @@ function renderItem(item: TranscriptItem): HTMLElement {
 		else if (content.type === "image") appendText(article, `[image: ${content.mimeType}]`);
 	}
 	return article;
+}
+
+function renderToolActivity(item: Extract<TranscriptItem, { role: "tool" }>): HTMLDetailsElement {
+	const details = document.createElement("details");
+	details.className = "tool-activity";
+	details.open = expandedToolActivity.get(item.toolCallId) ?? item.status !== "complete";
+	details.addEventListener("toggle", () => expandedToolActivity.set(item.toolCallId, details.open));
+
+	const summary = document.createElement("summary");
+	summary.className = "tool-activity-summary";
+	const name = document.createElement("strong");
+	name.textContent = item.toolName;
+	const target = toolActivityTarget(item.input);
+	if (target) {
+		const targetLabel = document.createElement("span");
+		targetLabel.className = "tool-activity-target";
+		targetLabel.textContent = target;
+		summary.append(name, targetLabel);
+	} else {
+		summary.append(name);
+	}
+	const state = document.createElement("span");
+	state.className = "tool-activity-state";
+	state.textContent = item.status === "complete" ? "Completed" : item.status === "error" ? "Failed" : "Running";
+	summary.append(state);
+
+	const body = document.createElement("div");
+	body.className = "tool-activity-body";
+	appendToolActivitySection(body, "Input", JSON.stringify(item.input, undefined, 2));
+	for (const content of item.content) {
+		appendToolActivitySection(
+			body,
+			"Output",
+			content.type === "text" ? content.text : `[image: ${content.mimeType}]`,
+		);
+	}
+	if (item.details !== undefined) {
+		appendToolActivitySection(body, "Details", JSON.stringify(item.details, undefined, 2));
+	}
+	details.append(summary, body);
+	return details;
+}
+
+function toolActivityTarget(input: unknown): string | undefined {
+	if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
+	const record = input as Record<string, unknown>;
+	for (const key of ["path", "filePath", "url", "command", "query", "pattern", "name"]) {
+		const value = record[key];
+		if (typeof value !== "string" || value.trim().length === 0) continue;
+		const compact = value.replace(/\s+/g, " ").trim();
+		return compact.length > 88 ? `${compact.slice(0, 85)}…` : compact;
+	}
+	return undefined;
+}
+
+function appendToolActivitySection(parent: HTMLElement, label: string, value: string): void {
+	const section = document.createElement("section");
+	const heading = document.createElement("div");
+	heading.className = "tool-activity-heading";
+	heading.textContent = label;
+	const content = document.createElement("pre");
+	content.textContent = value;
+	section.append(heading, content);
+	parent.append(section);
 }
 
 function appendText(parent: HTMLElement, text: string, className?: string): void {

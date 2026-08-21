@@ -1,5 +1,4 @@
-import type { RawData, WebSocket } from "ws";
-import type { BrowserConsoleService } from "./browser-console-service.ts";
+import { type RawData, WebSocket } from "ws";
 import type { BrowserFrame } from "./browser-session-manager.ts";
 
 const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
@@ -13,11 +12,19 @@ interface StreamRequest {
 	input?: unknown;
 }
 
+interface BrowserStreamConsole {
+	get(id: string): unknown;
+	subscribeFrames(id: string, listener: (frame: BrowserFrame) => void): Promise<() => Promise<void>>;
+	pointerClick(id: string, x: number, y: number): Promise<void>;
+	typeText(id: string, text: string): Promise<void>;
+	scroll(id: string, deltaX: number, deltaY: number): Promise<void>;
+}
+
 /** Bridges managed Chromium frames and user input over one authenticated WebSocket. */
 export class BrowserStreamServer {
-	readonly #browserConsole: BrowserConsoleService;
+	readonly #browserConsole: BrowserStreamConsole;
 
-	constructor(browserConsole: BrowserConsoleService) {
+	constructor(browserConsole: BrowserStreamConsole) {
 		this.#browserConsole = browserConsole;
 	}
 
@@ -43,7 +50,7 @@ export class BrowserStreamServer {
 						if (!this.#browserConsole.get(request.sessionId)) throw new Error("Browser session not found");
 						activeSessionId = request.sessionId;
 						const stop = await this.#browserConsole.subscribeFrames(request.sessionId, (frame) => {
-							if (socket.readyState !== socket.OPEN || socket.bufferedAmount > MAX_BUFFERED_BYTES) return;
+							if (socket.readyState !== WebSocket.OPEN || socket.bufferedAmount > MAX_BUFFERED_BYTES) return;
 							socket.send(encodeBrowserFrame(request.sessionId, frame), { binary: true });
 						});
 						if (closed) {
@@ -99,7 +106,7 @@ export class BrowserStreamServer {
 	}
 
 	#sendJson(socket: WebSocket, value: unknown): void {
-		if (socket.readyState === socket.OPEN && socket.bufferedAmount <= MAX_BUFFERED_BYTES) {
+		if (socket.readyState === WebSocket.OPEN && socket.bufferedAmount <= MAX_BUFFERED_BYTES) {
 			socket.send(JSON.stringify(value));
 		}
 	}

@@ -151,6 +151,7 @@ describe("createServePage", () => {
 		expect(page.headers.get("cache-control")).toBe("no-store");
 		expect(page.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
 		expect(page.headers.get("content-security-policy")).toContain("connect-src 'self' ws: wss:");
+		expect(page.headers.get("content-security-policy")).toContain("img-src 'self' data: blob:");
 		const html = await page.text();
 		expect(html).toContain('data-rail-tab="sessions"');
 		expect(html).toContain('id="connection-form"');
@@ -167,7 +168,10 @@ describe("createServePage", () => {
 		const bundle = await fetch(`${origin}/browser-client.js?token=secret-token`);
 		expect(bundle.status).toBe(200);
 		expect(bundle.headers.get("content-type")).toContain("text/javascript");
-		expect((await bundle.text()).length).toBeGreaterThan(1000);
+		const bundleText = await bundle.text();
+		expect(bundleText.length).toBeGreaterThan(1000);
+		expect(bundleText).toContain("tool-activity-summary");
+		expect(bundleText).toContain("tool-activity-state");
 	});
 
 	test("uploads, previews, renames, and removes attachments", async () => {
