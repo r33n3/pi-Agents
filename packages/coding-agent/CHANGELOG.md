@@ -7,9 +7,11 @@
 - Added transcript usage notices for compaction and branch summaries when cache miss notices are enabled.
 - Added expandable web-console tool activity that keeps completed actions compact while exposing full input and output on demand.
 - Added five-entry, per-session web-console prompt history with Up/Down navigation and immediate composer clearing on send.
+- Added icon-based browser diagnostics and opt-in walkthrough recording that sends redacted interaction steps to Pi for semantic review.
 
 ### Fixed
 
+- Fixed browser access-policy blocks appearing as unexplained generic Chromium network failures in managed-browser diagnostics.
 - Fixed managed-browser live frames being dropped by WebSocket state checks or blocked by the console content security policy.
 - Fixed UTF-8 BOM markers preventing frontmatter and user configuration files from loading ([#8337](https://github.com/earendil-works/pi/issues/8337)).
 - Fixed invalid settings files being easy to miss during interactive startup by rendering warnings with the file path inside the TUI ([#7829](https://github.com/earendil-works/pi/issues/7829)).
