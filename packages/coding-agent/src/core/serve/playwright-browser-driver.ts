@@ -78,6 +78,7 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 	#history: string[] = [];
 	#historyIndex = -1;
 	readonly #diagnostics: BrowserDiagnostics = { console: [], networkFailures: [] };
+	readonly #blockedRequestReasons = new Map<string, string>();
 	#assertNavigationAllowed: ((url: string) => Promise<void>) | undefined;
 
 	constructor(context: BrowserContext, page: Page) {
@@ -91,10 +92,13 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 			});
 		});
 		page.on("requestfailed", (request) => {
+			const url = request.url();
+			const policyReason = this.#blockedRequestReasons.get(url);
+			this.#blockedRequestReasons.delete(url);
 			appendBounded(this.#diagnostics.networkFailures, {
-				url: request.url().slice(0, 4_000),
+				url: url.slice(0, 4_000),
 				method: request.method(),
-				reason: request.failure()?.errorText ?? "Request failed",
+				reason: policyReason ?? request.failure()?.errorText ?? "Request failed",
 				timestamp: Date.now(),
 			});
 		});
@@ -106,7 +110,11 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 			try {
 				await this.#assertNavigationAllowed?.(route.request().url());
 				await route.continue();
-			} catch {
+			} catch (error) {
+				this.#blockedRequestReasons.set(
+					route.request().url(),
+					`Blocked by browser access policy: ${error instanceof Error ? error.message : String(error)}`,
+				);
 				await route.abort("blockedbyclient");
 			}
 		});

@@ -172,6 +172,8 @@ describe("createServePage", () => {
 		expect(bundleText.length).toBeGreaterThan(1000);
 		expect(bundleText).toContain("tool-activity-summary");
 		expect(bundleText).toContain("tool-activity-state");
+		expect(bundleText).toContain("preview-tab-icon");
+		expect(bundleText).toContain("Send steps to Pi");
 	});
 
 	test("uploads, previews, renames, and removes attachments", async () => {

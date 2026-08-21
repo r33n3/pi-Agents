@@ -59,6 +59,8 @@ const previewTypeForm = requiredElement<HTMLFormElement>("preview-type-form");
 const previewType = requiredElement<HTMLInputElement>("preview-type");
 const previewConsole = element("preview-console");
 const previewNetwork = element("preview-network");
+const { consoleCount: previewConsoleCount, networkCount: previewNetworkCount } = installPreviewTabIcons();
+const { record: previewRecord, send: previewSendRecording, status: previewRecordingStatus } = createPreviewRecorder();
 const modelPicker = installThemedSelect(model);
 const agentModelPicker = installThemedSelect(agentModel);
 const externalModelPicker = installThemedSelect(externalModel);
@@ -77,6 +79,9 @@ let activePreviewSession: BrowserSessionSummary | undefined;
 let previewStream: WebSocket | undefined;
 let previewStreamSessionId: string | undefined;
 let previewFrameUrl: string | undefined;
+let previewRecording = false;
+let previewRecordingSessionId: string | undefined;
+let recordedPreviewSteps: RecordedPreviewStep[] = [];
 let selectedExternalConnectionId: string | undefined;
 let availableModels: ModelMetadata[] = [];
 let agents: AgentSummary[] = [];
@@ -170,6 +175,17 @@ interface BrowserDiagnostics {
 	networkFailures: Array<{ url: string; method: string; reason: string; timestamp: number }>;
 }
 
+interface RecordedPreviewStep {
+	action: "open" | "navigate" | "back" | "forward" | "reload" | "click" | "type" | "scroll";
+	timestamp: number;
+	url?: string;
+	x?: number;
+	y?: number;
+	deltaX?: number;
+	deltaY?: number;
+	textLength?: number;
+}
+
 let externalConnections: ExternalConnectionSummary[] = [];
 
 const connections = new Map<string, ConnectionEntry>();
@@ -219,6 +235,69 @@ function element(id: string): HTMLElement {
 
 function requiredElement<T extends HTMLElement>(id: string): T {
 	return element(id) as T;
+}
+
+function installPreviewTabIcons(): { consoleCount: HTMLSpanElement; networkCount: HTMLSpanElement } {
+	const paths = {
+		page: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm0 0c2.4 2.5 3.6 5.5 3.6 9s-1.2 6.5-3.6 9m0-18C9.6 5.5 8.4 8.5 8.4 12s1.2 6.5 3.6 9M3.5 9h17M3.5 15h17",
+		console: "m8 8-4 4 4 4m8-8 4 4-4 4m-2-11-4 14",
+		network:
+			"M6 7a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm12 16a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM6 7v4c0 2 1 3 3 3h6c2 0 3 1 3 3M15 5h6m-2-2 2 2-2 2",
+	} as const;
+	const labels = { page: "Page", console: "Console", network: "Network" } as const;
+	const counts = {
+		console: document.createElement("span"),
+		network: document.createElement("span"),
+	};
+	counts.console.id = "preview-console-count";
+	counts.network.id = "preview-network-count";
+	for (const kind of ["page", "console", "network"] as const) {
+		const button = document.querySelector<HTMLButtonElement>(`[data-preview-tab="${kind}"]`);
+		if (!button) throw new Error(`Missing ${kind} preview tab`);
+		const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+		icon.classList.add("preview-tab-icon");
+		icon.setAttribute("viewBox", "0 0 24 24");
+		icon.setAttribute("aria-hidden", "true");
+		const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+		path.setAttribute("d", paths[kind]);
+		icon.append(path);
+		button.title = labels[kind];
+		button.setAttribute("aria-label", labels[kind]);
+		if (kind === "page") {
+			button.replaceChildren(icon);
+		} else {
+			counts[kind].className = "diagnostic-count";
+			counts[kind].setAttribute("aria-hidden", "true");
+			button.replaceChildren(icon, counts[kind]);
+		}
+	}
+	return { consoleCount: counts.console, networkCount: counts.network };
+}
+
+function createPreviewRecorder(): {
+	record: HTMLButtonElement;
+	send: HTMLButtonElement;
+	status: HTMLSpanElement;
+} {
+	const actions = document.createElement("div");
+	actions.className = "preview-recorder";
+	const record = document.createElement("button");
+	record.id = "preview-record";
+	record.type = "button";
+	record.disabled = true;
+	record.textContent = "● Record";
+	record.setAttribute("aria-pressed", "false");
+	const send = document.createElement("button");
+	send.id = "preview-send-recording";
+	send.type = "button";
+	send.disabled = true;
+	send.textContent = "Send steps to Pi";
+	actions.append(record, send);
+	const status = document.createElement("span");
+	status.id = "preview-recording-status";
+	status.className = "preview-recording-status";
+	previewControl.after(actions, status);
+	return { record, send, status };
 }
 
 function createRoutineEditor(): {
@@ -360,6 +439,7 @@ function setBusy(snapshot: SessionSnapshot): void {
 	thinking.disabled = busy;
 	attachmentButton.disabled = busy || !activeConnectionIsPrimary();
 	attachmentInput.disabled = busy || !activeConnectionIsPrimary();
+	renderPreviewRecording();
 }
 
 function render(snapshot: SessionSnapshot): void {
@@ -652,6 +732,11 @@ function setPreviewMessage(message: string, error = false): void {
 
 function setPreviewControls(browserSession: BrowserSessionSummary | undefined): void {
 	const sessionId = browserSession?.id;
+	if (previewRecordingSessionId && previewRecordingSessionId !== sessionId) {
+		previewRecording = false;
+		previewRecordingSessionId = undefined;
+		recordedPreviewSteps = [];
+	}
 	const userControls = browserSession?.controlOwner === "user";
 	activePreviewSessionId = sessionId;
 	activePreviewSession = browserSession;
@@ -663,6 +748,93 @@ function setPreviewControls(browserSession: BrowserSessionSummary | undefined): 
 	previewType.disabled = !userControls;
 	previewControl.disabled = sessionId === undefined;
 	previewControl.textContent = userControls ? "Return to agent" : "Take control";
+	renderPreviewRecording();
+}
+
+function renderPreviewRecording(): void {
+	const stepCount = recordedPreviewSteps.length;
+	previewRecord.disabled = activePreviewSessionId === undefined;
+	previewRecord.classList.toggle("recording", previewRecording);
+	previewRecord.textContent = previewRecording ? "■ Stop" : "● Record";
+	previewRecord.setAttribute("aria-pressed", String(previewRecording));
+	previewSendRecording.disabled = stepCount === 0 || session?.snapshot?.phase !== "idle";
+	previewRecordingStatus.textContent = previewRecording
+		? `Recording · ${stepCount} step${stepCount === 1 ? "" : "s"}`
+		: stepCount > 0
+			? `${stepCount} recorded step${stepCount === 1 ? "" : "s"} ready for Pi`
+			: "Record a walkthrough, then send it to Pi for review.";
+}
+
+function togglePreviewRecording(): void {
+	if (!activePreviewSessionId) return;
+	if (previewRecording) {
+		previewRecording = false;
+		renderPreviewRecording();
+		return;
+	}
+	previewRecording = true;
+	previewRecordingSessionId = activePreviewSessionId;
+	recordedPreviewSteps = [];
+	if (activePreviewSession?.url) {
+		recordedPreviewSteps.push({ action: "open", url: activePreviewSession.url, timestamp: Date.now() });
+	}
+	renderPreviewRecording();
+}
+
+function recordPreviewStep(step: RecordedPreviewStep): void {
+	if (!previewRecording || previewRecordingSessionId !== activePreviewSessionId) return;
+	if (step.action === "scroll") {
+		const previous = recordedPreviewSteps.at(-1);
+		if (previous?.action === "scroll" && step.timestamp - previous.timestamp < 750) {
+			previous.deltaX = (previous.deltaX ?? 0) + (step.deltaX ?? 0);
+			previous.deltaY = (previous.deltaY ?? 0) + (step.deltaY ?? 0);
+			previous.timestamp = step.timestamp;
+			renderPreviewRecording();
+			return;
+		}
+	}
+	recordedPreviewSteps.push(step);
+	if (recordedPreviewSteps.length >= 100) previewRecording = false;
+	renderPreviewRecording();
+}
+
+function recordedStepText(step: RecordedPreviewStep, index: number): string {
+	const prefix = `${index + 1}.`;
+	switch (step.action) {
+		case "open":
+		case "navigate":
+			return `${prefix} ${step.action} ${step.url ?? "the current page"}`;
+		case "click":
+			return `${prefix} click viewport coordinate (${Math.round(step.x ?? 0)}, ${Math.round(step.y ?? 0)})`;
+		case "type":
+			return `${prefix} type a redacted value (${step.textLength ?? 0} characters) into the focused field`;
+		case "scroll":
+			return `${prefix} scroll by (${Math.round(step.deltaX ?? 0)}, ${Math.round(step.deltaY ?? 0)})`;
+		case "back":
+		case "forward":
+		case "reload":
+			return `${prefix} ${step.action}`;
+	}
+}
+
+async function sendPreviewRecordingToPi(): Promise<void> {
+	if (!session || session.snapshot?.phase !== "idle" || recordedPreviewSteps.length === 0) return;
+	previewRecording = false;
+	if (activePreviewSession?.controlOwner === "user") await setPreviewControl("agent");
+	const steps = recordedPreviewSteps.map(recordedStepText).join("\n");
+	recordedPreviewSteps = [];
+	previewRecordingSessionId = undefined;
+	renderPreviewRecording();
+	await session.prompt(
+		[
+			"Review this recorded managed-browser walkthrough and turn it into a robust browser workflow for an agent.",
+			"Do not replay viewport coordinates blindly. Navigate to the starting URL, use browser_snapshot, and translate each click into a semantic role/name target.",
+			"Typed values were intentionally redacted. Treat them as workflow parameters and ask for required values without requesting secrets in chat.",
+			"Report ambiguous or unnecessary steps before proposing the final workflow.",
+			"",
+			steps,
+		].join("\n"),
+	);
 }
 
 function ensurePreviewStream(sessionId: string): boolean {
@@ -774,15 +946,15 @@ async function loadPreview(): Promise<void> {
 		previewImage.src = `/browser/sessions/${encodeURIComponent(browserSession.id)}/screenshot?token=${encodeURIComponent(capabilityToken)}&at=${browserSession.updatedAt}`;
 	}
 	setPreviewMessage(`${browserSession.status} · managed Chromium · live`);
-	if (document.querySelector("[data-preview-tab].active")?.getAttribute("data-preview-tab") !== "page") {
-		void loadPreviewDiagnostics();
-	}
+	void loadPreviewDiagnostics().catch(() => {});
 }
 
 async function loadPreviewDiagnostics(): Promise<void> {
 	if (!capabilityToken || !activePreviewSessionId) {
 		previewConsole.replaceChildren();
 		previewNetwork.replaceChildren();
+		setDiagnosticCount(previewConsoleCount, 0);
+		setDiagnosticCount(previewNetworkCount, 0);
 		return;
 	}
 	const response = await fetch(
@@ -799,8 +971,16 @@ async function loadPreviewDiagnostics(): Promise<void> {
 			diagnosticRow(`${entry.method} ${entry.url}\n${entry.reason}`, entry.timestamp),
 		),
 	);
+	setDiagnosticCount(previewConsoleCount, diagnostics.console.length);
+	setDiagnosticCount(previewNetworkCount, diagnostics.networkFailures.length);
 	if (diagnostics.console.length === 0) appendText(previewConsole, "No console entries", "muted");
 	if (diagnostics.networkFailures.length === 0) appendText(previewNetwork, "No failed requests", "muted");
+}
+
+function setDiagnosticCount(element: HTMLElement, count: number): void {
+	element.textContent = count > 0 ? String(count) : "";
+	element.classList.toggle("has-diagnostics", count > 0);
+	element.setAttribute("aria-label", count === 1 ? "1 diagnostic" : `${count} diagnostics`);
 }
 
 function diagnosticRow(text: string, timestamp: number): HTMLElement {
@@ -835,6 +1015,7 @@ async function navigatePreview(url: string): Promise<void> {
 	if (!response.ok) throw new Error(await responseError(response, "Could not navigate managed browser"));
 	setPreviewMessage("Navigating managed browser…");
 	await loadPreview();
+	recordPreviewStep({ action: "navigate", url: activePreviewSession?.url ?? url, timestamp: Date.now() });
 }
 
 async function previewAction(action: "back" | "forward" | "reload"): Promise<void> {
@@ -845,6 +1026,7 @@ async function previewAction(action: "back" | "forward" | "reload"): Promise<voi
 	);
 	if (!response.ok) throw new Error(await responseError(response, `Could not ${action} managed browser`));
 	await loadPreview();
+	recordPreviewStep({ action, timestamp: Date.now() });
 }
 
 async function setPreviewControl(controlOwner: "agent" | "user"): Promise<void> {
@@ -2037,12 +2219,19 @@ previewControl.addEventListener("click", () => {
 		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
 	);
 });
+previewRecord.addEventListener("click", togglePreviewRecording);
+previewSendRecording.addEventListener("click", () => {
+	void sendPreviewRecordingToPi().catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
+});
 previewTypeForm.addEventListener("submit", (event) => {
 	event.preventDefault();
 	const text = previewType.value;
 	if (!text) return;
 	void sendPreviewInput({ kind: "type", text })
 		.then(() => {
+			recordPreviewStep({ action: "type", textLength: text.length, timestamp: Date.now() });
 			previewType.value = "";
 		})
 		.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
@@ -2053,18 +2242,25 @@ previewImage.addEventListener("click", (event) => {
 	if (bounds.width === 0 || bounds.height === 0) return;
 	const x = ((event.clientX - bounds.left) / bounds.width) * activePreviewSession.viewport.width;
 	const y = ((event.clientY - bounds.top) / bounds.height) * activePreviewSession.viewport.height;
-	void sendPreviewInput({ kind: "click", x, y }).catch((error: unknown) =>
-		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
-	);
+	void sendPreviewInput({ kind: "click", x, y })
+		.then(() => recordPreviewStep({ action: "click", x, y, timestamp: Date.now() }))
+		.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
 });
 previewImage.addEventListener(
 	"wheel",
 	(event) => {
 		if (activePreviewSession?.controlOwner !== "user") return;
 		event.preventDefault();
-		void sendPreviewInput({ kind: "scroll", deltaX: event.deltaX, deltaY: event.deltaY }).catch((error: unknown) =>
-			setPreviewMessage(error instanceof Error ? error.message : String(error), true),
-		);
+		void sendPreviewInput({ kind: "scroll", deltaX: event.deltaX, deltaY: event.deltaY })
+			.then(() =>
+				recordPreviewStep({
+					action: "scroll",
+					deltaX: event.deltaX,
+					deltaY: event.deltaY,
+					timestamp: Date.now(),
+				}),
+			)
+			.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
 	},
 	{ passive: false },
 );

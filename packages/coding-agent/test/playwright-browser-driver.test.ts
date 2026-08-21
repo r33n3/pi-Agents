@@ -19,7 +19,7 @@ describe("PlaywrightBrowserDriver", () => {
 			response
 				.writeHead(200, { "content-type": "text/html; charset=utf-8" })
 				.end(
-					'<!doctype html><title>Browser fixture</title><input aria-label="Search"><button>Save</button><script>console.error("fixture console")</script>',
+					'<!doctype html><title>Browser fixture</title><input aria-label="Search"><button>Save</button><img src="https://example.com/blocked.png" alt=""><script>console.error("fixture console")</script>',
 				);
 		});
 		await new Promise<void>((resolve, reject) => {
@@ -58,6 +58,11 @@ describe("PlaywrightBrowserDriver", () => {
 		expect((await manager.screenshot(session.id)).byteLength).toBeGreaterThan(100);
 		expect(manager.diagnostics(session.id).console).toEqual(
 			expect.arrayContaining([expect.objectContaining({ type: "error", text: "fixture console" })]),
+		);
+		expect(manager.diagnostics(session.id).networkFailures).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ reason: expect.stringContaining("Blocked by browser access policy") }),
+			]),
 		);
 
 		let resolveFrame: ((frame: Uint8Array) => void) | undefined;
