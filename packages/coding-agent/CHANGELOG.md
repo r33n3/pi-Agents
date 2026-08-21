@@ -6,6 +6,7 @@
 
 - Added transcript usage notices for compaction and branch summaries when cache miss notices are enabled.
 - Added expandable web-console tool activity that keeps completed actions compact while exposing full input and output on demand.
+- Added five-entry, per-session web-console prompt history with Up/Down navigation and immediate composer clearing on send.
 
 ### Fixed
 

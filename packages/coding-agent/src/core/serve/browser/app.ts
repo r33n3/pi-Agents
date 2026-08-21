@@ -176,6 +176,14 @@ const connections = new Map<string, ConnectionEntry>();
 const reconnecting = new Set<string>();
 const sessionAliases = readSessionAliases();
 const expandedToolActivity = new Map<string, boolean>();
+const promptHistoryBySession = new Map<string, PromptHistory>();
+const MAX_PROMPT_HISTORY = 5;
+
+interface PromptHistory {
+	entries: string[];
+	index: number;
+	draft: string;
+}
 
 function readSessionAliases(): Record<string, string> {
 	try {
@@ -1390,6 +1398,48 @@ function resizeComposer(): void {
 	input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
 }
 
+function activePromptHistory(): PromptHistory | undefined {
+	if (!session) return undefined;
+	let history = promptHistoryBySession.get(session.id);
+	if (!history) {
+		history = { entries: [], index: 0, draft: "" };
+		promptHistoryBySession.set(session.id, history);
+	}
+	return history;
+}
+
+function recordPromptHistory(text: string): void {
+	if (!text) return;
+	const history = activePromptHistory();
+	if (!history) return;
+	if (history.entries.at(-1) !== text) history.entries.push(text);
+	if (history.entries.length > MAX_PROMPT_HISTORY)
+		history.entries.splice(0, history.entries.length - MAX_PROMPT_HISTORY);
+	history.index = history.entries.length;
+	history.draft = "";
+}
+
+function navigatePromptHistory(direction: -1 | 1): boolean {
+	const history = activePromptHistory();
+	if (!history || history.entries.length === 0 || input.selectionStart !== input.selectionEnd) return false;
+	const singleLine = !input.value.includes("\n");
+	if (direction === -1 && !singleLine && input.selectionStart !== 0) return false;
+	if (direction === 1 && !singleLine && input.selectionEnd !== input.value.length) return false;
+	if (direction === -1) {
+		if (history.index === history.entries.length) history.draft = input.value;
+		if (history.index === 0) return false;
+		history.index -= 1;
+		input.value = history.entries[history.index] ?? "";
+	} else {
+		if (history.index >= history.entries.length) return false;
+		history.index += 1;
+		input.value = history.index === history.entries.length ? history.draft : (history.entries[history.index] ?? "");
+	}
+	input.setSelectionRange(input.value.length, input.value.length);
+	resizeComposer();
+	return true;
+}
+
 function installPanelResizer(
 	id: string,
 	property: "--rail-width" | "--details-width",
@@ -1925,6 +1975,9 @@ async function submitComposer(): Promise<void> {
 	const text = input.value.trim();
 	const attachments = [...activeAttachments()];
 	if (!text && attachments.length === 0) return;
+	recordPromptHistory(text);
+	input.value = "";
+	resizeComposer();
 	if (attachments.length > 0) {
 		if (!activeConnectionIsPrimary()) throw new Error("Attachments require a session hosted by this Pi console");
 		const response = await fetch(`/session-prompts?token=${encodeURIComponent(capabilityToken ?? "")}`, {
@@ -1938,11 +1991,15 @@ async function submitComposer(): Promise<void> {
 	} else {
 		await session.prompt(text);
 	}
-	input.value = "";
-	resizeComposer();
 }
 
-input.addEventListener("input", resizeComposer);
+input.addEventListener("input", () => {
+	resizeComposer();
+	const history = activePromptHistory();
+	if (!history) return;
+	history.index = history.entries.length;
+	history.draft = input.value;
+});
 attachmentButton.addEventListener("click", () => attachmentInput.click());
 attachmentInput.addEventListener("change", () => {
 	const files = [...(attachmentInput.files ?? [])];
@@ -2044,6 +2101,17 @@ form.addEventListener("drop", (event) => {
 	);
 });
 input.addEventListener("keydown", (event) => {
+	if (
+		!event.isComposing &&
+		!event.altKey &&
+		!event.ctrlKey &&
+		!event.metaKey &&
+		(event.key === "ArrowUp" || event.key === "ArrowDown") &&
+		navigatePromptHistory(event.key === "ArrowUp" ? -1 : 1)
+	) {
+		event.preventDefault();
+		return;
+	}
 	if (event.key !== "Enter" || event.shiftKey || event.isComposing || session?.snapshot?.phase !== "idle") return;
 	event.preventDefault();
 	form.requestSubmit();
