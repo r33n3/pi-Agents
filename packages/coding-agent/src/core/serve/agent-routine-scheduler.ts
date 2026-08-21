@@ -1,36 +1,37 @@
-import type { AgentRegistry } from "./agent-registry.ts";
-import type { AgentRunRecord } from "./agent-run-manager.ts";
+import type { RoutineDefinition, RoutineRegistry } from "./routine-registry.ts";
 
-export interface RoutineRunStarter {
-	start(agentId: string, prompt: string, source: "routine"): Promise<AgentRunRecord>;
+export interface RoutineExecution {
+	runId: string;
+	completion: Promise<{ error?: string }>;
 }
 
-export interface AgentRoutineState {
-	agentId: string;
-	routineId: string;
-	prompt: string;
-	intervalMinutes: number;
-	nextRunAt: number;
+export interface RoutineDispatcher {
+	start(definition: RoutineDefinition): Promise<RoutineExecution>;
+}
+
+export interface AgentRoutineState extends RoutineDefinition {
+	nextRunAt?: number;
 	lastRunAt?: number;
 	lastRunId?: string;
 	lastError?: string;
+	activeRunId?: string;
 }
 
-/** Converts persisted interval definitions into runs without bypassing workspace leases. */
+/** Schedules target-agnostic routine definitions while preventing overlapping runs. */
 export class AgentRoutineScheduler implements AsyncDisposable {
-	readonly #registry: AgentRegistry;
-	readonly #runs: RoutineRunStarter;
+	readonly #registry: RoutineRegistry;
+	readonly #dispatcher: RoutineDispatcher;
 	readonly #states = new Map<string, AgentRoutineState>();
 	#timer: NodeJS.Timeout | undefined;
 	#tickActive = false;
 
-	constructor(registry: AgentRegistry, runs: RoutineRunStarter) {
+	constructor(registry: RoutineRegistry, dispatcher: RoutineDispatcher) {
 		this.#registry = registry;
-		this.#runs = runs;
+		this.#dispatcher = dispatcher;
 	}
 
 	list(): AgentRoutineState[] {
-		return [...this.#states.values()].sort((left, right) => left.nextRunAt - right.nextRunAt);
+		return [...this.#states.values()].sort((left, right) => left.name.localeCompare(right.name));
 	}
 
 	async start(): Promise<void> {
@@ -42,25 +43,20 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 
 	async refresh(now = Date.now()): Promise<void> {
 		const next = new Map<string, AgentRoutineState>();
-		for (const agent of await this.#registry.list()) {
-			for (const routine of agent.schedules) {
-				if (!routine.enabled) continue;
-				const key = `${agent.id}/${routine.id}`;
-				const existing = this.#states.get(key);
-				next.set(key, {
-					agentId: agent.id,
-					routineId: routine.id,
-					prompt: routine.prompt,
-					intervalMinutes: routine.intervalMinutes,
-					nextRunAt:
-						existing && existing.intervalMinutes === routine.intervalMinutes
-							? existing.nextRunAt
-							: now + routine.intervalMinutes * 60_000,
-					lastRunAt: existing?.lastRunAt,
-					lastRunId: existing?.lastRunId,
-					lastError: existing?.lastError,
-				});
-			}
+		for (const routine of await this.#registry.list()) {
+			const existing = this.#states.get(routine.id);
+			next.set(routine.id, {
+				...routine,
+				nextRunAt: routine.enabled
+					? existing?.nextRunAt && existing.intervalMinutes === routine.intervalMinutes
+						? existing.nextRunAt
+						: now + routine.intervalMinutes * 60_000
+					: undefined,
+				lastRunAt: existing?.lastRunAt,
+				lastRunId: existing?.lastRunId,
+				lastError: existing?.lastError,
+				activeRunId: existing?.activeRunId,
+			});
 		}
 		this.#states.clear();
 		for (const [key, state] of next) this.#states.set(key, state);
@@ -68,17 +64,18 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 
 	async runDue(now = Date.now()): Promise<void> {
 		for (const state of this.#states.values()) {
-			if (state.nextRunAt > now) continue;
+			if (!state.enabled || state.nextRunAt === undefined || state.nextRunAt > now) continue;
 			state.nextRunAt = now + state.intervalMinutes * 60_000;
-			try {
-				const run = await this.#runs.start(state.agentId, state.prompt, "routine");
-				state.lastRunAt = now;
-				state.lastRunId = run.id;
-				state.lastError = undefined;
-			} catch (error) {
-				state.lastError = error instanceof Error ? error.message : String(error);
-			}
+			if (!state.activeRunId) await this.#run(state, now);
 		}
+	}
+
+	async runNow(id: string, now = Date.now()): Promise<AgentRoutineState> {
+		const state = this.#states.get(id);
+		if (!state) throw new Error(`Routine ${id} was not found`);
+		if (state.activeRunId) throw new Error(`Routine ${id} already has an active run`);
+		await this.#run(state, now);
+		return { ...state };
 	}
 
 	dispose(): Promise<void> {
@@ -98,6 +95,23 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 			await this.runDue();
 		} finally {
 			this.#tickActive = false;
+		}
+	}
+
+	async #run(state: AgentRoutineState, now: number): Promise<void> {
+		try {
+			const execution = await this.#dispatcher.start(state);
+			state.lastRunAt = now;
+			state.lastRunId = execution.runId;
+			state.activeRunId = execution.runId;
+			state.lastError = undefined;
+			void execution.completion.then((result) => {
+				if (state.activeRunId !== execution.runId) return;
+				state.activeRunId = undefined;
+				state.lastError = result.error;
+			});
+		} catch (error) {
+			state.lastError = error instanceof Error ? error.message : String(error);
 		}
 	}
 }

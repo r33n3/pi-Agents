@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import type { ModelMetadata, SessionMetadata } from "@earendil-works/pi-protocol";
 import {
 	type CreateSessionOptions,
@@ -8,6 +10,7 @@ import {
 import type { AgentSession } from "../agent-session.ts";
 import { AgentSessionServeDelegate } from "./agent-session-serve-delegate.ts";
 import { LiveSessionRuntime } from "./live-session-runtime.ts";
+import type { ServeAttachment } from "./serve-attachment-store.ts";
 
 export type HostedSessionFactory = (options: CreateSessionOptions) => Promise<AgentSession>;
 
@@ -92,6 +95,38 @@ export class CurrentSessionService implements PiServerService {
 		throw new PiServerError("not_found", `Unknown session: ${sessionId}`);
 	}
 
+	async promptWithAttachments(sessionId: string, text: string, attachments: ServeAttachment[]): Promise<void> {
+		const session = this.#findSession(sessionId);
+		const images: ImageContent[] = [];
+		const context: string[] = [];
+		for (const attachment of attachments) {
+			if (isModelImage(attachment.mimeType)) {
+				images.push({
+					type: "image",
+					data: (await readFile(attachment.path)).toString("base64"),
+					mimeType: attachment.mimeType,
+				});
+				continue;
+			}
+			if (isInlineText(attachment) && attachment.size <= 1024 * 1024) {
+				context.push(
+					`Attached file: ${attachment.name}\n--- attachment content ---\n${await readFile(attachment.path, "utf8")}\n--- end attachment ---`,
+				);
+				continue;
+			}
+			context.push(`Attached file: ${attachment.name}\nLocal path: ${attachment.path}`);
+		}
+		const prompt = context.length > 0 ? `${text}\n\n${context.join("\n\n")}` : text;
+		await session.prompt(prompt, { images });
+	}
+
+	#findSession(sessionId: string): AgentSession {
+		if (sessionId === this.#session.sessionId) return this.#session;
+		const hosted = this.#hosted.get(sessionId);
+		if (hosted) return hosted.session;
+		throw new PiServerError("not_found", `Unknown session: ${sessionId}`);
+	}
+
 	#metadata(session: AgentSession, createdAt: number): SessionMetadata {
 		return {
 			id: session.sessionId,
@@ -101,4 +136,15 @@ export class CurrentSessionService implements PiServerService {
 			cwd: session.sessionManager.getCwd(),
 		};
 	}
+}
+
+function isModelImage(mimeType: string): boolean {
+	return ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mimeType);
+}
+
+function isInlineText(attachment: ServeAttachment): boolean {
+	return (
+		attachment.mimeType.startsWith("text/") ||
+		["application/json", "application/xml", "application/javascript"].includes(attachment.mimeType)
+	);
 }

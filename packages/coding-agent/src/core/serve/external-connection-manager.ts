@@ -183,6 +183,14 @@ export class ExternalConnectionManager implements AsyncDisposable {
 		return { ...active.record };
 	}
 
+	async waitForCompletion(runId: string): Promise<ExternalConnectionRunRecord> {
+		const active = this.#activeByRun.get(runId);
+		if (active?.completion) await active.completion;
+		const record = this.#records.get(runId);
+		if (!record) throw new Error(`External run ${runId} was not found`);
+		return { ...record };
+	}
+
 	async dispose(): Promise<void> {
 		if (this.#disposed) return;
 		this.#disposed = true;
