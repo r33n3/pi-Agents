@@ -116,4 +116,25 @@ describe("AgentRunManager", () => {
 		expect(executor.executions[0].aborted).toBe(true);
 		await expect.poll(() => runs.get(run.id)?.finishedAt).toBeTypeOf("number");
 	});
+
+	test("prevents different agents from mutating the same project concurrently", async () => {
+		const { registry, executor, runs } = await setup();
+		await registry.save({
+			id: "review",
+			name: "Review",
+			description: "Reviews",
+			tools: ["read"],
+			memory: "none",
+			persona: "Careful",
+			executor: "harness",
+			permissionPolicy: "read-only",
+			schedules: [],
+		});
+		const active = await runs.start("research", "Research");
+		await expect(runs.start("review", "Review")).rejects.toThrow("already has an active run");
+		executor.executions[0]!.resolve({ output: "Done", transcript: [] });
+		await runs.waitForCompletion(active.id);
+		await expect(runs.start("review", "Review after release")).resolves.toMatchObject({ agentId: "review" });
+		executor.executions[1]!.resolve({ output: "Done", transcript: [] });
+	});
 });

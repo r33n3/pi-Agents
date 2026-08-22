@@ -105,7 +105,12 @@ describe("createServePage", () => {
 		await externalConnections.initialize();
 		const routines = new RoutineRegistry(join(root, "routines"));
 		const routineScheduler = new AgentRoutineScheduler(routines, {
-			start: (definition) => Promise.resolve({ runId: `run-${definition.id}`, completion: Promise.resolve({}) }),
+			start: (definition) =>
+				Promise.resolve({
+					runId: `run-${definition.id}`,
+					completion: Promise.resolve({}),
+					cancel: () => Promise.resolve(),
+				}),
 		});
 		await routineScheduler.refresh();
 		attachmentStore = new ServeAttachmentStore();
@@ -153,7 +158,7 @@ describe("createServePage", () => {
 		expect(page.headers.get("content-security-policy")).toContain("connect-src 'self' ws: wss:");
 		expect(page.headers.get("content-security-policy")).toContain("img-src 'self' data: blob:");
 		const html = await page.text();
-		expect(html).toContain('data-rail-tab="sessions"');
+		expect(html).toContain('id="sessions"');
 		expect(html).toContain('id="connection-form"');
 		expect(html).toContain('class="pi-watermark"');
 		expect(html).toContain('id="left-resizer"');
@@ -162,10 +167,13 @@ describe("createServePage", () => {
 		expect(html).toContain('id="session-stats"');
 		expect(html).toContain(".thinking-activity");
 		expect(html).toContain('id="attachment-button"');
-		expect(html).toContain('data-tab="capabilities"');
+		expect(html).toContain('data-tab="browser"');
+		expect(html).toContain('data-tab="agents-workspace"');
+		expect(html).toContain('data-tab="agent-builder"');
 		expect(html).toContain('data-builder-tab="builder-chat-panel"');
 		expect(html).toContain('id="external-connection-list"');
 		expect(html).toContain('id="external-run-form"');
+		expect(html).not.toContain('id="preview-type-form"');
 		expect(html).not.toContain('class="brand"');
 
 		const bundle = await fetch(`${origin}/browser-client.js?token=secret-token`);
@@ -177,6 +185,11 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("tool-activity-state");
 		expect(bundleText).toContain("browser-session-tabs");
 		expect(bundleText).toContain("Active browsers");
+		expect(bundleText).toContain("browserPopout");
+		expect(bundleText).toContain("Pop out browser");
+		expect(bundleText).not.toContain("No active browser");
+		expect(bundleText).not.toContain("Record a walkthrough, then send it to Pi for review.");
+		expect(bundleText).not.toContain("Ask Pi or an agent to open a permitted URL.");
 		expect(bundleText).not.toContain("Could not load browser diagnostics");
 		expect(bundleText).toContain("Send to Pi");
 	});
@@ -289,7 +302,9 @@ describe("createServePage", () => {
 				name: "Review changes",
 				prompt: "Review the repository",
 				enabled: false,
-				intervalMinutes: 60,
+				cron: "0 9 * * 1-5",
+				timezone: "America/Chicago",
+				maxDurationMinutes: 60,
 				target: { kind: "skill", skillName: "code-review" },
 			}),
 		});

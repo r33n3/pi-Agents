@@ -20,6 +20,7 @@ class FakeDispatcher implements RoutineDispatcher {
 		return Promise.resolve({
 			runId: `run-${this.calls.length}`,
 			completion: Promise.resolve({}),
+			cancel: () => Promise.resolve(),
 		});
 	}
 }
@@ -33,7 +34,9 @@ describe("AgentRoutineScheduler", () => {
 			id: "daily-report",
 			name: "Daily report",
 			prompt: "Write the report",
-			intervalMinutes: 5,
+			cron: "*/5 * * * *",
+			timezone: "UTC",
+			maxDurationMinutes: 60,
 			enabled: true,
 			target: { kind: "agent", agentId: "daily" },
 		});
@@ -41,11 +44,11 @@ describe("AgentRoutineScheduler", () => {
 		const scheduler = new AgentRoutineScheduler(registry, dispatcher);
 		await scheduler.refresh(1000);
 
-		await scheduler.runDue(300_999);
+		await scheduler.runDue(299_999);
 		expect(dispatcher.calls).toEqual([]);
-		await scheduler.runDue(301_000);
+		await scheduler.runDue(300_000);
 		expect(dispatcher.calls).toMatchObject([{ id: "daily-report", target: { agentId: "daily" } }]);
-		expect(scheduler.list()[0]).toMatchObject({ lastRunId: "run-1", nextRunAt: 601_000 });
+		expect(scheduler.list()[0]).toMatchObject({ lastRunId: "run-1", nextRunAt: 600_000 });
 	});
 
 	test("runs paused routines manually without enabling their schedule", async () => {
@@ -56,7 +59,9 @@ describe("AgentRoutineScheduler", () => {
 			id: "review",
 			name: "Review",
 			prompt: "Review changes",
-			intervalMinutes: 60,
+			cron: "0 * * * *",
+			timezone: "UTC",
+			maxDurationMinutes: 60,
 			enabled: false,
 			target: { kind: "skill", skillName: "code-review" },
 		});

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
-import type { ModelRef } from "@earendil-works/pi-protocol";
+import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, parse, relative, resolve } from "node:path";
+import type { ModelRef, ThinkingLevel } from "@earendil-works/pi-protocol";
 import { parseFrontmatter } from "../../utils/frontmatter.ts";
 import type { BrowserAccess } from "./browser-policy.ts";
 import type { BrowserProfile } from "./browser-profile-store.ts";
@@ -26,30 +26,47 @@ export interface AgentRoutineDefinition {
 
 export interface AgentDefinition {
 	id: string;
+	revision: number;
 	source: AgentDefinitionSource;
 	personaId?: string;
 	name: string;
 	description: string;
 	model?: ModelRef;
+	thinking?: ThinkingLevel;
 	tools: string[];
 	memory: AgentMemoryKind;
 	persona: string;
+	projectRoot: string;
 	workspace: string;
 	executor: AgentExecutorKind;
 	permissionPolicy: AgentPermissionPolicy;
 	schedules: AgentRoutineDefinition[];
 	browser?: AgentBrowserPolicy;
+	delegateAgentIds: string[];
+	a2a: { enabled: boolean };
 }
 
-export type AgentDefinitionInput = Omit<AgentDefinition, "id" | "personaId" | "source" | "workspace"> & {
+export type AgentDefinitionInput = Omit<
+	AgentDefinition,
+	"id" | "revision" | "personaId" | "source" | "workspace" | "projectRoot" | "delegateAgentIds" | "a2a"
+> & {
 	id?: string;
+	personaId?: string;
 	workspace?: string;
+	projectRoot?: string;
+	delegateAgentIds?: string[];
+	a2a?: { enabled: boolean };
 };
 
 export interface AgentRegistryOptions {
 	catalogDirectory?: string;
 	personaDirectory?: string;
 	defaultWorkspace?: string;
+}
+
+export interface AgentRegistryEvent {
+	type: "agent.created" | "agent.updated" | "agent.removed";
+	agentId: string;
 }
 
 /** Owns durable agent definitions and guarantees every workspace stays under its configured root. */
@@ -61,6 +78,7 @@ export class AgentRegistry {
 	readonly #personaDirectory: string | undefined;
 	readonly #defaultWorkspace: string;
 	readonly #queue = new SerialOperationQueue();
+	readonly #listeners = new Set<(event: AgentRegistryEvent) => void>();
 
 	constructor(root: string, options: AgentRegistryOptions = {}) {
 		this.#root = resolve(root);
@@ -103,23 +121,57 @@ export class AgentRegistry {
 	async save(input: AgentDefinitionInput): Promise<AgentDefinition> {
 		return this.#queue.run(async () => {
 			await this.initialize();
-			const definition = normalizeDefinition(input);
+			const normalized = normalizeDefinition(input, this.#defaultWorkspace);
+			let previous: AgentDefinition | undefined;
+			try {
+				previous = await this.#read(resolve(this.#definitionsDir, `${normalized.id}.json`));
+			} catch (error) {
+				if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+			}
+			const definition = { ...normalized, revision: (previous?.revision ?? 0) + 1 };
 			if (await this.#readCatalog(definition.id)) {
 				throw new Error(`Agent ${definition.id} is managed by the Pi Markdown agent catalog`);
 			}
-			const workspace = resolveWithin(this.#root, definition.workspace, "workspace");
-			await mkdir(workspace, { recursive: true });
+			for (const delegateId of definition.delegateAgentIds) {
+				if (delegateId === definition.id) throw new Error("An agent cannot delegate to itself");
+				if (!(await this.get(delegateId))) throw new Error(`Delegate agent ${delegateId} was not found`);
+			}
+			await mkdir(definition.projectRoot, { recursive: true });
 			const target = resolveWithin(this.#definitionsDir, `${definition.id}.json`, "definition");
 			const temporary = resolve(dirname(target), `.${definition.id}.${randomUUID()}.tmp`);
 			await writeFile(temporary, `${JSON.stringify(definition, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
 			await rename(temporary, target);
+			this.#emit({ type: previous ? "agent.updated" : "agent.created", agentId: definition.id });
 			return definition;
 		});
 	}
 
+	async delete(id: string): Promise<boolean> {
+		assertIdentifier(id, "agent id");
+		return this.#queue.run(async () => {
+			if (await this.#readCatalog(id)) throw new Error(`Agent ${id} is managed by the Pi Markdown agent catalog`);
+			try {
+				await unlink(resolveWithin(this.#definitionsDir, `${id}.json`, "definition"));
+				this.#emit({ type: "agent.removed", agentId: id });
+				return true;
+			} catch (error) {
+				if (isNodeError(error) && error.code === "ENOENT") return false;
+				throw error;
+			}
+		});
+	}
+
+	subscribe(listener: (event: AgentRegistryEvent) => void): () => void {
+		this.#listeners.add(listener);
+		return () => this.#listeners.delete(listener);
+	}
+
+	#emit(event: AgentRegistryEvent): void {
+		for (const listener of this.#listeners) listener(event);
+	}
+
 	workspacePath(definition: AgentDefinition): string {
-		if (definition.source === "pi-agent") return this.#defaultWorkspace;
-		return resolveWithin(this.#root, definition.workspace, "workspace");
+		return resolve(definition.projectRoot);
 	}
 
 	async readIcon(id: string): Promise<Uint8Array | undefined> {
@@ -135,7 +187,7 @@ export class AgentRegistry {
 
 	async #read(path: string): Promise<AgentDefinition> {
 		const value: unknown = JSON.parse(await readFile(path, "utf8"));
-		return normalizeDefinition(value);
+		return normalizeDefinition(value, this.#defaultWorkspace);
 	}
 
 	async #listCatalog(): Promise<AgentDefinition[]> {
@@ -169,14 +221,17 @@ export class AgentRegistry {
 		const personaId = body.match(/<!-- persona:start name=([a-z0-9-]+) -->/)?.[1];
 		return {
 			id,
+			revision: 1,
 			source: "pi-agent",
 			personaId,
 			name,
 			description: requiredString(frontmatter.description, "description"),
 			model: parseCatalogModel(frontmatter.model),
+			thinking: undefined,
 			tools,
 			memory: frontmatter.memory === "notes" ? "notes" : "none",
 			persona: requiredString(body, "agent prompt"),
+			projectRoot: this.#defaultWorkspace,
 			workspace: ".",
 			executor: "session",
 			permissionPolicy: tools.some((tool) => ["bash", "edit", "write"].includes(tool))
@@ -184,20 +239,28 @@ export class AgentRegistry {
 				: "read-only",
 			schedules: [],
 			browser: { access: "disabled", profile: { kind: "ephemeral" } },
+			delegateAgentIds: [],
+			a2a: { enabled: false },
 		};
 	}
 }
 
-function normalizeDefinition(value: unknown): AgentDefinition {
+function normalizeDefinition(value: unknown, defaultWorkspace: string): AgentDefinition {
 	const input = record(value, "agent definition");
 	const name = requiredString(input.name, "name");
 	const id = input.id === undefined ? slugify(name) : requiredString(input.id, "id");
 	assertIdentifier(id, "agent id");
-	const workspace = input.workspace === undefined ? `workspaces/${id}` : requiredString(input.workspace, "workspace");
-	if (isAbsolute(workspace)) throw new Error("Agent workspace must be relative to the registry root");
+	const projectRoot = resolve(
+		input.projectRoot === undefined
+			? input.workspace === undefined
+				? defaultWorkspace
+				: requiredString(input.workspace, "workspace")
+			: requiredString(input.projectRoot, "projectRoot"),
+	);
+	if (projectRoot === parse(projectRoot).root) throw new Error("projectRoot must not be a filesystem root");
 	const tools = stringArray(input.tools, "tools");
-	const unsupportedTool = tools.find((tool) => !["read", "list", "write", "browser"].includes(tool));
-	if (unsupportedTool) throw new Error(`Unsupported isolated agent tool: ${unsupportedTool}`);
+	const unsupportedTool = tools.find((tool) => !/^[a-zA-Z0-9][a-zA-Z0-9:._-]{0,127}$/.test(tool));
+	if (unsupportedTool) throw new Error(`Unsupported agent tool name: ${unsupportedTool}`);
 	const permissionPolicy = oneOf(input.permissionPolicy, ["read-only", "workspace-write"], "permissionPolicy");
 	if (permissionPolicy === "read-only" && tools.includes("write")) {
 		throw new Error("read-only agents cannot enable the write tool");
@@ -208,19 +271,40 @@ function normalizeDefinition(value: unknown): AgentDefinition {
 	}
 	return {
 		id,
+		revision:
+			typeof input.revision === "number" && Number.isSafeInteger(input.revision) && input.revision > 0
+				? input.revision
+				: 1,
 		source: "managed",
+		personaId: input.personaId === undefined ? undefined : validatedIdentifier(input.personaId, "personaId"),
 		name,
 		description: requiredString(input.description, "description"),
 		model: normalizeModel(input.model),
+		thinking: normalizeThinking(input.thinking),
 		tools: [...new Set(tools)],
 		memory: oneOf(input.memory, ["none", "notes"], "memory"),
 		persona: requiredString(input.persona, "persona"),
-		workspace,
+		projectRoot,
+		workspace: projectRoot,
 		executor: oneOf(input.executor, ["session", "harness"], "executor"),
 		permissionPolicy,
 		schedules: normalizeSchedules(input.schedules),
 		browser,
+		delegateAgentIds: identifierArray(input.delegateAgentIds, "delegateAgentIds"),
+		a2a: normalizeA2a(input.a2a),
 	};
+}
+
+function normalizeThinking(value: unknown): ThinkingLevel | undefined {
+	if (value === undefined) return undefined;
+	return oneOf(value, ["off", "minimal", "low", "medium", "high", "xhigh", "max"], "thinking");
+}
+
+function normalizeA2a(value: unknown): { enabled: boolean } {
+	if (value === undefined) return { enabled: false };
+	const input = record(value, "a2a");
+	if (typeof input.enabled !== "boolean") throw new Error("a2a.enabled must be a boolean");
+	return { enabled: input.enabled };
 }
 
 function normalizeBrowserPolicy(value: unknown): AgentBrowserPolicy {
@@ -283,6 +367,13 @@ function stringArray(value: unknown, name: string): string[] {
 	return value.map((entry, index) => requiredString(entry, `${name}[${index}]`));
 }
 
+function identifierArray(value: unknown, name: string): string[] {
+	if (value === undefined) return [];
+	const values = stringArray(value, name);
+	for (const entry of values) assertIdentifier(entry, name);
+	return [...new Set(values)];
+}
+
 function commaSeparatedStrings(value: unknown, name: string): string[] {
 	if (value === undefined) return [];
 	return requiredString(value, name)
@@ -302,6 +393,12 @@ function assertIdentifier(value: string, name: string): void {
 	if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(value)) {
 		throw new Error(`${name} must contain only lowercase letters, numbers, and hyphens`);
 	}
+}
+
+function validatedIdentifier(value: unknown, name: string): string {
+	const identifier = requiredString(value, name);
+	assertIdentifier(identifier, name);
+	return identifier;
 }
 
 function slugify(value: string): string {

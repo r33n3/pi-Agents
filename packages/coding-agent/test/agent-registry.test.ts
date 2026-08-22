@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
 
@@ -21,21 +21,30 @@ async function registry(): Promise<{ root: string; registry: AgentRegistry }> {
 describe("AgentRegistry", () => {
 	test("persists normalized definitions and creates their workspace", async () => {
 		const { root, registry: agents } = await registry();
+		const projectRoot = join(root, "projects", "research");
 		const saved = await agents.save({
 			name: "Research Agent",
+			personaId: "careful-researcher",
 			description: "Researches a bounded question",
 			tools: ["read"],
 			memory: "notes",
 			persona: "Careful researcher",
+			projectRoot,
 			executor: "harness",
 			permissionPolicy: "workspace-write",
 			schedules: [],
 		});
 
-		expect(saved).toMatchObject({ id: "research-agent", workspace: "workspaces/research-agent" });
+		expect(saved).toMatchObject({
+			id: "research-agent",
+			revision: 1,
+			personaId: "careful-researcher",
+			projectRoot,
+			workspace: projectRoot,
+		});
 		expect(await agents.list()).toEqual([saved]);
 		expect(JSON.parse(await readFile(join(root, "definitions", "research-agent.json"), "utf8"))).toEqual(saved);
-		expect(agents.workspacePath(saved)).toBe(join(root, "workspaces", "research-agent"));
+		expect(agents.workspacePath(saved)).toBe(projectRoot);
 	});
 
 	test("updates an existing definition atomically", async () => {
@@ -54,7 +63,7 @@ describe("AgentRegistry", () => {
 		await agents.save(base);
 		await agents.save({ ...base, description: "Writes concise reports" });
 
-		expect(await agents.get("writer")).toMatchObject({ description: "Writes concise reports" });
+		expect(await agents.get("writer")).toMatchObject({ revision: 2, description: "Writes concise reports" });
 	});
 
 	test("requires an explicit policy when an agent enables browser tools", async () => {
@@ -79,22 +88,42 @@ describe("AgentRegistry", () => {
 		).resolves.toMatchObject({ browser: { access: "public-web", profile: { kind: "named", id: "research" } } });
 	});
 
-	test("rejects workspaces outside the registry", async () => {
+	test("allows an explicit local project folder", async () => {
 		const { registry: agents } = await registry();
+		const projectRoot = await mkdtemp(join(tmpdir(), "pi-agent-project-"));
+		roots.push(projectRoot);
 		await expect(
 			agents.save({
 				id: "escape",
-				name: "Escape",
-				description: "Invalid",
+				name: "Outside project",
+				description: "Works in a selected project",
 				tools: [],
 				memory: "none",
 				persona: "None",
-				workspace: "../../outside",
+				projectRoot,
 				executor: "harness",
 				permissionPolicy: "read-only",
 				schedules: [],
 			}),
-		).rejects.toThrow("escapes the registry root");
+		).resolves.toMatchObject({ projectRoot });
+	});
+
+	test("rejects a filesystem root as an agent project", async () => {
+		const { registry: agents } = await registry();
+		await expect(
+			agents.save({
+				id: "root-project",
+				name: "Root project",
+				description: "Too broad",
+				tools: [],
+				memory: "none",
+				persona: "None",
+				projectRoot: parse(tmpdir()).root,
+				executor: "harness",
+				permissionPolicy: "read-only",
+				schedules: [],
+			}),
+		).rejects.toThrow("must not be a filesystem root");
 	});
 
 	test("includes existing Pi Markdown agents without duplicating their definitions", async () => {

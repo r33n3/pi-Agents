@@ -26,6 +26,7 @@ export interface AgentRunRecord {
 interface ActiveRun {
 	record: AgentRunRecord;
 	execution: AgentExecution;
+	workspaceKey: string;
 	abortRequested: boolean;
 	completion?: Promise<void>;
 }
@@ -38,6 +39,7 @@ export class AgentRunManager implements AsyncDisposable {
 	readonly #queue = new SerialOperationQueue();
 	readonly #records = new Map<string, AgentRunRecord>();
 	readonly #activeByAgent = new Map<string, ActiveRun>();
+	readonly #activeByWorkspace = new Map<string, ActiveRun>();
 	readonly #activeByRun = new Map<string, ActiveRun>();
 	#disposed = false;
 
@@ -100,9 +102,14 @@ export class AgentRunManager implements AsyncDisposable {
 		return this.#queue.run(async () => {
 			if (this.#disposed) throw new Error("Agent run manager is disposed");
 			if (prompt.trim() === "") throw new Error("Agent run prompt is required");
-			if (this.#activeByAgent.has(agentId)) throw new Error(`Agent ${agentId} already has an active run`);
 			const definition = await this.#registry.get(agentId);
 			if (!definition) throw new Error(`Agent ${agentId} was not found`);
+			if (this.#activeByAgent.has(agentId)) throw new Error(`Agent ${agentId} already has an active run`);
+			const workspace = this.#registry.workspacePath(definition);
+			const workspaceKey = process.platform === "win32" ? resolve(workspace).toLowerCase() : resolve(workspace);
+			if (this.#activeByWorkspace.has(workspaceKey)) {
+				throw new Error(`Agent project ${workspace} already has an active run`);
+			}
 			const runId = randomUUID();
 			const artifactDirectory = resolve(this.#artifactsRoot, agentId, runId);
 			const record: AgentRunRecord = {
@@ -121,13 +128,14 @@ export class AgentRunManager implements AsyncDisposable {
 				const execution = await this.#executor.start({
 					runId,
 					definition: model ? { ...definition, model } : definition,
-					workspace: this.#registry.workspacePath(definition),
+					workspace,
 					prompt: record.prompt,
 				});
 				record.status = "running";
 				record.startedAt = Date.now();
-				const active: ActiveRun = { record, execution, abortRequested: false };
+				const active: ActiveRun = { record, execution, workspaceKey, abortRequested: false };
 				this.#activeByAgent.set(agentId, active);
+				this.#activeByWorkspace.set(workspaceKey, active);
 				this.#activeByRun.set(runId, active);
 				await this.#persistRecord(record);
 				active.completion = this.#settle(active);
@@ -193,6 +201,7 @@ export class AgentRunManager implements AsyncDisposable {
 			record.finishedAt = Date.now();
 			await this.#persistRecord(record);
 			this.#activeByAgent.delete(record.agentId);
+			this.#activeByWorkspace.delete(active.workspaceKey);
 			this.#activeByRun.delete(record.id);
 			await execution.dispose();
 		}

@@ -12,6 +12,9 @@
 - Added five-entry, per-session web-console prompt history with Up/Down navigation and immediate composer clearing on send.
 - Added icon-based browser diagnostics and opt-in walkthrough recording that sends redacted interaction steps to Pi for semantic review.
 - Added compact, collapsible local and remote capability panels with expandable descriptions and metadata.
+- Added a persistent `pi --serve` agent workspace with persona-backed definitions, durable conversations and tasks, cron routines, sequential/parallel/supervisor workflows, explicit plugin lifecycle approval, and per-agent capability grants.
+- Added an opt-in, authenticated A2A v1.0 HTTP+JSON boundary with Agent Cards, task operations, cancellation, and Server-Sent Event updates.
+- Added the `agent_deploy` Pi tool so agents created from a Pi session and Agent Builder share one validated registry and appear without a server restart.
 
 ### Fixed
 
@@ -55,8 +58,10 @@
 
 ### Changed
 
-- Redesigned the managed-browser preview with browser-style tabs, labeled navigation controls, an address bar, ownership state, and automatic selection across Pi and agent browser sessions.
+- Redesigned the managed-browser preview with browser-style tabs, compact icon toolbars, an address bar, ownership state, and automatic selection across Pi and agent browser sessions.
+- Added session-bound pop-out windows for managed browser previews.
 - Simplified the managed-browser sidebar to the live page preview and walkthrough controls; console and network diagnostics remain available to agent tooling.
+- Consolidated the web console workspace into Browser, Agents, and Agent Builder, including project-root execution, persistent agent chat, model/tool selection, connections, workflows, and cron automation.
 
 - Changed inherited Kimi Coding requests to use pi's runtime `User-Agent` header.
 - Replaced the inherited Mistral SDK transport with a native Chat Completions HTTP stream, eliminating its generated client and schema runtime overhead.
