@@ -1,0 +1,15 @@
+{
+  "name": "pi-agent-builder",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Create and update reusable local pi agents with validated persona support.",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": [
+      "./extensions/agent-builder.ts",
+      "./extensions/persona.ts"
+    ]
+  }
+}

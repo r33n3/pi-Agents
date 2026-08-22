@@ -78,6 +78,17 @@ Both executor forms use the same single-lease task service. Chat, Pi delegation,
 routine, workflow, and A2A tasks cannot overlap while mutating one agent project
 root, and abort waits for the session to become idle before releasing the lease.
 
+## Companion extensions
+
+- [`pi-agent-builder`](../packages/extensions/pi-agent-builder/README.md) adds the
+  `configure_agent` tool and `/persona` command for reusable Markdown agents in
+  normal Pi sessions. Persona names are normalized and path-validated before
+  fetching or caching. Use Agent Builder in `pi --serve` for routines and
+  workflows.
+- [`pi-switch-project`](../packages/extensions/pi-switch-project/README.md) adds
+  `/cd <path>`, which relaunches Pi in another working directory and resumes the
+  persisted session when possible.
+
 ## Verification
 
 ```sh

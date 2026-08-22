@@ -2,6 +2,7 @@ node_modules/
 dist/
 .artifacts/
 *.log
+nul
 .DS_Store
 *.tsbuildinfo
 # packages/*/node_modules/

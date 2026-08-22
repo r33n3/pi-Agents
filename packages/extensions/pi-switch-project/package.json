@@ -1,0 +1,12 @@
+{
+  "name": "pi-switch-project",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "/cd command for pi: switch to a different project directory, resuming the current session there.",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}
