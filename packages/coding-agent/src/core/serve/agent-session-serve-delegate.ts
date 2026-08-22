@@ -121,6 +121,7 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 					toolName: message.toolName,
 					input: {},
 					content: message.content,
+					usage: message.usage,
 					timestamp: message.timestamp,
 				};
 				return [
@@ -173,6 +174,8 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 			role: "assistant" as const,
 			content,
 			model: { provider: message.provider, id: message.model },
+			responseModel: message.responseModel,
+			usage: message.usage,
 			timestamp: message.timestamp,
 		};
 		if (message.stopReason === "error")

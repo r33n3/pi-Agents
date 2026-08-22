@@ -10,6 +10,8 @@ import { installThemedSelect } from "./themed-select.ts";
 import { createBrowserWebSocketTransport } from "./websocket-transport.ts";
 
 const status = element("status");
+const sessionPath = element("session-path");
+const sessionStats = element("session-stats");
 const transcript = element("transcript");
 const form = requiredElement<HTMLFormElement>("composer");
 const input = requiredElement<HTMLTextAreaElement>("prompt");
@@ -57,9 +59,7 @@ const previewReload = requiredElement<HTMLButtonElement>("preview-reload");
 const previewControl = requiredElement<HTMLButtonElement>("preview-control");
 const previewTypeForm = requiredElement<HTMLFormElement>("preview-type-form");
 const previewType = requiredElement<HTMLInputElement>("preview-type");
-const previewConsole = element("preview-console");
-const previewNetwork = element("preview-network");
-const { consoleCount: previewConsoleCount, networkCount: previewNetworkCount } = installPreviewTabIcons();
+const previewSessionTabs = installPreviewBrowserChrome();
 const { record: previewRecord, send: previewSendRecording, status: previewRecordingStatus } = createPreviewRecorder();
 const modelPicker = installThemedSelect(model);
 const agentModelPicker = installThemedSelect(agentModel);
@@ -76,6 +76,7 @@ let activeSidebarAgent: AgentSummary | undefined;
 let activeTargetKey: string | undefined;
 let activePreviewSessionId: string | undefined;
 let activePreviewSession: BrowserSessionSummary | undefined;
+let selectedPreviewSessionId: string | undefined;
 let previewStream: WebSocket | undefined;
 let previewStreamSessionId: string | undefined;
 let previewFrameUrl: string | undefined;
@@ -170,11 +171,6 @@ interface BrowserSessionSummary {
 	canGoForward: boolean;
 }
 
-interface BrowserDiagnostics {
-	console: Array<{ type: string; text: string; timestamp: number }>;
-	networkFailures: Array<{ url: string; method: string; reason: string; timestamp: number }>;
-}
-
 interface RecordedPreviewStep {
 	action: "open" | "navigate" | "back" | "forward" | "reload" | "click" | "type" | "scroll";
 	timestamp: number;
@@ -191,6 +187,9 @@ let externalConnections: ExternalConnectionSummary[] = [];
 const connections = new Map<string, ConnectionEntry>();
 const reconnecting = new Set<string>();
 const sessionAliases = readSessionAliases();
+const expandedThinking = new Map<string, boolean>();
+const thinkingCollapseTimers = new Map<string, number>();
+const streamingThinking = new Set<string>();
 const expandedToolActivity = new Map<string, boolean>();
 const promptHistoryBySession = new Map<string, PromptHistory>();
 const MAX_PROMPT_HISTORY = 5;
@@ -214,7 +213,16 @@ function readSessionAliases(): Record<string, string> {
 }
 
 function sessionDisplayName(target: SessionTarget): string {
-	return sessionAliases[target.key] ?? target.session.sessionName ?? "Pi session";
+	return (
+		sessionAliases[target.key] ?? target.session.sessionName ?? sessionFolderName(target.session.cwd) ?? "Pi session"
+	);
+}
+
+function sessionFolderName(cwd: string | undefined): string | undefined {
+	const normalized = cwd?.replace(/[\\/]+$/, "");
+	const folder = normalized?.split(/[\\/]/).at(-1);
+	if (!folder) return undefined;
+	return folder.length > 6 ? `${folder.slice(0, 6)}…` : folder;
 }
 
 function renameSession(target: SessionTarget): void {
@@ -237,41 +245,98 @@ function requiredElement<T extends HTMLElement>(id: string): T {
 	return element(id) as T;
 }
 
-function installPreviewTabIcons(): { consoleCount: HTMLSpanElement; networkCount: HTMLSpanElement } {
-	const paths = {
-		page: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm0 0c2.4 2.5 3.6 5.5 3.6 9s-1.2 6.5-3.6 9m0-18C9.6 5.5 8.4 8.5 8.4 12s1.2 6.5 3.6 9M3.5 9h17M3.5 15h17",
-		console: "m8 8-4 4 4 4m8-8 4 4-4 4m-2-11-4 14",
-		network:
-			"M6 7a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm12 16a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM6 7v4c0 2 1 3 3 3h6c2 0 3 1 3 3M15 5h6m-2-2 2 2-2 2",
-	} as const;
-	const labels = { page: "Page", console: "Console", network: "Network" } as const;
-	const counts = {
-		console: document.createElement("span"),
-		network: document.createElement("span"),
-	};
-	counts.console.id = "preview-console-count";
-	counts.network.id = "preview-network-count";
-	for (const kind of ["page", "console", "network"] as const) {
-		const button = document.querySelector<HTMLButtonElement>(`[data-preview-tab="${kind}"]`);
-		if (!button) throw new Error(`Missing ${kind} preview tab`);
-		const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-		icon.classList.add("preview-tab-icon");
-		icon.setAttribute("viewBox", "0 0 24 24");
-		icon.setAttribute("aria-hidden", "true");
-		const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-		path.setAttribute("d", paths[kind]);
-		icon.append(path);
-		button.title = labels[kind];
-		button.setAttribute("aria-label", labels[kind]);
-		if (kind === "page") {
-			button.replaceChildren(icon);
-		} else {
-			counts[kind].className = "diagnostic-count";
-			counts[kind].setAttribute("aria-hidden", "true");
-			button.replaceChildren(icon, counts[kind]);
-		}
+function installPreviewBrowserChrome(): HTMLElement {
+	const tabs = document.querySelector<HTMLElement>(".preview-tabs");
+	if (!tabs) throw new Error("Missing browser session tabs");
+	tabs.className = "browser-session-tabs";
+	tabs.setAttribute("aria-label", "Active browsers");
+	tabs.replaceChildren();
+	for (const kind of ["console", "network"]) {
+		document.querySelector(`[data-preview-panel="${kind}"]`)?.remove();
 	}
-	return { consoleCount: counts.console, networkCount: counts.network };
+	previewForm.className = "browser-toolbar";
+	const navigation = document.createElement("div");
+	navigation.className = "browser-nav-actions";
+	setBrowserAction(previewBack, "back", "Back", "Go back");
+	setBrowserAction(previewForward, "forward", "Forward", "Go forward");
+	setBrowserAction(previewReload, "reload", "Reload", "Reload page");
+	navigation.append(previewBack, previewForward, previewReload);
+	const omnibox = document.createElement("div");
+	omnibox.className = "browser-omnibox";
+	const security = document.createElement("span");
+	security.className = "browser-address-icon";
+	security.textContent = "◎";
+	security.title = "Managed browser address";
+	const go = document.createElement("button");
+	go.type = "submit";
+	setBrowserAction(go, "go", "Go", "Open address");
+	omnibox.append(security, previewAddress, go);
+	previewForm.replaceChildren(navigation, omnibox);
+	setBrowserAction(previewControl, "human", "Take control", "Take control from the agent");
+	document.querySelector<HTMLElement>(".preview-card > strong")?.replaceChildren("Browser");
+	return tabs;
+}
+
+type BrowserActionIcon = "back" | "forward" | "reload" | "go" | "human" | "agent" | "record" | "stop" | "pi-send";
+
+function setBrowserAction(
+	button: HTMLButtonElement,
+	iconKind: BrowserActionIcon,
+	labelText: string,
+	tooltip: string,
+): void {
+	const icon = browserActionIcon(iconKind);
+	const label = document.createElement("span");
+	label.className = "browser-action-label";
+	label.textContent = labelText;
+	button.replaceChildren(icon, label);
+	button.dataset.browserIcon = iconKind;
+	button.title = tooltip;
+	button.setAttribute("aria-label", labelText);
+}
+
+function browserActionIcon(kind: BrowserActionIcon): SVGSVGElement {
+	const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+	icon.classList.add("browser-action-icon");
+	icon.setAttribute("viewBox", "0 0 24 24");
+	icon.setAttribute("aria-hidden", "true");
+	const pathData: Partial<Record<BrowserActionIcon, string>> = {
+		back: "M15 18l-6-6 6-6",
+		forward: "m9 18 6-6-6-6",
+		reload: "M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7",
+		go: "M5 12h13m-5-5 5 5-5 5",
+		human: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-7 8c.8-4 3.1-6 7-6s6.2 2 7 6",
+		agent: "M5 12h14M12 5v14m-6.5-3.5 13-7",
+		stop: "M7 7h10v10H7z",
+	};
+	if (kind === "record") {
+		const outer = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+		outer.setAttribute("cx", "12");
+		outer.setAttribute("cy", "12");
+		outer.setAttribute("r", "8");
+		const inner = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+		inner.setAttribute("class", "browser-action-icon-fill");
+		inner.setAttribute("cx", "12");
+		inner.setAttribute("cy", "12");
+		inner.setAttribute("r", "3.5");
+		icon.append(outer, inner);
+		return icon;
+	}
+	if (kind === "pi-send") {
+		const pi = document.createElementNS("http://www.w3.org/2000/svg", "text");
+		pi.setAttribute("x", "3");
+		pi.setAttribute("y", "18");
+		pi.setAttribute("class", "browser-action-pi");
+		pi.textContent = "π";
+		const arrow = document.createElementNS("http://www.w3.org/2000/svg", "path");
+		arrow.setAttribute("d", "M14 15 21 8m-5 0h5v5");
+		icon.append(pi, arrow);
+		return icon;
+	}
+	const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+	path.setAttribute("d", pathData[kind] ?? "");
+	icon.append(path);
+	return icon;
 }
 
 function createPreviewRecorder(): {
@@ -285,13 +350,13 @@ function createPreviewRecorder(): {
 	record.id = "preview-record";
 	record.type = "button";
 	record.disabled = true;
-	record.textContent = "● Record";
+	setBrowserAction(record, "record", "Record", "Record a browser walkthrough");
 	record.setAttribute("aria-pressed", "false");
 	const send = document.createElement("button");
 	send.id = "preview-send-recording";
 	send.type = "button";
 	send.disabled = true;
-	send.textContent = "Send steps to Pi";
+	setBrowserAction(send, "pi-send", "Send to Pi", "Send recorded steps to the selected Pi session");
 	actions.append(record, send);
 	const status = document.createElement("span");
 	status.id = "preview-recording-status";
@@ -450,7 +515,69 @@ function render(snapshot: SessionSnapshot): void {
 	model.value = `${snapshot.model.provider}/${snapshot.model.id}`;
 	modelPicker.refresh();
 	thinking.value = snapshot.thinkingLevel;
+	sessionPath.textContent = formatWorkingDirectory(snapshot.cwd);
+	sessionPath.title = snapshot.cwd;
+	renderSessionStats(snapshot);
 	transcript.scrollTop = nearBottom ? transcript.scrollHeight : previousScrollTop;
+}
+
+function renderSessionStats(snapshot: SessionSnapshot): void {
+	const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+	let latestAssistantUsage: Extract<TranscriptItem, { role: "assistant" }>["usage"];
+	for (const item of snapshot.transcript) {
+		if ((item.role !== "assistant" && item.role !== "tool") || !item.usage) continue;
+		totals.input += item.usage.input;
+		totals.output += item.usage.output;
+		totals.cacheRead += item.usage.cacheRead;
+		totals.cacheWrite += item.usage.cacheWrite;
+		totals.cost += item.usage.cost.total;
+		if (item.role === "assistant" && item.status !== "error" && item.status !== "aborted") {
+			latestAssistantUsage = item.usage;
+		}
+	}
+	const parts: string[] = [];
+	if (totals.input) parts.push(`↑${formatTokens(totals.input)}`);
+	if (totals.output) parts.push(`↓${formatTokens(totals.output)}`);
+	if (totals.cacheRead) parts.push(`R${formatTokens(totals.cacheRead)}`);
+	if (totals.cacheWrite) parts.push(`W${formatTokens(totals.cacheWrite)}`);
+	if (latestAssistantUsage && (totals.cacheRead > 0 || totals.cacheWrite > 0)) {
+		const promptTokens =
+			latestAssistantUsage.input + latestAssistantUsage.cacheRead + latestAssistantUsage.cacheWrite;
+		if (promptTokens > 0) parts.push(`CH${((latestAssistantUsage.cacheRead / promptTokens) * 100).toFixed(1)}%`);
+	}
+	if (totals.cost) parts.push(`$${totals.cost.toFixed(3)}`);
+	const currentModel = availableModels.find(
+		(entry) => entry.provider === snapshot.model.provider && entry.id === snapshot.model.id,
+	);
+	if (currentModel) {
+		const contextTokens = latestAssistantUsage
+			? latestAssistantUsage.totalTokens ||
+				latestAssistantUsage.input +
+					latestAssistantUsage.output +
+					latestAssistantUsage.cacheRead +
+					latestAssistantUsage.cacheWrite
+			: 0;
+		parts.push(
+			`${((contextTokens / currentModel.contextWindow) * 100).toFixed(1)}%/${formatTokens(currentModel.contextWindow)} (auto)`,
+		);
+	}
+	sessionStats.textContent = parts.join(" ");
+	sessionStats.title = "Input · output · cache read · cache write · cache hit · cost · context";
+}
+
+function formatTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
+	if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+	return `${Math.round(count / 1_000_000)}M`;
+}
+
+function formatWorkingDirectory(cwd: string): string {
+	const windowsHome = cwd.match(/^([A-Za-z]:\\Users\\[^\\]+)(?:\\|$)/)?.[1];
+	if (windowsHome) return cwd.replace(windowsHome, "~");
+	const unixHome = cwd.match(/^\/(?:home|Users)\/[^/]+(?:\/|$)/)?.[0].replace(/\/$/, "");
+	return unixHome ? cwd.replace(unixHome, "~") : cwd;
 }
 
 function renderItem(item: TranscriptItem): HTMLElement {
@@ -466,13 +593,59 @@ function renderItem(item: TranscriptItem): HTMLElement {
 	label.textContent = item.role === "assistant" ? "π" : item.role;
 	article.append(label);
 
-	for (const content of item.content) {
+	for (const [index, content] of item.content.entries()) {
 		if (content.type === "text") appendText(article, content.text);
-		else if (content.type === "thinking") appendText(article, content.thinking, "thinking");
-		else if (content.type === "toolCall") appendText(article, `Using ${content.toolName}`, "tool-call");
+		else if (item.role === "assistant" && content.type === "thinking") {
+			article.append(renderThinkingActivity(item, content.thinking, index));
+		} else if (content.type === "toolCall") appendText(article, `Using ${content.toolName}`, "tool-call");
 		else if (content.type === "image") appendText(article, `[image: ${content.mimeType}]`);
 	}
 	return article;
+}
+
+function renderThinkingActivity(
+	item: Extract<TranscriptItem, { role: "assistant" }>,
+	content: string,
+	index: number,
+): HTMLDetailsElement {
+	const thinkingId = `${item.id}:${index}`;
+	const details = document.createElement("details");
+	details.className = `thinking-activity${item.status === "streaming" ? " is-streaming" : ""}`;
+	details.dataset.thinkingId = thinkingId;
+	if (item.status === "streaming") {
+		streamingThinking.add(thinkingId);
+		expandedThinking.set(thinkingId, true);
+	}
+	details.open = expandedThinking.get(thinkingId) ?? false;
+	details.addEventListener("toggle", () => expandedThinking.set(thinkingId, details.open));
+
+	const summary = document.createElement("summary");
+	const label = document.createElement("span");
+	label.textContent = item.status === "streaming" ? "Thinking" : "Thought process";
+	const dots = document.createElement("span");
+	dots.className = "thinking-dots";
+	dots.setAttribute("aria-hidden", "true");
+	dots.append(document.createElement("i"), document.createElement("i"), document.createElement("i"));
+	summary.append(label, dots);
+
+	const body = document.createElement("div");
+	body.className = "thinking-body";
+	body.textContent = content;
+	details.append(summary, body);
+
+	if (item.status !== "streaming" && streamingThinking.delete(thinkingId) && !thinkingCollapseTimers.has(thinkingId)) {
+		thinkingCollapseTimers.set(
+			thinkingId,
+			window.setTimeout(() => {
+				expandedThinking.set(thinkingId, false);
+				thinkingCollapseTimers.delete(thinkingId);
+				for (const current of document.querySelectorAll<HTMLDetailsElement>(".thinking-activity")) {
+					if (current.dataset.thinkingId === thinkingId) current.open = false;
+				}
+			}, 3000),
+		);
+	}
+	return details;
 }
 
 function renderToolActivity(item: Extract<TranscriptItem, { role: "tool" }>): HTMLDetailsElement {
@@ -747,7 +920,12 @@ function setPreviewControls(browserSession: BrowserSessionSummary | undefined): 
 	previewReload.disabled = !userControls || !browserSession?.url;
 	previewType.disabled = !userControls;
 	previewControl.disabled = sessionId === undefined;
-	previewControl.textContent = userControls ? "Return to agent" : "Take control";
+	setBrowserAction(
+		previewControl,
+		userControls ? "agent" : "human",
+		userControls ? "Return to agent" : "Take control",
+		userControls ? "Return browser control to the agent" : "Take browser control from the agent",
+	);
 	renderPreviewRecording();
 }
 
@@ -755,7 +933,12 @@ function renderPreviewRecording(): void {
 	const stepCount = recordedPreviewSteps.length;
 	previewRecord.disabled = activePreviewSessionId === undefined;
 	previewRecord.classList.toggle("recording", previewRecording);
-	previewRecord.textContent = previewRecording ? "■ Stop" : "● Record";
+	setBrowserAction(
+		previewRecord,
+		previewRecording ? "stop" : "record",
+		previewRecording ? "Stop" : "Record",
+		previewRecording ? "Stop recording the walkthrough" : "Record a browser walkthrough",
+	);
 	previewRecord.setAttribute("aria-pressed", String(previewRecording));
 	previewSendRecording.disabled = stepCount === 0 || session?.snapshot?.phase !== "idle";
 	previewRecordingStatus.textContent = previewRecording
@@ -897,11 +1080,12 @@ function handlePreviewStreamMessage(event: MessageEvent): void {
 
 async function loadPreview(): Promise<void> {
 	if (!capabilityToken) return;
-	if (!session || !activeConnectionIsPrimary()) {
-		previewSession.textContent = "No local Pi session selected";
+	if (!session) {
+		previewSession.textContent = "No Pi session selected";
 		previewImage.removeAttribute("src");
 		setPreviewControls(undefined);
-		setPreviewMessage("Preview is available for sessions hosted by this Pi console.");
+		renderPreviewSessionTabs([], undefined);
+		setPreviewMessage("Select a Pi session to inspect its managed browsers.");
 		previewStream?.close();
 		return;
 	}
@@ -916,26 +1100,24 @@ async function loadPreview(): Promise<void> {
 		setPreviewMessage("Run `pi browser install chromium`, then ask Pi to open a local URL.");
 		return;
 	}
-	const sessionsResponse = await fetch(
-		`/browser/sessions?token=${encodeURIComponent(capabilityToken)}&ownerKind=pi-session&ownerId=${encodeURIComponent(session.id)}`,
-	);
+	const sessionsResponse = await fetch(`/browser/sessions?token=${encodeURIComponent(capabilityToken)}`);
 	if (!sessionsResponse.ok) throw new Error(await responseError(sessionsResponse, "Could not load browser sessions"));
 	const payload: unknown = await sessionsResponse.json();
 	if (!isBrowserSessionList(payload)) throw new Error("Browser session response is invalid");
-	const browserSession = payload.sessions
+	const browserSessions = payload.sessions
 		.filter((entry) => entry.status !== "closed")
-		.sort((left, right) => right.updatedAt - left.updatedAt)[0];
+		.sort((left, right) => right.updatedAt - left.updatedAt);
+	const browserSession = selectPreviewSession(browserSessions);
+	renderPreviewSessionTabs(browserSessions, browserSession?.id);
 	if (!browserSession) {
-		previewSession.textContent = "No browser session for this Pi chat";
+		previewSession.textContent = "No active browser";
 		previewImage.removeAttribute("src");
 		setPreviewControls(undefined);
-		setPreviewMessage("Ask Pi to use browser_open with a permitted local URL.");
+		setPreviewMessage("Ask Pi or an agent to open a permitted URL.");
 		previewStream?.close();
 		return;
 	}
-	previewSession.textContent = [browserSession.title ?? "Untitled page", browserSession.url ?? browserSession.status]
-		.filter(Boolean)
-		.join(" · ");
+	previewSession.textContent = `${browserOwnerLabel(browserSession)} · ${browserSession.controlOwner === "user" ? "User control" : "Agent control"}`;
 	setPreviewControls(browserSession);
 	if (browserSession.status === "failed") {
 		previewImage.removeAttribute("src");
@@ -946,60 +1128,65 @@ async function loadPreview(): Promise<void> {
 		previewImage.src = `/browser/sessions/${encodeURIComponent(browserSession.id)}/screenshot?token=${encodeURIComponent(capabilityToken)}&at=${browserSession.updatedAt}`;
 	}
 	setPreviewMessage(`${browserSession.status} · managed Chromium · live`);
-	void loadPreviewDiagnostics().catch(() => {});
 }
 
-async function loadPreviewDiagnostics(): Promise<void> {
-	if (!capabilityToken || !activePreviewSessionId) {
-		previewConsole.replaceChildren();
-		previewNetwork.replaceChildren();
-		setDiagnosticCount(previewConsoleCount, 0);
-		setDiagnosticCount(previewNetworkCount, 0);
+function selectPreviewSession(browserSessions: BrowserSessionSummary[]): BrowserSessionSummary | undefined {
+	const selected = browserSessions.find((entry) => entry.id === selectedPreviewSessionId);
+	if (selected) return selected;
+	selectedPreviewSessionId = undefined;
+	if (activeConnectionIsPrimary()) {
+		const currentPiBrowser = browserSessions.find(
+			(entry) => entry.owner.kind === "pi-session" && entry.owner.id === session?.id,
+		);
+		if (currentPiBrowser) return currentPiBrowser;
+	}
+	return browserSessions[0];
+}
+
+function renderPreviewSessionTabs(browserSessions: BrowserSessionSummary[], selectedId: string | undefined): void {
+	if (browserSessions.length === 0) {
+		const empty = document.createElement("button");
+		empty.type = "button";
+		empty.disabled = true;
+		empty.textContent = "No active browser";
+		previewSessionTabs.replaceChildren(empty);
 		return;
 	}
-	const response = await fetch(
-		`/browser/sessions/${encodeURIComponent(activePreviewSessionId)}/diagnostics?token=${encodeURIComponent(capabilityToken)}`,
+	previewSessionTabs.replaceChildren(
+		...browserSessions.map((browserSession) => {
+			const button = document.createElement("button");
+			button.type = "button";
+			button.classList.toggle("active", browserSession.id === selectedId);
+			const icon = document.createElement("span");
+			icon.className = "browser-tab-icon";
+			icon.textContent = browserSession.owner.kind === "pi-session" ? "π" : "◎";
+			const label = document.createElement("span");
+			label.textContent = browserSession.title ?? browserOwnerLabel(browserSession);
+			button.append(icon, label);
+			button.title = [browserOwnerLabel(browserSession), browserSession.title, browserSession.url]
+				.filter(Boolean)
+				.join(" · ");
+			button.addEventListener("click", () => {
+				selectedPreviewSessionId = browserSession.id;
+				void loadPreview().catch((error: unknown) =>
+					setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+				);
+			});
+			return button;
+		}),
 	);
-	if (!response.ok) throw new Error(await responseError(response, "Could not load browser diagnostics"));
-	const diagnostics: unknown = await response.json();
-	if (!isBrowserDiagnostics(diagnostics)) throw new Error("Browser diagnostics response is invalid");
-	previewConsole.replaceChildren(
-		...diagnostics.console.map((entry) => diagnosticRow(`${entry.type} · ${entry.text}`, entry.timestamp)),
-	);
-	previewNetwork.replaceChildren(
-		...diagnostics.networkFailures.map((entry) =>
-			diagnosticRow(`${entry.method} ${entry.url}\n${entry.reason}`, entry.timestamp),
-		),
-	);
-	setDiagnosticCount(previewConsoleCount, diagnostics.console.length);
-	setDiagnosticCount(previewNetworkCount, diagnostics.networkFailures.length);
-	if (diagnostics.console.length === 0) appendText(previewConsole, "No console entries", "muted");
-	if (diagnostics.networkFailures.length === 0) appendText(previewNetwork, "No failed requests", "muted");
 }
 
-function setDiagnosticCount(element: HTMLElement, count: number): void {
-	element.textContent = count > 0 ? String(count) : "";
-	element.classList.toggle("has-diagnostics", count > 0);
-	element.setAttribute("aria-label", count === 1 ? "1 diagnostic" : `${count} diagnostics`);
+function browserOwnerLabel(browserSession: BrowserSessionSummary): string {
+	if (browserSession.owner.kind === "pi-session") {
+		return browserSession.owner.id === session?.id ? "Current Pi" : `Pi · ${shortId(browserSession.owner.id)}`;
+	}
+	if (browserSession.owner.kind === "agent-run") return `Agent · ${shortId(browserSession.owner.id)}`;
+	return `External · ${shortId(browserSession.owner.id)}`;
 }
 
-function diagnosticRow(text: string, timestamp: number): HTMLElement {
-	const row = document.createElement("div");
-	row.className = "preview-diagnostic";
-	appendText(row, new Date(timestamp).toLocaleTimeString(), "muted");
-	appendText(row, text);
-	return row;
-}
-
-function isBrowserDiagnostics(value: unknown): value is BrowserDiagnostics {
-	return (
-		typeof value === "object" &&
-		value !== null &&
-		"console" in value &&
-		Array.isArray(value.console) &&
-		"networkFailures" in value &&
-		Array.isArray(value.networkFailures)
-	);
+function shortId(value: string): string {
+	return value.length > 8 ? `${value.slice(0, 8)}…` : value;
 }
 
 async function navigatePreview(url: string): Promise<void> {
@@ -1088,6 +1275,15 @@ function isBrowserSessionList(value: unknown): value is { sessions: BrowserSessi
 			typeof entry.id === "string" &&
 			"status" in entry &&
 			typeof entry.status === "string" &&
+			"owner" in entry &&
+			typeof entry.owner === "object" &&
+			entry.owner !== null &&
+			"kind" in entry.owner &&
+			(entry.owner.kind === "pi-session" ||
+				entry.owner.kind === "agent-run" ||
+				entry.owner.kind === "external-run") &&
+			"id" in entry.owner &&
+			typeof entry.owner.id === "string" &&
 			"updatedAt" in entry &&
 			typeof entry.updatedAt === "number" &&
 			"controlOwner" in entry &&
@@ -2371,23 +2567,6 @@ for (const button of document.querySelectorAll<HTMLButtonElement>("[data-rail-ta
 
 for (const button of document.querySelectorAll<HTMLButtonElement>("[data-builder-tab]")) {
 	button.addEventListener("click", () => activateBuilderTab(button.dataset.builderTab ?? "builder-chat-panel"));
-}
-
-for (const button of document.querySelectorAll<HTMLButtonElement>("[data-preview-tab]")) {
-	button.addEventListener("click", () => {
-		const tab = button.dataset.previewTab ?? "page";
-		document.querySelectorAll("[data-preview-tab]").forEach((entry) => {
-			entry.classList.toggle("active", entry.getAttribute("data-preview-tab") === tab);
-		});
-		document.querySelectorAll("[data-preview-panel]").forEach((entry) => {
-			entry.classList.toggle("hidden", entry.getAttribute("data-preview-panel") !== tab);
-		});
-		if (tab !== "page") {
-			void loadPreviewDiagnostics().catch((error: unknown) =>
-				setPreviewMessage(error instanceof Error ? error.message : String(error), true),
-			);
-		}
-	});
 }
 
 newAgent.addEventListener("click", () => {

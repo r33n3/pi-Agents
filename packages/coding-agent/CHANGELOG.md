@@ -4,6 +4,9 @@
 
 ### Added
 
+- Added web-console session directory, folder-derived session labels, and live token, cache, cost, and context usage around the composer.
+- Added expandable web-console reasoning that streams visibly and collapses shortly after each response completes.
+
 - Added transcript usage notices for compaction and branch summaries when cache miss notices are enabled.
 - Added expandable web-console tool activity that keeps completed actions compact while exposing full input and output on demand.
 - Added five-entry, per-session web-console prompt history with Up/Down navigation and immediate composer clearing on send.
@@ -51,6 +54,9 @@
 - Added inherited unbound single-line transcript scrolling actions for fullscreen mode. See [TUI Fullscreen Viewport](docs/keybindings.md#tui-fullscreen-viewport) ([#7903](https://github.com/earendil-works/pi/pull/7903) by [@midastruth](https://github.com/midastruth)).
 
 ### Changed
+
+- Redesigned the managed-browser preview with browser-style tabs, labeled navigation controls, an address bar, ownership state, and automatic selection across Pi and agent browser sessions.
+- Simplified the managed-browser sidebar to the live page preview and walkthrough controls; console and network diagnostics remain available to agent tooling.
 
 - Changed inherited Kimi Coding requests to use pi's runtime `User-Agent` header.
 - Replaced the inherited Mistral SDK transport with a native Chat Completions HTTP stream, eliminating its generated client and schema runtime overhead.
