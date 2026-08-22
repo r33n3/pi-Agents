@@ -23,15 +23,27 @@ strict. The default bind address is `127.0.0.1`; an explicit non-loopback
   stored in browser-local layout preferences.
 - The composer sends with an arrow while idle and becomes a red stop control
   during a turn. Enter sends; Shift+Enter inserts a newline.
-- New Agent opens Builder with separate Chat and Settings tabs. The chat uses
-  an isolated helper session while Settings owns the persisted definition.
-- Preview replaces Overview and, when the managed-browser milestone is
+- The right workspace contains Browser, Agents, and Agent Builder. Selecting an
+  agent opens its persistent chat and its manual, scheduled, and workflow run
+  history. Agent Builder owns persona, model, built-in tools, plugins, MCP/API
+  connections, per-agent grants, workflows, and cron automation.
+- Browser, when the managed-browser milestone is
   installed, shows the same Chromium page controlled by the user and agent.
   See the [managed-browser specification](pi-browser-preview-spec.md) for the
   implementation contract.
-- Activity launches and aborts local agents. Completed results link to their
-  persisted artifact.
-- Routines show enabled interval schedules and their next/last run state.
+- Agents deployed through Pi and Agent Builder share one registry and appear
+  without restarting the serve host.
+- Cron routines are configured in Agent Builder and their next/last task state
+  and artifacts are reviewed under Agents.
+- Pi sessions discover their configured tools automatically. Installing a
+  plugin does not grant it to every deployed agent; Agent Builder explicitly
+  controls each agent's tool grants.
+
+The target persistent-chat, workflow, persona, cron, and A2A design is defined
+in the [agent workspace specification](pi-agent-workspace-spec.md).
+The A2A boundary is pinned to the official
+[A2A v1.0.1 specification](https://github.com/a2aproject/A2A/releases/tag/v1.0.1)
+and advertises the compatible `1.0` wire-protocol version.
 
 ## Storage
 
@@ -39,10 +51,14 @@ Serve data is owned by `~/.pi/agent/serve`:
 
 ```text
 definitions/<agent-id>.json
-workspaces/<agent-id>/
+conversations/<conversation-id>/
+tasks/<agent-id>/<task-id>/
 runs/<agent-id>/<run-id>/run.json
 runs/<agent-id>/<run-id>/result.md
 runs/<agent-id>/<run-id>/transcript.json
+workflows/definitions/<workflow-id>.json
+workflows/runs/<workflow-run-id>/run.json
+routines/<routine-id>.json
 ```
 
 Definitions and workspace paths are validated before use. Interrupted run
@@ -58,9 +74,9 @@ remain listed and readable.
 - `session` creates a fresh local Pi session with the selected standard tools.
   Use it for trusted interactive local work that needs normal Pi path behavior.
 
-Both executor forms use the same single-lease run manager. Manual and routine
-runs cannot overlap for one agent workspace, and abort waits for the session to
-become idle before releasing the lease.
+Both executor forms use the same single-lease task service. Chat, Pi delegation,
+routine, workflow, and A2A tasks cannot overlap while mutating one agent project
+root, and abort waits for the session to become idle before releasing the lease.
 
 ## Verification
 
@@ -70,6 +86,9 @@ cd packages/coding-agent
 node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run \
   test/args.test.ts test/serial-operation-queue.test.ts \
   test/agent-registry.test.ts test/agent-run-manager.test.ts \
-  test/agent-routine-scheduler.test.ts test/serve-page.test.ts \
+  test/agent-task-service.test.ts test/cron-schedule.test.ts \
+  test/agent-routine-scheduler.test.ts test/persona-catalog.test.ts \
+  test/plugin-management-service.test.ts test/serve-agent-services.test.ts \
+  test/serve-a2a-http.test.ts test/serve-page.test.ts \
   test/websocket-listener.test.ts
 ```

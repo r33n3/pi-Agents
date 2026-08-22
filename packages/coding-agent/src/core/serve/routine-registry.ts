@@ -2,10 +2,12 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { ModelRef } from "@earendil-works/pi-protocol";
+import { validateCron } from "./cron-schedule.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
 export type RoutineTarget =
 	| { kind: "agent"; agentId: string }
+	| { kind: "workflow"; workflowId: string }
 	| { kind: "acp"; connectionId: string }
 	| { kind: "skill"; skillName: string };
 
@@ -14,7 +16,9 @@ export interface RoutineDefinition {
 	name: string;
 	prompt: string;
 	enabled: boolean;
-	intervalMinutes: number;
+	cron: string;
+	timezone: string;
+	maxDurationMinutes: number;
 	target: RoutineTarget;
 	model?: ModelRef;
 	cwd?: string;
@@ -89,15 +93,20 @@ function normalizeRoutine(value: unknown): RoutineDefinition {
 	const id = input.id === undefined ? slugify(name) : requiredString(input.id, "id");
 	assertIdentifier(id, "routine id");
 	if (typeof input.enabled !== "boolean") throw new Error("enabled must be a boolean");
-	if (!Number.isSafeInteger(input.intervalMinutes) || Number(input.intervalMinutes) < 1) {
-		throw new Error("intervalMinutes must be a positive integer");
+	const cron = requiredString(input.cron, "cron");
+	const timezone = requiredString(input.timezone, "timezone");
+	validateCron(cron, timezone);
+	if (!Number.isSafeInteger(input.maxDurationMinutes) || Number(input.maxDurationMinutes) < 1) {
+		throw new Error("maxDurationMinutes must be a positive integer");
 	}
 	return {
 		id,
 		name,
 		prompt: requiredString(input.prompt, "prompt"),
 		enabled: input.enabled,
-		intervalMinutes: Number(input.intervalMinutes),
+		cron,
+		timezone,
+		maxDurationMinutes: Number(input.maxDurationMinutes),
 		target: normalizeTarget(input.target),
 		model: input.model === undefined ? undefined : normalizeModel(input.model),
 		cwd: input.cwd === undefined ? undefined : requiredString(input.cwd, "cwd"),
@@ -112,6 +121,11 @@ function normalizeTarget(value: unknown): RoutineTarget {
 			assertIdentifier(agentId, "target agent id");
 			return { kind: "agent", agentId };
 		}
+		case "workflow": {
+			const workflowId = requiredString(target.workflowId, "target.workflowId");
+			assertIdentifier(workflowId, "target workflow id");
+			return { kind: "workflow", workflowId };
+		}
 		case "acp": {
 			const connectionId = requiredString(target.connectionId, "target.connectionId");
 			assertIdentifier(connectionId, "target connection id");
@@ -125,7 +139,7 @@ function normalizeTarget(value: unknown): RoutineTarget {
 			return { kind: "skill", skillName };
 		}
 		default:
-			throw new Error("target.kind must be one of: agent, acp, skill");
+			throw new Error("target.kind must be one of: agent, workflow, acp, skill");
 	}
 }
 

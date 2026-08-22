@@ -1,15 +1,21 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { A2A_MEDIA_TYPE, type A2aAdapter, A2aError, type A2aTask } from "./a2a-adapter.ts";
 import type { AgentDefinitionInput, AgentRegistry } from "./agent-registry.ts";
 import type { AgentRoutineScheduler } from "./agent-routine-scheduler.ts";
 import type { AgentRunManager } from "./agent-run-manager.ts";
+import type { AgentTaskService } from "./agent-task-service.ts";
 import { SERVE_BROWSER_BUNDLE } from "./browser-bundle.generated.ts";
 import type { BrowserConsoleService } from "./browser-console-service.ts";
 import type { CapabilityCatalog } from "./capability-catalog.ts";
 import { matchesCapabilityToken } from "./capability-token.ts";
+import { nextCronRun } from "./cron-schedule.ts";
 import type { CurrentSessionService } from "./current-session-service.ts";
 import type { ExternalConnectionManager } from "./external-connection-manager.ts";
+import type { PersonaCatalog } from "./persona-catalog.ts";
+import type { PluginManagementService } from "./plugin-management-service.ts";
 import type { RoutineDefinitionInput, RoutineRegistry } from "./routine-registry.ts";
 import type { ServeAttachment, ServeAttachmentStore } from "./serve-attachment-store.ts";
+import type { WorkflowDefinitionInput, WorkflowService } from "./workflow-service.ts";
 
 const SECURITY_HEADERS = {
 	"cache-control": "no-store",
@@ -31,6 +37,11 @@ export function createServePage(
 	attachmentStore?: ServeAttachmentStore,
 	capabilityCatalog?: CapabilityCatalog,
 	browserConsole?: BrowserConsoleService,
+	agentTaskService?: AgentTaskService,
+	workflowService?: WorkflowService,
+	personaCatalog?: PersonaCatalog,
+	a2aAdapter?: A2aAdapter,
+	pluginManagement?: PluginManagementService,
 ): (request: IncomingMessage, response: ServerResponse) => void {
 	return (request, response) => {
 		void serveRequest(
@@ -46,6 +57,11 @@ export function createServePage(
 			attachmentStore,
 			capabilityCatalog,
 			browserConsole,
+			agentTaskService,
+			workflowService,
+			personaCatalog,
+			a2aAdapter,
+			pluginManagement,
 		).catch((error: unknown) => {
 			if (response.headersSent) {
 				response.end();
@@ -69,10 +85,49 @@ async function serveRequest(
 	attachmentStore: ServeAttachmentStore | undefined,
 	capabilityCatalog: CapabilityCatalog | undefined,
 	browserConsole: BrowserConsoleService | undefined,
+	agentTaskService: AgentTaskService | undefined,
+	workflowService: WorkflowService | undefined,
+	personaCatalog: PersonaCatalog | undefined,
+	a2aAdapter: A2aAdapter | undefined,
+	pluginManagement: PluginManagementService | undefined,
 ): Promise<void> {
 	const url = new URL(request.url ?? "/", "http://localhost");
-	if (!matchesCapabilityToken(token, url.searchParams.get("token"))) {
+	const bearer = bearerToken(request.headers.authorization);
+	if (
+		!matchesCapabilityToken(token, url.searchParams.get("token")) &&
+		!matchesCapabilityToken(token, bearer ?? null)
+	) {
 		response.writeHead(403, SECURITY_HEADERS).end();
+		return;
+	}
+	if (url.pathname === "/agent-events") {
+		serveAgentEvents(request, response, agentRegistry, agentTaskService);
+		return;
+	}
+	if (url.pathname.startsWith("/a2a/")) {
+		await serveA2a(request, response, url, a2aAdapter);
+		return;
+	}
+	if (url.pathname === "/plugins.json" || url.pathname.startsWith("/plugins/")) {
+		await servePlugins(request, response, url, pluginManagement);
+		return;
+	}
+	if (url.pathname === "/personas.json" || url.pathname.startsWith("/personas/")) {
+		await servePersonas(request, response, url, personaCatalog);
+		return;
+	}
+	if (
+		url.pathname === "/agent-tasks.json" ||
+		url.pathname === "/agent-tasks" ||
+		url.pathname.startsWith("/agent-tasks/") ||
+		url.pathname === "/agent-conversations.json" ||
+		url.pathname.startsWith("/agent-conversations/")
+	) {
+		await serveAgentTasks(request, response, url, agentTaskService);
+		return;
+	}
+	if (url.pathname === "/workflows.json" || url.pathname === "/workflows" || url.pathname.startsWith("/workflows/")) {
+		await serveWorkflows(request, response, url, workflowService);
 		return;
 	}
 	if (url.pathname === "/agents.json" || url.pathname === "/agents" || url.pathname.startsWith("/agents/")) {
@@ -141,6 +196,360 @@ async function serveRequest(
 	response
 		.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/html; charset=utf-8" })
 		.end(renderPage(encodeURIComponent(token)));
+}
+
+function serveAgentEvents(
+	request: IncomingMessage,
+	response: ServerResponse,
+	registry: AgentRegistry | undefined,
+	tasks: AgentTaskService | undefined,
+): void {
+	if (request.method !== "GET" || !registry || !tasks) {
+		response.writeHead(registry && tasks ? 405 : 503, SECURITY_HEADERS).end();
+		return;
+	}
+	response.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/event-stream", connection: "keep-alive" });
+	response.write(": connected\n\n");
+	const send = (event: unknown) => response.write(`data: ${JSON.stringify(event)}\n\n`);
+	const unsubscribeRegistry = registry.subscribe(send);
+	const unsubscribeTasks = tasks.subscribe(send);
+	const heartbeat = setInterval(() => response.write(": heartbeat\n\n"), 15_000);
+	heartbeat.unref();
+	request.once("close", () => {
+		clearInterval(heartbeat);
+		unsubscribeRegistry();
+		unsubscribeTasks();
+	});
+}
+
+async function servePlugins(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	service: PluginManagementService | undefined,
+): Promise<void> {
+	if (!service) {
+		json(response, 503, { error: "Plugin management is unavailable" });
+		return;
+	}
+	if (request.method === "GET" && url.pathname === "/plugins.json") {
+		json(response, 200, { plugins: service.list() });
+		return;
+	}
+	try {
+		const body = object(await readJsonBody(request), "plugin operation");
+		const source = requiredString(body.source, "source");
+		const approved = body.approved === true;
+		const scope = oneOf(body.scope ?? "user", ["user", "project"], "scope");
+		if (request.method === "POST" && url.pathname === "/plugins/install") {
+			await service.install(source, scope, approved);
+			json(response, 200, { installed: true });
+			return;
+		}
+		if (request.method === "POST" && url.pathname === "/plugins/remove") {
+			json(response, 200, { removed: await service.remove(source, scope, approved) });
+			return;
+		}
+		if (request.method === "POST" && url.pathname === "/plugins/update") {
+			await service.update(source, approved);
+			json(response, 200, { updated: true });
+			return;
+		}
+		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+	} catch (error) {
+		json(response, 400, { error: error instanceof Error ? error.message : "Plugin operation failed" });
+	}
+}
+
+async function servePersonas(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	catalog: PersonaCatalog | undefined,
+): Promise<void> {
+	if (!catalog) {
+		json(response, 503, { error: "Persona catalog is unavailable" });
+		return;
+	}
+	if (request.method === "GET" && url.pathname === "/personas.json") {
+		json(response, 200, { personas: catalog.list() });
+		return;
+	}
+	if (request.method === "GET" && url.pathname.endsWith("/image")) {
+		const id = decodeURIComponent(url.pathname.slice("/personas/".length, -"/image".length));
+		const image = await catalog.readImage(id);
+		if (!image) response.writeHead(404, SECURITY_HEADERS).end();
+		else response.writeHead(200, { ...SECURITY_HEADERS, "content-type": image.contentType }).end(image.data);
+		return;
+	}
+	response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET" }).end();
+}
+
+async function serveAgentTasks(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	service: AgentTaskService | undefined,
+): Promise<void> {
+	if (!service) {
+		json(response, 503, { error: "Agent task service is unavailable" });
+		return;
+	}
+	if (request.method === "GET" && url.pathname === "/agent-conversations.json") {
+		json(response, 200, { conversations: service.listConversations(url.searchParams.get("agentId") ?? undefined) });
+		return;
+	}
+	if (
+		request.method === "GET" &&
+		url.pathname.startsWith("/agent-conversations/") &&
+		url.pathname.endsWith("/messages")
+	) {
+		const id = decodeURIComponent(url.pathname.slice("/agent-conversations/".length, -"/messages".length));
+		try {
+			json(response, 200, { messages: await service.listMessages(id) });
+		} catch (error) {
+			json(response, 404, { error: error instanceof Error ? error.message : "Conversation not found" });
+		}
+		return;
+	}
+	const suffix =
+		url.pathname === "/agent-tasks.json" || url.pathname === "/agent-tasks"
+			? ""
+			: decodeURIComponent(url.pathname.slice("/agent-tasks/".length));
+	if (request.method === "GET" && suffix === "") {
+		json(response, 200, {
+			tasks: service.listTasks({
+				agentId: url.searchParams.get("agentId") ?? undefined,
+				conversationId: url.searchParams.get("conversationId") ?? undefined,
+				workflowRunId: url.searchParams.get("workflowRunId") ?? undefined,
+			}),
+		});
+		return;
+	}
+	if (request.method === "GET" && suffix) {
+		const task = service.getTask(suffix);
+		json(response, task ? 200 : 404, task ?? { error: "Task not found" });
+		return;
+	}
+	if (request.method === "POST" && suffix === "") {
+		try {
+			const body = object(await readJsonBody(request), "agent task request");
+			json(
+				response,
+				202,
+				await service.submit({
+					agentId: requiredString(body.agentId, "agentId"),
+					prompt: requiredString(body.prompt, "prompt"),
+					conversationId: optionalString(body.conversationId, "conversationId"),
+					source: oneOf(body.source ?? "chat", ["chat", "pi", "routine", "workflow", "a2a"], "source"),
+				}),
+			);
+		} catch (error) {
+			json(response, 400, { error: error instanceof Error ? error.message : "Invalid agent task request" });
+		}
+		return;
+	}
+	if (request.method === "POST" && suffix.endsWith("/cancel")) {
+		try {
+			json(response, 200, await service.cancel(suffix.slice(0, -"/cancel".length)));
+		} catch (error) {
+			json(response, 409, { error: error instanceof Error ? error.message : "Could not cancel task" });
+		}
+		return;
+	}
+	if (request.method === "POST" && suffix.endsWith("/continue")) {
+		try {
+			const body = object(await readJsonBody(request), "continue task request");
+			json(
+				response,
+				202,
+				await service.continue(suffix.slice(0, -"/continue".length), requiredString(body.message, "message")),
+			);
+		} catch (error) {
+			json(response, 400, { error: error instanceof Error ? error.message : "Could not continue task" });
+		}
+		return;
+	}
+	response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+}
+
+async function serveWorkflows(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	service: WorkflowService | undefined,
+): Promise<void> {
+	if (!service) {
+		json(response, 503, { error: "Workflow service is unavailable" });
+		return;
+	}
+	const suffix =
+		url.pathname === "/workflows.json" || url.pathname === "/workflows"
+			? ""
+			: decodeURIComponent(url.pathname.slice("/workflows/".length));
+	if (request.method === "GET" && suffix === "") {
+		json(response, 200, { workflows: service.listDefinitions(), runs: service.listRuns() });
+		return;
+	}
+	if (request.method === "POST" && suffix === "") {
+		try {
+			json(response, 201, await service.save((await readJsonBody(request)) as WorkflowDefinitionInput));
+		} catch (error) {
+			json(response, 400, { error: error instanceof Error ? error.message : "Invalid workflow" });
+		}
+		return;
+	}
+	if (request.method === "PUT" && suffix && !suffix.endsWith("/run")) {
+		try {
+			const input = (await readJsonBody(request)) as WorkflowDefinitionInput;
+			json(response, 200, await service.save({ ...input, id: suffix }));
+		} catch (error) {
+			json(response, 400, { error: error instanceof Error ? error.message : "Invalid workflow" });
+		}
+		return;
+	}
+	if (request.method === "POST" && suffix.endsWith("/run")) {
+		try {
+			const body = object(await readJsonBody(request), "workflow run request");
+			json(
+				response,
+				202,
+				await service.start(suffix.slice(0, -"/run".length), requiredString(body.prompt, "prompt")),
+			);
+		} catch (error) {
+			json(response, 400, { error: error instanceof Error ? error.message : "Could not start workflow" });
+		}
+		return;
+	}
+	if (request.method === "DELETE" && suffix) {
+		try {
+			const deleted = await service.delete(suffix);
+			json(response, deleted ? 200 : 404, deleted ? { deleted: true } : { error: "Workflow not found" });
+		} catch (error) {
+			json(response, 409, { error: error instanceof Error ? error.message : "Could not delete workflow" });
+		}
+		return;
+	}
+	const definition = service.getDefinition(suffix);
+	json(response, definition ? 200 : 404, definition ?? { error: "Workflow not found" });
+}
+
+async function serveA2a(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	adapter: A2aAdapter | undefined,
+): Promise<void> {
+	if (!adapter) {
+		a2aError(response, new A2aError("UNAVAILABLE", 503, "A2A adapter is unavailable"));
+		return;
+	}
+	const match = url.pathname.match(/^\/a2a\/agents\/([^/]+)(\/.*)?$/);
+	if (!match) {
+		a2aError(response, new A2aError("AGENT_NOT_FOUND", 404, "Agent was not found"));
+		return;
+	}
+	const agentId = decodeURIComponent(match[1]!);
+	const suffix = match[2] ?? "";
+	try {
+		if (request.method === "GET" && suffix === "/.well-known/agent-card.json") {
+			jsonA2a(
+				response,
+				200,
+				await adapter.agentCard(agentId, `${url.protocol}//${request.headers.host ?? "localhost"}`),
+			);
+			return;
+		}
+		adapter.validateVersion(singleHeader(request.headers["a2a-version"]));
+		if (request.method === "POST" && (suffix === "/message:send" || suffix === "/message:stream")) {
+			if (!singleHeader(request.headers["content-type"])?.toLowerCase().startsWith(A2A_MEDIA_TYPE)) {
+				throw new A2aError("INVALID_PARAMS", 415, `Content-Type must be ${A2A_MEDIA_TYPE}`);
+			}
+			const result = await adapter.sendMessage(agentId, await readJsonBody(request));
+			if (suffix === "/message:send") jsonA2a(response, 200, result);
+			else streamA2aTask(request, response, adapter, agentId, result.task);
+			return;
+		}
+		if (request.method === "GET" && suffix === "/tasks") {
+			jsonA2a(response, 200, adapter.listTasks(agentId, url.searchParams.get("status") ?? undefined));
+			return;
+		}
+		const taskMatch = suffix.match(/^\/tasks\/([^/:]+)(?::(cancel|subscribe))?$/);
+		if (!taskMatch) throw new A2aError("UNSUPPORTED_OPERATION", 404, "A2A operation was not found");
+		const taskId = decodeURIComponent(taskMatch[1]!);
+		const action = taskMatch[2];
+		if (request.method === "GET" && action === undefined) jsonA2a(response, 200, adapter.getTask(agentId, taskId));
+		else if (request.method === "POST" && action === "cancel")
+			jsonA2a(response, 200, await adapter.cancelTask(agentId, taskId));
+		else if (request.method === "POST" && action === "subscribe")
+			streamA2aTask(request, response, adapter, agentId, adapter.getTask(agentId, taskId));
+		else throw new A2aError("UNSUPPORTED_OPERATION", 405, "HTTP method is not supported for this operation");
+	} catch (error) {
+		a2aError(
+			response,
+			error instanceof A2aError
+				? error
+				: new A2aError("INTERNAL", 500, error instanceof Error ? error.message : "Internal error"),
+		);
+	}
+}
+
+function streamA2aTask(
+	request: IncomingMessage,
+	response: ServerResponse,
+	adapter: A2aAdapter,
+	agentId: string,
+	task: A2aTask,
+): void {
+	response.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/event-stream", connection: "keep-alive" });
+	response.write(`data: ${JSON.stringify({ task })}\n\n`);
+	if (["TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"].includes(task.status.state)) {
+		response.end();
+		return;
+	}
+	const unsubscribe = adapter.subscribe(agentId, task.id, (next) => {
+		response.write(`data: ${JSON.stringify({ task: next })}\n\n`);
+		if (["TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"].includes(next.status.state)) {
+			unsubscribe();
+			response.end();
+		}
+	});
+	request.once("close", unsubscribe);
+}
+
+function jsonA2a(response: ServerResponse, status: number, value: unknown): void {
+	response
+		.writeHead(status, { ...SECURITY_HEADERS, "content-type": A2A_MEDIA_TYPE })
+		.end(`${JSON.stringify(value)}\n`);
+}
+
+function a2aError(response: ServerResponse, error: A2aError): void {
+	jsonA2a(response, error.status, {
+		error: {
+			code: error.status,
+			status:
+				error.status === 404
+					? "NOT_FOUND"
+					: error.status === 400 || error.status === 415
+						? "INVALID_ARGUMENT"
+						: error.status === 503
+							? "UNAVAILABLE"
+							: "INTERNAL",
+			message: error.message,
+			details: [
+				{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: error.reason, domain: "a2a-protocol.org" },
+			],
+		},
+	});
+}
+
+function bearerToken(value: string | undefined): string | undefined {
+	const match = value?.match(/^Bearer\s+(.+)$/i);
+	return match?.[1];
+}
+
+function singleHeader(value: string | string[] | undefined): string | undefined {
+	return Array.isArray(value) ? value[0] : value;
 }
 
 async function serveBrowser(
@@ -407,6 +816,23 @@ async function serveRoutines(
 		json(response, routine ? 200 : 404, routine ?? { error: "Routine not found" });
 		return;
 	}
+	if (request.method === "POST" && suffix === "preview") {
+		try {
+			const body = object(await readJsonBody(request), "cron preview request");
+			const cron = requiredString(body.cron, "cron");
+			const timezone = requiredString(body.timezone, "timezone");
+			const next: number[] = [];
+			let after = Date.now();
+			for (let index = 0; index < 3; index += 1) {
+				after = nextCronRun(cron, timezone, after);
+				next.push(after);
+			}
+			json(response, 200, { next });
+		} catch (error) {
+			json(response, 400, { error: error instanceof Error ? error.message : "Invalid cron schedule" });
+		}
+		return;
+	}
 	if (request.method === "POST" && suffix === "") {
 		try {
 			const saved = await registry.save((await readJsonBody(request)) as RoutineDefinitionInput);
@@ -605,6 +1031,15 @@ async function serveAgents(
 		}
 		return;
 	}
+	if (request.method === "DELETE" && id) {
+		try {
+			const deleted = await agentRegistry.delete(id);
+			json(response, deleted ? 200 : 404, deleted ? { deleted: true } : { error: "Agent not found" });
+		} catch (error) {
+			json(response, 409, { error: error instanceof Error ? error.message : "Could not delete agent" });
+		}
+		return;
+	}
 	response.writeHead(405, { ...SECURITY_HEADERS, allow: id ? "GET, PUT" : "GET, POST" }).end();
 }
 
@@ -666,18 +1101,21 @@ function renderPage(token: string): string {
 .agent-chat-composer{display:flex!important;align-items:flex-end;gap:7px;padding:7px;border:1px solid #3a3a42;border-radius:15px;background:var(--surface)}.agent-chat-composer #builder-prompt{min-height:42px;max-height:120px;resize:none;border:0;background:transparent;outline:0}.agent-chat-composer button{width:38px;height:38px;flex:0 0 38px;padding:0!important;border-radius:50%!important;font-size:22px}.agent-chat-composer button.is-stopping{background:var(--danger)!important;color:#fff!important;font-size:12px}
 .themed-select{display:inline-block;min-width:0;width:100%}.themed-select-trigger{position:relative;width:100%;min-width:0;padding:8px 28px 8px 10px;border:1px solid var(--line);border-radius:8px;background:#131316;color:var(--text);overflow:hidden;text-align:left;text-overflow:ellipsis;white-space:nowrap}.themed-select-trigger:after{position:absolute;right:10px;top:50%;width:6px;height:6px;border-right:1px solid var(--muted);border-bottom:1px solid var(--muted);content:"";transform:translateY(-70%) rotate(45deg)}.themed-select-trigger:focus-visible{outline:2px solid var(--pi);outline-offset:1px}.themed-select-list{position:fixed;z-index:1000;overflow:auto;padding:6px;border:1px solid #3a3a42;border-radius:10px;background:#111114;box-shadow:0 18px 50px rgba(0,0,0,.65);scrollbar-color:#44444d #111114}.themed-select-option{display:block;width:100%;padding:9px 10px;border:0;border-radius:6px;background:transparent;color:var(--text);overflow:hidden;text-align:left;text-overflow:ellipsis;white-space:nowrap}.themed-select-option:hover,.themed-select-option:focus-visible{background:var(--surface2);outline:0}.themed-select-option[aria-selected="true"]{background:#20344b;color:#cfe5ff}.themed-select-option:disabled{opacity:.4}.controls .themed-select{width:210px}.controls label{min-width:0}
 .pi-watermark{font-size:650px}
-#routine-editor{display:grid;gap:10px}#routine-editor label{display:grid;gap:5px;color:var(--muted);font-size:11px}#routine-editor input,#routine-editor textarea,#routine-editor select{width:100%;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}#routine-editor button{border:1px solid var(--line);border-radius:7px;background:var(--surface2);color:var(--text);padding:8px}.routine-actions{display:flex;gap:7px}.routine-actions button{flex:1}.routine-actions .primary{border:0!important;background:var(--pi)!important;color:#07101b!important;font-weight:700}.routine-actions .danger{color:var(--danger)!important;border-color:var(--danger)!important}.routine-card{cursor:pointer}.routine-card.active{border-color:var(--pi)}.routine-state{display:flex;justify-content:space-between;gap:8px}.routine-target{color:var(--pi);font-size:11px}
+#routine-editor{display:grid;gap:10px}#routine-editor label{display:grid;gap:5px;color:var(--muted);font-size:11px}#routine-editor input,#routine-editor textarea,#routine-editor select{width:100%;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}#routine-editor button{border:1px solid var(--line);border-radius:7px;background:var(--surface2);color:var(--text);padding:8px}.routine-actions{display:flex;gap:7px}.routine-actions button{flex:1}.routine-actions .primary{border:0!important;background:var(--pi)!important;color:#07101b!important;font-weight:700}.routine-actions .danger{color:var(--danger)!important;border-color:var(--danger)!important}.routine-card{cursor:pointer}.routine-card.active{border-color:var(--pi)}.routine-state{display:flex;align-items:center;gap:8px}.routine-state>.routine-target{margin-left:auto}.routine-target{color:var(--pi);font-size:11px}.routine-preview{font-size:10px;line-height:1.4}.routine-menu{position:relative}.routine-menu>summary{display:grid;width:24px;height:24px;place-items:center;border-radius:50%;cursor:pointer;list-style:none}.routine-menu>summary::-webkit-details-marker{display:none}.routine-menu>div{position:absolute;z-index:5;top:26px;right:0;display:grid;width:110px;padding:5px;border:1px solid var(--line);border-radius:8px;background:#151519;box-shadow:0 12px 30px #000}.routine-menu button{border:0!important;background:transparent!important;color:var(--text)!important;text-align:left}.routine-menu button:hover{background:var(--surface2)!important}
 #attachment-list{display:flex;flex-wrap:wrap;gap:7px;margin:0 8px 7px}#attachment-list:empty{display:none}.attachment-chip{display:flex;align-items:center;gap:6px;max-width:250px;padding:6px 8px;border:1px solid var(--line);border-radius:9px;background:var(--surface2);font-size:11px}.attachment-chip a{min-width:0;overflow:hidden;color:var(--text);text-overflow:ellipsis;white-space:nowrap}.attachment-chip span{color:var(--muted);white-space:nowrap}.attachment-chip button,#attachment-button{border:0;background:transparent;color:var(--muted)}.attachment-chip button:hover,#attachment-button:hover{color:var(--text)}#attachment-button{flex:0 0 42px;width:42px;height:42px;border-radius:50%;font-size:25px}.composer-drop{border-color:var(--pi)!important;background:#1b2735!important}.capability-section{margin-bottom:9px;border:1px solid var(--line);border-radius:10px;background:rgba(20,20,23,.55);overflow:hidden}.capability-section>summary,.capability-card>summary{display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none}.capability-section>summary::-webkit-details-marker,.capability-card>summary::-webkit-details-marker{display:none}.capability-section>summary{padding:10px 11px}.capability-section>summary::before,.capability-card>summary::before{content:"›";flex:0 0 auto;color:var(--muted);font-size:17px;line-height:1;transition:transform .15s}.capability-section[open]>summary::before,.capability-card[open]>summary::before{transform:rotate(90deg)}.capability-section>summary strong{font-size:11px;text-transform:uppercase;letter-spacing:.09em}.capability-location{margin-left:auto;border:1px solid var(--line);border-radius:999px;padding:2px 6px;color:var(--muted);font-size:8px;text-transform:uppercase;letter-spacing:.08em}.capability-location.remote{border-color:#4b3d63;color:#c4a7e7}.capability-count{min-width:18px;color:var(--muted);font-size:10px;text-align:right}.capability-section>.muted{display:block;padding:0 12px 11px;font-size:11px}.capability-card{margin:0 8px 8px;padding:0;border-color:var(--line);background:#131316}.capability-card>summary{padding:8px 9px}.capability-card>summary span:first-of-type{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.capability-status{margin-left:auto;color:var(--pi);font-size:9px;text-transform:uppercase}.capability-body{padding:0 10px 9px 28px;border-top:1px solid var(--line);font-size:11px;line-height:1.45}.capability-body>.muted{padding-top:8px}.capability-meta{margin-top:5px;color:var(--muted);font-size:10px;overflow-wrap:anywhere}
-.preview-card{display:grid;gap:10px;padding:10px}#preview-form,#preview-type-form,.preview-tabs{display:flex;gap:6px}#preview-address,#preview-type{min-width:0;flex:1;border:1px solid var(--line);border-radius:7px;background:#131316;color:var(--text);padding:8px;font-size:11px}#preview-back,#preview-forward,#preview-reload,#preview-control,#preview-type-form button,.preview-tabs button{flex:0 0 auto;border:1px solid var(--line);border-radius:7px;background:var(--surface2);color:var(--text);padding:7px 9px}.preview-tabs button.active{border-color:var(--pi);color:var(--pi)}#preview-control{justify-self:start}.preview-frame{display:grid;min-height:220px;place-items:center;overflow:hidden;border:1px solid var(--line);border-radius:8px;background:#0c0c0e}.preview-frame img{display:block;max-width:100%;height:auto;cursor:default}.preview-frame img:hover{cursor:pointer}.preview-diagnostics{display:grid;gap:7px;max-height:360px;overflow:auto}.preview-diagnostic{white-space:pre-wrap;overflow-wrap:anywhere;padding:8px;border:1px solid var(--line);border-radius:7px;background:#131316;font-size:11px;line-height:1.4}.preview-session{overflow:hidden;color:var(--muted);font-size:11px;line-height:1.4;text-overflow:ellipsis}.preview-status{font-size:11px;color:var(--muted)}.preview-status.error{color:var(--danger)}
+.preview-card{display:grid;gap:10px;padding:10px}#preview-form,.preview-tabs{display:flex;gap:6px}#preview-address{min-width:0;flex:1;border:1px solid var(--line);border-radius:7px;background:#131316;color:var(--text);padding:8px;font-size:11px}#preview-back,#preview-forward,#preview-reload,#preview-control,.preview-tabs button{flex:0 0 auto;border:1px solid var(--line);border-radius:7px;background:var(--surface2);color:var(--text);padding:7px 9px}.preview-tabs button.active{border-color:var(--pi);color:var(--pi)}#preview-control{justify-self:start}.preview-frame{display:grid;min-height:220px;place-items:center;overflow:hidden;border:1px solid var(--line);border-radius:8px;background:#0c0c0e;outline:none}.preview-frame:focus-visible{border-color:var(--pi);box-shadow:0 0 0 2px color-mix(in srgb,var(--pi) 25%,transparent)}.preview-frame img{display:block;max-width:100%;height:auto;cursor:default}.preview-frame img:hover{cursor:pointer}.preview-diagnostics{display:grid;gap:7px;max-height:360px;overflow:auto}.preview-diagnostic{white-space:pre-wrap;overflow-wrap:anywhere;padding:8px;border:1px solid var(--line);border-radius:7px;background:#131316;font-size:11px;line-height:1.4}.preview-session{overflow:hidden;color:var(--muted);font-size:11px;line-height:1.4;text-overflow:ellipsis}.preview-status:empty,.preview-session:empty,.preview-recording-status:empty{display:none}.preview-status{font-size:11px;color:var(--muted)}.preview-status.error{color:var(--danger)}
 .message.tool{padding:0;overflow:hidden}.message.tool-error{border-color:color-mix(in srgb,var(--danger) 55%,var(--line))}.tool-activity>summary{display:flex;align-items:center;gap:9px;padding:10px 12px;cursor:pointer;list-style:none;white-space:normal}.tool-activity>summary::-webkit-details-marker{display:none}.tool-activity>summary::before{content:"›";flex:0 0 auto;color:var(--muted);font-size:18px;line-height:1;transition:transform .15s}.tool-activity[open]>summary::before{transform:rotate(90deg)}.tool-activity-summary strong{color:var(--text);font-size:12px}.tool-activity-target{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}.tool-activity-state{margin-left:auto;flex:0 0 auto;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.tool-running .tool-activity-state{color:var(--pi)}.tool-error .tool-activity-state{color:var(--danger)}.tool-activity-body{display:grid;gap:10px;padding:0 12px 12px;border-top:1px solid var(--line)}.tool-activity-body section{min-width:0;padding-top:10px}.tool-activity-heading{margin-bottom:4px;color:var(--pi);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.1em}.tool-activity-body pre{max-height:320px;margin:0;overflow:auto;color:var(--muted);font:11px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
-.preview-recorder{display:flex;gap:7px}.preview-recorder button{flex:1;border:1px solid var(--line);border-radius:7px;background:var(--surface2);color:var(--text);padding:8px}.preview-recorder button:disabled{opacity:.4;cursor:default}.preview-recorder #preview-record.recording{border-color:var(--danger);color:var(--danger)}.preview-recording-status{color:var(--muted);font-size:10px;line-height:1.4}
-.browser-session-tabs{display:flex;min-width:0;gap:3px;padding:0 3px;overflow-x:auto;border-bottom:1px solid var(--line)}.browser-session-tabs button{display:flex;min-width:96px;max-width:180px;align-items:center;gap:6px;padding:8px 10px;border:1px solid transparent;border-bottom:0;border-radius:8px 8px 0 0;background:#121216;color:var(--muted);font-size:10px}.browser-session-tabs button span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.browser-session-tabs button.active{border-color:var(--line);background:var(--surface2);color:var(--text)}.browser-tab-icon{flex:0 0 auto;color:var(--pi);font:700 13px/1 Georgia,serif}.browser-toolbar{display:grid!important;gap:7px!important}.browser-nav-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.browser-nav-actions button,#preview-control,.preview-recorder button,.browser-omnibox button{display:flex;align-items:center;justify-content:center;gap:5px}.browser-action-icon{width:16px;height:16px;flex:0 0 16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.browser-action-icon-fill{fill:currentColor;stroke:none}.browser-action-pi{fill:currentColor;stroke:none;font:700 16px Georgia,serif}.browser-action-label{font-size:10px;white-space:nowrap}.browser-omnibox{display:flex;min-width:0;align-items:center;gap:5px;padding:3px 3px 3px 9px;border:1px solid var(--line);border-radius:999px;background:#131316}.browser-address-icon{color:var(--muted);font-size:12px}.browser-omnibox #preview-address{min-width:0;padding:5px 2px;border:0;background:transparent;outline:0}.browser-omnibox button{border:0!important;border-radius:999px!important;padding:6px 10px!important}.preview-recorder button[data-browser-icon="record"]{color:var(--danger)}.preview-session{padding:0 3px}.preview-frame{border-radius:9px;box-shadow:0 10px 28px rgba(0,0,0,.24)}
+.browser-utility-actions{display:flex;align-items:center;gap:6px}.browser-utility-actions button{width:34px;height:34px;flex:0 0 34px;border:1px solid var(--line);border-radius:7px;background:var(--surface2);color:var(--text);padding:0}.browser-utility-actions button:disabled{opacity:.4;cursor:default}.browser-utility-actions #preview-record.recording{border-color:var(--danger);color:var(--danger)}.preview-recording-status{color:var(--muted);font-size:10px;line-height:1.4}
+.browser-session-tabs{display:flex;min-width:0;gap:3px;padding:0 3px;overflow-x:auto;border-bottom:1px solid var(--line)}.browser-session-tabs:empty{display:none}.browser-session-tabs button{display:flex;min-width:96px;max-width:180px;align-items:center;gap:6px;padding:8px 10px;border:1px solid transparent;border-bottom:0;border-radius:8px 8px 0 0;background:#121216;color:var(--muted);font-size:10px}.browser-session-tabs button span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.browser-session-tabs button.active{border-color:var(--line);background:var(--surface2);color:var(--text)}.browser-tab-icon{flex:0 0 auto;color:var(--pi);font:700 13px/1 Georgia,serif}.browser-window-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.browser-window-heading strong{margin:0}.browser-window-heading #preview-popout{display:grid;width:30px;height:30px;place-items:center;padding:0;border:1px solid var(--line);border-radius:7px;background:var(--surface2);color:var(--text)}.browser-toolbar{display:grid!important;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:6px!important}.browser-nav-actions{display:flex;gap:3px}.browser-nav-actions button,.browser-utility-actions button,.browser-omnibox button{display:grid;place-items:center}.browser-nav-actions button{width:30px;height:30px;flex:0 0 30px;padding:0!important;border:0!important;border-radius:50%!important;background:transparent!important}.browser-nav-actions button:hover:not(:disabled){background:var(--surface2)!important}.browser-action-icon{width:16px;height:16px;flex:0 0 16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.browser-action-icon-fill{fill:currentColor;stroke:none}.browser-action-pi{fill:currentColor;stroke:none;font:700 16px Georgia,serif}.browser-omnibox{display:flex;min-width:0;align-items:center;gap:5px;padding:3px 3px 3px 9px;border:1px solid var(--line);border-radius:999px;background:#131316}.browser-address-icon{color:var(--muted);font-size:12px}.browser-omnibox #preview-address{min-width:0;padding:5px 2px;border:0;background:transparent;outline:0}.browser-omnibox button{width:28px;height:28px;border:0!important;border-radius:50%!important;padding:0!important}.browser-utility-actions button[data-browser-icon="record"]{color:var(--danger)}.preview-session{padding:0 3px}.preview-frame{border-radius:9px;box-shadow:0 10px 28px rgba(0,0,0,.24)}
+body.browser-popout{display:block}body.browser-popout>.rail,body.browser-popout>.resizer,body.browser-popout>main{display:none}body.browser-popout>.details{position:fixed;inset:0;display:flex!important;width:auto;height:100dvh;padding:0;background:var(--bg)}body.browser-popout>.details>.tabs{display:none}body.browser-popout>.details>[data-panel]{display:none}body.browser-popout>.details>#browser{display:block!important;flex:1;overflow:auto}body.browser-popout .preview-card{min-height:100%;margin:0;padding:12px;border:0;border-radius:0}body.browser-popout .preview-frame{min-height:calc(100vh - 275px)}body.browser-popout .preview-frame img{max-height:calc(100vh - 275px)}
+.agent-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.agent-entry-card{position:relative;min-width:0}.agent-grid .agent-entry{display:grid;width:100%;min-height:112px;place-items:center;margin:0;text-align:center}.agent-grid .agent-icon{width:52px;height:52px}.agent-menu{position:absolute;z-index:3;top:5px;right:5px}.agent-menu>summary{display:grid;width:28px;height:28px;place-items:center;border-radius:50%;color:var(--muted);cursor:pointer;list-style:none}.agent-menu>summary::-webkit-details-marker{display:none}.agent-menu[open]>summary{background:var(--surface2);color:var(--text)}.agent-menu>div{position:absolute;top:30px;right:0;display:grid;width:108px;padding:5px;border:1px solid var(--line);border-radius:8px;background:#151519;box-shadow:0 12px 30px #000}.agent-menu button{border:0;border-radius:5px;background:transparent;color:var(--text);padding:7px;text-align:left}.agent-menu button:hover{background:var(--surface2)}.agent-menu button.danger{color:var(--danger)}.agent-menu button:disabled{opacity:.4}.agent-workspace-actions{display:flex;justify-content:flex-end}.agent-workspace-actions button{width:32px;height:32px;border:1px solid var(--line);border-radius:50%;background:var(--surface2);color:var(--text)}.agent-chat-card{display:grid;gap:8px}.agent-chat{display:grid;gap:8px;max-height:360px;overflow:auto}.agent-chat-message{padding:9px 11px;border-radius:10px;background:#151519;white-space:pre-wrap}.agent-chat-message.user{margin-left:16%;background:#202d3d}.agent-chat-message.agent{margin-right:10%}#selected-agent-chat-form{display:flex;gap:6px}#selected-agent-prompt{min-width:0;flex:1;resize:vertical;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:9px}#selected-agent-send{width:36px;height:36px;align-self:end;border:0;border-radius:50%;background:var(--text);color:var(--bg)}.builder-panel>label,.workflow-editor label,#routine-editor label{display:grid;gap:5px;margin:9px 0;color:var(--muted);font-size:11px}.builder-panel>label input,.builder-panel>label textarea,.builder-panel>label select,#plugin-form input,#plugin-form select,.workflow-editor input,.workflow-editor textarea,.workflow-editor select,#routine-editor input,#routine-editor textarea,#routine-editor select{width:100%;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}.workflow-editor textarea{min-height:88px;font-family:ui-monospace,monospace}.persona-preview{display:block;width:84px;height:84px;margin:8px auto;border-radius:12px;object-fit:cover}#agent-form{display:flex;justify-content:flex-end;margin-top:10px}#agent-form button,#plugin-form button{border:0;border-radius:8px;background:var(--pi);color:#07101b;padding:9px 13px;font-weight:700}#plugin-form{display:grid;gap:8px;padding:10px}#plugin-form label{display:grid;gap:5px;color:var(--muted);font-size:11px}
+.builder-tabs button{min-width:0;padding-inline:1px;font-size:9px;white-space:nowrap}.builder-panel{max-width:100%;overflow-x:hidden}#agent-builder>.card{max-width:100%;overflow:hidden}#routine-editor{min-width:0}.routine-actions{min-width:0;flex-wrap:wrap}.routine-actions button{min-width:calc(50% - 4px)}
 </style></head><body>
 <svg class="hidden" aria-hidden="true"><defs><symbol id="external-icon-anthropic" viewBox="0 0 24 24"><path fill="currentColor" d="M13.3 3h3.5L22 21h-3.4l-1.2-4.2h-5.9L10.2 21H6.8l6.5-18Zm-.9 10.8h4.1l-2-7-2.1 7ZM2 3h3.3l3.8 12.4L7.4 21 2 3Z"/></symbol><symbol id="external-icon-openai" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.65"><ellipse cx="12" cy="8" rx="3.4" ry="5.2"/><ellipse cx="12" cy="8" rx="3.4" ry="5.2" transform="rotate(60 12 12)"/><ellipse cx="12" cy="8" rx="3.4" ry="5.2" transform="rotate(120 12 12)"/><ellipse cx="12" cy="8" rx="3.4" ry="5.2" transform="rotate(180 12 12)"/><ellipse cx="12" cy="8" rx="3.4" ry="5.2" transform="rotate(240 12 12)"/><ellipse cx="12" cy="8" rx="3.4" ry="5.2" transform="rotate(300 12 12)"/></g></symbol><symbol id="external-icon-hermes" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M6.2 18.7h11.6M8 18.7v-5.3a4 4 0 0 1 8 0v5.3M8.4 12.1c-2.5-.2-4.2-1.4-5.4-3.6 2.3-.3 4.2.3 5.7 1.8M15.6 12.1c2.5-.2 4.2-1.4 5.4-3.6-2.3-.3-4.2.3-5.7 1.8M9.3 7.1c.7-.7 1.6-1.1 2.7-1.1s2 .4 2.7 1.1M12 6V3.5"/></symbol><symbol id="external-icon-pi" viewBox="0 0 24 24"><text x="12" y="18" text-anchor="middle" fill="currentColor" font-size="20" font-family="serif">π</text></symbol></defs></svg>
-<aside class="rail"><div class="pi-watermark" aria-hidden="true">π</div><nav class="rail-tabs" aria-label="Workspace"><button class="active" data-rail-tab="sessions">Sessions</button><button data-rail-tab="agents">Agents</button></nav><section id="sessions" class="rail-panel" data-rail-panel><button id="show-connection-form" class="secondary-action" type="button">+ Connect another Pi</button><form id="connection-form" class="hidden"><label>Pi control URL<input id="connection-url" type="url" placeholder="http://127.0.0.1:4173/?token=…" required></label><button type="submit">Connect</button></form><div id="connection-list"></div></section><section id="agents" class="rail-panel hidden" data-rail-panel><div class="section-title">Agents</div><div id="agent-list"></div><button id="new-agent" class="nav-item new-agent">+ New Agent</button><div class="section-title">Delegate to</div><div id="external-connection-list"></div></section></aside>
+<aside class="rail"><div class="pi-watermark" aria-hidden="true">π</div><div class="section-title">Pi sessions</div><section id="sessions" class="rail-panel"><button id="show-connection-form" class="secondary-action" type="button" title="Connect another Pi session">+ Connect Pi</button><form id="connection-form" class="hidden"><label>Pi control URL<input id="connection-url" type="url" placeholder="http://127.0.0.1:4173/?token=…" required></label><button type="submit">Connect</button></form><div id="connection-list"></div></section></aside>
 <div id="left-resizer" class="resizer left-resizer" role="separator" aria-label="Resize navigation" aria-orientation="vertical" tabindex="0"></div>
 <main><header class="header"><div id="session-tabs" class="session-tabs" role="tablist" aria-label="Open Pi sessions"></div><span id="session-path">Starting Pi…</span></header><section id="transcript" aria-live="polite"></section><div class="chat-dock"><div class="controls"><label>Model <select id="model"></select></label><label>Thinking <select id="thinking"><option>off</option><option>minimal</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label><span id="phase">idle</span></div><div id="attachment-list" aria-live="polite"></div><form id="composer"><input id="attachment-input" class="hidden" type="file" multiple><button id="attachment-button" type="button" aria-label="Attach files" title="Attach files">+</button><textarea id="prompt" aria-label="Message Pi" placeholder="Message Pi…" rows="1"></textarea><button id="composer-action" type="submit" aria-label="Send message"><svg class="send-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg><span class="stop-icon" aria-hidden="true"></span></button></form><div class="composer-meta"><span id="status" aria-live="polite">Connecting…</span><span id="session-stats"></span></div></div></main>
 <div id="right-resizer" class="resizer right-resizer" role="separator" aria-label="Resize details" aria-orientation="vertical" tabindex="0"></div>
-<aside class="details"><nav class="tabs"><button class="active" data-tab="preview">Preview</button><button data-tab="activity">Activity</button><button data-tab="routines">Routines</button><button data-tab="capabilities">Capabilities</button><button data-tab="configure">Builder</button><button class="hidden" data-tab="external">External</button></nav><section id="preview" data-panel><div class="card preview-card"><strong>Managed browser</strong><form id="preview-form"><button id="preview-back" type="button" title="Back" aria-label="Back" disabled>←</button><button id="preview-forward" type="button" title="Forward" aria-label="Forward" disabled>→</button><input id="preview-address" type="url" placeholder="Open a permitted URL" aria-label="Managed browser address" disabled><button id="preview-reload" type="button" title="Reload" aria-label="Reload managed browser" disabled>↻</button></form><span id="preview-session" class="preview-session">Loading browser status…</span><button id="preview-control" type="button" disabled>Take control</button><nav class="preview-tabs"><button class="active" type="button" data-preview-tab="page">Page</button><button type="button" data-preview-tab="console">Console</button><button type="button" data-preview-tab="network">Network</button></nav><section data-preview-panel="page"><div class="preview-frame"><img id="preview-image" alt="Latest managed browser viewport"></div><form id="preview-type-form"><input id="preview-type" type="text" placeholder="Type into focused page field" aria-label="Type into focused page field" disabled><button type="submit">Type</button></form></section><section class="hidden" data-preview-panel="console"><div id="preview-console" class="preview-diagnostics"></div></section><section class="hidden" data-preview-panel="network"><div id="preview-network" class="preview-diagnostics"></div></section><span id="preview-status" class="preview-status">Loading…</span></div></section><section id="activity" data-panel class="hidden"><div class="card"><strong>Run an agent</strong><form id="run-form"><label>Agent<select id="run-agent"></select></label><label>Task<textarea id="run-prompt" required></textarea></label><button type="submit">Start isolated run</button></form></div><div id="run-list"></div></section><section id="routines" data-panel class="hidden"><div id="routine-list"></div></section><section id="capabilities" data-panel class="hidden"><div id="capability-list"></div></section><section id="configure" data-panel class="hidden"><div class="card"><strong id="builder-title">Build a new agent</strong><nav class="builder-tabs"><button class="active" type="button" data-builder-tab="builder-chat-panel">Chat</button><button type="button" data-builder-tab="builder-settings-panel">Settings</button></nav><section id="builder-chat-panel" class="builder-panel" data-builder-panel><div id="builder-chat"></div><form id="builder-chat-form"><textarea id="builder-prompt" placeholder="Describe the agent you want to build"></textarea><button type="submit">Ask builder</button></form></section><section id="builder-settings-panel" class="builder-panel hidden" data-builder-panel><form id="agent-form"><input id="agent-id" type="hidden"><label>Name<input id="agent-name" required></label><label>Description<textarea id="agent-description" required></textarea></label><label>Persona<textarea id="agent-persona" required></textarea></label><label>Model<select id="agent-model"></select></label><label>Tools<input id="agent-tools" placeholder="read, list, write, browser"></label><label>Browser access<select id="agent-browser-access"><option value="disabled">Disabled</option><option value="loopback">Local development only</option><option value="public-web">Public web</option><option value="private-network">Private network</option></select></label><label>Memory<select id="agent-memory"><option value="none">None</option><option value="notes">Notes</option></select></label><label>Executor<select id="agent-executor"><option value="harness">Isolated harness</option><option value="session">Pi session</option></select></label><label>Permissions<select id="agent-permissions"><option value="read-only">Read only</option><option value="workspace-write">Workspace write</option></select></label><div class="section-title">Optional routine</div><label>Routine id<input id="routine-id" value="routine"></label><label>Every minutes<input id="routine-interval" type="number" min="1" value="60"></label><label>Routine task<textarea id="routine-prompt"></textarea></label><label><input id="routine-enabled" type="checkbox"> Enabled</label><button type="submit">Save agent</button></form></section></div></section><section id="external" data-panel class="hidden"><div class="card"><strong id="external-title">External connection</strong><p id="external-description" class="muted"></p><p id="external-warning" class="external-warning"></p><form id="external-run-form"><input id="external-id" type="hidden"><label id="external-prompt-label">Task<textarea id="external-prompt" required></textarea></label><label>Working directory<input id="external-cwd" required></label><label>Model<select id="external-model"></select></label><button type="submit">Delegate</button></form></div><div id="external-run-list"></div></section></aside>
+<aside class="details"><nav class="tabs" aria-label="Agent workspace"><button class="active" data-tab="browser">Browser</button><button data-tab="agents-workspace">Agents</button><button data-tab="agent-builder">Agent Builder</button></nav><section id="browser" data-panel><div class="card preview-card"><strong>Browser</strong><form id="preview-form"><button id="preview-back" type="button" title="Back" aria-label="Back" disabled>←</button><button id="preview-forward" type="button" title="Forward" aria-label="Forward" disabled>→</button><input id="preview-address" type="url" placeholder="Open a permitted URL" aria-label="Managed browser address" disabled><button id="preview-reload" type="button" title="Reload" aria-label="Reload managed browser" disabled>↻</button></form><span id="preview-session" class="preview-session"></span><button id="preview-control" type="button" disabled>Take control</button><nav class="preview-tabs" aria-label="Active browsers"></nav><section data-preview-panel="page"><div class="preview-frame"><img id="preview-image" alt="Latest managed browser viewport"></div></section><span id="preview-status" class="preview-status"></span></div></section><section id="agents-workspace" data-panel class="hidden"><div class="agent-workspace-actions"><button id="new-agent" type="button" title="Build a new agent" aria-label="Build a new agent">+</button></div><div id="agent-list" class="agent-grid"></div><section id="selected-agent" class="hidden"><div class="card agent-chat-card"><strong id="selected-agent-title"></strong><div id="selected-agent-chat" class="agent-chat"></div><form id="selected-agent-chat-form"><textarea id="selected-agent-prompt" placeholder="Message agent…" required></textarea><button id="selected-agent-send" type="submit" aria-label="Send message">↑</button></form></div><div id="agent-task-list"></div></section><details class="card"><summary>Delegation connections</summary><div id="external-connection-list"></div><div id="external-delegate" class="hidden"><strong id="external-title">External connection</strong><p id="external-description" class="muted"></p><p id="external-warning" class="external-warning"></p><form id="external-run-form"><input id="external-id" type="hidden"><label id="external-prompt-label">Task<textarea id="external-prompt" required></textarea></label><label>Working directory<input id="external-cwd" required></label><label>Model<select id="external-model"></select></label><button type="submit">Delegate</button></form><div id="external-run-list"></div></div></details></section><section id="agent-builder" data-panel class="hidden"><div class="card"><strong id="builder-title">Build a new agent</strong><nav class="builder-tabs"><button class="active" type="button" data-builder-tab="builder-chat-panel">Chat</button><button type="button" data-builder-tab="builder-profile-panel">Profile</button><button type="button" data-builder-tab="builder-tools-panel">Model &amp; Tools</button><button type="button" data-builder-tab="builder-connections-panel">Connections</button><button type="button" data-builder-tab="builder-automation-panel">Automation</button></nav><section id="builder-chat-panel" class="builder-panel" data-builder-panel><div id="builder-chat"></div><form id="builder-chat-form"><textarea id="builder-prompt" placeholder="Describe the agent you want to build"></textarea><button type="submit">Ask builder</button></form></section><section id="builder-profile-panel" class="builder-panel hidden" data-builder-panel><input id="agent-id" form="agent-form" type="hidden"><label>Name<input id="agent-name" form="agent-form" required></label><label>Description<textarea id="agent-description" form="agent-form" required></textarea></label><label>Project folder<input id="agent-project-root" form="agent-form" required></label><label>Persona<select id="agent-persona-select" form="agent-form"><option value="">Custom</option></select></label><img id="agent-persona-image" class="persona-preview hidden" alt=""><label>Persona instructions<textarea id="agent-persona" form="agent-form" required></textarea></label></section><section id="builder-tools-panel" class="builder-panel hidden" data-builder-panel><label>Model<select id="agent-model" form="agent-form"></select></label><label>Thinking<select id="agent-thinking" form="agent-form"><option>off</option><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></label><label>Executor<select id="agent-executor" form="agent-form"><option value="harness">Isolated harness</option><option value="session">Pi session</option></select></label><label>Permissions<select id="agent-permissions" form="agent-form"><option value="read-only">Read only</option><option value="workspace-write">Workspace write</option></select></label><label>Browser access<select id="agent-browser-access" form="agent-form"><option value="disabled">Disabled</option><option value="loopback">Local development only</option><option value="public-web">Public web</option><option value="private-network">Private network</option></select></label><label class="hidden">Memory<select id="agent-memory" form="agent-form"><option value="none">None</option><option value="notes">Notes</option></select></label><input id="agent-tools" form="agent-form" type="hidden"><div id="capability-list"></div><details class="capability-section"><summary><strong>Plugin management</strong></summary><form id="plugin-form"><label>Source<input id="plugin-source" placeholder="package@version" required></label><label>Scope<select id="plugin-scope"><option value="user">User</option><option value="project">Project</option></select></label><button type="submit">Install</button></form></details></section><section id="builder-connections-panel" class="builder-panel hidden" data-builder-panel><label>May delegate to agents<input id="agent-delegates" form="agent-form" placeholder="researcher, reviewer"></label><label><input id="agent-a2a" form="agent-form" type="checkbox"> Expose through authenticated A2A</label></section><section id="builder-automation-panel" class="builder-panel hidden" data-builder-panel><div id="routines"><div id="routine-list"></div></div><div id="workflows"><div id="workflow-list"></div></div></section><form id="agent-form"><button type="submit">Save agent</button></form></div></section></aside>
 <script src="/browser-client.js?token=${token}"></script></body></html>`;
 }

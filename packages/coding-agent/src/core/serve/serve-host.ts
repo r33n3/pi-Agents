@@ -6,10 +6,13 @@ import type { ToolDefinition } from "../extensions/types.ts";
 import { DefaultResourceLoader } from "../resource-loader.ts";
 import { createAgentSession } from "../sdk.ts";
 import { SessionManager } from "../session-manager.ts";
+import { A2aAdapter } from "./a2a-adapter.ts";
 import { AgentSessionExecutor } from "./agent-executor.ts";
 import { type AgentDefinition, AgentRegistry } from "./agent-registry.ts";
+import { createAgentRegistryTools } from "./agent-registry-tools.ts";
 import { AgentRoutineScheduler } from "./agent-routine-scheduler.ts";
 import { AgentRunManager } from "./agent-run-manager.ts";
+import { AgentTaskService } from "./agent-task-service.ts";
 import { BrowserArtifactStore } from "./browser-artifact-store.ts";
 import { BrowserConsoleService } from "./browser-console-service.ts";
 import { BrowserProfileStore } from "./browser-profile-store.ts";
@@ -19,12 +22,15 @@ import { createBrowserTools } from "./browser-tools.ts";
 import { CapabilityCatalog } from "./capability-catalog.ts";
 import { CurrentSessionService } from "./current-session-service.ts";
 import { type ExternalConnectionDefinition, ExternalConnectionManager } from "./external-connection-manager.ts";
+import { PersonaCatalog, resolvePersonaProject } from "./persona-catalog.ts";
 import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
+import { PluginManagementService } from "./plugin-management-service.ts";
 import { RoutineRegistry } from "./routine-registry.ts";
 import { createScopedAgentTools } from "./scoped-agent-tools.ts";
 import { ServeAttachmentStore } from "./serve-attachment-store.ts";
 import { createServePage } from "./serve-page.ts";
 import { WebSocketListener } from "./websocket-listener.ts";
+import { WorkflowService } from "./workflow-service.ts";
 import { WorkspacePreviewServer } from "./workspace-preview-server.ts";
 
 export interface ServeHostOptions {
@@ -52,6 +58,8 @@ export class ServeHost implements AsyncDisposable {
 	readonly #options: ServeHostOptions;
 	#server: PiServer | undefined;
 	#agentRunManager: AgentRunManager | undefined;
+	#agentTaskService: AgentTaskService | undefined;
+	#workflowService: WorkflowService | undefined;
 	#agentRoutineScheduler: AgentRoutineScheduler | undefined;
 	#externalConnectionManager: ExternalConnectionManager | undefined;
 	#externalSessionExecutor: AgentSessionExecutor | undefined;
@@ -119,6 +127,17 @@ export class ServeHost implements AsyncDisposable {
 			defaultWorkspace: session.sessionManager.getCwd(),
 		});
 		await agentRegistry.initialize();
+		session.registerCustomTools(createAgentRegistryTools(agentRegistry) as ToolDefinition[]);
+		let personaCatalog: PersonaCatalog | undefined;
+		const personaProject = resolvePersonaProject(agentDir);
+		if (personaProject) {
+			try {
+				personaCatalog = new PersonaCatalog(personaProject);
+				await personaCatalog.initialize();
+			} catch {
+				personaCatalog = undefined;
+			}
+		}
 
 		const createConfiguredAgentSession = async (
 			definition: AgentDefinition,
@@ -177,6 +196,7 @@ export class ServeHost implements AsyncDisposable {
 				agentDir,
 				modelRuntime,
 				model: agentModel,
+				thinkingLevel: definition.thinking,
 				tools: toolNames,
 				customTools: customTools.length > 0 ? customTools : undefined,
 				resourceLoader,
@@ -192,6 +212,11 @@ export class ServeHost implements AsyncDisposable {
 		const executor = new AgentSessionExecutor(createExecutionSession);
 		this.#agentRunManager = new AgentRunManager(agentRegistry, executor, join(serveRoot, "runs"));
 		await this.#agentRunManager.initialize();
+		this.#agentTaskService = new AgentTaskService(agentRegistry, this.#agentRunManager, serveRoot);
+		await this.#agentTaskService.initialize();
+		this.#workflowService = new WorkflowService(join(serveRoot, "workflows"), agentRegistry, this.#agentTaskService);
+		await this.#workflowService.initialize();
+		const a2aAdapter = new A2aAdapter(agentRegistry, this.#agentTaskService);
 
 		const availableModels = modelRuntime
 			.getAvailableSnapshot()
@@ -258,10 +283,12 @@ export class ServeHost implements AsyncDisposable {
 							: request.prompt,
 					definition: {
 						id: `external-${request.connection.id}`,
+						revision: 1,
 						source: "managed",
 						name: request.connection.name,
 						description: request.connection.description,
 						model: isClaude ? undefined : isHermes ? luna : request.model,
+						thinking: undefined,
 						tools: isClaude
 							? ["claude_code"]
 							: isHermes
@@ -273,10 +300,13 @@ export class ServeHost implements AsyncDisposable {
 							: isHermes
 								? "Delegate through the hermes_agent tool immediately and report its returned data."
 								: "Complete the delegated task independently and return a concise result.",
+						projectRoot: request.cwd,
 						workspace: request.cwd,
 						executor: "session",
 						permissionPolicy: "workspace-write",
 						schedules: [],
+						delegateAgentIds: [],
+						a2a: { enabled: false },
 					},
 				});
 			},
@@ -287,37 +317,38 @@ export class ServeHost implements AsyncDisposable {
 
 		const routineRegistry = new RoutineRegistry(join(serveRoot, "routines"));
 		await routineRegistry.initialize();
-		for (const agent of await agentRegistry.list()) {
-			for (const schedule of agent.schedules) {
-				const id = `${agent.id}-${schedule.id}`.slice(0, 64);
-				if (await routineRegistry.get(id)) continue;
-				await routineRegistry.save({
-					id,
-					name: `${agent.name}: ${schedule.id}`,
-					prompt: schedule.prompt,
-					enabled: schedule.enabled,
-					intervalMinutes: schedule.intervalMinutes,
-					target: { kind: "agent", agentId: agent.id },
-					model: agent.model,
-				});
-			}
-		}
-
 		this.#agentRoutineScheduler = new AgentRoutineScheduler(routineRegistry, {
 			start: async (definition) => {
 				if (definition.target.kind === "agent") {
-					const run = await this.#agentRunManager!.start(
-						definition.target.agentId,
-						definition.prompt,
-						"routine",
-						definition.model,
-					);
+					const task = await this.#agentTaskService!.submit({
+						agentId: definition.target.agentId,
+						prompt: definition.prompt,
+						source: "routine",
+						model: definition.model,
+					});
+					return {
+						runId: task.id,
+						cancel: async () => {
+							await this.#agentTaskService!.cancel(task.id);
+						},
+						completion: this.#agentTaskService!.waitForCompletion(task.id).then((completed) =>
+							completed.status === "completed"
+								? {}
+								: { error: completed.error ?? `Agent task ${completed.status}` },
+						),
+					};
+				}
+				if (definition.target.kind === "workflow") {
+					const run = await this.#workflowService!.start(definition.target.workflowId, definition.prompt);
 					return {
 						runId: run.id,
-						completion: this.#agentRunManager!.waitForCompletion(run.id).then((completed) =>
-							completed.status === "succeeded"
+						cancel: async () => {
+							await this.#workflowService!.cancel(run.id);
+						},
+						completion: this.#workflowService!.waitForCompletion(run.id).then((completed) =>
+							completed.status === "completed"
 								? {}
-								: { error: completed.error ?? `Agent run ${completed.status}` },
+								: { error: completed.error ?? `Workflow ${completed.status}` },
 						),
 					};
 				}
@@ -334,6 +365,9 @@ export class ServeHost implements AsyncDisposable {
 				});
 				return {
 					runId: run.id,
+					cancel: async () => {
+						await this.#externalConnectionManager!.abort(run.id);
+					},
 					completion: this.#externalConnectionManager!.waitForCompletion(run.id).then((completed) =>
 						completed.status === "succeeded"
 							? {}
@@ -384,7 +418,13 @@ export class ServeHost implements AsyncDisposable {
 			).session;
 		});
 		this.#attachmentStore = new ServeAttachmentStore();
-		const capabilityCatalog = new CapabilityCatalog(session, this.#externalConnectionManager, browserConsole);
+		const pluginManagement = new PluginManagementService(session, session.sessionManager.getCwd(), agentDir);
+		const capabilityCatalog = new CapabilityCatalog(
+			session,
+			this.#externalConnectionManager,
+			browserConsole,
+			pluginManagement,
+		);
 		const listener = new WebSocketListener({
 			host,
 			port: requestedPort,
@@ -401,6 +441,11 @@ export class ServeHost implements AsyncDisposable {
 				this.#attachmentStore,
 				capabilityCatalog,
 				browserConsole,
+				this.#agentTaskService,
+				this.#workflowService,
+				personaCatalog,
+				a2aAdapter,
+				pluginManagement,
 			),
 			auxiliary: {
 				path: "/browser-stream",
@@ -432,6 +477,7 @@ export class ServeHost implements AsyncDisposable {
 		const disposals: Array<() => Promise<void>> = [
 			() => this.#server?.close() ?? Promise.resolve(),
 			() => this.#agentRoutineScheduler?.dispose() ?? Promise.resolve(),
+			() => this.#agentTaskService?.dispose() ?? Promise.resolve(),
 			() => this.#agentRunManager?.dispose() ?? Promise.resolve(),
 			() => this.#externalConnectionManager?.dispose() ?? Promise.resolve(),
 			() => this.#externalSessionExecutor?.dispose() ?? Promise.resolve(),

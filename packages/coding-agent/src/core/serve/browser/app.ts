@@ -9,6 +9,13 @@ import type {
 import { installThemedSelect } from "./themed-select.ts";
 import { createBrowserWebSocketTransport } from "./websocket-transport.ts";
 
+const pageUrl = new URL(location.href);
+const capabilityToken = pageUrl.searchParams.get("token");
+const browserPopoutMode = pageUrl.searchParams.get("browserPopout") === "1";
+const requestedPreviewSessionId = pageUrl.searchParams.get("browserSession") ?? undefined;
+document.body.classList.toggle("browser-popout", browserPopoutMode);
+if (browserPopoutMode) document.title = "Pi Browser";
+
 const status = element("status");
 const sessionPath = element("session-path");
 const sessionStats = element("session-stats");
@@ -26,11 +33,20 @@ const phase = element("phase");
 const agentList = element("agent-list");
 const newAgent = requiredElement<HTMLButtonElement>("new-agent");
 const agentForm = requiredElement<HTMLFormElement>("agent-form");
-const runForm = requiredElement<HTMLFormElement>("run-form");
-const runAgent = requiredElement<HTMLSelectElement>("run-agent");
-const runList = element("run-list");
+const selectedAgentPanel = element("selected-agent");
+const selectedAgentTitle = element("selected-agent-title");
+const selectedAgentChat = element("selected-agent-chat");
+const selectedAgentChatForm = requiredElement<HTMLFormElement>("selected-agent-chat-form");
+const selectedAgentPrompt = requiredElement<HTMLTextAreaElement>("selected-agent-prompt");
+const selectedAgentSend = requiredElement<HTMLButtonElement>("selected-agent-send");
+const agentTaskList = element("agent-task-list");
 const routineList = element("routine-list");
 const routineEditor = createRoutineEditor();
+const workflowList = element("workflow-list");
+const workflowEditor = createWorkflowEditor();
+const personaSelect = requiredElement<HTMLSelectElement>("agent-persona-select");
+const personaImage = requiredElement<HTMLImageElement>("agent-persona-image");
+const pluginForm = requiredElement<HTMLFormElement>("plugin-form");
 const builderChat = element("builder-chat");
 const builderChatForm = requiredElement<HTMLFormElement>("builder-chat-form");
 const builderPrompt = requiredElement<HTMLTextAreaElement>("builder-prompt");
@@ -57,15 +73,17 @@ const previewBack = requiredElement<HTMLButtonElement>("preview-back");
 const previewForward = requiredElement<HTMLButtonElement>("preview-forward");
 const previewReload = requiredElement<HTMLButtonElement>("preview-reload");
 const previewControl = requiredElement<HTMLButtonElement>("preview-control");
-const previewTypeForm = requiredElement<HTMLFormElement>("preview-type-form");
-const previewType = requiredElement<HTMLInputElement>("preview-type");
-const previewSessionTabs = installPreviewBrowserChrome();
+const previewFrame = (() => {
+	const value = previewImage.closest<HTMLElement>(".preview-frame");
+	if (!value) throw new Error("Missing browser preview frame");
+	return value;
+})();
+const { tabs: previewSessionTabs, popout: previewPopout } = installPreviewBrowserChrome();
 const { record: previewRecord, send: previewSendRecording, status: previewRecordingStatus } = createPreviewRecorder();
 const modelPicker = installThemedSelect(model);
 const agentModelPicker = installThemedSelect(agentModel);
 const externalModelPicker = installThemedSelect(externalModel);
 const routineModelPicker = installThemedSelect(routineEditor.model);
-const capabilityToken = new URL(location.href).searchParams.get("token");
 
 let client: PiClient | undefined;
 let session: PiSessionHandle | undefined;
@@ -76,7 +94,7 @@ let activeSidebarAgent: AgentSummary | undefined;
 let activeTargetKey: string | undefined;
 let activePreviewSessionId: string | undefined;
 let activePreviewSession: BrowserSessionSummary | undefined;
-let selectedPreviewSessionId: string | undefined;
+let selectedPreviewSessionId = requestedPreviewSessionId;
 let previewStream: WebSocket | undefined;
 let previewStreamSessionId: string | undefined;
 let previewFrameUrl: string | undefined;
@@ -86,6 +104,8 @@ let recordedPreviewSteps: RecordedPreviewStep[] = [];
 let selectedExternalConnectionId: string | undefined;
 let availableModels: ModelMetadata[] = [];
 let agents: AgentSummary[] = [];
+let personas: PersonaSummary[] = [];
+let agentEvents: EventSource | undefined;
 const attachmentsBySession = new Map<string, AttachmentSummary[]>();
 
 interface AttachmentSummary {
@@ -109,9 +129,39 @@ interface CapabilitySnapshot {
 	tools: CapabilityEntry[];
 	skills: CapabilityEntry[];
 	extensions: CapabilityEntry[];
+	plugins: CapabilityEntry[];
 	mcpServers: CapabilityEntry[];
 	acpConnections: CapabilityEntry[];
 	modelProviders: CapabilityEntry[];
+}
+
+interface PersonaSummary {
+	id: string;
+	name: string;
+	category: string;
+	description: string;
+	instructions: string;
+	image?: string;
+}
+
+interface AgentTaskSummary {
+	id: string;
+	conversationId: string;
+	agentId: string;
+	status: "queued" | "running" | "completed" | "failed" | "cancelled";
+	prompt: string;
+	createdAt: number;
+	result?: string;
+	error?: string;
+}
+
+interface AgentMessageSummary {
+	id: string;
+	conversationId: string;
+	role: "user" | "agent";
+	text: string;
+	taskId: string;
+	createdAt: number;
 }
 
 interface ConnectionEntry {
@@ -245,7 +295,7 @@ function requiredElement<T extends HTMLElement>(id: string): T {
 	return element(id) as T;
 }
 
-function installPreviewBrowserChrome(): HTMLElement {
+function installPreviewBrowserChrome(): { tabs: HTMLElement; popout: HTMLButtonElement } {
 	const tabs = document.querySelector<HTMLElement>(".preview-tabs");
 	if (!tabs) throw new Error("Missing browser session tabs");
 	tabs.className = "browser-session-tabs";
@@ -272,12 +322,41 @@ function installPreviewBrowserChrome(): HTMLElement {
 	setBrowserAction(go, "go", "Go", "Open address");
 	omnibox.append(security, previewAddress, go);
 	previewForm.replaceChildren(navigation, omnibox);
+	previewFrame.tabIndex = 0;
+	previewFrame.setAttribute("aria-label", "Interactive managed browser viewport");
 	setBrowserAction(previewControl, "human", "Take control", "Take control from the agent");
-	document.querySelector<HTMLElement>(".preview-card > strong")?.replaceChildren("Browser");
-	return tabs;
+	const title = document.querySelector<HTMLElement>(".preview-card > strong");
+	if (!title) throw new Error("Missing browser preview title");
+	const heading = document.createElement("div");
+	heading.className = "browser-window-heading";
+	const label = document.createElement("strong");
+	label.textContent = "Browser";
+	const popout = document.createElement("button");
+	popout.id = "preview-popout";
+	popout.type = "button";
+	setBrowserAction(
+		popout,
+		browserPopoutMode ? "close" : "popout",
+		browserPopoutMode ? "Close browser window" : "Pop out browser",
+		browserPopoutMode ? "Close browser window" : "Open this browser session in its own window",
+	);
+	heading.append(label, popout);
+	title.replaceWith(heading);
+	return { tabs, popout };
 }
 
-type BrowserActionIcon = "back" | "forward" | "reload" | "go" | "human" | "agent" | "record" | "stop" | "pi-send";
+type BrowserActionIcon =
+	| "back"
+	| "forward"
+	| "reload"
+	| "go"
+	| "human"
+	| "agent"
+	| "record"
+	| "stop"
+	| "pi-send"
+	| "popout"
+	| "close";
 
 function setBrowserAction(
 	button: HTMLButtonElement,
@@ -287,7 +366,7 @@ function setBrowserAction(
 ): void {
 	const icon = browserActionIcon(iconKind);
 	const label = document.createElement("span");
-	label.className = "browser-action-label";
+	label.className = "browser-action-label hidden";
 	label.textContent = labelText;
 	button.replaceChildren(icon, label);
 	button.dataset.browserIcon = iconKind;
@@ -308,6 +387,8 @@ function browserActionIcon(kind: BrowserActionIcon): SVGSVGElement {
 		human: "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-7 8c.8-4 3.1-6 7-6s6.2 2 7 6",
 		agent: "M5 12h14M12 5v14m-6.5-3.5 13-7",
 		stop: "M7 7h10v10H7z",
+		popout: "M14 4h6v6m0-6-9 9M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6",
+		close: "M6 6l12 12M18 6 6 18",
 	};
 	if (kind === "record") {
 		const outer = document.createElementNS("http://www.w3.org/2000/svg", "circle");
@@ -345,7 +426,7 @@ function createPreviewRecorder(): {
 	status: HTMLSpanElement;
 } {
 	const actions = document.createElement("div");
-	actions.className = "preview-recorder";
+	actions.className = "browser-utility-actions";
 	const record = document.createElement("button");
 	record.id = "preview-record";
 	record.type = "button";
@@ -357,11 +438,12 @@ function createPreviewRecorder(): {
 	send.type = "button";
 	send.disabled = true;
 	setBrowserAction(send, "pi-send", "Send to Pi", "Send recorded steps to the selected Pi session");
-	actions.append(record, send);
+	actions.append(previewControl, record, send);
+	previewForm.append(actions);
 	const status = document.createElement("span");
 	status.id = "preview-recording-status";
 	status.className = "preview-recording-status";
-	previewControl.after(actions, status);
+	actions.after(status);
 	return { record, send, status };
 }
 
@@ -371,14 +453,21 @@ function createRoutineEditor(): {
 	name: HTMLInputElement;
 	targetKind: HTMLSelectElement;
 	agent: HTMLSelectElement;
+	workflow: HTMLSelectElement;
 	acp: HTMLSelectElement;
 	skill: HTMLInputElement;
 	prompt: HTMLTextAreaElement;
 	cwd: HTMLInputElement;
 	model: HTMLSelectElement;
-	interval: HTMLInputElement;
+	preset: HTMLSelectElement;
+	time: HTMLInputElement;
+	cron: HTMLInputElement;
+	timezone: HTMLInputElement;
+	maxDuration: HTMLInputElement;
+	preview: HTMLDivElement;
 	enabled: HTMLInputElement;
 	agentLabel: HTMLLabelElement;
+	workflowLabel: HTMLLabelElement;
 	acpLabel: HTMLLabelElement;
 	skillLabel: HTMLLabelElement;
 	cwdLabel: HTMLLabelElement;
@@ -401,6 +490,7 @@ function createRoutineEditor(): {
 	const targetKind = document.createElement("select");
 	for (const [value, label] of [
 		["agent", "Local agent"],
+		["workflow", "Workflow"],
 		["acp", "ACP target"],
 		["skill", "Skill"],
 	] as const) {
@@ -410,6 +500,7 @@ function createRoutineEditor(): {
 		targetKind.append(option);
 	}
 	const agent = document.createElement("select");
+	const workflow = document.createElement("select");
 	const acp = document.createElement("select");
 	const skill = document.createElement("input");
 	skill.placeholder = "skill-name";
@@ -417,19 +508,44 @@ function createRoutineEditor(): {
 	prompt.required = true;
 	const cwd = document.createElement("input");
 	const model = document.createElement("select");
-	const interval = document.createElement("input");
-	interval.type = "number";
-	interval.min = "1";
-	interval.value = "60";
-	interval.required = true;
+	const preset = document.createElement("select");
+	for (const [value, text] of [
+		["weekdays", "Weekdays"],
+		["daily", "Every day"],
+		["hourly", "Every hour"],
+		["weekly", "Every week"],
+		["custom", "Advanced cron"],
+	] as const) {
+		const option = document.createElement("option");
+		option.value = value;
+		option.textContent = text;
+		preset.append(option);
+	}
+	const time = document.createElement("input");
+	time.type = "time";
+	time.value = "09:00";
+	const cron = document.createElement("input");
+	cron.value = "0 9 * * 1-5";
+	cron.required = true;
+	const timezone = document.createElement("input");
+	timezone.value = Intl.DateTimeFormat().resolvedOptions().timeZone;
+	timezone.required = true;
+	const maxDuration = document.createElement("input");
+	maxDuration.type = "number";
+	maxDuration.min = "1";
+	maxDuration.value = "60";
+	maxDuration.required = true;
 	const enabled = document.createElement("input");
 	enabled.type = "checkbox";
+	const preview = document.createElement("div");
+	preview.className = "muted routine-preview";
 	const label = (text: string, control: HTMLElement) => {
 		const wrapper = document.createElement("label");
 		wrapper.append(text, control);
 		return wrapper;
 	};
 	const agentLabel = label("Agent", agent);
+	const workflowLabel = label("Workflow", workflow);
 	const acpLabel = label("ACP target", acp);
 	const skillLabel = label("Skill name", skill);
 	const cwdLabel = label("Working directory", cwd);
@@ -456,13 +572,19 @@ function createRoutineEditor(): {
 		label("Name", name),
 		label("Run with", targetKind),
 		agentLabel,
+		workflowLabel,
 		acpLabel,
 		skillLabel,
 		label("Instructions", prompt),
 		cwdLabel,
 		label("Model", model),
-		label("Run every (minutes)", interval),
+		label("Schedule", preset),
+		label("Start time", time),
+		label("Cron schedule", cron),
+		label("Timezone", timezone),
+		label("Maximum duration (minutes)", maxDuration),
 		enabledLabel,
+		preview,
 		actions,
 	);
 	card.append(title, form);
@@ -473,17 +595,139 @@ function createRoutineEditor(): {
 		name,
 		targetKind,
 		agent,
+		workflow,
 		acp,
 		skill,
 		prompt,
 		cwd,
 		model,
-		interval,
+		preset,
+		time,
+		cron,
+		timezone,
+		maxDuration,
+		preview,
 		enabled,
 		agentLabel,
+		workflowLabel,
 		acpLabel,
 		skillLabel,
 		cwdLabel,
+		deleteButton,
+		runButton,
+		clearButton,
+	};
+}
+
+function createWorkflowEditor(): {
+	form: HTMLFormElement;
+	id: HTMLInputElement;
+	name: HTMLInputElement;
+	pattern: HTMLSelectElement;
+	nodes: HTMLTextAreaElement;
+	edges: HTMLTextAreaElement;
+	supervisor: HTMLSelectElement;
+	maxConcurrency: HTMLInputElement;
+	maxDepth: HTMLInputElement;
+	failurePolicy: HTMLSelectElement;
+	runPrompt: HTMLTextAreaElement;
+	deleteButton: HTMLButtonElement;
+	runButton: HTMLButtonElement;
+	clearButton: HTMLButtonElement;
+} {
+	const panel = element("workflows");
+	const card = document.createElement("details");
+	card.className = "card workflow-editor";
+	const summary = document.createElement("summary");
+	summary.id = "workflow-editor-title";
+	summary.textContent = "New workflow";
+	const form = document.createElement("form");
+	form.id = "workflow-editor";
+	const id = document.createElement("input");
+	id.type = "hidden";
+	const name = document.createElement("input");
+	name.required = true;
+	const pattern = document.createElement("select");
+	for (const value of ["sequential", "parallel", "supervisor"] as const) {
+		const option = document.createElement("option");
+		option.value = value;
+		option.textContent = value[0]?.toUpperCase() + value.slice(1);
+		pattern.append(option);
+	}
+	const nodes = document.createElement("textarea");
+	nodes.required = true;
+	nodes.placeholder = '[{"id":"research","agentId":"researcher","prompt":"Research the goal"}]';
+	const edges = document.createElement("textarea");
+	edges.placeholder = '[{"from":"research","to":"review"}]';
+	const supervisor = document.createElement("select");
+	const maxConcurrency = document.createElement("input");
+	maxConcurrency.type = "number";
+	maxConcurrency.min = "1";
+	maxConcurrency.max = "16";
+	maxConcurrency.value = "4";
+	const maxDepth = document.createElement("input");
+	maxDepth.type = "number";
+	maxDepth.min = "1";
+	maxDepth.max = "8";
+	maxDepth.value = "4";
+	const failurePolicy = document.createElement("select");
+	for (const value of ["stop", "continue", "supervisor-decides"] as const) {
+		const option = document.createElement("option");
+		option.value = value;
+		option.textContent = value;
+		failurePolicy.append(option);
+	}
+	const runPrompt = document.createElement("textarea");
+	runPrompt.placeholder = "Goal for this run";
+	const label = (text: string, control: HTMLElement) => {
+		const wrapper = document.createElement("label");
+		wrapper.append(text, control);
+		return wrapper;
+	};
+	const actions = document.createElement("div");
+	actions.className = "routine-actions";
+	const save = document.createElement("button");
+	save.type = "submit";
+	save.className = "primary";
+	save.textContent = "Save";
+	const runButton = document.createElement("button");
+	runButton.type = "button";
+	runButton.textContent = "Run now";
+	const clearButton = document.createElement("button");
+	clearButton.type = "button";
+	clearButton.textContent = "New";
+	const deleteButton = document.createElement("button");
+	deleteButton.type = "button";
+	deleteButton.className = "danger";
+	deleteButton.textContent = "Delete";
+	actions.append(save, runButton, clearButton, deleteButton);
+	form.append(
+		id,
+		label("Name", name),
+		label("Pattern", pattern),
+		label("Agent steps (JSON)", nodes),
+		label("Dependencies (JSON)", edges),
+		label("Supervisor", supervisor),
+		label("Maximum parallel tasks", maxConcurrency),
+		label("Maximum delegation depth", maxDepth),
+		label("Failure policy", failurePolicy),
+		label("Run goal", runPrompt),
+		actions,
+	);
+	card.append(summary, form);
+	panel.insertBefore(card, workflowList);
+	return {
+		form,
+		id,
+		name,
+		pattern,
+		nodes,
+		edges,
+		supervisor,
+		maxConcurrency,
+		maxDepth,
+		failurePolicy,
+		runPrompt,
 		deleteButton,
 		runButton,
 		clearButton,
@@ -918,8 +1162,8 @@ function setPreviewControls(browserSession: BrowserSessionSummary | undefined): 
 	previewBack.disabled = !userControls || !browserSession?.canGoBack;
 	previewForward.disabled = !userControls || !browserSession?.canGoForward;
 	previewReload.disabled = !userControls || !browserSession?.url;
-	previewType.disabled = !userControls;
 	previewControl.disabled = sessionId === undefined;
+	previewPopout.disabled = !browserPopoutMode && sessionId === undefined;
 	setBrowserAction(
 		previewControl,
 		userControls ? "agent" : "human",
@@ -945,7 +1189,7 @@ function renderPreviewRecording(): void {
 		? `Recording · ${stepCount} step${stepCount === 1 ? "" : "s"}`
 		: stepCount > 0
 			? `${stepCount} recorded step${stepCount === 1 ? "" : "s"} ready for Pi`
-			: "Record a walkthrough, then send it to Pi for review.";
+			: "";
 }
 
 function togglePreviewRecording(): void {
@@ -1110,10 +1354,10 @@ async function loadPreview(): Promise<void> {
 	const browserSession = selectPreviewSession(browserSessions);
 	renderPreviewSessionTabs(browserSessions, browserSession?.id);
 	if (!browserSession) {
-		previewSession.textContent = "No active browser";
+		previewSession.textContent = "";
 		previewImage.removeAttribute("src");
 		setPreviewControls(undefined);
-		setPreviewMessage("Ask Pi or an agent to open a permitted URL.");
+		setPreviewMessage("");
 		previewStream?.close();
 		return;
 	}
@@ -1145,11 +1389,7 @@ function selectPreviewSession(browserSessions: BrowserSessionSummary[]): Browser
 
 function renderPreviewSessionTabs(browserSessions: BrowserSessionSummary[], selectedId: string | undefined): void {
 	if (browserSessions.length === 0) {
-		const empty = document.createElement("button");
-		empty.type = "button";
-		empty.disabled = true;
-		empty.textContent = "No active browser";
-		previewSessionTabs.replaceChildren(empty);
+		previewSessionTabs.replaceChildren();
 		return;
 	}
 	previewSessionTabs.replaceChildren(
@@ -1476,15 +1716,32 @@ async function connect(): Promise<void> {
 	const initial = sessionTargets().find((target) => target.connectionId === primary.id);
 	if (!initial) throw new Error("The active Pi session is unavailable");
 	await switchSession(initial);
+	installAgentEvents();
 	await Promise.all([
 		loadAgents().catch(() => {}),
+		loadPersonas().catch(() => {}),
 		loadRoutines().catch(() => {}),
+		loadWorkflows().catch(() => {}),
 		loadCapabilities().catch(() => {}),
 		loadExternalConnections().catch((error: unknown) =>
 			setStatus(error instanceof Error ? error.message : String(error), true),
 		),
 	]);
 }
+
+function installAgentEvents(): void {
+	agentEvents?.close();
+	if (!capabilityToken) return;
+	agentEvents = new EventSource(`/agent-events?token=${encodeURIComponent(capabilityToken)}`);
+	agentEvents.addEventListener("message", () => {
+		void loadAgents().catch(() => {});
+		if (activeSidebarAgent) void loadSelectedAgent().catch(() => {});
+		void loadRoutines().catch(() => {});
+		void loadWorkflows().catch(() => {});
+	});
+}
+
+window.addEventListener("beforeunload", () => agentEvents?.close());
 
 async function loadCapabilities(): Promise<void> {
 	if (!capabilityToken) return;
@@ -1495,6 +1752,7 @@ async function loadCapabilities(): Promise<void> {
 	const groups: Array<["local" | "remote", string, CapabilityEntry[], boolean]> = [
 		["local", "Tools", payload.tools, true],
 		["local", "Skills", payload.skills, false],
+		["local", "Plugins", payload.plugins, true],
 		["local", "Extensions", payload.extensions, false],
 		["remote", "MCP servers", payload.mcpServers, true],
 		["remote", "ACP connectors", payload.acpConnections, false],
@@ -1537,6 +1795,33 @@ async function loadCapabilities(): Promise<void> {
 				meta.className = "capability-meta";
 				meta.textContent = [entry.scope, entry.source, entry.path].filter(Boolean).join(" · ");
 				body.append(meta);
+				if (label === "Tools") {
+					const grant = document.createElement("label");
+					const checkbox = document.createElement("input");
+					checkbox.type = "checkbox";
+					checkbox.checked = selectedAgentTools().has(entry.id);
+					const harness = requiredElement<HTMLSelectElement>("agent-executor").value === "harness";
+					checkbox.disabled = harness && !["read", "ls", "list", "write"].includes(entry.id);
+					checkbox.title = checkbox.disabled ? "Use the Pi session executor for extension and remote tools" : "";
+					checkbox.addEventListener("change", () => updateAgentToolGrant(entry.id, checkbox.checked));
+					grant.append(checkbox, " Grant to this agent");
+					body.append(grant);
+				}
+				if (label === "Plugins" && entry.source) {
+					const actions = document.createElement("div");
+					actions.className = "routine-actions";
+					const update = document.createElement("button");
+					update.type = "button";
+					update.textContent = "Update";
+					update.addEventListener("click", () => void changePlugin("update", entry.source ?? "", entry.scope));
+					const remove = document.createElement("button");
+					remove.type = "button";
+					remove.className = "danger";
+					remove.textContent = "Remove";
+					remove.addEventListener("click", () => void changePlugin("remove", entry.source ?? "", entry.scope));
+					actions.append(update, remove);
+					body.append(actions);
+				}
 				card.append(title, body);
 				section.append(card);
 			}
@@ -1545,15 +1830,45 @@ async function loadCapabilities(): Promise<void> {
 	);
 }
 
+async function changePlugin(action: "install" | "update" | "remove", source: string, scope: string): Promise<void> {
+	if (!capabilityToken || !source) return;
+	if (!window.confirm(`${action[0]?.toUpperCase()}${action.slice(1)} plugin ${source}?`)) return;
+	const response = await fetch(`/plugins/${action}?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ source, scope: scope === "project" ? "project" : "user", approved: true }),
+	});
+	if (!response.ok) throw new Error(await responseError(response, `Could not ${action} plugin`));
+	await loadCapabilities();
+	setStatus(`Plugin ${action} complete`);
+}
+
 function isCapabilitySnapshot(value: unknown): value is CapabilitySnapshot {
 	if (typeof value !== "object" || value === null) return false;
-	return ["tools", "skills", "extensions", "mcpServers", "acpConnections", "modelProviders"].every(
+	return ["tools", "skills", "extensions", "plugins", "mcpServers", "acpConnections", "modelProviders"].every(
 		(key) => key in value && Array.isArray(value[key as keyof typeof value]),
 	);
 }
 
+function selectedAgentTools(): Set<string> {
+	return new Set(
+		requiredElement<HTMLInputElement>("agent-tools")
+			.value.split(",")
+			.map((entry) => entry.trim())
+			.filter(Boolean),
+	);
+}
+
+function updateAgentToolGrant(tool: string, enabled: boolean): void {
+	const tools = selectedAgentTools();
+	if (enabled) tools.add(tool);
+	else tools.delete(tool);
+	requiredElement<HTMLInputElement>("agent-tools").value = [...tools].sort().join(",");
+}
+
 interface AgentSummary {
 	id: string;
+	revision: number;
 	source: "managed" | "pi-agent";
 	personaId?: string;
 	name: string;
@@ -1564,6 +1879,10 @@ interface AgentSummary {
 	executor: "session" | "harness";
 	permissionPolicy: "read-only" | "workspace-write";
 	model?: { provider: string; id: string };
+	thinking?: ThinkingLevel;
+	projectRoot: string;
+	delegateAgentIds: string[];
+	a2a: { enabled: boolean };
 	browser?: { access: "disabled" | "loopback" | "public-web" | "private-network"; profile: { kind: "ephemeral" } };
 	schedules: Array<{ id: string; prompt: string; intervalMinutes: number; enabled: boolean }>;
 }
@@ -1577,13 +1896,15 @@ async function loadAgents(): Promise<void> {
 	agents = payload.agents;
 	agentList.replaceChildren(
 		...payload.agents.map((agent) => {
+			const card = document.createElement("div");
+			card.className = "agent-entry-card";
 			const button = document.createElement("button");
 			button.type = "button";
 			button.className = "nav-item agent-entry";
 			const icon = agent.personaId ? document.createElement("img") : document.createElement("span");
 			icon.className = "agent-icon";
 			if (icon instanceof HTMLImageElement) {
-				icon.src = `/agents/${encodeURIComponent(agent.id)}/icon?token=${encodeURIComponent(capabilityToken ?? "")}`;
+				icon.src = `/personas/${encodeURIComponent(agent.personaId ?? "")}/image?token=${encodeURIComponent(capabilityToken ?? "")}`;
 				icon.alt = "";
 				icon.addEventListener("error", () => {
 					const fallback = document.createElement("span");
@@ -1600,20 +1921,62 @@ async function loadAgents(): Promise<void> {
 			button.append(icon, name);
 			button.title = agent.description;
 			button.addEventListener("click", () => void openAgent(agent));
-			return button;
+			const menu = document.createElement("details");
+			menu.className = "agent-menu";
+			const menuButton = document.createElement("summary");
+			menuButton.textContent = "⋯";
+			menuButton.title = "Agent actions";
+			const actions = document.createElement("div");
+			const edit = document.createElement("button");
+			edit.type = "button";
+			edit.textContent = "Edit";
+			edit.addEventListener("click", () => void openAgentBuilder(agent));
+			const duplicate = document.createElement("button");
+			duplicate.type = "button";
+			duplicate.textContent = "Duplicate";
+			duplicate.disabled = agent.source === "pi-agent";
+			duplicate.addEventListener(
+				"click",
+				() => void openAgentBuilder({ ...agent, id: "", name: `${agent.name} copy`, revision: 0 }),
+			);
+			const remove = document.createElement("button");
+			remove.type = "button";
+			remove.textContent = "Delete";
+			remove.className = "danger";
+			remove.disabled = agent.source === "pi-agent";
+			remove.addEventListener(
+				"click",
+				() =>
+					void deleteAgent(agent).catch((error: unknown) =>
+						setStatus(error instanceof Error ? error.message : String(error), true),
+					),
+			);
+			actions.append(edit, duplicate, remove);
+			menu.append(menuButton, actions);
+			card.append(button, menu);
+			return card;
 		}),
 	);
-	const selectedAgent = runAgent.value;
-	runAgent.replaceChildren(
-		...payload.agents.map((agent) => {
-			const option = document.createElement("option");
-			option.value = agent.id;
-			option.textContent = agent.name;
-			return option;
-		}),
-	);
-	if (payload.agents.some((agent) => agent.id === selectedAgent)) runAgent.value = selectedAgent;
 	refreshRoutineEditorOptions();
+	refreshWorkflowEditorOptions();
+}
+
+async function deleteAgent(agent: AgentSummary): Promise<void> {
+	if (!capabilityToken || !window.confirm(`Delete agent "${agent.name}"? Its project files will not be deleted.`))
+		return;
+	const response = await fetch(
+		`/agents/${encodeURIComponent(agent.id)}?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "DELETE",
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not delete agent"));
+	if (activeSidebarAgent?.id === agent.id) {
+		activeSidebarAgent = undefined;
+		selectedAgentPanel.classList.add("hidden");
+	}
+	await loadAgents();
+	setStatus("Agent deleted");
 }
 
 function isAgentList(value: unknown): value is { agents: AgentSummary[] } {
@@ -1625,6 +1988,8 @@ function isAgentList(value: unknown): value is { agents: AgentSummary[] } {
 			entry !== null &&
 			"id" in entry &&
 			typeof entry.id === "string" &&
+			"revision" in entry &&
+			typeof entry.revision === "number" &&
 			"source" in entry &&
 			(entry.source === "managed" || entry.source === "pi-agent") &&
 			(!("personaId" in entry) || entry.personaId === undefined || typeof entry.personaId === "string") &&
@@ -1651,8 +2016,69 @@ function isAgentList(value: unknown): value is { agents: AgentSummary[] } {
 					typeof entry.model.provider === "string" &&
 					"id" in entry.model &&
 					typeof entry.model.id === "string")) &&
+			"projectRoot" in entry &&
+			typeof entry.projectRoot === "string" &&
+			"delegateAgentIds" in entry &&
+			Array.isArray(entry.delegateAgentIds) &&
+			"a2a" in entry &&
+			typeof entry.a2a === "object" &&
+			entry.a2a !== null &&
 			"schedules" in entry &&
 			Array.isArray(entry.schedules),
+	);
+}
+
+async function loadPersonas(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/personas.json?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) return;
+	const payload: unknown = await response.json();
+	if (!isPersonaList(payload)) throw new Error("Persona catalog returned an invalid response");
+	personas = payload.personas;
+	const selected = personaSelect.value;
+	const custom = document.createElement("option");
+	custom.value = "";
+	custom.textContent = "Custom";
+	personaSelect.replaceChildren(
+		custom,
+		...personas.map((persona) => {
+			const option = document.createElement("option");
+			option.value = persona.id;
+			option.textContent = `${persona.name} · ${persona.category}`;
+			return option;
+		}),
+	);
+	if (personas.some((entry) => entry.id === selected)) personaSelect.value = selected;
+	updatePersonaPreview();
+}
+
+function updatePersonaPreview(applyInstructions = false): void {
+	const persona = personas.find((entry) => entry.id === personaSelect.value);
+	if (applyInstructions && persona) requiredElement<HTMLTextAreaElement>("agent-persona").value = persona.instructions;
+	personaImage.classList.toggle("hidden", !persona?.image);
+	personaImage.src = persona?.image
+		? `/personas/${encodeURIComponent(persona.id)}/image?token=${encodeURIComponent(capabilityToken ?? "")}`
+		: "";
+	personaImage.alt = persona ? persona.name : "";
+}
+
+function isPersonaList(value: unknown): value is { personas: PersonaSummary[] } {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"personas" in value &&
+		Array.isArray(value.personas) &&
+		value.personas.every(
+			(entry) =>
+				typeof entry === "object" &&
+				entry !== null &&
+				"id" in entry &&
+				typeof entry.id === "string" &&
+				"name" in entry &&
+				typeof entry.name === "string" &&
+				"instructions" in entry &&
+				typeof entry.instructions === "string",
+		)
 	);
 }
 
@@ -1749,8 +2175,8 @@ function openExternalConnection(connection: ExternalConnectionSummary): void {
 	);
 	externalModel.value = `${connection.defaultModel.provider}/${connection.defaultModel.id}`;
 	externalModelPicker.refresh();
-	document.querySelector<HTMLElement>('[data-tab="external"]')?.classList.remove("hidden");
-	activateTab("external");
+	element("external-delegate").classList.remove("hidden");
+	activateTab("agents-workspace");
 	void loadExternalConnections().catch(() => {});
 	void loadExternalRuns().catch(() => {});
 }
@@ -1760,15 +2186,6 @@ function activateTab(id: string): void {
 		entry.classList.toggle("active", entry.getAttribute("data-tab") === id);
 	});
 	document.querySelectorAll("[data-panel]").forEach((entry) => {
-		entry.classList.toggle("hidden", entry.id !== id);
-	});
-}
-
-function activateRailTab(id: string): void {
-	document.querySelectorAll("[data-rail-tab]").forEach((entry) => {
-		entry.classList.toggle("active", entry.getAttribute("data-rail-tab") === id);
-	});
-	document.querySelectorAll("[data-rail-panel]").forEach((entry) => {
 		entry.classList.toggle("hidden", entry.id !== id);
 	});
 }
@@ -1883,102 +2300,209 @@ function installPanelResizer(
 }
 
 async function openAgent(agent?: AgentSummary): Promise<void> {
+	if (!agent) {
+		await openAgentBuilder();
+		return;
+	}
+	activeSidebarAgent = agent;
+	selectedAgentTitle.textContent = agent.name;
+	selectedAgentPanel.classList.remove("hidden");
+	delete selectedAgentChat.dataset.continueTask;
+	selectedAgentPrompt.placeholder = `Message ${agent.name}…`;
+	activateTab("agents-workspace");
+	await loadSelectedAgent();
+}
+
+async function openAgentBuilder(agent?: AgentSummary): Promise<void> {
 	activeSidebarAgent = agent;
 	agentForm.reset();
 	const catalogAgent = agent?.source === "pi-agent";
-	for (const control of agentForm.querySelectorAll<
-		HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | HTMLButtonElement
-	>("input, textarea, select, button")) {
-		control.disabled = catalogAgent;
+	for (const id of [
+		"agent-name",
+		"agent-description",
+		"agent-project-root",
+		"agent-persona-select",
+		"agent-persona",
+		"agent-model",
+		"agent-thinking",
+		"agent-executor",
+		"agent-permissions",
+		"agent-browser-access",
+		"agent-delegates",
+		"agent-a2a",
+	]) {
+		requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(id).disabled = catalogAgent;
 	}
 	requiredElement<HTMLInputElement>("agent-id").value = agent?.id ?? "";
 	requiredElement<HTMLInputElement>("agent-name").value = agent?.name ?? "";
 	requiredElement<HTMLTextAreaElement>("agent-description").value = agent?.description ?? "";
+	requiredElement<HTMLInputElement>("agent-project-root").value = agent?.projectRoot ?? session?.snapshot?.cwd ?? "";
+	personaSelect.value = agent?.personaId ?? "";
 	requiredElement<HTMLTextAreaElement>("agent-persona").value = agent?.persona ?? "";
-	requiredElement<HTMLInputElement>("agent-tools").value = agent?.tools.join(", ") ?? "";
+	requiredElement<HTMLInputElement>("agent-tools").value = agent?.tools.join(",") ?? "";
 	requiredElement<HTMLSelectElement>("agent-memory").value = agent?.memory ?? "none";
 	requiredElement<HTMLSelectElement>("agent-executor").value = agent?.executor ?? "harness";
 	requiredElement<HTMLSelectElement>("agent-permissions").value = agent?.permissionPolicy ?? "read-only";
 	requiredElement<HTMLSelectElement>("agent-browser-access").value = agent?.browser?.access ?? "disabled";
+	requiredElement<HTMLSelectElement>("agent-thinking").value = agent?.thinking ?? "high";
+	requiredElement<HTMLInputElement>("agent-delegates").value = agent?.delegateAgentIds.join(", ") ?? "";
+	requiredElement<HTMLInputElement>("agent-a2a").checked = agent?.a2a.enabled ?? false;
 	agentModel.value = agent?.model ? `${agent.model.provider}/${agent.model.id}` : "";
 	agentModelPicker.refresh();
+	updatePersonaPreview();
 	element("builder-title").textContent = agent
 		? catalogAgent
 			? `${agent.name} · Pi agent catalog`
 			: agent.name
 		: "Build a new agent";
-	const configureTab = document.querySelector<HTMLElement>('[data-tab="configure"]');
-	if (configureTab) configureTab.textContent = agent ? "Agent" : "Builder";
-	builderPrompt.placeholder = agent ? `Message ${agent.name}…` : "Describe the agent you want to build";
-	builderChatForm.classList.toggle("agent-chat-composer", agent !== undefined);
-	builderSubmit.textContent = agent ? "↑" : "Ask builder";
-	builderSubmit.setAttribute("aria-label", agent ? `Send message to ${agent.name}` : "Ask builder");
-	activateTab("configure");
+	activateTab("agent-builder");
 	activateBuilderTab("builder-chat-panel");
 	unsubscribeBuilder?.();
 	await builderSession?.dispose().catch(() => {});
 	builderChat.replaceChildren();
 	if (!client) return;
-	builderSession = await client.createSession({ name: agent ? `agent:${agent.id}` : "builder:new" });
+	builderSession = await client.createSession({ name: agent ? `builder:${agent.id}` : "builder:new" });
 	unsubscribeBuilder = builderSession.subscribe((snapshot) => {
 		builderChat.replaceChildren(...snapshot.transcript.map(renderItem));
 		builderChat.scrollTop = builderChat.scrollHeight;
 		const busy = snapshot.phase !== "idle";
 		builderPrompt.disabled = busy;
-		builderSubmit.classList.toggle("is-stopping", busy && activeSidebarAgent !== undefined);
-		builderSubmit.textContent = activeSidebarAgent ? (busy ? "■" : "↑") : "Ask builder";
-		builderSubmit.setAttribute(
-			"aria-label",
-			activeSidebarAgent ? (busy ? "Stop response" : `Send message to ${agent?.name ?? "agent"}`) : "Ask builder",
-		);
+		builderSubmit.textContent = "Ask builder";
 	});
+	await loadCapabilities().catch(() => {});
 }
 
-interface RunSummary {
-	id: string;
-	agentId: string;
-	prompt: string;
-	status: string;
-	createdAt: number;
-	error?: string;
+async function loadSelectedAgent(): Promise<void> {
+	if (!capabilityToken || !activeSidebarAgent) return;
+	const conversationsResponse = await fetch(
+		`/agent-conversations.json?agentId=${encodeURIComponent(activeSidebarAgent.id)}&token=${encodeURIComponent(capabilityToken)}`,
+	);
+	if (!conversationsResponse.ok)
+		throw new Error(await responseError(conversationsResponse, "Could not load agent conversation"));
+	const conversationsPayload: unknown = await conversationsResponse.json();
+	const conversationId = conversationIdFromPayload(conversationsPayload);
+	let messages: AgentMessageSummary[] = [];
+	if (conversationId) {
+		const messagesResponse = await fetch(
+			`/agent-conversations/${encodeURIComponent(conversationId)}/messages?token=${encodeURIComponent(capabilityToken)}`,
+		);
+		if (!messagesResponse.ok) throw new Error(await responseError(messagesResponse, "Could not load agent messages"));
+		const payload: unknown = await messagesResponse.json();
+		messages = messagesFromPayload(payload);
+	}
+	selectedAgentChat.dataset.conversationId = conversationId ?? "";
+	selectedAgentChat.replaceChildren(
+		...messages.map((message) => {
+			const block = document.createElement("div");
+			block.className = `agent-chat-message ${message.role}`;
+			block.textContent = message.text;
+			return block;
+		}),
+	);
+	selectedAgentChat.scrollTop = selectedAgentChat.scrollHeight;
+	await loadAgentTasks();
 }
 
-async function loadRuns(): Promise<void> {
-	if (!capabilityToken) return;
-	const response = await fetch(`/runs.json?token=${encodeURIComponent(capabilityToken)}`);
-	if (!response.ok) throw new Error(`Could not load runs: HTTP ${response.status}`);
+function conversationIdFromPayload(value: unknown): string | undefined {
+	if (
+		typeof value !== "object" ||
+		value === null ||
+		!("conversations" in value) ||
+		!Array.isArray(value.conversations)
+	)
+		return undefined;
+	const first = value.conversations[0];
+	return typeof first === "object" && first !== null && "id" in first && typeof first.id === "string"
+		? first.id
+		: undefined;
+}
+
+function messagesFromPayload(value: unknown): AgentMessageSummary[] {
+	if (typeof value !== "object" || value === null || !("messages" in value) || !Array.isArray(value.messages))
+		return [];
+	return value.messages.filter(isAgentMessageSummary);
+}
+
+function isAgentMessageSummary(value: unknown): value is AgentMessageSummary {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"id" in value &&
+		typeof value.id === "string" &&
+		"conversationId" in value &&
+		typeof value.conversationId === "string" &&
+		"role" in value &&
+		(value.role === "user" || value.role === "agent") &&
+		"text" in value &&
+		typeof value.text === "string" &&
+		"taskId" in value &&
+		typeof value.taskId === "string" &&
+		"createdAt" in value &&
+		typeof value.createdAt === "number"
+	);
+}
+
+async function loadAgentTasks(): Promise<void> {
+	if (!capabilityToken || !activeSidebarAgent) return;
+	const response = await fetch(
+		`/agent-tasks.json?agentId=${encodeURIComponent(activeSidebarAgent.id)}&token=${encodeURIComponent(capabilityToken)}`,
+	);
+	if (!response.ok) throw new Error(`Could not load agent tasks: HTTP ${response.status}`);
 	const payload: unknown = await response.json();
-	if (!isRunList(payload)) throw new Error("Run manager returned an invalid response");
-	runList.replaceChildren(
-		...payload.runs.map((run) => {
+	if (!isAgentTaskList(payload)) throw new Error("Agent task service returned an invalid response");
+	agentTaskList.replaceChildren(
+		...payload.tasks.map((task) => {
 			const card = document.createElement("div");
 			card.className = "card run-card";
-			appendText(card, `${run.agentId} · ${run.status}`);
-			appendText(card, run.prompt, "muted");
-			if (run.error) appendText(card, run.error, "run-error");
-			if (run.status === "succeeded" && capabilityToken) {
-				const result = document.createElement("a");
-				result.href = `/runs/${encodeURIComponent(run.id)}/result?token=${encodeURIComponent(capabilityToken)}`;
-				result.target = "_blank";
-				result.rel = "noreferrer";
-				result.textContent = "Open result";
-				card.append(result);
-			}
-			if (run.status === "starting" || run.status === "running") {
+			if (task.status === "queued" || task.status === "running") card.dataset.activeTask = task.id;
+			appendText(card, task.status);
+			appendText(card, task.prompt, "muted");
+			if (task.result) appendText(card, task.result);
+			if (task.error) appendText(card, task.error, "run-error");
+			if (task.status === "queued" || task.status === "running") {
 				const button = document.createElement("button");
 				button.type = "button";
-				button.textContent = "Abort";
-				button.addEventListener("click", () => void abortRun(run.id));
+				button.textContent = "Stop";
+				button.addEventListener("click", () => void cancelAgentTask(task.id));
 				card.append(button);
+			} else {
+				const actions = document.createElement("div");
+				actions.className = "result-actions";
+				const continueButton = document.createElement("button");
+				continueButton.type = "button";
+				continueButton.textContent = "Continue";
+				continueButton.addEventListener("click", () => {
+					selectedAgentChat.dataset.continueTask = task.id;
+					selectedAgentPrompt.placeholder = `Continue ${activeSidebarAgent?.name ?? "agent"} task…`;
+					selectedAgentPrompt.focus();
+				});
+				actions.append(continueButton);
+				if (task.status === "failed" || task.status === "cancelled") {
+					const retry = document.createElement("button");
+					retry.type = "button";
+					retry.textContent = "Retry";
+					retry.addEventListener(
+						"click",
+						() =>
+							void continueAgentTask(task.id, task.prompt).catch((error: unknown) =>
+								setStatus(error instanceof Error ? error.message : String(error), true),
+							),
+					);
+					actions.append(retry);
+				}
+				card.append(actions);
 			}
 			return card;
 		}),
 	);
+	selectedAgentSend.textContent = payload.tasks.some((task) => task.status === "queued" || task.status === "running")
+		? "■"
+		: "↑";
 }
 
-function isRunList(value: unknown): value is { runs: RunSummary[] } {
-	if (typeof value !== "object" || value === null || !("runs" in value) || !Array.isArray(value.runs)) return false;
-	return value.runs.every(
+function isAgentTaskList(value: unknown): value is { tasks: AgentTaskSummary[] } {
+	if (typeof value !== "object" || value === null || !("tasks" in value) || !Array.isArray(value.tasks)) return false;
+	return value.tasks.every(
 		(entry) =>
 			typeof entry === "object" &&
 			entry !== null &&
@@ -1988,24 +2512,40 @@ function isRunList(value: unknown): value is { runs: RunSummary[] } {
 			typeof entry.agentId === "string" &&
 			"prompt" in entry &&
 			typeof entry.prompt === "string" &&
+			"conversationId" in entry &&
+			typeof entry.conversationId === "string" &&
 			"status" in entry &&
-			typeof entry.status === "string" &&
+			["queued", "running", "completed", "failed", "cancelled"].includes(String(entry.status)) &&
 			"createdAt" in entry &&
 			typeof entry.createdAt === "number" &&
 			(!("error" in entry) || entry.error === undefined || typeof entry.error === "string"),
 	);
 }
 
-async function abortRun(runId: string): Promise<void> {
+async function cancelAgentTask(taskId: string): Promise<void> {
 	if (!capabilityToken) return;
 	const response = await fetch(
-		`/runs/${encodeURIComponent(runId)}/abort?token=${encodeURIComponent(capabilityToken)}`,
+		`/agent-tasks/${encodeURIComponent(taskId)}/cancel?token=${encodeURIComponent(capabilityToken)}`,
 		{
 			method: "POST",
 		},
 	);
-	if (!response.ok) throw new Error(`Could not abort run: HTTP ${response.status}`);
-	await loadRuns();
+	if (!response.ok) throw new Error(`Could not stop task: HTTP ${response.status}`);
+	await loadSelectedAgent();
+}
+
+async function continueAgentTask(taskId: string, message: string): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(
+		`/agent-tasks/${encodeURIComponent(taskId)}/continue?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ message }),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not continue task"));
+	await loadSelectedAgent();
 }
 
 async function loadExternalRuns(): Promise<void> {
@@ -2134,9 +2674,12 @@ interface RoutineSummary {
 	name: string;
 	prompt: string;
 	enabled: boolean;
-	intervalMinutes: number;
+	cron: string;
+	timezone: string;
+	maxDurationMinutes: number;
 	target:
 		| { kind: "agent"; agentId: string }
+		| { kind: "workflow"; workflowId: string }
 		| { kind: "acp"; connectionId: string }
 		| { kind: "skill"; skillName: string };
 	model?: { provider: string; id: string };
@@ -2155,6 +2698,10 @@ function routineTargetLabel(routine: RoutineSummary): string {
 		case "agent": {
 			const agentId = routine.target.agentId;
 			return `Agent · ${agents.find((agent) => agent.id === agentId)?.name ?? agentId}`;
+		}
+		case "workflow": {
+			const workflowId = routine.target.workflowId;
+			return `Workflow · ${workflows.find((entry) => entry.id === workflowId)?.name ?? workflowId}`;
 		}
 		case "acp": {
 			const connectionId = routine.target.connectionId;
@@ -2177,6 +2724,16 @@ function refreshRoutineEditorOptions(): void {
 		}),
 	);
 	if (agents.some((entry) => entry.id === selectedAgent)) routineEditor.agent.value = selectedAgent;
+	const selectedWorkflow = routineEditor.workflow.value;
+	routineEditor.workflow.replaceChildren(
+		...workflows.map((entry) => {
+			const option = document.createElement("option");
+			option.value = entry.id;
+			option.textContent = entry.name;
+			return option;
+		}),
+	);
+	if (workflows.some((entry) => entry.id === selectedWorkflow)) routineEditor.workflow.value = selectedWorkflow;
 	routineEditor.acp.replaceChildren(
 		...externalConnections.map((entry) => {
 			const option = document.createElement("option");
@@ -2216,16 +2773,63 @@ function refreshRoutineModels(selected = routineEditor.model.value): void {
 function updateRoutineTargetFields(): void {
 	const kind = routineEditor.targetKind.value;
 	routineEditor.agentLabel.classList.toggle("hidden", kind !== "agent");
+	routineEditor.workflowLabel.classList.toggle("hidden", kind !== "workflow");
 	routineEditor.acpLabel.classList.toggle("hidden", kind !== "acp");
 	routineEditor.skillLabel.classList.toggle("hidden", kind !== "skill");
-	routineEditor.cwdLabel.classList.toggle("hidden", kind === "agent");
+	routineEditor.cwdLabel.classList.toggle("hidden", kind === "agent" || kind === "workflow");
 	refreshRoutineModels("");
+}
+
+function updateRoutineCronFromPreset(): void {
+	const [hourText = "9", minuteText = "0"] = routineEditor.time.value.split(":");
+	const minute = Number(minuteText);
+	const hour = Number(hourText);
+	switch (routineEditor.preset.value) {
+		case "hourly":
+			routineEditor.cron.value = `${minute} * * * *`;
+			break;
+		case "daily":
+			routineEditor.cron.value = `${minute} ${hour} * * *`;
+			break;
+		case "weekly":
+			routineEditor.cron.value = `${minute} ${hour} * * 1`;
+			break;
+		case "weekdays":
+			routineEditor.cron.value = `${minute} ${hour} * * 1-5`;
+			break;
+	}
+	routineEditor.cron.disabled = routineEditor.preset.value !== "custom";
+	routineEditor.time.disabled = routineEditor.preset.value === "custom";
+	void refreshRoutinePreview();
+}
+
+async function refreshRoutinePreview(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/routines/preview?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ cron: routineEditor.cron.value, timezone: routineEditor.timezone.value }),
+	});
+	if (!response.ok) {
+		routineEditor.preview.textContent = await responseError(response, "Invalid schedule");
+		return;
+	}
+	const payload: unknown = await response.json();
+	if (typeof payload !== "object" || payload === null || !("next" in payload) || !Array.isArray(payload.next)) return;
+	routineEditor.preview.textContent = payload.next
+		.filter((entry): entry is number => typeof entry === "number")
+		.map((entry) => new Date(entry).toLocaleString())
+		.join(" · ");
 }
 
 function clearRoutineEditor(): void {
 	routineEditor.form.reset();
 	routineEditor.id.value = "";
-	routineEditor.interval.value = "60";
+	routineEditor.cron.value = "0 9 * * 1-5";
+	routineEditor.preset.value = "weekdays";
+	routineEditor.time.value = "09:00";
+	routineEditor.timezone.value = Intl.DateTimeFormat().resolvedOptions().timeZone;
+	routineEditor.maxDuration.value = "60";
 	routineEditor.deleteButton.disabled = true;
 	routineEditor.runButton.disabled = true;
 	element("routine-editor-title").textContent = "New routine";
@@ -2233,6 +2837,7 @@ function clearRoutineEditor(): void {
 		card.classList.remove("active");
 	});
 	updateRoutineTargetFields();
+	updateRoutineCronFromPreset();
 }
 
 function editRoutine(routine: RoutineSummary): void {
@@ -2240,9 +2845,14 @@ function editRoutine(routine: RoutineSummary): void {
 	routineEditor.name.value = routine.name;
 	routineEditor.prompt.value = routine.prompt;
 	routineEditor.enabled.checked = routine.enabled;
-	routineEditor.interval.value = String(routine.intervalMinutes);
+	routineEditor.cron.value = routine.cron;
+	routineEditor.preset.value = "custom";
+	routineEditor.timezone.value = routine.timezone;
+	routineEditor.maxDuration.value = String(routine.maxDurationMinutes);
+	updateRoutineCronFromPreset();
 	routineEditor.targetKind.value = routine.target.kind;
 	if (routine.target.kind === "agent") routineEditor.agent.value = routine.target.agentId;
+	else if (routine.target.kind === "workflow") routineEditor.workflow.value = routine.target.workflowId;
 	else if (routine.target.kind === "acp") routineEditor.acp.value = routine.target.connectionId;
 	else routineEditor.skill.value = routine.target.skillName;
 	routineEditor.cwd.value = routine.cwd ?? session?.snapshot?.cwd ?? "";
@@ -2273,13 +2883,52 @@ async function loadRoutines(): Promise<void> {
 			state.className = "routine-state";
 			appendText(state, routine.name);
 			appendText(state, routine.activeRunId ? "Running" : routine.enabled ? "Active" : "Paused", "routine-target");
+			const menu = document.createElement("details");
+			menu.className = "routine-menu";
+			const summary = document.createElement("summary");
+			summary.textContent = "⋯";
+			summary.title = "Routine actions";
+			const actions = document.createElement("div");
+			const run = document.createElement("button");
+			run.type = "button";
+			run.textContent = "Run now";
+			run.disabled = routine.activeRunId !== undefined;
+			run.addEventListener("click", (event) => {
+				event.stopPropagation();
+				void runRoutine(routine.id).catch((error: unknown) =>
+					setStatus(error instanceof Error ? error.message : String(error), true),
+				);
+			});
+			const toggle = document.createElement("button");
+			toggle.type = "button";
+			toggle.textContent = routine.enabled ? "Pause" : "Resume";
+			toggle.addEventListener("click", (event) => {
+				event.stopPropagation();
+				void setRoutineEnabled(routine, !routine.enabled).catch((error: unknown) =>
+					setStatus(error instanceof Error ? error.message : String(error), true),
+				);
+			});
+			const duplicate = document.createElement("button");
+			duplicate.type = "button";
+			duplicate.textContent = "Duplicate";
+			duplicate.addEventListener("click", (event) => {
+				event.stopPropagation();
+				editRoutine(routine);
+				routineEditor.id.value = "";
+				routineEditor.name.value = `${routine.name} copy`;
+				routineEditor.deleteButton.disabled = true;
+				routineEditor.runButton.disabled = true;
+			});
+			actions.append(run, toggle, duplicate);
+			menu.append(summary, actions);
+			state.append(menu);
 			card.append(state);
 			appendText(card, routineTargetLabel(routine), "routine-target");
 			appendText(
 				card,
 				routine.nextRunAt
-					? `Every ${routine.intervalMinutes} minutes · next ${new Date(routine.nextRunAt).toLocaleString()}`
-					: `Every ${routine.intervalMinutes} minutes`,
+					? `${routine.cron} · ${routine.timezone} · next ${new Date(routine.nextRunAt).toLocaleString()}`
+					: `${routine.cron} · ${routine.timezone}`,
 				"muted",
 			);
 			appendText(card, routine.prompt, "muted");
@@ -2290,6 +2939,42 @@ async function loadRoutines(): Promise<void> {
 	);
 	const selected = routines.find((routine) => routine.id === routineEditor.id.value);
 	if (selected) editRoutine(selected);
+}
+
+async function runRoutine(id: string): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(
+		`/routines/${encodeURIComponent(id)}/run?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not start routine"));
+	await loadRoutines();
+}
+
+async function setRoutineEnabled(routine: RoutineSummary, enabled: boolean): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(
+		`/routines/${encodeURIComponent(routine.id)}?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				name: routine.name,
+				prompt: routine.prompt,
+				enabled,
+				cron: routine.cron,
+				timezone: routine.timezone,
+				maxDurationMinutes: routine.maxDurationMinutes,
+				target: routine.target,
+				model: routine.model,
+				cwd: routine.cwd,
+			}),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not update routine"));
+	await loadRoutines();
 }
 
 function isRoutineList(value: unknown): value is { routines: RoutineSummary[] } {
@@ -2308,8 +2993,12 @@ function isRoutineList(value: unknown): value is { routines: RoutineSummary[] } 
 			typeof entry.prompt !== "string" ||
 			!("enabled" in entry) ||
 			typeof entry.enabled !== "boolean" ||
-			!("intervalMinutes" in entry) ||
-			typeof entry.intervalMinutes !== "number" ||
+			!("cron" in entry) ||
+			typeof entry.cron !== "string" ||
+			!("timezone" in entry) ||
+			typeof entry.timezone !== "string" ||
+			!("maxDurationMinutes" in entry) ||
+			typeof entry.maxDurationMinutes !== "number" ||
 			!("target" in entry) ||
 			typeof entry.target !== "object" ||
 			entry.target === null ||
@@ -2317,8 +3006,137 @@ function isRoutineList(value: unknown): value is { routines: RoutineSummary[] } 
 		) {
 			return false;
 		}
-		return entry.target.kind === "agent" || entry.target.kind === "acp" || entry.target.kind === "skill";
+		return (
+			entry.target.kind === "agent" ||
+			entry.target.kind === "workflow" ||
+			entry.target.kind === "acp" ||
+			entry.target.kind === "skill"
+		);
 	});
+}
+
+interface WorkflowSummary {
+	id: string;
+	name: string;
+	pattern: "sequential" | "parallel" | "supervisor";
+	nodes: Array<{ id: string; agentId: string; prompt: string }>;
+	edges: Array<{ from: string; to: string }>;
+	supervisorAgentId?: string;
+	maxConcurrency: number;
+	maxDelegationDepth: number;
+	failurePolicy: "stop" | "continue" | "supervisor-decides";
+}
+
+interface WorkflowRunSummary {
+	id: string;
+	workflowId: string;
+	status: "running" | "completed" | "failed" | "cancelled";
+	prompt: string;
+	createdAt: number;
+	result?: string;
+	error?: string;
+}
+
+let workflows: WorkflowSummary[] = [];
+let workflowRuns: WorkflowRunSummary[] = [];
+
+function refreshWorkflowEditorOptions(): void {
+	const selected = workflowEditor.supervisor.value;
+	const none = document.createElement("option");
+	none.value = "";
+	none.textContent = "None";
+	workflowEditor.supervisor.replaceChildren(
+		none,
+		...agents.map((agent) => {
+			const option = document.createElement("option");
+			option.value = agent.id;
+			option.textContent = agent.name;
+			return option;
+		}),
+	);
+	if (agents.some((agent) => agent.id === selected)) workflowEditor.supervisor.value = selected;
+	refreshRoutineEditorOptions();
+}
+
+function clearWorkflowEditor(): void {
+	workflowEditor.form.reset();
+	workflowEditor.id.value = "";
+	workflowEditor.nodes.value = "[]";
+	workflowEditor.edges.value = "[]";
+	workflowEditor.maxConcurrency.value = "4";
+	workflowEditor.maxDepth.value = "4";
+	workflowEditor.deleteButton.disabled = true;
+	workflowEditor.runButton.disabled = true;
+	element("workflow-editor-title").textContent = "New workflow";
+}
+
+function editWorkflow(workflow: WorkflowSummary): void {
+	element("workflow-editor-title").closest<HTMLDetailsElement>("details")!.open = true;
+	workflowEditor.id.value = workflow.id;
+	workflowEditor.name.value = workflow.name;
+	workflowEditor.pattern.value = workflow.pattern;
+	workflowEditor.nodes.value = JSON.stringify(workflow.nodes, null, 2);
+	workflowEditor.edges.value = JSON.stringify(workflow.edges, null, 2);
+	workflowEditor.supervisor.value = workflow.supervisorAgentId ?? "";
+	workflowEditor.maxConcurrency.value = String(workflow.maxConcurrency);
+	workflowEditor.maxDepth.value = String(workflow.maxDelegationDepth);
+	workflowEditor.failurePolicy.value = workflow.failurePolicy;
+	workflowEditor.deleteButton.disabled = false;
+	workflowEditor.runButton.disabled = workflowRuns.some(
+		(run) => run.workflowId === workflow.id && run.status === "running",
+	);
+	element("workflow-editor-title").textContent = workflow.name;
+}
+
+async function loadWorkflows(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/workflows.json?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load workflows"));
+	const payload: unknown = await response.json();
+	if (!isWorkflowPayload(payload)) throw new Error("Workflow service returned an invalid response");
+	workflows = payload.workflows;
+	workflowRuns = payload.runs;
+	workflowList.replaceChildren(
+		...workflows.map((workflow) => {
+			const card = document.createElement("button");
+			card.type = "button";
+			card.className = "card routine-card";
+			appendText(card, workflow.name);
+			appendText(card, `${workflow.pattern} · ${workflow.nodes.length} agents`, "muted");
+			const latest = workflowRuns.find((run) => run.workflowId === workflow.id);
+			if (latest)
+				appendText(card, latest.error ?? latest.result ?? latest.status, latest.error ? "run-error" : "muted");
+			card.addEventListener("click", () => editWorkflow(workflow));
+			return card;
+		}),
+	);
+	refreshWorkflowEditorOptions();
+	const selected = workflows.find((workflow) => workflow.id === workflowEditor.id.value);
+	if (selected) editWorkflow(selected);
+}
+
+function isWorkflowPayload(value: unknown): value is { workflows: WorkflowSummary[]; runs: WorkflowRunSummary[] } {
+	if (
+		typeof value !== "object" ||
+		value === null ||
+		!("workflows" in value) ||
+		!Array.isArray(value.workflows) ||
+		!("runs" in value) ||
+		!Array.isArray(value.runs)
+	) {
+		return false;
+	}
+	return value.workflows.every(
+		(entry) =>
+			typeof entry === "object" &&
+			entry !== null &&
+			"id" in entry &&
+			typeof entry.id === "string" &&
+			"name" in entry &&
+			typeof entry.name === "string" &&
+			"nodes" in entry &&
+			Array.isArray(entry.nodes),
+	);
 }
 
 async function reconnect(entry: ConnectionEntry): Promise<void> {
@@ -2426,31 +3244,53 @@ previewControl.addEventListener("click", () => {
 		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
 	);
 });
+previewPopout.addEventListener("click", () => {
+	if (browserPopoutMode) {
+		window.close();
+		return;
+	}
+	if (!activePreviewSessionId) return;
+	const childUrl = new URL(location.href);
+	childUrl.searchParams.set("browserPopout", "1");
+	childUrl.searchParams.set("browserSession", activePreviewSessionId);
+	window.open(
+		childUrl.href,
+		`pi-browser-${activePreviewSessionId}`,
+		"popup=yes,width=1200,height=850,resizable=yes,scrollbars=yes",
+	);
+});
 previewRecord.addEventListener("click", togglePreviewRecording);
 previewSendRecording.addEventListener("click", () => {
 	void sendPreviewRecordingToPi().catch((error: unknown) =>
 		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
 	);
 });
-previewTypeForm.addEventListener("submit", (event) => {
-	event.preventDefault();
-	const text = previewType.value;
-	if (!text) return;
-	void sendPreviewInput({ kind: "type", text })
-		.then(() => {
-			recordPreviewStep({ action: "type", textLength: text.length, timestamp: Date.now() });
-			previewType.value = "";
-		})
-		.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
-});
 previewImage.addEventListener("click", (event) => {
 	if (activePreviewSession?.controlOwner !== "user") return;
+	previewFrame.focus();
 	const bounds = previewImage.getBoundingClientRect();
 	if (bounds.width === 0 || bounds.height === 0) return;
 	const x = ((event.clientX - bounds.left) / bounds.width) * activePreviewSession.viewport.width;
 	const y = ((event.clientY - bounds.top) / bounds.height) * activePreviewSession.viewport.height;
 	void sendPreviewInput({ kind: "click", x, y })
 		.then(() => recordPreviewStep({ action: "click", x, y, timestamp: Date.now() }))
+		.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
+});
+previewFrame.addEventListener("keydown", (event) => {
+	if (activePreviewSession?.controlOwner !== "user" || event.isComposing) return;
+	if (event.ctrlKey || event.metaKey || event.altKey || event.key.length !== 1) return;
+	event.preventDefault();
+	void sendPreviewInput({ kind: "type", text: event.key })
+		.then(() => recordPreviewStep({ action: "type", textLength: 1, timestamp: Date.now() }))
+		.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
+});
+previewFrame.addEventListener("paste", (event) => {
+	if (activePreviewSession?.controlOwner !== "user") return;
+	const text = event.clipboardData?.getData("text/plain") ?? "";
+	if (!text) return;
+	event.preventDefault();
+	void sendPreviewInput({ kind: "type", text })
+		.then(() => recordPreviewStep({ action: "type", textLength: text.length, timestamp: Date.now() }))
 		.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
 });
 previewImage.addEventListener(
@@ -2538,30 +3378,18 @@ thinking.addEventListener("change", () => {
 
 for (const button of document.querySelectorAll<HTMLButtonElement>("[data-tab]")) {
 	button.addEventListener("click", () => {
-		const tab = button.dataset.tab ?? "overview";
+		const tab = button.dataset.tab ?? "browser";
 		activateTab(tab);
-		if (tab === "capabilities") {
-			void loadCapabilities().catch((error: unknown) =>
-				setStatus(error instanceof Error ? error.message : String(error), true),
-			);
-		}
-		if (tab === "preview") {
+		if (tab === "browser") {
 			void loadPreview().catch((error: unknown) =>
 				setPreviewMessage(error instanceof Error ? error.message : String(error), true),
 			);
 		}
-	});
-}
-
-for (const button of document.querySelectorAll<HTMLButtonElement>("[data-rail-tab]")) {
-	button.addEventListener("click", () => {
-		const tab = button.dataset.railTab ?? "sessions";
-		activateRailTab(tab);
-		if (tab === "agents") {
-			void loadExternalConnections().catch((error: unknown) =>
-				setStatus(error instanceof Error ? error.message : String(error), true),
-			);
-		}
+		if (tab === "agents-workspace")
+			void loadAgents()
+				.then(loadSelectedAgent)
+				.catch((error: unknown) => setStatus(String(error), true));
+		if (tab === "agent-builder") void loadCapabilities().catch((error: unknown) => setStatus(String(error), true));
 	});
 }
 
@@ -2570,8 +3398,7 @@ for (const button of document.querySelectorAll<HTMLButtonElement>("[data-builder
 }
 
 newAgent.addEventListener("click", () => {
-	activateRailTab("agents");
-	void openAgent();
+	void openAgentBuilder();
 });
 
 showConnectionForm.addEventListener("click", () => {
@@ -2601,19 +3428,36 @@ agentForm.addEventListener("submit", (event) => {
 		requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(field).value;
 	const selectedModel = value("agent-model");
 	const modelSeparator = selectedModel.indexOf("/");
+	const executor = value("agent-executor");
+	const browserAccess = value("agent-browser-access");
+	const tools = value("agent-tools")
+		.split(",")
+		.map((entry) => entry.trim())
+		.filter(Boolean)
+		.map((entry) => (executor === "harness" && entry === "ls" ? "list" : entry));
+	if (browserAccess !== "disabled" && !tools.includes("browser")) tools.push("browser");
+	if (browserAccess === "disabled") {
+		const browserIndex = tools.indexOf("browser");
+		if (browserIndex >= 0) tools.splice(browserIndex, 1);
+	}
 	const definition = {
+		personaId: value("agent-persona-select") || undefined,
 		name: value("agent-name"),
 		description: value("agent-description"),
-		tools: value("agent-tools")
+		projectRoot: value("agent-project-root"),
+		tools,
+		memory: value("agent-memory"),
+		persona: value("agent-persona"),
+		executor,
+		permissionPolicy: value("agent-permissions"),
+		thinking: value("agent-thinking"),
+		delegateAgentIds: value("agent-delegates")
 			.split(",")
 			.map((entry) => entry.trim())
 			.filter(Boolean),
-		memory: value("agent-memory"),
-		persona: value("agent-persona"),
-		executor: value("agent-executor"),
-		permissionPolicy: value("agent-permissions"),
+		a2a: { enabled: requiredElement<HTMLInputElement>("agent-a2a").checked },
 		browser: {
-			access: value("agent-browser-access"),
+			access: browserAccess,
 			profile: { kind: "ephemeral" },
 		},
 		model:
@@ -2644,8 +3488,12 @@ agentForm.addEventListener("submit", (event) => {
 				);
 			}
 			await loadAgents();
-			await loadRoutines();
-			agentForm.reset();
+			const saved: unknown = await response.json();
+			await Promise.all([loadRoutines(), loadWorkflows()]);
+			if (typeof saved === "object" && saved !== null && "id" in saved && typeof saved.id === "string") {
+				const agent = agents.find((entry) => entry.id === saved.id);
+				if (agent) await openAgent(agent);
+			}
 			setStatus("Agent definition saved");
 		})
 		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
@@ -2653,7 +3501,7 @@ agentForm.addEventListener("submit", (event) => {
 
 builderChatForm.addEventListener("submit", (event) => {
 	event.preventDefault();
-	if (activeSidebarAgent && builderSession?.snapshot && builderSession.snapshot.phase !== "idle") {
+	if (builderSession?.snapshot && builderSession.snapshot.phase !== "idle") {
 		void builderSession.abort().catch((error: unknown) => {
 			setStatus(error instanceof Error ? error.message : String(error), true);
 		});
@@ -2663,37 +3511,71 @@ builderChatForm.addEventListener("submit", (event) => {
 	const chatSession = builderSession;
 	if (!prompt || !chatSession) return;
 	builderPrompt.value = "";
-	const message = activeSidebarAgent
-		? prompt
-		: [
-				`You are helping configure a local Pi agent. Ask concise questions and recommend values for the visible form.`,
-				`Current name: ${requiredElement<HTMLInputElement>("agent-name").value || "not set"}`,
-				`Current description: ${requiredElement<HTMLTextAreaElement>("agent-description").value || "not set"}`,
-				`Current persona: ${requiredElement<HTMLTextAreaElement>("agent-persona").value || "not set"}`,
-				`User: ${prompt}`,
-			].join("\n");
+	const message = [
+		`You are helping configure a local Pi agent. Ask concise questions and recommend values for the visible form.`,
+		`Current name: ${requiredElement<HTMLInputElement>("agent-name").value || "not set"}`,
+		`Current description: ${requiredElement<HTMLTextAreaElement>("agent-description").value || "not set"}`,
+		`Current persona: ${requiredElement<HTMLTextAreaElement>("agent-persona").value || "not set"}`,
+		`User: ${prompt}`,
+	].join("\n");
 	void chatSession.prompt(message).catch((error: unknown) => {
 		setStatus(error instanceof Error ? error.message : String(error), true);
 	});
 });
 
-runForm.addEventListener("submit", (event) => {
+selectedAgentChatForm.addEventListener("submit", (event) => {
 	event.preventDefault();
-	if (!capabilityToken) return;
-	const prompt = requiredElement<HTMLTextAreaElement>("run-prompt").value.trim();
-	if (!runAgent.value || !prompt) return;
-	void fetch(`/runs?token=${encodeURIComponent(capabilityToken)}`, {
+	if (!capabilityToken || !activeSidebarAgent) return;
+	const activeTask = agentTaskList.querySelector<HTMLElement>("[data-active-task]")?.dataset.activeTask;
+	if (activeTask) {
+		void cancelAgentTask(activeTask);
+		return;
+	}
+	const prompt = selectedAgentPrompt.value.trim();
+	if (!prompt) return;
+	const continueTask = selectedAgentChat.dataset.continueTask;
+	if (continueTask) {
+		void continueAgentTask(continueTask, prompt)
+			.then(() => {
+				selectedAgentPrompt.value = "";
+				delete selectedAgentChat.dataset.continueTask;
+				selectedAgentPrompt.placeholder = `Message ${activeSidebarAgent?.name ?? "agent"}…`;
+			})
+			.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+		return;
+	}
+	void fetch(`/agent-tasks?token=${encodeURIComponent(capabilityToken)}`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ agentId: runAgent.value, prompt }),
+		body: JSON.stringify({
+			agentId: activeSidebarAgent.id,
+			conversationId: selectedAgentChat.dataset.conversationId || undefined,
+			prompt,
+			source: "chat",
+		}),
 	})
 		.then(async (response) => {
-			if (!response.ok) throw new Error(`Could not start run: HTTP ${response.status}`);
-			requiredElement<HTMLTextAreaElement>("run-prompt").value = "";
-			activateTab("activity");
-			await loadRuns();
+			if (!response.ok) throw new Error(await responseError(response, "Could not message agent"));
+			selectedAgentPrompt.value = "";
+			await loadSelectedAgent();
 		})
 		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+});
+
+personaSelect.addEventListener("change", () => updatePersonaPreview(true));
+requiredElement<HTMLSelectElement>("agent-executor").addEventListener("change", () => {
+	void loadCapabilities().catch((error: unknown) =>
+		setStatus(error instanceof Error ? error.message : String(error), true),
+	);
+});
+
+pluginForm.addEventListener("submit", (event) => {
+	event.preventDefault();
+	const source = requiredElement<HTMLInputElement>("plugin-source").value.trim();
+	const scope = requiredElement<HTMLSelectElement>("plugin-scope").value;
+	void changePlugin("install", source, scope).catch((error: unknown) =>
+		setStatus(error instanceof Error ? error.message : String(error), true),
+	);
 });
 
 externalRunForm.addEventListener("submit", (event) => {
@@ -2735,6 +3617,10 @@ externalRunForm.addEventListener("submit", (event) => {
 
 routineEditor.targetKind.addEventListener("change", updateRoutineTargetFields);
 routineEditor.acp.addEventListener("change", () => refreshRoutineModels(""));
+routineEditor.preset.addEventListener("change", updateRoutineCronFromPreset);
+routineEditor.time.addEventListener("change", updateRoutineCronFromPreset);
+routineEditor.cron.addEventListener("change", () => void refreshRoutinePreview());
+routineEditor.timezone.addEventListener("change", () => void refreshRoutinePreview());
 routineEditor.clearButton.addEventListener("click", clearRoutineEditor);
 
 routineEditor.form.addEventListener("submit", (event) => {
@@ -2744,15 +3630,19 @@ routineEditor.form.addEventListener("submit", (event) => {
 	const target =
 		kind === "agent"
 			? { kind: "agent" as const, agentId: routineEditor.agent.value }
-			: kind === "acp"
-				? { kind: "acp" as const, connectionId: routineEditor.acp.value }
-				: { kind: "skill" as const, skillName: routineEditor.skill.value.trim() };
+			: kind === "workflow"
+				? { kind: "workflow" as const, workflowId: routineEditor.workflow.value }
+				: kind === "acp"
+					? { kind: "acp" as const, connectionId: routineEditor.acp.value }
+					: { kind: "skill" as const, skillName: routineEditor.skill.value.trim() };
 	const separator = routineEditor.model.value.indexOf("/");
 	const definition = {
 		name: routineEditor.name.value,
 		prompt: routineEditor.prompt.value,
 		enabled: routineEditor.enabled.checked,
-		intervalMinutes: Number(routineEditor.interval.value),
+		cron: routineEditor.cron.value,
+		timezone: routineEditor.timezone.value,
+		maxDurationMinutes: Number(routineEditor.maxDuration.value),
 		target,
 		model:
 			separator > 0
@@ -2761,7 +3651,7 @@ routineEditor.form.addEventListener("submit", (event) => {
 						id: routineEditor.model.value.slice(separator + 1),
 					}
 				: undefined,
-		cwd: kind === "agent" ? undefined : routineEditor.cwd.value.trim() || undefined,
+		cwd: kind === "agent" || kind === "workflow" ? undefined : routineEditor.cwd.value.trim() || undefined,
 	};
 	const id = routineEditor.id.value;
 	void fetch(
@@ -2822,22 +3712,94 @@ routineEditor.deleteButton.addEventListener("click", () => {
 		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
 });
 
+workflowEditor.clearButton.addEventListener("click", clearWorkflowEditor);
+workflowEditor.form.addEventListener("submit", (event) => {
+	event.preventDefault();
+	if (!capabilityToken) return;
+	let nodes: unknown;
+	let edges: unknown;
+	try {
+		nodes = JSON.parse(workflowEditor.nodes.value);
+		edges = JSON.parse(workflowEditor.edges.value || "[]");
+	} catch {
+		setStatus("Workflow steps and dependencies must be valid JSON", true);
+		return;
+	}
+	const id = workflowEditor.id.value;
+	const definition = {
+		name: workflowEditor.name.value,
+		pattern: workflowEditor.pattern.value,
+		nodes,
+		edges,
+		supervisorAgentId: workflowEditor.supervisor.value || undefined,
+		maxConcurrency: Number(workflowEditor.maxConcurrency.value),
+		maxDelegationDepth: Number(workflowEditor.maxDepth.value),
+		failurePolicy: workflowEditor.failurePolicy.value,
+	};
+	void fetch(
+		`${id ? `/workflows/${encodeURIComponent(id)}` : "/workflows"}?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: id ? "PUT" : "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(definition),
+		},
+	)
+		.then(async (response) => {
+			if (!response.ok) throw new Error(await responseError(response, "Could not save workflow"));
+			const saved: unknown = await response.json();
+			await loadWorkflows();
+			if (typeof saved === "object" && saved !== null && "id" in saved && typeof saved.id === "string") {
+				const workflow = workflows.find((entry) => entry.id === saved.id);
+				if (workflow) editWorkflow(workflow);
+			}
+			setStatus("Workflow saved");
+		})
+		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+});
+
+workflowEditor.runButton.addEventListener("click", () => {
+	if (!capabilityToken || !workflowEditor.id.value || !workflowEditor.runPrompt.value.trim()) return;
+	void fetch(
+		`/workflows/${encodeURIComponent(workflowEditor.id.value)}/run?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ prompt: workflowEditor.runPrompt.value }),
+		},
+	)
+		.then(async (response) => {
+			if (!response.ok) throw new Error(await responseError(response, "Could not run workflow"));
+			workflowEditor.runPrompt.value = "";
+			await loadWorkflows();
+			setStatus("Workflow started");
+		})
+		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+});
+
+workflowEditor.deleteButton.addEventListener("click", () => {
+	const id = workflowEditor.id.value;
+	if (!capabilityToken || !id || !window.confirm(`Delete workflow "${workflowEditor.name.value}"?`)) return;
+	void fetch(`/workflows/${encodeURIComponent(id)}?token=${encodeURIComponent(capabilityToken)}`, { method: "DELETE" })
+		.then(async (response) => {
+			if (!response.ok) throw new Error(await responseError(response, "Could not delete workflow"));
+			clearWorkflowEditor();
+			await loadWorkflows();
+			setStatus("Workflow deleted");
+		})
+		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+});
+
 window.setInterval(() => {
-	void loadRuns().catch(() => {});
+	if (activeSidebarAgent) void loadSelectedAgent().catch(() => {});
 	void loadRoutines().catch(() => {});
+	void loadWorkflows().catch(() => {});
 	void loadExternalRuns().catch(() => {});
-	if (document.querySelector('[data-tab="preview"]')?.classList.contains("active")) void loadPreview().catch(() => {});
+	if (document.querySelector('[data-tab="browser"]')?.classList.contains("active")) void loadPreview().catch(() => {});
 }, 1500);
-void loadRuns().catch(() => {});
 
 installPanelResizer("left-resizer", "--rail-width", "pi-serve-rail-width", 1, 190, 420);
 installPanelResizer("right-resizer", "--details-width", "pi-serve-details-width", -1, 280, 560);
-for (const id of ["routine-id", "routine-interval", "routine-prompt", "routine-enabled"]) {
-	document.getElementById(id)?.closest("label")?.remove();
-}
-for (const heading of agentForm.querySelectorAll<HTMLElement>(".section-title")) {
-	if (heading.textContent === "Optional routine") heading.remove();
-}
 resizeComposer();
 clearRoutineEditor();
+clearWorkflowEditor();
 void connect().catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));

@@ -1,8 +1,10 @@
+import { nextCronRun } from "./cron-schedule.ts";
 import type { RoutineDefinition, RoutineRegistry } from "./routine-registry.ts";
 
 export interface RoutineExecution {
 	runId: string;
 	completion: Promise<{ error?: string }>;
+	cancel: () => Promise<void>;
 }
 
 export interface RoutineDispatcher {
@@ -48,9 +50,9 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 			next.set(routine.id, {
 				...routine,
 				nextRunAt: routine.enabled
-					? existing?.nextRunAt && existing.intervalMinutes === routine.intervalMinutes
+					? existing?.nextRunAt && existing.cron === routine.cron && existing.timezone === routine.timezone
 						? existing.nextRunAt
-						: now + routine.intervalMinutes * 60_000
+						: nextCronRun(routine.cron, routine.timezone, now)
 					: undefined,
 				lastRunAt: existing?.lastRunAt,
 				lastRunId: existing?.lastRunId,
@@ -65,7 +67,7 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 	async runDue(now = Date.now()): Promise<void> {
 		for (const state of this.#states.values()) {
 			if (!state.enabled || state.nextRunAt === undefined || state.nextRunAt > now) continue;
-			state.nextRunAt = now + state.intervalMinutes * 60_000;
+			state.nextRunAt = nextCronRun(state.cron, state.timezone, now);
 			if (!state.activeRunId) await this.#run(state, now);
 		}
 	}
@@ -105,7 +107,13 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 			state.lastRunId = execution.runId;
 			state.activeRunId = execution.runId;
 			state.lastError = undefined;
+			const timeout = setTimeout(
+				() => void execution.cancel().catch(() => undefined),
+				state.maxDurationMinutes * 60_000,
+			);
+			timeout.unref();
 			void execution.completion.then((result) => {
+				clearTimeout(timeout);
 				if (state.activeRunId !== execution.runId) return;
 				state.activeRunId = undefined;
 				state.lastError = result.error;

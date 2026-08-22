@@ -3,6 +3,7 @@ import type { AgentSession } from "../agent-session.ts";
 import type { SourceInfo } from "../source-info.ts";
 import type { BrowserConsoleService } from "./browser-console-service.ts";
 import type { ExternalConnectionManager } from "./external-connection-manager.ts";
+import type { PluginManagementService } from "./plugin-management-service.ts";
 
 export interface CapabilityEntry {
 	id: string;
@@ -18,6 +19,7 @@ export interface CapabilitySnapshot {
 	tools: CapabilityEntry[];
 	skills: CapabilityEntry[];
 	extensions: CapabilityEntry[];
+	plugins: CapabilityEntry[];
 	mcpServers: CapabilityEntry[];
 	acpConnections: CapabilityEntry[];
 	modelProviders: CapabilityEntry[];
@@ -28,15 +30,18 @@ export class CapabilityCatalog {
 	readonly #session: AgentSession;
 	readonly #externalConnections: ExternalConnectionManager | undefined;
 	readonly #browserConsole: BrowserConsoleService | undefined;
+	readonly #plugins: PluginManagementService | undefined;
 
 	constructor(
 		session: AgentSession,
 		externalConnections?: ExternalConnectionManager,
 		browserConsole?: BrowserConsoleService,
+		plugins?: PluginManagementService,
 	) {
 		this.#session = session;
 		this.#externalConnections = externalConnections;
 		this.#browserConsole = browserConsole;
+		this.#plugins = plugins;
 	}
 
 	list(): CapabilitySnapshot {
@@ -75,6 +80,17 @@ export class CapabilityCatalog {
 			status: "active" as const,
 			...sourceFields(extension.sourceInfo),
 		}));
+		const plugins = (this.#plugins?.list() ?? []).map((plugin) => ({
+			id: `${plugin.scope}:${plugin.source}`,
+			name: plugin.source,
+			description: plugin.installedPath
+				? `Installed at ${plugin.installedPath}`
+				: "Configured; installation unavailable",
+			status: plugin.installedPath ? ("active" as const) : ("unavailable" as const),
+			scope: plugin.scope,
+			source: plugin.source,
+			path: plugin.installedPath,
+		}));
 		const acpConnections = (this.#externalConnections?.listConnections() ?? []).map((connection) => ({
 			id: connection.id,
 			name: connection.name,
@@ -99,7 +115,7 @@ export class CapabilityCatalog {
 			scope: "user",
 			source: "model runtime",
 		}));
-		return { tools, skills, extensions, mcpServers: [], acpConnections, modelProviders };
+		return { tools, skills, extensions, plugins, mcpServers: [], acpConnections, modelProviders };
 	}
 }
 
