@@ -158,6 +158,9 @@ describe("createServePage", () => {
 		expect(html).toContain('class="pi-watermark"');
 		expect(html).toContain('id="left-resizer"');
 		expect(html).toContain('id="composer-action"');
+		expect(html).toContain('id="session-path"');
+		expect(html).toContain('id="session-stats"');
+		expect(html).toContain(".thinking-activity");
 		expect(html).toContain('id="attachment-button"');
 		expect(html).toContain('data-tab="capabilities"');
 		expect(html).toContain('data-builder-tab="builder-chat-panel"');
@@ -172,8 +175,10 @@ describe("createServePage", () => {
 		expect(bundleText.length).toBeGreaterThan(1000);
 		expect(bundleText).toContain("tool-activity-summary");
 		expect(bundleText).toContain("tool-activity-state");
-		expect(bundleText).toContain("preview-tab-icon");
-		expect(bundleText).toContain("Send steps to Pi");
+		expect(bundleText).toContain("browser-session-tabs");
+		expect(bundleText).toContain("Active browsers");
+		expect(bundleText).not.toContain("Could not load browser diagnostics");
+		expect(bundleText).toContain("Send to Pi");
 	});
 
 	test("uploads, previews, renames, and removes attachments", async () => {
