@@ -2,7 +2,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import type { ExtensionContext } from "../src/core/extensions/types.ts";
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
+import { createAgentRegistryTools } from "../src/core/serve/agent-registry-tools.ts";
 
 const roots: string[] = [];
 
@@ -66,6 +68,35 @@ describe("AgentRegistry", () => {
 		expect(await agents.get("writer")).toMatchObject({ revision: 2, description: "Writes concise reports" });
 	});
 
+	test("requires canonical model identifiers from the active catalog", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-agent-registry-"));
+		roots.push(root);
+		const agents = new AgentRegistry(root, {
+			modelCatalog: () => [{ provider: "openai", id: "gpt-5.6-luna", name: "GPT-5.6 Luna" }],
+		});
+		const input = {
+			id: "frontend-designer",
+			name: "Frontend Designer",
+			description: "Designs interfaces",
+			tools: [],
+			memory: "none" as const,
+			persona: "Design carefully",
+			executor: "session" as const,
+			permissionPolicy: "read-only" as const,
+			schedules: [],
+		};
+
+		await expect(agents.save({ ...input, model: { provider: "openai", id: "GPT5.6 Luna" } })).rejects.toThrow(
+			"Use openai/gpt-5.6-luna (GPT-5.6 Luna)",
+		);
+		await expect(agents.save({ ...input, model: { provider: "openai", id: "gpt-5.6-luna" } })).resolves.toMatchObject(
+			{ model: { provider: "openai", id: "gpt-5.6-luna" } },
+		);
+		await expect(
+			agents.save({ ...input, id: "unknown-model", model: { provider: "openai", id: "not-real" } }),
+		).rejects.toThrow("Select a model from the active Pi model catalog");
+	});
+
 	test("requires an explicit policy when an agent enables browser tools", async () => {
 		const { registry: agents } = await registry();
 		const input = {
@@ -86,6 +117,41 @@ describe("AgentRegistry", () => {
 				browser: { access: "public-web", profile: { kind: "named", id: "research" } },
 			}),
 		).resolves.toMatchObject({ browser: { access: "public-web", profile: { kind: "named", id: "research" } } });
+	});
+
+	test("keeps browser tool and access policy paired when Pi deploys an agent", async () => {
+		const { root, registry: agents } = await registry();
+		const deploy = createAgentRegistryTools(agents)[0]!;
+		const base = {
+			id: "browser-agent",
+			name: "Browser Agent",
+			description: "Reviews local pages",
+			persona: "Review pages carefully",
+			projectRoot: join(root, "browser-project"),
+		};
+		await deploy.execute(
+			"deploy-browser",
+			{ ...base, tools: ["read", "browser"] },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		expect(await agents.get("browser-agent")).toMatchObject({
+			tools: ["read", "browser"],
+			browser: { access: "loopback" },
+		});
+
+		await deploy.execute(
+			"disable-browser",
+			{ ...base, browserAccess: "disabled" },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		expect(await agents.get("browser-agent")).toMatchObject({
+			tools: ["read"],
+			browser: { access: "disabled" },
+		});
 	});
 
 	test("allows an explicit local project folder", async () => {

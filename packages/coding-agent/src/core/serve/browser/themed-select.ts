@@ -1,3 +1,5 @@
+import { createBrowserId } from "./browser-id.ts";
+
 export interface ThemedSelectController {
 	refresh(): void;
 }
@@ -17,7 +19,7 @@ export function installThemedSelect(select: HTMLSelectElement): ThemedSelectCont
 	const label = select.getAttribute("aria-label") ?? select.closest("label")?.childNodes[0]?.textContent?.trim();
 	trigger.setAttribute("aria-label", label || "Model");
 	const list = document.createElement("div");
-	list.id = `themed-select-${crypto.randomUUID()}`;
+	list.id = `themed-select-${createBrowserId()}`;
 	list.className = "themed-select-list hidden";
 	list.setAttribute("role", "listbox");
 	trigger.setAttribute("aria-controls", list.id);

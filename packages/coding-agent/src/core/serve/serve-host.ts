@@ -125,6 +125,10 @@ export class ServeHost implements AsyncDisposable {
 			catalogDirectory: join(agentDir, "agents"),
 			personaDirectory: join(agentDir, "personas"),
 			defaultWorkspace: session.sessionManager.getCwd(),
+			modelCatalog: () =>
+				session.modelRuntime
+					.getAvailableSnapshot()
+					.map((model) => ({ provider: model.provider, id: model.id, name: model.name })),
 		});
 		await agentRegistry.initialize();
 		session.registerCustomTools(createAgentRegistryTools(agentRegistry) as ToolDefinition[]);

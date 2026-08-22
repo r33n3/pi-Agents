@@ -12,10 +12,13 @@ The browser console has three stable areas:
 
 1. **Left rail** — Pi sessions and connection management only. A supplied local
    Pi capability URL may link another server; no discovery is performed.
-2. **Center** — tabbed live Pi sessions, readable conversation scrolling, and
-   a composer whose send arrow becomes a red stop control during a turn.
-3. **Right workspace** — Browser, Agents, and Agent Builder tabs. Agents owns
-   persistent agent chat and operational history. Agent Builder owns profile,
+2. **Center** — tabbed live Pi sessions and agent conversations, readable
+   conversation scrolling, and one composer whose send arrow becomes a red
+   stop control during the selected Pi turn or agent task. Closing an agent tab
+   hides the conversation without cancelling its task.
+3. **Right workspace** — Browser, Agents, and Agent Builder tabs. Agents is the
+   launcher and compact operational-history surface; selecting an agent opens
+   its persistent conversation in the center. Agent Builder owns profile,
    persona, model, built-in tools, plugins, MCP/API connections, per-agent
    grants, workflows, and cron automation. Browser follows the
    [managed-browser design](pi-browser-preview-spec.md).
@@ -129,7 +132,10 @@ browser evidence, and browser-specific LAN policy. See the
   session and reject conflicts clearly.
 - The right workspace exposes only Browser, Agents, and Agent Builder.
 - Agents deployed by Pi or Agent Builder appear without a server restart and
-  open a persistent chat when selected.
+  open a persistent center conversation tab when selected. Several agent tabs
+  may remain open while their tasks continue independently.
+- Agent responses render readable headings, lists, emphasis, links, and code;
+  run details remain collapsed in the Agents workspace until requested.
 - A harness agent run is isolated to its configured workspace and its final
   output/artifacts remain visible after completion and restart.
 - Chat, Pi delegation, cron, workflows, and A2A use the same task service; no
@@ -150,3 +156,32 @@ browser evidence, and browser-specific LAN policy. See the
 
 These can extend the executor and authentication boundaries later without
 changing the browser or agent-definition contract.
+
+## Backlog: enterprise Docker deployment
+
+Package the customized Pi environment as a versioned Docker image in Amazon
+ECR and launch one isolated Pi development environment per user or session on
+Amazon ECS Fargate. This is an enterprise consumption path for developers to
+build, run, review, and deploy agents through the Pi web console; it is not part
+of the local `--serve` v1 delivery.
+
+The target design includes:
+
+- An authenticated session broker that starts, resumes, and stops ECS tasks.
+- One Pi process, workspace, internal capability token, and task identity per
+  environment.
+- HTTPS and WebSocket routing through an Application Load Balancer without
+  exposing task ports or capability tokens to users.
+- Repository checkout and durable workspace or artifact recovery through an
+  explicitly scoped storage design.
+- Secrets Manager injection, least-privilege task roles, and per-user model,
+  tool, plugin, and external-connection authorization.
+- CPU, memory, storage, concurrency, idle-timeout, and maximum-runtime limits.
+- Auditable session, prompt, tool, file, agent-delegation, and deployment
+  activity.
+- Image provenance, vulnerability scanning, controlled rollout, and rollback.
+
+The initial implementation should preserve the existing Pi protocol and
+`pi --serve` behavior inside the container. The session broker and routing
+layer own multi-user authentication and lifecycle; the URL capability token is
+an internal process credential, not an enterprise login mechanism.

@@ -62,6 +62,11 @@ export interface AgentRegistryOptions {
 	catalogDirectory?: string;
 	personaDirectory?: string;
 	defaultWorkspace?: string;
+	modelCatalog?: () => readonly AgentModelCatalogEntry[];
+}
+
+export interface AgentModelCatalogEntry extends ModelRef {
+	name: string;
 }
 
 export interface AgentRegistryEvent {
@@ -77,6 +82,7 @@ export class AgentRegistry {
 	readonly #catalogDirectory: string | undefined;
 	readonly #personaDirectory: string | undefined;
 	readonly #defaultWorkspace: string;
+	readonly #modelCatalog: (() => readonly AgentModelCatalogEntry[]) | undefined;
 	readonly #queue = new SerialOperationQueue();
 	readonly #listeners = new Set<(event: AgentRegistryEvent) => void>();
 
@@ -87,6 +93,7 @@ export class AgentRegistry {
 		this.#catalogDirectory = options.catalogDirectory ? resolve(options.catalogDirectory) : undefined;
 		this.#personaDirectory = options.personaDirectory ? resolve(options.personaDirectory) : undefined;
 		this.#defaultWorkspace = resolve(options.defaultWorkspace ?? process.cwd());
+		this.#modelCatalog = options.modelCatalog;
 	}
 
 	async initialize(): Promise<void> {
@@ -122,6 +129,7 @@ export class AgentRegistry {
 		return this.#queue.run(async () => {
 			await this.initialize();
 			const normalized = normalizeDefinition(input, this.#defaultWorkspace);
+			this.#validateModel(normalized.model);
 			let previous: AgentDefinition | undefined;
 			try {
 				previous = await this.#read(resolve(this.#definitionsDir, `${normalized.id}.json`));
@@ -144,6 +152,25 @@ export class AgentRegistry {
 			this.#emit({ type: previous ? "agent.updated" : "agent.created", agentId: definition.id });
 			return definition;
 		});
+	}
+
+	#validateModel(model: ModelRef | undefined): void {
+		if (!model || !this.#modelCatalog) return;
+		const catalog = this.#modelCatalog();
+		if (catalog.some((entry) => entry.provider === model.provider && entry.id === model.id)) return;
+		const comparableId = comparableModelText(model.id);
+		const suggestion = catalog.find(
+			(entry) =>
+				entry.provider.toLowerCase() === model.provider.toLowerCase() &&
+				(comparableModelText(entry.id) === comparableId || comparableModelText(entry.name) === comparableId),
+		);
+		const requested = `${model.provider}/${model.id}`;
+		if (suggestion) {
+			throw new Error(
+				`Agent model ${requested} is not a canonical available model. Use ${suggestion.provider}/${suggestion.id} (${suggestion.name}).`,
+			);
+		}
+		throw new Error(`Agent model ${requested} is unavailable. Select a model from the active Pi model catalog.`);
 	}
 
 	async delete(id: string): Promise<boolean> {
@@ -329,6 +356,10 @@ function normalizeModel(value: unknown): ModelRef | undefined {
 	if (value === undefined) return undefined;
 	const model = record(value, "model");
 	return { provider: requiredString(model.provider, "model.provider"), id: requiredString(model.id, "model.id") };
+}
+
+function comparableModelText(value: string): string {
+	return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
 function normalizeSchedules(value: unknown): AgentRoutineDefinition[] {

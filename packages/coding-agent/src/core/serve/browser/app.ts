@@ -6,6 +6,7 @@ import type {
 	ThinkingLevel,
 	TranscriptItem,
 } from "@earendil-works/pi-protocol";
+import { createBrowserId } from "./browser-id.ts";
 import { installThemedSelect } from "./themed-select.ts";
 import { createBrowserWebSocketTransport } from "./websocket-transport.ts";
 
@@ -13,6 +14,7 @@ const pageUrl = new URL(location.href);
 const capabilityToken = pageUrl.searchParams.get("token");
 const browserPopoutMode = pageUrl.searchParams.get("browserPopout") === "1";
 const requestedPreviewSessionId = pageUrl.searchParams.get("browserSession") ?? undefined;
+const recommendedAgentModel = { provider: "openai", id: "gpt-5.6-luna" } as const;
 document.body.classList.toggle("browser-popout", browserPopoutMode);
 if (browserPopoutMode) document.title = "Pi Browser";
 
@@ -23,6 +25,7 @@ const transcript = element("transcript");
 const form = requiredElement<HTMLFormElement>("composer");
 const input = requiredElement<HTMLTextAreaElement>("prompt");
 const send = requiredElement<HTMLButtonElement>("composer-action");
+const mobilePanelNone = requiredElement<HTMLInputElement>("mobile-panel-none");
 const attachmentInput = requiredElement<HTMLInputElement>("attachment-input");
 const attachmentButton = requiredElement<HTMLButtonElement>("attachment-button");
 const attachmentList = element("attachment-list");
@@ -35,10 +38,7 @@ const newAgent = requiredElement<HTMLButtonElement>("new-agent");
 const agentForm = requiredElement<HTMLFormElement>("agent-form");
 const selectedAgentPanel = element("selected-agent");
 const selectedAgentTitle = element("selected-agent-title");
-const selectedAgentChat = element("selected-agent-chat");
-const selectedAgentChatForm = requiredElement<HTMLFormElement>("selected-agent-chat-form");
-const selectedAgentPrompt = requiredElement<HTMLTextAreaElement>("selected-agent-prompt");
-const selectedAgentSend = requiredElement<HTMLButtonElement>("selected-agent-send");
+const selectedAgentMeta = element("selected-agent-meta");
 const agentTaskList = element("agent-task-list");
 const routineList = element("routine-list");
 const routineEditor = createRoutineEditor();
@@ -92,6 +92,10 @@ let builderSession: PiSessionHandle | undefined;
 let unsubscribeBuilder: Unsubscribe | undefined;
 let activeSidebarAgent: AgentSummary | undefined;
 let activeTargetKey: string | undefined;
+let activeAgentId: string | undefined;
+const openAgentIds: string[] = [];
+const agentConversationIds = new Map<string, string>();
+const agentTasksByAgent = new Map<string, AgentTaskSummary[]>();
 let activePreviewSessionId: string | undefined;
 let activePreviewSession: BrowserSessionSummary | undefined;
 let selectedPreviewSessionId = requestedPreviewSessionId;
@@ -103,6 +107,7 @@ let previewRecordingSessionId: string | undefined;
 let recordedPreviewSteps: RecordedPreviewStep[] = [];
 let selectedExternalConnectionId: string | undefined;
 let availableModels: ModelMetadata[] = [];
+let agentModelsInitialized = false;
 let agents: AgentSummary[] = [];
 let personas: PersonaSummary[] = [];
 let agentEvents: EventSource | undefined;
@@ -752,6 +757,7 @@ function setBusy(snapshot: SessionSnapshot): void {
 }
 
 function render(snapshot: SessionSnapshot): void {
+	if (activeAgentId) return;
 	const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
 	const previousScrollTop = transcript.scrollTop;
 	transcript.replaceChildren(...snapshot.transcript.map(renderItem));
@@ -759,6 +765,8 @@ function render(snapshot: SessionSnapshot): void {
 	model.value = `${snapshot.model.provider}/${snapshot.model.id}`;
 	modelPicker.refresh();
 	thinking.value = snapshot.thinkingLevel;
+	input.placeholder = "Message Pi…";
+	input.setAttribute("aria-label", "Message Pi");
 	sessionPath.textContent = formatWorkingDirectory(snapshot.cwd);
 	sessionPath.title = snapshot.cwd;
 	renderSessionStats(snapshot);
@@ -982,10 +990,20 @@ function populateModels(models: readonly ModelMetadata[], includeAgentModels = f
 		...models.map((entry) => {
 			const option = document.createElement("option");
 			option.value = `${entry.provider}/${entry.id}`;
-			option.textContent = `${entry.provider} / ${entry.name}`;
+			const recommended = entry.provider === recommendedAgentModel.provider && entry.id === recommendedAgentModel.id;
+			option.textContent = `${entry.provider} / ${entry.name}${recommended ? " · Recommended" : ""}`;
 			return option;
 		}),
 	);
+	if (!agentModelsInitialized) {
+		const recommendedModelValue = `${recommendedAgentModel.provider}/${recommendedAgentModel.id}`;
+		agentModel.value = models.some(
+			(entry) => entry.provider === recommendedAgentModel.provider && entry.id === recommendedAgentModel.id,
+		)
+			? recommendedModelValue
+			: "";
+		agentModelsInitialized = true;
+	}
 	agentModelPicker.refresh();
 	refreshRoutineEditorOptions();
 }
@@ -1010,7 +1028,7 @@ async function addConnection(controlUrl: string, primary = false): Promise<Conne
 		transportFactory: createBrowserWebSocketTransport(socket.url),
 		onListenerError: (error) => setStatus(error.message, true),
 	});
-	const id = connectedClient.snapshot?.serverId ?? crypto.randomUUID();
+	const id = connectedClient.snapshot?.serverId ?? createBrowserId();
 	const existing = connections.get(id);
 	if (existing) {
 		await connectedClient.dispose();
@@ -1062,17 +1080,43 @@ function renderSessionNavigation(): void {
 	const targets = sessionTargets();
 	sessionTabs.replaceChildren(
 		...targets.map((target) => {
+			const wrapper = document.createElement("div");
+			wrapper.className = "session-tab-wrap";
+			wrapper.classList.toggle("active", !activeAgentId && target.key === activeTargetKey);
 			const button = document.createElement("button");
 			button.type = "button";
 			button.className = "session-tab";
-			button.classList.toggle("active", target.key === activeTargetKey);
+			button.classList.toggle("active", !activeAgentId && target.key === activeTargetKey);
 			const sessionName = sessionDisplayName(target);
 			const connection = connections.get(target.connectionId);
 			button.textContent = connections.size > 1 && connection ? `${connection.label} · ${sessionName}` : sessionName;
 			button.title = target.session.cwd ?? target.session.id;
 			button.addEventListener("click", () => void switchSession(target));
 			button.addEventListener("dblclick", () => renameSession(target));
-			return button;
+			wrapper.append(button);
+			return wrapper;
+		}),
+		...openAgentIds.flatMap((agentId) => {
+			const agent = agents.find((entry) => entry.id === agentId);
+			if (!agent) return [];
+			const wrapper = document.createElement("div");
+			wrapper.className = "session-tab-wrap";
+			wrapper.classList.toggle("active", agent.id === activeAgentId);
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "session-tab agent-session-tab";
+			button.textContent = agent.name;
+			button.title = `${agent.name} · ${agent.projectRoot}`;
+			button.addEventListener("click", () => void openAgent(agent));
+			const close = document.createElement("button");
+			close.type = "button";
+			close.className = "session-tab-close";
+			close.textContent = "×";
+			close.title = `Close ${agent.name} chat`;
+			close.setAttribute("aria-label", `Close ${agent.name} chat`);
+			close.addEventListener("click", () => closeAgentTab(agent.id));
+			wrapper.append(button, close);
+			return [wrapper];
 		}),
 	);
 	connectionList.replaceChildren(
@@ -1123,7 +1167,13 @@ function renderSessionNavigation(): void {
 }
 
 async function switchSession(target: SessionTarget): Promise<void> {
-	if (target.key === activeTargetKey && session?.attached) return;
+	if (target.key === activeTargetKey && session?.attached) {
+		activeAgentId = undefined;
+		if (session.snapshot) render(session.snapshot);
+		renderSessionNavigation();
+		renderAttachments();
+		return;
+	}
 	const entry = connections.get(target.connectionId);
 	if (!entry) throw new Error("Pi connection is unavailable");
 	unsubscribeSession?.();
@@ -1131,6 +1181,7 @@ async function switchSession(target: SessionTarget): Promise<void> {
 	await session?.dispose().catch(() => {});
 	session = await entry.client.attachSession(target.session.id);
 	activeTargetKey = target.key;
+	activeAgentId = undefined;
 	populateModels(entry.client.snapshot?.models ?? []);
 	unsubscribeSession = session.subscribe(render);
 	if (session.snapshot) render(session.snapshot);
@@ -1139,7 +1190,8 @@ async function switchSession(target: SessionTarget): Promise<void> {
 	void loadPreview().catch((error: unknown) =>
 		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
 	);
-	setStatus(`Connected to ${entry.label}`);
+	const cwd = session.snapshot?.cwd ?? target.session.cwd;
+	setStatus(cwd ? formatWorkingDirectory(cwd) : entry.label);
 }
 
 function setPreviewMessage(message: string, error = false): void {
@@ -1474,7 +1526,7 @@ async function sendPreviewInput(input: Record<string, unknown>): Promise<void> {
 	if (!capabilityToken || !activePreviewSessionId) return;
 	if (previewStream?.readyState === WebSocket.OPEN && previewStreamSessionId === activePreviewSessionId) {
 		previewStream.send(
-			JSON.stringify({ type: "input", sessionId: activePreviewSessionId, requestId: crypto.randomUUID(), input }),
+			JSON.stringify({ type: "input", sessionId: activePreviewSessionId, requestId: createBrowserId(), input }),
 		);
 		return;
 	}
@@ -1894,6 +1946,9 @@ async function loadAgents(): Promise<void> {
 	const payload: unknown = await response.json();
 	if (!isAgentList(payload)) throw new Error("Agent registry returned an invalid response");
 	agents = payload.agents;
+	for (let index = openAgentIds.length - 1; index >= 0; index -= 1) {
+		if (!agents.some((agent) => agent.id === openAgentIds[index])) openAgentIds.splice(index, 1);
+	}
 	agentList.replaceChildren(
 		...payload.agents.map((agent) => {
 			const card = document.createElement("div");
@@ -1959,6 +2014,7 @@ async function loadAgents(): Promise<void> {
 	);
 	refreshRoutineEditorOptions();
 	refreshWorkflowEditorOptions();
+	renderSessionNavigation();
 }
 
 async function deleteAgent(agent: AgentSummary): Promise<void> {
@@ -1975,7 +2031,12 @@ async function deleteAgent(agent: AgentSummary): Promise<void> {
 		activeSidebarAgent = undefined;
 		selectedAgentPanel.classList.add("hidden");
 	}
+	const openIndex = openAgentIds.indexOf(agent.id);
+	if (openIndex >= 0) openAgentIds.splice(openIndex, 1);
+	if (activeAgentId === agent.id) activeAgentId = undefined;
 	await loadAgents();
+	if (session?.snapshot) render(session.snapshot);
+	renderSessionNavigation();
 	setStatus("Agent deleted");
 }
 
@@ -2205,11 +2266,12 @@ function resizeComposer(): void {
 }
 
 function activePromptHistory(): PromptHistory | undefined {
-	if (!session) return undefined;
-	let history = promptHistoryBySession.get(session.id);
+	const key = activeAgentId ? `agent:${activeAgentId}` : session?.id;
+	if (!key) return undefined;
+	let history = promptHistoryBySession.get(key);
 	if (!history) {
 		history = { entries: [], index: 0, draft: "" };
-		promptHistoryBySession.set(session.id, history);
+		promptHistoryBySession.set(key, history);
 	}
 	return history;
 }
@@ -2305,12 +2367,37 @@ async function openAgent(agent?: AgentSummary): Promise<void> {
 		return;
 	}
 	activeSidebarAgent = agent;
+	activeAgentId = agent.id;
+	if (!openAgentIds.includes(agent.id)) openAgentIds.push(agent.id);
 	selectedAgentTitle.textContent = agent.name;
+	selectedAgentMeta.textContent = `${agent.model ? `${agent.model.provider}/${agent.model.id}` : "Current Pi model"} · ${formatWorkingDirectory(agent.projectRoot)}`;
+	selectedAgentMeta.title = agent.projectRoot;
 	selectedAgentPanel.classList.remove("hidden");
-	delete selectedAgentChat.dataset.continueTask;
-	selectedAgentPrompt.placeholder = `Message ${agent.name}…`;
 	activateTab("agents-workspace");
+	mobilePanelNone.checked = true;
+	renderSessionNavigation();
 	await loadSelectedAgent();
+}
+
+function closeAgentTab(agentId: string): void {
+	const index = openAgentIds.indexOf(agentId);
+	if (index >= 0) openAgentIds.splice(index, 1);
+	if (activeAgentId !== agentId) {
+		renderSessionNavigation();
+		return;
+	}
+	const fallbackId = openAgentIds.at(-1);
+	const fallback = fallbackId ? agents.find((entry) => entry.id === fallbackId) : undefined;
+	if (fallback) {
+		void openAgent(fallback);
+		return;
+	}
+	activeAgentId = undefined;
+	activeSidebarAgent = undefined;
+	selectedAgentPanel.classList.add("hidden");
+	if (session?.snapshot) render(session.snapshot);
+	renderSessionNavigation();
+	renderAttachments();
 }
 
 async function openAgentBuilder(agent?: AgentSummary): Promise<void> {
@@ -2347,7 +2434,16 @@ async function openAgentBuilder(agent?: AgentSummary): Promise<void> {
 	requiredElement<HTMLSelectElement>("agent-thinking").value = agent?.thinking ?? "high";
 	requiredElement<HTMLInputElement>("agent-delegates").value = agent?.delegateAgentIds.join(", ") ?? "";
 	requiredElement<HTMLInputElement>("agent-a2a").checked = agent?.a2a.enabled ?? false;
-	agentModel.value = agent?.model ? `${agent.model.provider}/${agent.model.id}` : "";
+	const recommendedModelValue = `${recommendedAgentModel.provider}/${recommendedAgentModel.id}`;
+	agentModel.value = agent
+		? agent.model
+			? `${agent.model.provider}/${agent.model.id}`
+			: ""
+		: availableModels.some(
+					(entry) => entry.provider === recommendedAgentModel.provider && entry.id === recommendedAgentModel.id,
+				)
+			? recommendedModelValue
+			: "";
 	agentModelPicker.refresh();
 	updatePersonaPreview();
 	element("builder-title").textContent = agent
@@ -2374,8 +2470,9 @@ async function openAgentBuilder(agent?: AgentSummary): Promise<void> {
 
 async function loadSelectedAgent(): Promise<void> {
 	if (!capabilityToken || !activeSidebarAgent) return;
+	const agent = activeSidebarAgent;
 	const conversationsResponse = await fetch(
-		`/agent-conversations.json?agentId=${encodeURIComponent(activeSidebarAgent.id)}&token=${encodeURIComponent(capabilityToken)}`,
+		`/agent-conversations.json?agentId=${encodeURIComponent(agent.id)}&token=${encodeURIComponent(capabilityToken)}`,
 	);
 	if (!conversationsResponse.ok)
 		throw new Error(await responseError(conversationsResponse, "Could not load agent conversation"));
@@ -2390,17 +2487,144 @@ async function loadSelectedAgent(): Promise<void> {
 		const payload: unknown = await messagesResponse.json();
 		messages = messagesFromPayload(payload);
 	}
-	selectedAgentChat.dataset.conversationId = conversationId ?? "";
-	selectedAgentChat.replaceChildren(
-		...messages.map((message) => {
-			const block = document.createElement("div");
-			block.className = `agent-chat-message ${message.role}`;
-			block.textContent = message.text;
-			return block;
-		}),
-	);
-	selectedAgentChat.scrollTop = selectedAgentChat.scrollHeight;
-	await loadAgentTasks();
+	if (conversationId) agentConversationIds.set(agent.id, conversationId);
+	else agentConversationIds.delete(agent.id);
+	const tasks = await loadAgentTasks(agent);
+	if (activeAgentId === agent.id) renderAgentConversation(agent, messages, tasks);
+}
+
+function renderAgentConversation(
+	agent: AgentSummary,
+	messages: AgentMessageSummary[],
+	tasks: AgentTaskSummary[],
+): void {
+	const activeTask = tasks.find((task) => task.status === "queued" || task.status === "running");
+	const items = messages.map((message) => renderAgentMessage(agent, message));
+	if (activeTask) {
+		const running = document.createElement("article");
+		running.className = "message assistant agent-running";
+		const dot = document.createElement("i");
+		const label = document.createElement("span");
+		label.textContent = `${agent.name} is working`;
+		running.append(dot, label);
+		items.push(running);
+	}
+	transcript.replaceChildren(...items);
+	transcript.scrollTop = transcript.scrollHeight;
+	phase.textContent = activeTask?.status ?? "idle";
+	send.classList.toggle("is-stopping", Boolean(activeTask));
+	send.setAttribute("aria-label", activeTask ? `Stop ${agent.name}` : `Message ${agent.name}`);
+	input.placeholder = `Message ${agent.name}…`;
+	input.setAttribute("aria-label", `Message ${agent.name}`);
+	model.disabled = true;
+	thinking.disabled = true;
+	attachmentButton.disabled = true;
+	attachmentInput.disabled = true;
+	attachmentButton.title = "Agent chat attachments are not available yet";
+	attachmentList.replaceChildren();
+	const selectedModel = agent.model ?? session?.snapshot?.model;
+	if (selectedModel) {
+		model.value = `${selectedModel.provider}/${selectedModel.id}`;
+		modelPicker.refresh();
+	}
+	thinking.value = agent.thinking ?? session?.snapshot?.thinkingLevel ?? "off";
+	sessionPath.textContent = formatWorkingDirectory(agent.projectRoot);
+	sessionPath.title = agent.projectRoot;
+	sessionStats.textContent = activeTask ? `${agent.name} · ${activeTask.status}` : agent.name;
+	sessionStats.title = "Active agent conversation";
+	setStatus(activeTask ? `${agent.name} is running a task` : agent.projectRoot);
+}
+
+function renderAgentMessage(agent: AgentSummary, message: AgentMessageSummary): HTMLElement {
+	const article = document.createElement("article");
+	article.className = `message ${message.role === "agent" ? "assistant" : "user"}`;
+	const label = document.createElement("div");
+	label.className = "message-label";
+	label.textContent = message.role === "agent" ? agent.name : "you";
+	const body = document.createElement("div");
+	body.className = "agent-message-content";
+	appendAgentMarkdown(body, message.text);
+	article.append(label, body);
+	return article;
+}
+
+function appendAgentMarkdown(parent: HTMLElement, text: string): void {
+	const lines = text.replace(/\r\n/g, "\n").split("\n");
+	let code: string[] | undefined;
+	let list: HTMLUListElement | HTMLOListElement | undefined;
+	const flushCode = () => {
+		if (!code) return;
+		const pre = document.createElement("pre");
+		const codeElement = document.createElement("code");
+		codeElement.textContent = code.join("\n");
+		pre.append(codeElement);
+		parent.append(pre);
+		code = undefined;
+	};
+	for (const line of lines) {
+		if (line.trim().startsWith("```")) {
+			if (code) flushCode();
+			else code = [];
+			list = undefined;
+			continue;
+		}
+		if (code) {
+			code.push(line);
+			continue;
+		}
+		const listMatch = line.match(/^\s*([-*]|\d+\.)\s+(.+)$/);
+		if (listMatch) {
+			const ordered = listMatch[1]?.endsWith(".") ?? false;
+			if (
+				!list ||
+				(ordered && !(list instanceof HTMLOListElement)) ||
+				(!ordered && !(list instanceof HTMLUListElement))
+			) {
+				list = ordered ? document.createElement("ol") : document.createElement("ul");
+				parent.append(list);
+			}
+			const item = document.createElement("li");
+			appendAgentInline(item, listMatch[2] ?? "");
+			list.append(item);
+			continue;
+		}
+		list = undefined;
+		if (!line.trim()) continue;
+		const heading = line.match(/^(#{1,3})\s+(.+)$/);
+		const block = heading
+			? document.createElement(heading[1]?.length === 1 ? "h2" : "h3")
+			: document.createElement("p");
+		appendAgentInline(block, heading?.[2] ?? line);
+		parent.append(block);
+	}
+	flushCode();
+}
+
+function appendAgentInline(parent: HTMLElement, text: string): void {
+	const pattern = /(\*\*([^*]+)\*\*|`([^`]+)`|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\))/g;
+	let offset = 0;
+	for (const match of text.matchAll(pattern)) {
+		const index = match.index ?? 0;
+		if (index > offset) parent.append(document.createTextNode(text.slice(offset, index)));
+		if (match[2]) {
+			const strong = document.createElement("strong");
+			strong.textContent = match[2];
+			parent.append(strong);
+		} else if (match[3]) {
+			const code = document.createElement("code");
+			code.textContent = match[3];
+			parent.append(code);
+		} else {
+			const link = document.createElement("a");
+			link.textContent = match[4] ?? match[5] ?? "link";
+			link.href = match[5] ?? "";
+			link.target = "_blank";
+			link.rel = "noreferrer";
+			parent.append(link);
+		}
+		offset = index + match[0].length;
+	}
+	if (offset < text.length) parent.append(document.createTextNode(text.slice(offset)));
 }
 
 function conversationIdFromPayload(value: unknown): string | undefined {
@@ -2442,62 +2666,55 @@ function isAgentMessageSummary(value: unknown): value is AgentMessageSummary {
 	);
 }
 
-async function loadAgentTasks(): Promise<void> {
-	if (!capabilityToken || !activeSidebarAgent) return;
+async function loadAgentTasks(agent: AgentSummary): Promise<AgentTaskSummary[]> {
+	if (!capabilityToken) return [];
 	const response = await fetch(
-		`/agent-tasks.json?agentId=${encodeURIComponent(activeSidebarAgent.id)}&token=${encodeURIComponent(capabilityToken)}`,
+		`/agent-tasks.json?agentId=${encodeURIComponent(agent.id)}&token=${encodeURIComponent(capabilityToken)}`,
 	);
 	if (!response.ok) throw new Error(`Could not load agent tasks: HTTP ${response.status}`);
 	const payload: unknown = await response.json();
 	if (!isAgentTaskList(payload)) throw new Error("Agent task service returned an invalid response");
+	agentTasksByAgent.set(agent.id, payload.tasks);
+	if (activeSidebarAgent?.id === agent.id) renderAgentTaskHistory(payload.tasks);
+	return payload.tasks;
+}
+
+function renderAgentTaskHistory(tasks: AgentTaskSummary[]): void {
 	agentTaskList.replaceChildren(
-		...payload.tasks.map((task) => {
-			const card = document.createElement("div");
-			card.className = "card run-card";
-			if (task.status === "queued" || task.status === "running") card.dataset.activeTask = task.id;
-			appendText(card, task.status);
-			appendText(card, task.prompt, "muted");
-			if (task.result) appendText(card, task.result);
-			if (task.error) appendText(card, task.error, "run-error");
-			if (task.status === "queued" || task.status === "running") {
-				const button = document.createElement("button");
-				button.type = "button";
-				button.textContent = "Stop";
-				button.addEventListener("click", () => void cancelAgentTask(task.id));
-				card.append(button);
-			} else {
-				const actions = document.createElement("div");
-				actions.className = "result-actions";
-				const continueButton = document.createElement("button");
-				continueButton.type = "button";
-				continueButton.textContent = "Continue";
-				continueButton.addEventListener("click", () => {
-					selectedAgentChat.dataset.continueTask = task.id;
-					selectedAgentPrompt.placeholder = `Continue ${activeSidebarAgent?.name ?? "agent"} task…`;
-					selectedAgentPrompt.focus();
-				});
-				actions.append(continueButton);
-				if (task.status === "failed" || task.status === "cancelled") {
-					const retry = document.createElement("button");
-					retry.type = "button";
-					retry.textContent = "Retry";
-					retry.addEventListener(
-						"click",
-						() =>
-							void continueAgentTask(task.id, task.prompt).catch((error: unknown) =>
-								setStatus(error instanceof Error ? error.message : String(error), true),
-							),
+		...tasks.slice(0, 20).map((task) => {
+			const details = document.createElement("details");
+			details.className = "agent-history-entry";
+			details.dataset.status = task.status;
+			const summary = document.createElement("summary");
+			const indicator = document.createElement("i");
+			indicator.className = "agent-history-status";
+			const prompt = document.createElement("span");
+			prompt.className = "agent-history-prompt";
+			prompt.textContent = task.prompt;
+			const time = document.createElement("time");
+			time.className = "agent-history-time";
+			time.dateTime = new Date(task.createdAt).toISOString();
+			time.textContent = task.status;
+			summary.append(indicator, prompt, time);
+			const body = document.createElement("div");
+			body.className = "agent-history-body";
+			if (task.result) appendText(body, task.result);
+			if (task.error) appendText(body, task.error, "run-error");
+			if (task.status === "failed" || task.status === "cancelled") {
+				const retry = document.createElement("button");
+				retry.type = "button";
+				retry.textContent = "Retry";
+				retry.addEventListener("click", () => {
+					void continueAgentTask(task.id, task.prompt).catch((error: unknown) =>
+						setStatus(error instanceof Error ? error.message : String(error), true),
 					);
-					actions.append(retry);
-				}
-				card.append(actions);
+				});
+				body.append(retry);
 			}
-			return card;
+			details.append(summary, body);
+			return details;
 		}),
 	);
-	selectedAgentSend.textContent = payload.tasks.some((task) => task.status === "queued" || task.status === "running")
-		? "■"
-		: "↑";
 }
 
 function isAgentTaskList(value: unknown): value is { tasks: AgentTaskSummary[] } {
@@ -3155,8 +3372,7 @@ async function reconnect(entry: ConnectionEntry): Promise<void> {
 			if (target) {
 				activeTargetKey = undefined;
 				await switchSession(target);
-			}
-			setStatus(`Reconnected to ${entry.label}`);
+			} else setStatus(`Reconnected to ${entry.label}`);
 			reconnecting.delete(entry.id);
 			return;
 		} catch {
@@ -3174,6 +3390,10 @@ form.addEventListener("submit", (event) => {
 });
 
 async function submitComposer(): Promise<void> {
+	if (activeAgentId) {
+		await submitAgentComposer(activeAgentId);
+		return;
+	}
 	if (!session) return;
 	if (session.snapshot?.phase !== "idle") {
 		await session.abort();
@@ -3198,6 +3418,36 @@ async function submitComposer(): Promise<void> {
 	} else {
 		await session.prompt(text);
 	}
+}
+
+async function submitAgentComposer(agentId: string): Promise<void> {
+	if (!capabilityToken) return;
+	const agent = agents.find((entry) => entry.id === agentId);
+	if (!agent) throw new Error("The selected agent is unavailable");
+	const activeTask = agentTasksByAgent
+		.get(agentId)
+		?.find((task) => task.status === "queued" || task.status === "running");
+	if (activeTask) {
+		await cancelAgentTask(activeTask.id);
+		return;
+	}
+	const prompt = input.value.trim();
+	if (!prompt) return;
+	recordPromptHistory(prompt);
+	input.value = "";
+	resizeComposer();
+	const response = await fetch(`/agent-tasks?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({
+			agentId,
+			conversationId: agentConversationIds.get(agentId),
+			prompt,
+			source: "chat",
+		}),
+	});
+	if (!response.ok) throw new Error(await responseError(response, "Could not message agent"));
+	await loadSelectedAgent();
 }
 
 input.addEventListener("input", () => {
@@ -3355,13 +3605,19 @@ input.addEventListener("keydown", (event) => {
 		event.preventDefault();
 		return;
 	}
-	if (event.key !== "Enter" || event.shiftKey || event.isComposing || session?.snapshot?.phase !== "idle") return;
+	if (
+		event.key !== "Enter" ||
+		event.shiftKey ||
+		event.isComposing ||
+		(!activeAgentId && session?.snapshot?.phase !== "idle")
+	)
+		return;
 	event.preventDefault();
 	form.requestSubmit();
 });
 
 model.addEventListener("change", () => {
-	if (!session) return;
+	if (!session || activeAgentId) return;
 	const separator = model.value.indexOf("/");
 	if (separator < 1) return;
 	void session
@@ -3370,7 +3626,7 @@ model.addEventListener("change", () => {
 });
 
 thinking.addEventListener("change", () => {
-	if (session)
+	if (session && !activeAgentId)
 		void session
 			.setThinking(thinking.value as ThinkingLevel)
 			.catch((error: unknown) => setStatus(String(error), true));
@@ -3521,45 +3777,6 @@ builderChatForm.addEventListener("submit", (event) => {
 	void chatSession.prompt(message).catch((error: unknown) => {
 		setStatus(error instanceof Error ? error.message : String(error), true);
 	});
-});
-
-selectedAgentChatForm.addEventListener("submit", (event) => {
-	event.preventDefault();
-	if (!capabilityToken || !activeSidebarAgent) return;
-	const activeTask = agentTaskList.querySelector<HTMLElement>("[data-active-task]")?.dataset.activeTask;
-	if (activeTask) {
-		void cancelAgentTask(activeTask);
-		return;
-	}
-	const prompt = selectedAgentPrompt.value.trim();
-	if (!prompt) return;
-	const continueTask = selectedAgentChat.dataset.continueTask;
-	if (continueTask) {
-		void continueAgentTask(continueTask, prompt)
-			.then(() => {
-				selectedAgentPrompt.value = "";
-				delete selectedAgentChat.dataset.continueTask;
-				selectedAgentPrompt.placeholder = `Message ${activeSidebarAgent?.name ?? "agent"}…`;
-			})
-			.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
-		return;
-	}
-	void fetch(`/agent-tasks?token=${encodeURIComponent(capabilityToken)}`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({
-			agentId: activeSidebarAgent.id,
-			conversationId: selectedAgentChat.dataset.conversationId || undefined,
-			prompt,
-			source: "chat",
-		}),
-	})
-		.then(async (response) => {
-			if (!response.ok) throw new Error(await responseError(response, "Could not message agent"));
-			selectedAgentPrompt.value = "";
-			await loadSelectedAgent();
-		})
-		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
 });
 
 personaSelect.addEventListener("change", () => updatePersonaPreview(true));
