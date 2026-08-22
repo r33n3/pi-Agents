@@ -133,11 +133,12 @@ describe("agent workflows and A2A", () => {
 			message: { parts: [{ text: "Find the evidence" }] },
 		});
 		const completed = await tasks.waitForCompletion(submitted.task.id);
-		expect(adapter.getTask("researcher", completed.id)).toMatchObject({
+		await expect(adapter.getTask("researcher", completed.id)).resolves.toMatchObject({
 			status: { state: "TASK_STATE_COMPLETED" },
 			artifacts: [{ parts: [{ text: expect.stringContaining("Find the evidence") }] }],
 		});
 		expect(() => adapter.validateVersion("0.3")).toThrow(A2aError);
+		await expect(adapter.listTasks("reviewer")).rejects.toMatchObject({ reason: "AGENT_NOT_FOUND" });
 		await tasks.dispose();
 	});
 });

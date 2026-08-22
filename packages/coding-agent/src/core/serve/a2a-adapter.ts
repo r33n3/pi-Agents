@@ -77,13 +77,18 @@ export class A2aAdapter {
 		return { task: toA2aTask(task) };
 	}
 
-	getTask(agentId: string, taskId: string): A2aTask {
+	async getTask(agentId: string, taskId: string): Promise<A2aTask> {
+		await this.#exposedAgent(agentId);
 		const task = this.#tasks.getTask(taskId);
 		if (!task || task.agentId !== agentId) throw new A2aError("TASK_NOT_FOUND", 404, "Task was not found");
 		return toA2aTask(task);
 	}
 
-	listTasks(agentId: string, status?: string): { tasks: A2aTask[]; totalSize: number; pageSize: number } {
+	async listTasks(
+		agentId: string,
+		status?: string,
+	): Promise<{ tasks: A2aTask[]; totalSize: number; pageSize: number }> {
+		await this.#exposedAgent(agentId);
 		const tasks = this.#tasks
 			.listTasks({ agentId })
 			.map(toA2aTask)
@@ -92,7 +97,7 @@ export class A2aAdapter {
 	}
 
 	async cancelTask(agentId: string, taskId: string): Promise<A2aTask> {
-		this.getTask(agentId, taskId);
+		await this.getTask(agentId, taskId);
 		try {
 			return toA2aTask(await this.#tasks.cancel(taskId));
 		} catch (error) {
@@ -104,7 +109,8 @@ export class A2aAdapter {
 		}
 	}
 
-	subscribe(agentId: string, taskId: string, listener: (task: A2aTask) => void): () => void {
+	async subscribe(agentId: string, taskId: string, listener: (task: A2aTask) => void): Promise<() => void> {
+		await this.#exposedAgent(agentId);
 		const task = this.#tasks.getTask(taskId);
 		if (!task || task.agentId !== agentId) throw new A2aError("TASK_NOT_FOUND", 404, "Task was not found");
 		if (isTerminal(task.status))

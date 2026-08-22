@@ -467,22 +467,23 @@ async function serveA2a(
 			}
 			const result = await adapter.sendMessage(agentId, await readJsonBody(request));
 			if (suffix === "/message:send") jsonA2a(response, 200, result);
-			else streamA2aTask(request, response, adapter, agentId, result.task);
+			else await streamA2aTask(request, response, adapter, agentId, result.task);
 			return;
 		}
 		if (request.method === "GET" && suffix === "/tasks") {
-			jsonA2a(response, 200, adapter.listTasks(agentId, url.searchParams.get("status") ?? undefined));
+			jsonA2a(response, 200, await adapter.listTasks(agentId, url.searchParams.get("status") ?? undefined));
 			return;
 		}
 		const taskMatch = suffix.match(/^\/tasks\/([^/:]+)(?::(cancel|subscribe))?$/);
 		if (!taskMatch) throw new A2aError("UNSUPPORTED_OPERATION", 404, "A2A operation was not found");
 		const taskId = decodeURIComponent(taskMatch[1]!);
 		const action = taskMatch[2];
-		if (request.method === "GET" && action === undefined) jsonA2a(response, 200, adapter.getTask(agentId, taskId));
+		if (request.method === "GET" && action === undefined)
+			jsonA2a(response, 200, await adapter.getTask(agentId, taskId));
 		else if (request.method === "POST" && action === "cancel")
 			jsonA2a(response, 200, await adapter.cancelTask(agentId, taskId));
 		else if (request.method === "POST" && action === "subscribe")
-			streamA2aTask(request, response, adapter, agentId, adapter.getTask(agentId, taskId));
+			await streamA2aTask(request, response, adapter, agentId, await adapter.getTask(agentId, taskId));
 		else throw new A2aError("UNSUPPORTED_OPERATION", 405, "HTTP method is not supported for this operation");
 	} catch (error) {
 		a2aError(
@@ -494,20 +495,20 @@ async function serveA2a(
 	}
 }
 
-function streamA2aTask(
+async function streamA2aTask(
 	request: IncomingMessage,
 	response: ServerResponse,
 	adapter: A2aAdapter,
 	agentId: string,
 	task: A2aTask,
-): void {
+): Promise<void> {
 	response.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/event-stream", connection: "keep-alive" });
 	response.write(`data: ${JSON.stringify({ task })}\n\n`);
 	if (["TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"].includes(task.status.state)) {
 		response.end();
 		return;
 	}
-	const unsubscribe = adapter.subscribe(agentId, task.id, (next) => {
+	const unsubscribe = await adapter.subscribe(agentId, task.id, (next) => {
 		response.write(`data: ${JSON.stringify({ task: next })}\n\n`);
 		if (["TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"].includes(next.status.state)) {
 			unsubscribe();
