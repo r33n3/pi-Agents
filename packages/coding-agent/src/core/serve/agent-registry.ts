@@ -5,6 +5,7 @@ import type { ModelRef, ThinkingLevel } from "@earendil-works/pi-protocol";
 import { parseFrontmatter } from "../../utils/frontmatter.ts";
 import type { BrowserAccess } from "./browser-policy.ts";
 import type { BrowserProfile } from "./browser-profile-store.ts";
+import type { BrowserRuntimeKind } from "./browser-session-manager.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
 export type AgentExecutorKind = "session" | "harness";
@@ -14,7 +15,13 @@ export type AgentDefinitionSource = "managed" | "pi-agent";
 
 export interface AgentBrowserPolicy {
 	access: BrowserAccess;
+	runtime: BrowserRuntimeKind;
 	profile: BrowserProfile;
+}
+
+export interface AgentBrowserWorkflowGrant {
+	id: string;
+	version: number;
 }
 
 export interface AgentRoutineDefinition {
@@ -42,19 +49,31 @@ export interface AgentDefinition {
 	permissionPolicy: AgentPermissionPolicy;
 	schedules: AgentRoutineDefinition[];
 	browser?: AgentBrowserPolicy;
+	browserWorkflows: AgentBrowserWorkflowGrant[];
 	delegateAgentIds: string[];
 	a2a: { enabled: boolean };
 }
 
 export type AgentDefinitionInput = Omit<
 	AgentDefinition,
-	"id" | "revision" | "personaId" | "source" | "workspace" | "projectRoot" | "delegateAgentIds" | "a2a"
+	| "id"
+	| "revision"
+	| "personaId"
+	| "source"
+	| "workspace"
+	| "projectRoot"
+	| "delegateAgentIds"
+	| "browserWorkflows"
+	| "browser"
+	| "a2a"
 > & {
 	id?: string;
 	personaId?: string;
 	workspace?: string;
 	projectRoot?: string;
 	delegateAgentIds?: string[];
+	browserWorkflows?: AgentBrowserWorkflowGrant[];
+	browser?: Omit<AgentBrowserPolicy, "runtime"> & { runtime?: BrowserRuntimeKind };
 	a2a?: { enabled: boolean };
 };
 
@@ -63,6 +82,7 @@ export interface AgentRegistryOptions {
 	personaDirectory?: string;
 	defaultWorkspace?: string;
 	modelCatalog?: () => readonly AgentModelCatalogEntry[];
+	browserWorkflowCatalog?: (id: string, version: number) => boolean;
 }
 
 export interface AgentModelCatalogEntry extends ModelRef {
@@ -83,6 +103,7 @@ export class AgentRegistry {
 	readonly #personaDirectory: string | undefined;
 	readonly #defaultWorkspace: string;
 	readonly #modelCatalog: (() => readonly AgentModelCatalogEntry[]) | undefined;
+	readonly #browserWorkflowCatalog: ((id: string, version: number) => boolean) | undefined;
 	readonly #queue = new SerialOperationQueue();
 	readonly #listeners = new Set<(event: AgentRegistryEvent) => void>();
 
@@ -94,6 +115,7 @@ export class AgentRegistry {
 		this.#personaDirectory = options.personaDirectory ? resolve(options.personaDirectory) : undefined;
 		this.#defaultWorkspace = resolve(options.defaultWorkspace ?? process.cwd());
 		this.#modelCatalog = options.modelCatalog;
+		this.#browserWorkflowCatalog = options.browserWorkflowCatalog;
 	}
 
 	async initialize(): Promise<void> {
@@ -130,6 +152,11 @@ export class AgentRegistry {
 			await this.initialize();
 			const normalized = normalizeDefinition(input, this.#defaultWorkspace);
 			this.#validateModel(normalized.model);
+			for (const workflow of normalized.browserWorkflows) {
+				if (this.#browserWorkflowCatalog && !this.#browserWorkflowCatalog(workflow.id, workflow.version)) {
+					throw new Error(`Browser workflow ${workflow.id} version ${workflow.version} is not active`);
+				}
+			}
 			let previous: AgentDefinition | undefined;
 			try {
 				previous = await this.#read(resolve(this.#definitionsDir, `${normalized.id}.json`));
@@ -265,7 +292,8 @@ export class AgentRegistry {
 				? "workspace-write"
 				: "read-only",
 			schedules: [],
-			browser: { access: "disabled", profile: { kind: "ephemeral" } },
+			browser: { access: "disabled", runtime: "managed-chromium", profile: { kind: "ephemeral" } },
+			browserWorkflows: [],
 			delegateAgentIds: [],
 			a2a: { enabled: false },
 		};
@@ -293,8 +321,12 @@ function normalizeDefinition(value: unknown, defaultWorkspace: string): AgentDef
 		throw new Error("read-only agents cannot enable the write tool");
 	}
 	const browser = normalizeBrowserPolicy(input.browser);
+	const browserWorkflows = normalizeBrowserWorkflows(input.browserWorkflows);
 	if (tools.includes("browser") !== (browser.access !== "disabled")) {
 		throw new Error("browser tool and browser access policy must be enabled together");
+	}
+	if (browserWorkflows.length > 0 && browser.access === "disabled") {
+		throw new Error("Assigned browser workflows require browser access");
 	}
 	return {
 		id,
@@ -317,6 +349,7 @@ function normalizeDefinition(value: unknown, defaultWorkspace: string): AgentDef
 		permissionPolicy,
 		schedules: normalizeSchedules(input.schedules),
 		browser,
+		browserWorkflows,
 		delegateAgentIds: identifierArray(input.delegateAgentIds, "delegateAgentIds"),
 		a2a: normalizeA2a(input.a2a),
 	};
@@ -335,13 +368,34 @@ function normalizeA2a(value: unknown): { enabled: boolean } {
 }
 
 function normalizeBrowserPolicy(value: unknown): AgentBrowserPolicy {
-	if (value === undefined) return { access: "disabled", profile: { kind: "ephemeral" } };
+	if (value === undefined) return { access: "disabled", runtime: "managed-chromium", profile: { kind: "ephemeral" } };
 	const input = record(value, "browser");
 	const access = oneOf(input.access, ["disabled", "loopback", "public-web", "private-network"], "browser.access");
+	const runtime =
+		input.runtime === undefined
+			? "managed-chromium"
+			: oneOf(input.runtime, ["managed-chromium", "installed-chrome"], "browser.runtime");
 	const profileInput = record(input.profile, "browser.profile");
 	const kind = oneOf(profileInput.kind, ["ephemeral", "named"], "browser.profile.kind");
-	if (kind === "ephemeral") return { access, profile: { kind } };
-	return { access, profile: { kind, id: requiredString(profileInput.id, "browser.profile.id") } };
+	if (kind === "ephemeral") return { access, runtime, profile: { kind } };
+	return { access, runtime, profile: { kind, id: requiredString(profileInput.id, "browser.profile.id") } };
+}
+
+function normalizeBrowserWorkflows(value: unknown): AgentBrowserWorkflowGrant[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) throw new Error("browserWorkflows must be an array");
+	const grants = value.map((entry, index) => {
+		const input = record(entry, `browserWorkflows[${index}]`);
+		const id = validatedIdentifier(input.id, `browserWorkflows[${index}].id`);
+		if (!Number.isSafeInteger(input.version) || Number(input.version) < 1) {
+			throw new Error(`browserWorkflows[${index}].version must be a positive integer`);
+		}
+		return { id, version: Number(input.version) };
+	});
+	if (new Set(grants.map((grant) => `${grant.id}@${grant.version}`)).size !== grants.length) {
+		throw new Error("browserWorkflows must not contain duplicate grants");
+	}
+	return grants;
 }
 
 function parseCatalogModel(value: unknown): ModelRef | undefined {

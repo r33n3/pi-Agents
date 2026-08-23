@@ -157,6 +157,13 @@ async function serveRequest(
 	}
 	if (
 		url.pathname === "/browser/status" ||
+		url.pathname === "/browser/workflows" ||
+		url.pathname === "/browser/workflow-runs" ||
+		url.pathname.startsWith("/browser/workflow-runs/") ||
+		url.pathname === "/browser/frontend-tests" ||
+		url.pathname === "/browser/profiles" ||
+		url.pathname.startsWith("/browser/profiles/") ||
+		url.pathname.startsWith("/browser/workflows/") ||
 		url.pathname === "/browser/sessions" ||
 		url.pathname.startsWith("/browser/sessions/")
 	) {
@@ -596,6 +603,151 @@ async function serveBrowser(
 		});
 		return;
 	}
+	if (url.pathname === "/browser/profiles") {
+		if (request.method !== "GET") {
+			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET" }).end();
+			return;
+		}
+		json(response, 200, { profiles: await browserConsole.listProfiles() });
+		return;
+	}
+	if (url.pathname.startsWith("/browser/profiles/")) {
+		if (request.method !== "DELETE") {
+			response.writeHead(405, { ...SECURITY_HEADERS, allow: "DELETE" }).end();
+			return;
+		}
+		try {
+			const id = decodeURIComponent(url.pathname.slice("/browser/profiles/".length));
+			json(response, (await browserConsole.clearProfile(id)) ? 200 : 404, { cleared: true });
+		} catch (error) {
+			json(response, 409, { error: error instanceof Error ? error.message : "Could not clear browser profile" });
+		}
+		return;
+	}
+	if (url.pathname === "/browser/workflows") {
+		if (request.method !== "GET") {
+			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET" }).end();
+			return;
+		}
+		json(response, 200, { workflows: browserConsole.listWorkflows() });
+		return;
+	}
+	if (url.pathname === "/browser/workflow-runs") {
+		if (request.method !== "GET") {
+			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET" }).end();
+			return;
+		}
+		json(response, 200, { runs: browserConsole.listWorkflowRuns(url.searchParams.get("workflowId") ?? undefined) });
+		return;
+	}
+	if (url.pathname.startsWith("/browser/workflow-runs/")) {
+		if (request.method !== "GET") {
+			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET" }).end();
+			return;
+		}
+		const segments = url.pathname.slice("/browser/workflow-runs/".length).split("/");
+		if (segments.length !== 3 || segments[1] !== "artifacts") {
+			response.writeHead(404, SECURITY_HEADERS).end();
+			return;
+		}
+		const png = await browserConsole.readWorkflowArtifact(
+			decodeURIComponent(segments[0]!),
+			decodeURIComponent(segments[2]!),
+		);
+		if (!png) response.writeHead(404, SECURITY_HEADERS).end();
+		else response.writeHead(200, { ...SECURITY_HEADERS, "content-type": "image/png" }).end(png);
+		return;
+	}
+	if (url.pathname === "/browser/frontend-tests") {
+		if (request.method !== "GET") {
+			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET" }).end();
+			return;
+		}
+		json(response, 200, { frontendTests: browserConsole.listFrontendTests() });
+		return;
+	}
+	if (url.pathname.startsWith("/browser/workflows/")) {
+		const suffix = decodeURIComponent(url.pathname.slice("/browser/workflows/".length));
+		const action = suffix.endsWith("/validate")
+			? "validate"
+			: suffix.endsWith("/activate")
+				? "activate"
+				: suffix.endsWith("/run")
+					? "run"
+					: suffix.endsWith("/create-skill")
+						? "create-skill"
+						: suffix.endsWith("/frontend-test")
+							? "frontend-test"
+							: suffix.endsWith("/review")
+								? "review"
+								: suffix.endsWith("/resolve-target")
+									? "resolve-target"
+									: undefined;
+		const id = action ? suffix.slice(0, -(action.length + 1)) : suffix;
+		try {
+			if (request.method === "GET" && (!action || action === "review")) {
+				const versionText = url.searchParams.get("version");
+				const version = versionText === null ? undefined : Number(versionText);
+				const workflow =
+					action === "review"
+						? browserConsole.workflowReview(id, version)
+						: browserConsole.getWorkflow(id, version);
+				json(response, workflow ? 200 : 404, workflow ?? { error: "Browser workflow not found" });
+				return;
+			}
+			if (request.method === "POST" && action) {
+				const body = object(await readJsonBody(request), "browser workflow request");
+				const parameters = browserWorkflowParameters(body.parameters);
+				if (action === "resolve-target") {
+					json(
+						response,
+						200,
+						await browserConsole.resolveWorkflowTarget(
+							id,
+							positiveInteger(body.version, "version"),
+							requiredString(body.stepId, "stepId"),
+							nonnegativeInteger(body.elementIndex, "elementIndex"),
+						),
+					);
+					return;
+				}
+				if (action === "run") {
+					json(
+						response,
+						200,
+						await browserConsole.executeWorkflow(
+							id,
+							positiveInteger(body.version, "version"),
+							parameters,
+							body.approved === true,
+						),
+					);
+					return;
+				}
+				const version = positiveInteger(body.version, "version");
+				if (action === "create-skill") {
+					json(response, 201, await browserConsole.createWorkflowSkill(id, version));
+					return;
+				}
+				if (action === "frontend-test") {
+					json(response, 201, await browserConsole.attachFrontendTest(id, version));
+					return;
+				}
+				json(
+					response,
+					200,
+					action === "validate"
+						? await browserConsole.validateWorkflow(id, version, parameters)
+						: await browserConsole.activateWorkflow(id, version),
+				);
+				return;
+			}
+			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+		} catch (error) {
+			json(response, 409, { error: error instanceof Error ? error.message : "Browser workflow request failed" });
+		}
+		return;
+	}
 	const suffix = decodeURIComponent(url.pathname.slice("/browser/sessions/".length));
 	if (request.method === "POST" && suffix.endsWith("/navigate")) {
 		const id = suffix.slice(0, -"/navigate".length);
@@ -652,6 +804,28 @@ async function serveBrowser(
 			json(response, 202, { accepted: true });
 		} catch (error) {
 			json(response, 409, { error: error instanceof Error ? error.message : "Could not send browser input" });
+		}
+		return;
+	}
+	if (suffix.endsWith("/capture")) {
+		const id = suffix.slice(0, -"/capture".length);
+		try {
+			if (request.method === "POST") {
+				json(response, 201, await browserConsole.startCapture(id));
+				return;
+			}
+			if (request.method === "DELETE") {
+				json(response, 200, await browserConsole.stopCapture(id));
+				return;
+			}
+			if (request.method === "GET") {
+				const capture = browserConsole.getCapture(id);
+				json(response, capture ? 200 : 404, capture ?? { error: "Browser session is not recording" });
+				return;
+			}
+			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST, DELETE" }).end();
+		} catch (error) {
+			json(response, 409, { error: error instanceof Error ? error.message : "Could not update browser capture" });
 		}
 		return;
 	}
@@ -1084,6 +1258,30 @@ function finiteNumber(value: unknown, name: string): number {
 	return value;
 }
 
+function positiveInteger(value: unknown, name: string): number {
+	if (!Number.isSafeInteger(value) || Number(value) < 1) throw new Error(`${name} must be a positive integer`);
+	return Number(value);
+}
+
+function nonnegativeInteger(value: unknown, name: string): number {
+	if (!Number.isSafeInteger(value) || Number(value) < 0) throw new Error(`${name} must be a nonnegative integer`);
+	return Number(value);
+}
+
+function browserWorkflowParameters(value: unknown): Record<string, string | number | boolean> {
+	if (value === undefined) return {};
+	const input = object(value, "browser workflow parameters");
+	const parameters: Record<string, string | number | boolean> = {};
+	for (const [name, entry] of Object.entries(input)) {
+		if (!/^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(name)) throw new Error("Browser workflow parameter name is invalid");
+		if (typeof entry !== "string" && typeof entry !== "number" && typeof entry !== "boolean") {
+			throw new Error(`Browser workflow parameter ${name} must be a string, number, or boolean`);
+		}
+		parameters[name] = entry;
+	}
+	return parameters;
+}
+
 function oneOf<const T extends string>(value: unknown, choices: readonly T[], name: string): T {
 	if (typeof value !== "string" || !choices.includes(value as T)) {
 		throw new Error(`${name} must be one of: ${choices.join(", ")}`);
@@ -1108,10 +1306,13 @@ function renderPage(token: string): string {
 .message.tool{padding:0;overflow:hidden}.message.tool-error{border-color:color-mix(in srgb,var(--danger) 55%,var(--line))}.tool-activity>summary{display:flex;align-items:center;gap:9px;padding:10px 12px;cursor:pointer;list-style:none;white-space:normal}.tool-activity>summary::-webkit-details-marker{display:none}.tool-activity>summary::before{content:"›";flex:0 0 auto;color:var(--muted);font-size:18px;line-height:1;transition:transform .15s}.tool-activity[open]>summary::before{transform:rotate(90deg)}.tool-activity-summary strong{color:var(--text);font-size:12px}.tool-activity-target{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}.tool-activity-state{margin-left:auto;flex:0 0 auto;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.tool-running .tool-activity-state{color:var(--pi)}.tool-error .tool-activity-state{color:var(--danger)}.tool-activity-body{display:grid;gap:10px;padding:0 12px 12px;border-top:1px solid var(--line)}.tool-activity-body section{min-width:0;padding-top:10px}.tool-activity-heading{margin-bottom:4px;color:var(--pi);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.1em}.tool-activity-body pre{max-height:320px;margin:0;overflow:auto;color:var(--muted);font:11px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 .subagent-card{display:grid;gap:9px;padding:12px 13px}.subagent-card-header{display:flex;align-items:center;gap:9px}.subagent-status-dot{width:8px;height:8px;flex:0 0 8px;border-radius:50%;background:var(--muted)}.subagent-card[data-status="running"] .subagent-status-dot{background:var(--pi);animation:pulse 1s infinite alternate}.subagent-card[data-status="error"] .subagent-status-dot{background:var(--danger)}.subagent-identity{display:flex;min-width:0;flex-direction:column}.subagent-identity strong{overflow:hidden;color:var(--text);font-size:12px;text-overflow:ellipsis;white-space:nowrap}.subagent-identity span{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.subagent-card-actions{display:flex;gap:4px;margin-left:auto}.subagent-card-actions button{display:grid;width:30px;height:30px;place-items:center;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--muted)}.subagent-card-actions button:hover{background:var(--surface2);color:var(--text)}.subagent-card-actions svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}.subagent-card-actions .subagent-stop{color:var(--danger);font-size:11px}.subagent-task{overflow:hidden;color:var(--text);font-size:12px;text-overflow:ellipsis;white-space:nowrap}.subagent-latest{overflow:hidden;color:var(--muted);font-size:11px;text-overflow:ellipsis;white-space:nowrap}.subagent-session-tab{color:#c4a7e7}.subagent-inspector-heading{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 14px;margin-bottom:18px;padding:16px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}.subagent-inspector-heading strong{font-size:16px}.subagent-inspector-heading span{color:var(--pi);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.subagent-inspector-heading p{grid-column:1/-1;margin:0;color:var(--muted);line-height:1.5}.subagent-timeline{display:grid;gap:12px}.subagent-result{display:grid;gap:10px;padding:14px;border:1px solid var(--line);border-radius:11px;background:rgba(20,20,23,.7)}.subagent-result>strong{color:var(--pi)}.subagent-event{border-top:1px solid var(--line);padding-top:8px}.subagent-event summary{cursor:pointer;color:var(--muted);font-size:11px}.subagent-event pre{max-height:280px;overflow:auto;color:var(--muted);font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 .browser-utility-actions{display:flex;align-items:center;gap:6px}.browser-utility-actions button{width:34px;height:34px;flex:0 0 34px;border:1px solid var(--line);border-radius:7px;background:var(--surface2);color:var(--text);padding:0}.browser-utility-actions button:disabled{opacity:.4;cursor:default}.browser-utility-actions #preview-record.recording{border-color:var(--danger);color:var(--danger)}.preview-recording-status{color:var(--muted);font-size:10px;line-height:1.4}
+.browser-workflow-section{display:grid;gap:8px;margin-top:10px}.browser-workflow-heading{display:flex;align-items:center;justify-content:space-between;padding:0 3px}.browser-workflow-heading button,.browser-workflow-actions button,.browser-workflow-issue button{display:grid;width:30px;height:30px;place-items:center;border:1px solid var(--line);border-radius:7px;background:var(--surface2);color:var(--text)}.browser-workflow-list{display:grid;gap:7px}.browser-workflow-card{border:1px solid var(--line);border-radius:9px;background:var(--surface);overflow:hidden}.browser-workflow-card>summary{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px;cursor:pointer;list-style:none}.browser-workflow-card>summary::-webkit-details-marker{display:none}.browser-workflow-state{color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.08em}.browser-workflow-state.state-active,.browser-workflow-state.state-validated{color:#43c58a}.browser-workflow-state.state-needs-input,.browser-workflow-state.state-invalid{color:var(--danger)}.browser-workflow-body{display:grid;gap:9px;padding:0 10px 10px}.browser-workflow-evidence{border:1px solid var(--line);border-radius:7px;padding:7px}.browser-workflow-evidence>summary{cursor:pointer;font-size:10px;text-transform:uppercase;letter-spacing:.06em}.browser-workflow-evidence>div{display:grid;gap:5px;padding-top:7px;overflow-wrap:anywhere}.browser-workflow-evidence a{color:var(--accent);font-size:10px}.browser-workflow-values{display:grid;gap:6px}.browser-workflow-values:empty{display:none}.browser-workflow-values label{display:grid;gap:4px;color:var(--muted);font-size:10px}.browser-workflow-values input,.browser-workflow-issue select{min-width:0;width:100%;padding:7px;border:1px solid var(--line);border-radius:7px;background:#131316;color:var(--text)}.browser-workflow-actions{display:flex;justify-content:flex-end;gap:6px}.browser-workflow-issue{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;align-items:center;padding:8px;border:1px solid color-mix(in srgb,var(--danger) 45%,var(--line));border-radius:8px}.browser-workflow-issue>span{grid-column:1/-1;color:var(--muted);font-size:10px;line-height:1.4}
+.agent-browser-workflow-grants{display:grid;gap:6px;padding:9px}.agent-browser-workflow-grants:empty:after{content:"No active browser workflows";color:var(--muted);font-size:10px}.agent-browser-workflow-grants label{display:flex;align-items:center;gap:7px;color:var(--text);font-size:11px}
 .browser-session-tabs{display:flex;min-width:0;gap:3px;padding:0 3px;overflow-x:auto;border-bottom:1px solid var(--line)}.browser-session-tabs:empty{display:none}.browser-session-tabs button{display:flex;min-width:96px;max-width:180px;align-items:center;gap:6px;padding:8px 10px;border:1px solid transparent;border-bottom:0;border-radius:8px 8px 0 0;background:#121216;color:var(--muted);font-size:10px}.browser-session-tabs button span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.browser-session-tabs button.active{border-color:var(--line);background:var(--surface2);color:var(--text)}.browser-tab-icon{flex:0 0 auto;color:var(--pi);font:700 13px/1 Georgia,serif}.browser-window-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.browser-window-heading strong{margin:0}.browser-window-heading #preview-popout{display:grid;width:30px;height:30px;place-items:center;padding:0;border:1px solid var(--line);border-radius:7px;background:var(--surface2);color:var(--text)}.browser-toolbar{display:grid!important;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:6px!important}.browser-nav-actions{display:flex;gap:3px}.browser-nav-actions button,.browser-utility-actions button,.browser-omnibox button{display:grid;place-items:center}.browser-nav-actions button{width:30px;height:30px;flex:0 0 30px;padding:0!important;border:0!important;border-radius:50%!important;background:transparent!important}.browser-nav-actions button:hover:not(:disabled){background:var(--surface2)!important}.browser-action-icon{width:16px;height:16px;flex:0 0 16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.browser-action-icon-fill{fill:currentColor;stroke:none}.browser-action-pi{fill:currentColor;stroke:none;font:700 16px Georgia,serif}.browser-omnibox{display:flex;min-width:0;align-items:center;gap:5px;padding:3px 3px 3px 9px;border:1px solid var(--line);border-radius:999px;background:#131316}.browser-address-icon{color:var(--muted);font-size:12px}.browser-omnibox #preview-address{min-width:0;padding:5px 2px;border:0;background:transparent;outline:0}.browser-omnibox button{width:28px;height:28px;border:0!important;border-radius:50%!important;padding:0!important}.browser-utility-actions button[data-browser-icon="record"]{color:var(--danger)}.preview-session{padding:0 3px}.preview-frame{border-radius:9px;box-shadow:0 10px 28px rgba(0,0,0,.24)}
 .mobile-panel-state{position:fixed;opacity:0;pointer-events:none}.mobile-panel-toggle,.mobile-panel-close,.mobile-panel-scrim{display:none}@media(max-width:1024px),(max-width:1366px) and (hover:none) and (pointer:coarse){body{display:block}main{height:100dvh}.resizer{display:none!important}.rail,.details{display:flex!important;position:fixed;z-index:50;top:0;bottom:0;width:min(88vw,360px);height:100dvh;box-shadow:0 0 48px rgba(0,0,0,.62);transition:transform .2s ease,visibility .2s;visibility:hidden}.rail{left:0;transform:translateX(-105%)}.details{right:0;transform:translateX(105%)}#mobile-panel-left:checked~.rail,#mobile-panel-right:checked~.details{transform:translateX(0);visibility:visible}.mobile-panel-scrim{position:fixed;z-index:40;inset:0;background:rgba(0,0,0,.58);backdrop-filter:blur(2px)}#mobile-panel-left:checked~.mobile-panel-scrim,#mobile-panel-right:checked~.mobile-panel-scrim{display:block}.mobile-panel-toggle,.mobile-panel-close{align-items:center;justify-content:center;width:44px;height:44px;border:1px solid var(--line);border-radius:10px;color:var(--text);background:var(--surface);cursor:pointer}.mobile-panel-toggle{display:flex;flex:0 0 44px}.mobile-panel-toggle svg,.mobile-panel-close svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.mobile-panel-close{position:fixed;z-index:60;top:8px}.mobile-panel-close-left{left:min(calc(88vw - 52px),308px)}.mobile-panel-close-right{right:8px}#mobile-panel-left:checked~.mobile-panel-close-left,#mobile-panel-right:checked~.mobile-panel-close-right{display:flex}.rail>.section-title{padding-right:48px;margin-top:12px}.details>.tabs{padding-right:48px}.header{padding:7px 10px;min-height:59px}.session-tabs{flex:1}#session-path{margin-left:0;max-width:28%}}@media(max-width:620px){#session-path{display:none}.session-tab{max-width:140px}.rail,.details{width:min(92vw,360px)}.mobile-panel-close-left{left:min(calc(92vw - 52px),308px)}}
 body.browser-popout{display:block}body.browser-popout>.mobile-panel-state,body.browser-popout>.mobile-panel-scrim,body.browser-popout>.mobile-panel-close,body.browser-popout .mobile-panel-toggle{display:none!important}body.browser-popout>.rail,body.browser-popout>.resizer,body.browser-popout>main{display:none}body.browser-popout>.details{position:fixed;inset:0;display:flex!important;width:auto;height:100dvh;padding:0;background:var(--bg);transform:none;visibility:visible}body.browser-popout>.details>.tabs{display:none}body.browser-popout>.details>[data-panel]{display:none}body.browser-popout>.details>#browser{display:block!important;flex:1;overflow:auto}body.browser-popout .preview-card{min-height:100%;margin:0;padding:12px;border:0;border-radius:0}body.browser-popout .preview-frame{min-height:calc(100vh - 275px)}body.browser-popout .preview-frame img{max-height:calc(100vh - 275px)}
 .agent-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.agent-entry-card{position:relative;min-width:0}.agent-grid .agent-entry{display:grid;width:100%;min-height:112px;place-items:center;margin:0;text-align:center}.agent-grid .agent-icon{width:52px;height:52px}.agent-menu{position:absolute;z-index:3;top:5px;right:5px}.agent-menu>summary{display:grid;width:28px;height:28px;place-items:center;border-radius:50%;color:var(--muted);cursor:pointer;list-style:none}.agent-menu>summary::-webkit-details-marker{display:none}.agent-menu[open]>summary{background:var(--surface2);color:var(--text)}.agent-menu>div{position:absolute;top:30px;right:0;display:grid;width:108px;padding:5px;border:1px solid var(--line);border-radius:8px;background:#151519;box-shadow:0 12px 30px #000}.agent-menu button{border:0;border-radius:5px;background:transparent;color:var(--text);padding:7px;text-align:left}.agent-menu button:hover{background:var(--surface2)}.agent-menu button.danger{color:var(--danger)}.agent-menu button:disabled{opacity:.4}.agent-workspace-actions{display:flex;justify-content:flex-end}.agent-workspace-actions button{width:32px;height:32px;border:1px solid var(--line);border-radius:50%;background:var(--surface2);color:var(--text)}.agent-chat-card{display:grid;gap:8px}.agent-chat{display:grid;gap:8px;max-height:360px;overflow:auto}.agent-chat-message{padding:9px 11px;border-radius:10px;background:#151519;white-space:pre-wrap}.agent-chat-message.user{margin-left:16%;background:#202d3d}.agent-chat-message.agent{margin-right:10%}#selected-agent-chat-form{display:flex;gap:6px}#selected-agent-prompt{min-width:0;flex:1;resize:vertical;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:9px}#selected-agent-send{width:36px;height:36px;align-self:end;border:0;border-radius:50%;background:var(--text);color:var(--bg)}.builder-panel>label,.workflow-editor label,#routine-editor label{display:grid;gap:5px;margin:9px 0;color:var(--muted);font-size:11px}.builder-panel>label input,.builder-panel>label textarea,.builder-panel>label select,#plugin-form input,#plugin-form select,.workflow-editor input,.workflow-editor textarea,.workflow-editor select,#routine-editor input,#routine-editor textarea,#routine-editor select{width:100%;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}.workflow-editor textarea{min-height:88px;font-family:ui-monospace,monospace}.persona-preview{display:block;width:84px;height:84px;margin:8px auto;border-radius:12px;object-fit:cover}#agent-form{display:flex;justify-content:flex-end;margin-top:10px}#agent-form button,#plugin-form button{border:0;border-radius:8px;background:var(--pi);color:#07101b;padding:9px 13px;font-weight:700}#plugin-form{display:grid;gap:8px;padding:10px}#plugin-form label{display:grid;gap:5px;color:var(--muted);font-size:11px}
+.browser-profiles>summary{cursor:pointer}.browser-profile-row{display:flex;align-items:center;justify-content:space-between;padding:7px 2px;border-top:1px solid var(--line)}.browser-profile-row button{width:28px;height:28px;border:1px solid var(--line);border-radius:50%;background:transparent;color:var(--muted)}
 .builder-tabs{overflow-x:auto;scrollbar-width:none}.builder-tabs::-webkit-scrollbar{display:none}.builder-tabs button{flex:0 0 auto;min-width:max-content;padding-inline:9px;font-size:10px;white-space:nowrap}.builder-panel{max-width:100%;overflow-x:hidden}#agent-builder>.card{max-width:100%;overflow:hidden}#routine-editor{min-width:0}.routine-actions{min-width:0;flex-wrap:wrap}.routine-actions button{min-width:calc(50% - 4px)}
 .session-tab-wrap{display:flex;align-items:center;min-width:0;border:1px solid transparent;border-radius:8px}.session-tab-wrap.active{background:var(--surface);border-color:var(--line)}.session-tab-wrap .session-tab{border:0;background:transparent}.agent-session-tab,.builder-session-tab{color:var(--pi)}.session-tab-close{display:grid;width:26px;height:26px;flex:0 0 26px;place-items:center;border:0;border-radius:50%;background:transparent;color:var(--muted)}.session-tab-close:hover{background:var(--surface2);color:var(--text)}.agent-summary-card{display:grid;gap:4px}.agent-summary-card strong{margin:0}.agent-summary-card span{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-run-history>summary{cursor:pointer}.agent-history-entry{margin-top:8px;border:1px solid var(--line);border-radius:8px;background:#151519}.agent-history-entry>summary{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:7px;align-items:center;padding:9px;cursor:pointer;list-style:none}.agent-history-entry>summary::-webkit-details-marker{display:none}.agent-history-status{width:7px;height:7px;border-radius:50%;background:var(--muted)}.agent-history-entry[data-status="running"] .agent-history-status,.agent-history-entry[data-status="queued"] .agent-history-status{background:var(--pi)}.agent-history-entry[data-status="failed"] .agent-history-status{background:var(--danger)}.agent-history-prompt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-history-time{font-size:9px;color:var(--muted)}.agent-history-body{display:grid;gap:8px;padding:0 9px 9px;white-space:pre-wrap;overflow-wrap:anywhere}.agent-history-body button{justify-self:start;border:1px solid var(--danger);border-radius:6px;background:transparent;color:var(--danger);padding:5px 8px}.agent-message-content{display:grid;gap:9px;overflow-wrap:anywhere}.agent-message-content p,.agent-message-content pre,.agent-message-content ul,.agent-message-content ol{margin:0}.agent-message-content pre{overflow:auto;padding:10px;border:1px solid var(--line);border-radius:8px;background:#121216;font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre}.agent-message-content code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.agent-message-content :not(pre)>code{padding:1px 4px;border-radius:4px;background:var(--surface2)}.agent-message-content h2,.agent-message-content h3{margin:6px 0 0;font-size:1em}.agent-running{display:flex;align-items:center;gap:8px;color:var(--muted);font-style:italic}.agent-running i{width:6px;height:6px;border-radius:50%;background:var(--pi);animation:pulse 1s infinite alternate}
 </style></head><body>
@@ -1121,6 +1322,6 @@ body.browser-popout{display:block}body.browser-popout>.mobile-panel-state,body.b
 <div id="left-resizer" class="resizer left-resizer" role="separator" aria-label="Resize navigation" aria-orientation="vertical" tabindex="0"></div>
 <main><header class="header"><label class="mobile-panel-toggle" for="mobile-panel-left" title="Sessions" aria-label="Open sessions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg></label><div id="session-tabs" class="session-tabs" role="tablist" aria-label="Open Pi sessions"></div><span id="session-path">Starting Pi…</span><label class="mobile-panel-toggle" for="mobile-panel-right" title="Workspace" aria-label="Open Browser, Agents, and Agent Builder"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></label></header><section id="transcript" aria-live="polite"></section><div class="chat-dock"><div class="controls"><label>Model <select id="model"></select></label><label>Thinking <select id="thinking"><option>off</option><option>minimal</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label><span id="phase">idle</span></div><div id="attachment-list" aria-live="polite"></div><form id="composer"><input id="attachment-input" class="hidden" type="file" multiple><button id="attachment-button" type="button" aria-label="Attach files" title="Attach files">+</button><textarea id="prompt" aria-label="Message Pi" placeholder="Message Pi…" rows="1"></textarea><button id="composer-action" type="submit" aria-label="Send message"><svg class="send-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg><span class="stop-icon" aria-hidden="true"></span></button></form><div class="composer-meta"><span id="status" aria-live="polite">Connecting…</span><span id="session-stats"></span></div></div></main>
 <div id="right-resizer" class="resizer right-resizer" role="separator" aria-label="Resize details" aria-orientation="vertical" tabindex="0"></div>
-<aside class="details"><nav class="tabs" aria-label="Agent workspace"><button class="active" data-tab="browser">Browser</button><button data-tab="agents-workspace">Agents</button><button data-tab="agent-builder">Agent Builder</button></nav><section id="browser" data-panel><div class="card preview-card"><strong>Browser</strong><form id="preview-form"><button id="preview-back" type="button" title="Back" aria-label="Back" disabled>←</button><button id="preview-forward" type="button" title="Forward" aria-label="Forward" disabled>→</button><input id="preview-address" type="url" placeholder="Open a permitted URL" aria-label="Managed browser address" disabled><button id="preview-reload" type="button" title="Reload" aria-label="Reload managed browser" disabled>↻</button></form><span id="preview-session" class="preview-session"></span><button id="preview-control" type="button" disabled>Take control</button><nav class="preview-tabs" aria-label="Active browsers"></nav><section data-preview-panel="page"><div class="preview-frame"><img id="preview-image" alt="Latest managed browser viewport"></div></section><span id="preview-status" class="preview-status"></span></div></section><section id="agents-workspace" data-panel class="hidden"><div class="agent-workspace-actions"><button id="new-agent" type="button" title="Build a new agent" aria-label="Build a new agent">+</button></div><div id="agent-list" class="agent-grid"></div><section id="selected-agent" class="hidden"><div class="card agent-summary-card"><strong id="selected-agent-title"></strong><span id="selected-agent-meta" class="muted"></span></div><details class="card agent-run-history"><summary>Run history</summary><div id="agent-task-list"></div></details></section><details class="card"><summary>Delegation connections</summary><div id="external-connection-list"></div><div id="external-delegate" class="hidden"><strong id="external-title">External connection</strong><p id="external-description" class="muted"></p><p id="external-warning" class="external-warning"></p><form id="external-run-form"><input id="external-id" type="hidden"><label id="external-prompt-label">Task<textarea id="external-prompt" required></textarea></label><label>Working directory<input id="external-cwd" required></label><label>Model<select id="external-model"></select></label><button type="submit">Delegate</button></form><div id="external-run-list"></div></div></details></section><section id="agent-builder" data-panel class="hidden"><div class="card"><strong id="builder-title">Build a new agent</strong><nav class="builder-tabs"><button class="active" type="button" data-builder-tab="builder-profile-panel">Profile</button><button type="button" data-builder-tab="builder-tools-panel">Model &amp; Tools</button><button type="button" data-builder-tab="builder-connections-panel">Connections</button><button type="button" data-builder-tab="builder-automation-panel">Automation</button></nav><section id="builder-profile-panel" class="builder-panel" data-builder-panel><input id="agent-id" form="agent-form" type="hidden"><label>Name<input id="agent-name" form="agent-form" required></label><label>Description<textarea id="agent-description" form="agent-form" required></textarea></label><label>Project folder<input id="agent-project-root" form="agent-form" required></label><label>Persona<select id="agent-persona-select" form="agent-form"><option value="">Custom</option></select></label><img id="agent-persona-image" class="persona-preview hidden" alt=""><label>Persona instructions<textarea id="agent-persona" form="agent-form" required></textarea></label></section><section id="builder-tools-panel" class="builder-panel hidden" data-builder-panel><label>Model<select id="agent-model" form="agent-form"></select></label><label>Thinking<select id="agent-thinking" form="agent-form"><option>off</option><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></label><label>Executor<select id="agent-executor" form="agent-form"><option value="harness">Isolated harness</option><option value="session">Pi session</option></select></label><label>Permissions<select id="agent-permissions" form="agent-form"><option value="read-only">Read only</option><option value="workspace-write">Workspace write</option></select></label><label>Browser access<select id="agent-browser-access" form="agent-form"><option value="disabled">Disabled</option><option value="loopback">Local development only</option><option value="public-web">Public web</option><option value="private-network">Private network</option></select></label><label class="hidden">Memory<select id="agent-memory" form="agent-form"><option value="none">None</option><option value="notes">Notes</option></select></label><input id="agent-tools" form="agent-form" type="hidden"><div id="capability-list"></div><details class="capability-section"><summary><strong>Plugin management</strong></summary><form id="plugin-form"><label>Source<input id="plugin-source" placeholder="package@version" required></label><label>Scope<select id="plugin-scope"><option value="user">User</option><option value="project">Project</option></select></label><button type="submit">Install</button></form></details></section><section id="builder-connections-panel" class="builder-panel hidden" data-builder-panel><label>May delegate to agents<input id="agent-delegates" form="agent-form" placeholder="researcher, reviewer"></label><label><input id="agent-a2a" form="agent-form" type="checkbox"> Expose through authenticated A2A</label></section><section id="builder-automation-panel" class="builder-panel hidden" data-builder-panel><div id="routines"><div id="routine-list"></div></div><div id="workflows"><div id="workflow-list"></div></div></section><form id="agent-form"><button type="submit">Save and deploy</button></form></div></section></aside>
+<aside class="details"><nav class="tabs" aria-label="Agent workspace"><button class="active" data-tab="browser">Browser</button><button data-tab="agents-workspace">Agents</button><button data-tab="agent-builder">Agent Builder</button></nav><section id="browser" data-panel><div class="card preview-card"><strong>Browser</strong><form id="preview-form"><button id="preview-back" type="button" title="Back" aria-label="Back" disabled>←</button><button id="preview-forward" type="button" title="Forward" aria-label="Forward" disabled>→</button><input id="preview-address" type="url" placeholder="Open a permitted URL" aria-label="Managed browser address" disabled><button id="preview-reload" type="button" title="Reload" aria-label="Reload managed browser" disabled>↻</button></form><span id="preview-session" class="preview-session"></span><button id="preview-control" type="button" disabled>Take control</button><nav class="preview-tabs" aria-label="Active browsers"></nav><section data-preview-panel="page"><div class="preview-frame"><img id="preview-image" alt="Latest managed browser viewport"></div></section><span id="preview-status" class="preview-status"></span></div></section><section id="agents-workspace" data-panel class="hidden"><div class="agent-workspace-actions"><button id="new-agent" type="button" title="Build a new agent" aria-label="Build a new agent">+</button></div><div id="agent-list" class="agent-grid"></div><section id="selected-agent" class="hidden"><div class="card agent-summary-card"><strong id="selected-agent-title"></strong><span id="selected-agent-meta" class="muted"></span></div><details class="card agent-run-history"><summary>Run history</summary><div id="agent-task-list"></div></details></section><details class="card"><summary>Delegation connections</summary><div id="external-connection-list"></div><div id="external-delegate" class="hidden"><strong id="external-title">External connection</strong><p id="external-description" class="muted"></p><p id="external-warning" class="external-warning"></p><form id="external-run-form"><input id="external-id" type="hidden"><label id="external-prompt-label">Task<textarea id="external-prompt" required></textarea></label><label>Working directory<input id="external-cwd" required></label><label>Model<select id="external-model"></select></label><button type="submit">Delegate</button></form><div id="external-run-list"></div></div></details></section><section id="agent-builder" data-panel class="hidden"><div class="card"><strong id="builder-title">Build a new agent</strong><nav class="builder-tabs"><button class="active" type="button" data-builder-tab="builder-profile-panel">Profile</button><button type="button" data-builder-tab="builder-tools-panel">Model &amp; Tools</button><button type="button" data-builder-tab="builder-connections-panel">Connections</button><button type="button" data-builder-tab="builder-automation-panel">Automation</button></nav><section id="builder-profile-panel" class="builder-panel" data-builder-panel><input id="agent-id" form="agent-form" type="hidden"><label>Name<input id="agent-name" form="agent-form" required></label><label>Description<textarea id="agent-description" form="agent-form" required></textarea></label><label>Project folder<input id="agent-project-root" form="agent-form" required></label><label>Persona<select id="agent-persona-select" form="agent-form"><option value="">Custom</option></select></label><img id="agent-persona-image" class="persona-preview hidden" alt=""><label>Persona instructions<textarea id="agent-persona" form="agent-form" required></textarea></label></section><section id="builder-tools-panel" class="builder-panel hidden" data-builder-panel><label>Model<select id="agent-model" form="agent-form"></select></label><label>Thinking<select id="agent-thinking" form="agent-form"><option>off</option><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></label><label>Executor<select id="agent-executor" form="agent-form"><option value="harness">Isolated harness</option><option value="session">Pi session</option></select></label><label>Permissions<select id="agent-permissions" form="agent-form"><option value="read-only">Read only</option><option value="workspace-write">Workspace write</option></select></label><label>Browser access<select id="agent-browser-access" form="agent-form"><option value="disabled">Disabled</option><option value="loopback">Local development only</option><option value="public-web">Public web</option><option value="private-network">Private network</option></select></label><label>Browser engine<select id="agent-browser-runtime" form="agent-form"><option value="managed-chromium">Managed Chromium (recommended)</option><option value="installed-chrome">Installed Chrome compatibility</option></select></label><label>Browser profile<select id="agent-browser-profile-kind" form="agent-form"><option value="ephemeral">Fresh for every run</option><option value="named">Named sign-in profile</option></select></label><label id="agent-browser-profile-id-label" class="hidden">Profile name<input id="agent-browser-profile-id" form="agent-form" pattern="[a-z0-9][a-z0-9-]{0,63}" placeholder="signed-in"></label><label class="hidden">Memory<select id="agent-memory" form="agent-form"><option value="none">None</option><option value="notes">Notes</option></select></label><input id="agent-tools" form="agent-form" type="hidden"><div id="capability-list"></div><details class="capability-section"><summary><strong>Plugin management</strong></summary><form id="plugin-form"><label>Source<input id="plugin-source" placeholder="package@version" required></label><label>Scope<select id="plugin-scope"><option value="user">User</option><option value="project">Project</option></select></label><button type="submit">Install</button></form></details></section><section id="builder-connections-panel" class="builder-panel hidden" data-builder-panel><label>May delegate to agents<input id="agent-delegates" form="agent-form" placeholder="researcher, reviewer"></label><label><input id="agent-a2a" form="agent-form" type="checkbox"> Expose through authenticated A2A</label></section><section id="builder-automation-panel" class="builder-panel hidden" data-builder-panel><div id="routines"><div id="routine-list"></div></div><div id="workflows"><div id="workflow-list"></div></div></section><form id="agent-form"><button type="submit">Save and deploy</button></form></div></section></aside>
 <script src="/browser-client.js?token=${token}"></script></body></html>`;
 }

@@ -3,8 +3,14 @@ import { resolve } from "node:path";
 import type { BrowserArtifact, BrowserArtifactStore } from "./browser-artifact-store.ts";
 import { type BrowserAccess, BrowserPolicy } from "./browser-policy.ts";
 import type { BrowserProfile, BrowserProfileStore } from "./browser-profile-store.ts";
+import type {
+	BrowserCapturePageState,
+	BrowserWorkflowCapture,
+	BrowserWorkflowCaptureStore,
+} from "./browser-workflow-capture.ts";
 
 export type BrowserOwnerKind = "pi-session" | "agent-run" | "external-run";
+export type BrowserRuntimeKind = "managed-chromium" | "installed-chrome";
 
 export interface BrowserOwner {
 	kind: BrowserOwnerKind;
@@ -26,6 +32,7 @@ export interface BrowserSessionRequest {
 	owner: BrowserOwner;
 	workspace: BrowserWorkspace;
 	access: BrowserAccess;
+	runtime?: BrowserRuntimeKind;
 	profile?: BrowserProfile;
 	viewport?: BrowserViewport;
 }
@@ -35,6 +42,7 @@ export interface BrowserSessionSnapshot {
 	owner: BrowserOwner;
 	workspace: BrowserWorkspace;
 	access: BrowserAccess;
+	runtime: BrowserRuntimeKind;
 	profile: BrowserProfile;
 	controlOwner: "agent" | "user";
 	viewport: BrowserViewport;
@@ -58,12 +66,17 @@ export interface BrowserDriverContext {
 	typeText(text: string): Promise<void>;
 	scroll(deltaX: number, deltaY: number): Promise<void>;
 	snapshot(): Promise<{ url: string; title: string; elements: BrowserPageElement[] }>;
+	elementAt(x: number, y: number): Promise<BrowserPageElement | undefined>;
+	focusedElement(): Promise<BrowserPageElement | undefined>;
 	click(elementIndex: number): Promise<void>;
 	fill(elementIndex: number, text: string): Promise<void>;
+	select(elementIndex: number, value: string): Promise<void>;
+	scrollIntoView(elementIndex: number): Promise<void>;
 	press(key: string): Promise<void>;
 	screenshot(): Promise<Uint8Array>;
 	subscribeFrames(listener: (frame: BrowserFrame) => void): Promise<() => Promise<void>>;
 	diagnostics(): BrowserDiagnostics;
+	downloads(): BrowserDownload[];
 	close(): Promise<void>;
 }
 
@@ -77,6 +90,24 @@ export interface BrowserFrame {
 export interface BrowserPageElement {
 	role: string;
 	name: string;
+	tag?: string;
+	label?: string;
+	testId?: string;
+	id?: string;
+	inputType?: string;
+	visible?: boolean;
+	enabled?: boolean;
+	frame?: BrowserPageFrame[];
+}
+
+export interface BrowserPageFrame {
+	name: string;
+	url: string;
+}
+
+export interface BrowserDownload {
+	name: string;
+	timestamp: number;
 }
 
 export interface BrowserSemanticSnapshot {
@@ -105,7 +136,11 @@ export interface BrowserDiagnostics {
 }
 
 export interface BrowserDriver {
-	createContext(input: { profilePath?: string; viewport: BrowserViewport }): Promise<BrowserDriverContext>;
+	createContext(input: {
+		profilePath?: string;
+		viewport: BrowserViewport;
+		runtime: BrowserRuntimeKind;
+	}): Promise<BrowserDriverContext>;
 	dispose(): Promise<void>;
 }
 
@@ -125,7 +160,9 @@ export class BrowserSessionManager implements AsyncDisposable {
 	readonly #profileStore: BrowserProfileStore;
 	readonly #maxSessions: number;
 	readonly #artifactStore: BrowserArtifactStore | undefined;
+	readonly #captureStore: BrowserWorkflowCaptureStore | undefined;
 	readonly #sessions = new Map<string, BrowserSessionRecord>();
+	readonly #namedProfileLeases = new Map<string, string>();
 	readonly #snapshots = new Map<string, BrowserSemanticSnapshot>();
 	readonly #snapshotRevisions = new Map<string, number>();
 	#disposed = false;
@@ -135,6 +172,7 @@ export class BrowserSessionManager implements AsyncDisposable {
 		profileStore: BrowserProfileStore,
 		maxSessions = 4,
 		artifactStore?: BrowserArtifactStore,
+		captureStore?: BrowserWorkflowCaptureStore,
 	) {
 		if (!Number.isSafeInteger(maxSessions) || maxSessions < 1)
 			throw new Error("Browser maxSessions must be positive");
@@ -142,6 +180,7 @@ export class BrowserSessionManager implements AsyncDisposable {
 		this.#profileStore = profileStore;
 		this.#maxSessions = maxSessions;
 		this.#artifactStore = artifactStore;
+		this.#captureStore = captureStore;
 	}
 
 	list(owner?: BrowserOwner): BrowserSessionSnapshot[] {
@@ -163,6 +202,11 @@ export class BrowserSessionManager implements AsyncDisposable {
 		assertOwner(request.owner);
 		const workspace = normalizeWorkspace(request.workspace);
 		const profile = request.profile ?? { kind: "ephemeral" };
+		const runtime = request.runtime ?? "managed-chromium";
+		if (profile.kind === "named") {
+			const leasedBy = this.#namedProfileLeases.get(profile.id);
+			if (leasedBy) throw new Error(`Browser profile ${profile.id} is already in use by session ${leasedBy}`);
+		}
 		const viewport = request.viewport ?? DEFAULT_VIEWPORT;
 		assertViewport(viewport);
 		const id = randomUUID();
@@ -172,6 +216,7 @@ export class BrowserSessionManager implements AsyncDisposable {
 			owner: { ...request.owner },
 			workspace,
 			access: request.access,
+			runtime,
 			profile,
 			controlOwner: "agent",
 			viewport,
@@ -182,10 +227,12 @@ export class BrowserSessionManager implements AsyncDisposable {
 			updatedAt: now,
 		};
 		try {
+			if (profile.kind === "named") this.#namedProfileLeases.set(profile.id, id);
 			const policy = new BrowserPolicy(request.access);
 			const context = await this.#driver.createContext({
 				profilePath: await this.#profileStore.pathFor(profile),
 				viewport,
+				runtime,
 			});
 			await context.setNavigationPolicy(async (url) => {
 				await policy.assertResolvedNavigation(url);
@@ -201,6 +248,7 @@ export class BrowserSessionManager implements AsyncDisposable {
 			});
 			return this.get(id)!;
 		} catch (error) {
+			if (profile.kind === "named") this.#namedProfileLeases.delete(profile.id);
 			snapshot.status = "failed";
 			snapshot.updatedAt = Date.now();
 			snapshot.lastError = message(error);
@@ -214,6 +262,7 @@ export class BrowserSessionManager implements AsyncDisposable {
 		this.#assertMutation(record, actor);
 		if (record.snapshot.status === "closed") throw new Error(`Browser session ${id} is closed`);
 		const allowedUrl = await record.policy.assertResolvedNavigation(url);
+		const before = await this.#capturePageState(id, record);
 		record.snapshot.status = "navigating";
 		record.snapshot.updatedAt = Date.now();
 		try {
@@ -234,6 +283,13 @@ export class BrowserSessionManager implements AsyncDisposable {
 			record.snapshot.updatedAt = Date.now();
 		}
 		this.#snapshots.delete(id);
+		if (before) {
+			await this.#captureStore?.record(id, {
+				action: { kind: "navigate", url: record.snapshot.url ?? allowedUrl.href },
+				before,
+				after: await this.#pageState(record.context),
+			});
+		}
 		return this.get(id)!;
 	}
 
@@ -262,9 +318,18 @@ export class BrowserSessionManager implements AsyncDisposable {
 		this.#assertMutation(record, "user");
 		assertCoordinate(x, "x", record.snapshot.viewport.width);
 		assertCoordinate(y, "y", record.snapshot.viewport.height);
+		const before = await this.#capturePageState(id, record);
+		const target = before ? await record.context.elementAt(x, y) : undefined;
 		await record.context.pointerClick(x, y);
 		record.snapshot.updatedAt = Date.now();
 		this.#snapshots.delete(id);
+		if (before) {
+			await this.#captureStore?.record(id, {
+				action: { kind: "click", x, y, target },
+				before,
+				after: await this.#pageState(record.context),
+			});
+		}
 	}
 
 	async typeText(id: string, text: string): Promise<void> {
@@ -272,9 +337,23 @@ export class BrowserSessionManager implements AsyncDisposable {
 		this.#assertMutation(record, "user");
 		if (text.length === 0 || text.length > 100_000)
 			throw new Error("Browser text must contain 1 to 100000 characters");
+		const before = await this.#capturePageState(id, record);
+		const target = before ? await record.context.focusedElement() : undefined;
 		await record.context.typeText(text);
 		record.snapshot.updatedAt = Date.now();
 		this.#snapshots.delete(id);
+		if (before) {
+			await this.#captureStore?.record(id, {
+				action: {
+					kind: "type",
+					textLength: text.length,
+					target,
+					sensitive: target?.inputType === "password",
+				},
+				before,
+				after: await this.#pageState(record.context),
+			});
+		}
 	}
 
 	async scroll(id: string, deltaX: number, deltaY: number): Promise<void> {
@@ -288,9 +367,38 @@ export class BrowserSessionManager implements AsyncDisposable {
 		) {
 			throw new Error("Browser scroll values are out of range");
 		}
+		const before = await this.#capturePageState(id, record);
 		await record.context.scroll(deltaX, deltaY);
 		record.snapshot.updatedAt = Date.now();
 		this.#snapshots.delete(id);
+		if (before) {
+			await this.#captureStore?.record(id, {
+				action: { kind: "scroll", deltaX, deltaY },
+				before,
+				after: await this.#pageState(record.context),
+			});
+		}
+	}
+
+	async startCapture(id: string): Promise<BrowserWorkflowCapture> {
+		if (!this.#captureStore) throw new Error("Browser workflow capture is unavailable");
+		const record = this.#requireSession(id);
+		return this.#captureStore.start({
+			sessionId: id,
+			owner: record.snapshot.owner,
+			profile: record.snapshot.profile,
+			viewport: record.snapshot.viewport,
+			initial: await this.#pageState(record.context),
+		});
+	}
+
+	async stopCapture(id: string): Promise<BrowserWorkflowCapture> {
+		if (!this.#captureStore) throw new Error("Browser workflow capture is unavailable");
+		return this.#captureStore.stop(id);
+	}
+
+	getCapture(id: string): BrowserWorkflowCapture | undefined {
+		return this.#captureStore?.getForSession(id);
 	}
 
 	async snapshot(id: string): Promise<BrowserSemanticSnapshot> {
@@ -318,6 +426,16 @@ export class BrowserSessionManager implements AsyncDisposable {
 		await this.#performElementAction(id, revision, ref, (context, index) => context.fill(index, text));
 	}
 
+	async select(id: string, revision: number, ref: string, value: string): Promise<void> {
+		this.#assertMutation(this.#requireSession(id), "agent");
+		await this.#performElementAction(id, revision, ref, (context, index) => context.select(index, value));
+	}
+
+	async scrollIntoView(id: string, revision: number, ref: string): Promise<void> {
+		this.#assertMutation(this.#requireSession(id), "agent");
+		await this.#performElementAction(id, revision, ref, (context, index) => context.scrollIntoView(index));
+	}
+
 	async press(id: string, key: string): Promise<void> {
 		const record = this.#requireSession(id);
 		this.#assertMutation(record, "agent");
@@ -337,10 +455,7 @@ export class BrowserSessionManager implements AsyncDisposable {
 	async captureScreenshotArtifact(id: string): Promise<{ png: Uint8Array; artifact?: BrowserArtifact }> {
 		const record = this.#requireSession(id);
 		const png = await record.context.screenshot();
-		const artifact =
-			record.snapshot.owner.kind === "agent-run" || record.snapshot.owner.kind === "external-run"
-				? await this.#artifactStore?.saveScreenshot(record.snapshot.owner, png)
-				: undefined;
+		const artifact = await this.#artifactStore?.saveScreenshot(record.snapshot.owner, png);
 		return { png, artifact };
 	}
 
@@ -357,12 +472,22 @@ export class BrowserSessionManager implements AsyncDisposable {
 		};
 	}
 
+	downloads(id: string): BrowserDownload[] {
+		return this.#requireSession(id)
+			.context.downloads()
+			.map((entry) => ({ ...entry }));
+	}
+
 	async close(id: string): Promise<void> {
 		const record = this.#sessions.get(id);
 		if (!record || record.snapshot.status === "closed") return;
 		record.snapshot.status = "closed";
 		record.snapshot.updatedAt = Date.now();
+		await this.#captureStore?.interrupt(id);
 		await record.context.close();
+		if (record.snapshot.profile.kind === "named") {
+			this.#namedProfileLeases.delete(record.snapshot.profile.id);
+		}
 		this.#snapshots.delete(id);
 	}
 
@@ -404,11 +529,12 @@ export class BrowserSessionManager implements AsyncDisposable {
 		id: string,
 		actor: "agent" | "user",
 		action: (context: BrowserDriverContext) => Promise<{ url: string; title: string }>,
-		name: string,
+		name: "back" | "forward" | "reload",
 	): Promise<BrowserSessionSnapshot> {
 		this.#assertActive();
 		const record = this.#requireSession(id);
 		this.#assertMutation(record, actor);
+		const before = await this.#capturePageState(id, record);
 		record.snapshot.status = "navigating";
 		record.snapshot.updatedAt = Date.now();
 		try {
@@ -433,7 +559,23 @@ export class BrowserSessionManager implements AsyncDisposable {
 			record.snapshot.updatedAt = Date.now();
 		}
 		this.#snapshots.delete(id);
+		if (before) {
+			await this.#captureStore?.record(id, {
+				action: { kind: name },
+				before,
+				after: await this.#pageState(record.context),
+			});
+		}
 		return this.get(id)!;
+	}
+
+	async #capturePageState(id: string, record: BrowserSessionRecord): Promise<BrowserCapturePageState | undefined> {
+		return this.#captureStore?.getForSession(id) ? this.#pageState(record.context) : undefined;
+	}
+
+	async #pageState(context: BrowserDriverContext): Promise<BrowserCapturePageState> {
+		const page = await context.snapshot();
+		return { url: page.url, title: page.title, elements: page.elements };
 	}
 
 	#assertMutation(record: BrowserSessionRecord, actor: "agent" | "user"): void {

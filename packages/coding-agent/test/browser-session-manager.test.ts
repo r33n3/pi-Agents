@@ -7,8 +7,10 @@ import { BrowserProfileStore } from "../src/core/serve/browser-profile-store.ts"
 import {
 	type BrowserDriver,
 	type BrowserDriverContext,
+	type BrowserRuntimeKind,
 	BrowserSessionManager,
 } from "../src/core/serve/browser-session-manager.ts";
+import { BrowserWorkflowCaptureStore } from "../src/core/serve/browser-workflow-capture.ts";
 
 class FakeBrowserContext implements BrowserDriverContext {
 	closed = false;
@@ -46,9 +48,19 @@ class FakeBrowserContext implements BrowserDriverContext {
 		return { url: "http://localhost:4173/", title: "Fixture page", elements: [{ role: "button", name: "Save" }] };
 	}
 
+	async elementAt(): Promise<{ role: string; name: string }> {
+		return { role: "button", name: "Save" };
+	}
+
+	async focusedElement(): Promise<{ role: string; name: string }> {
+		return { role: "textbox", name: "Name" };
+	}
+
 	async click(): Promise<void> {}
 
 	async fill(): Promise<void> {}
+	async select(): Promise<void> {}
+	async scrollIntoView(): Promise<void> {}
 
 	async press(): Promise<void> {}
 
@@ -63,6 +75,9 @@ class FakeBrowserContext implements BrowserDriverContext {
 	diagnostics() {
 		return { console: [], networkFailures: [] };
 	}
+	downloads() {
+		return [];
+	}
 
 	async close(): Promise<void> {
 		this.closed = true;
@@ -71,11 +86,13 @@ class FakeBrowserContext implements BrowserDriverContext {
 
 class FakeBrowserDriver implements BrowserDriver {
 	readonly contexts: FakeBrowserContext[] = [];
+	readonly runtimes: BrowserRuntimeKind[] = [];
 	disposed = false;
 
-	async createContext(): Promise<BrowserDriverContext> {
+	async createContext(input: { runtime: BrowserRuntimeKind }): Promise<BrowserDriverContext> {
 		const context = new FakeBrowserContext();
 		this.contexts.push(context);
+		this.runtimes.push(input.runtime);
 		return context;
 	}
 
@@ -89,6 +106,45 @@ describe("BrowserSessionManager", () => {
 
 	afterEach(async () => {
 		await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+	});
+
+	test("binds each session to the selected browser runtime", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-browser-manager-"));
+		roots.push(root);
+		const driver = new FakeBrowserDriver();
+		const manager = new BrowserSessionManager(driver, new BrowserProfileStore(root));
+		const session = await manager.create({
+			owner: { kind: "agent-run", id: "chrome-run" },
+			workspace: { id: "project-main", root },
+			access: "loopback",
+			runtime: "installed-chrome",
+		});
+		expect(session.runtime).toBe("installed-chrome");
+		expect(driver.runtimes).toEqual(["installed-chrome"]);
+		await manager.dispose();
+	});
+
+	test("interrupts an active recording when its browser session closes", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-browser-manager-"));
+		roots.push(root);
+		const captureStore = new BrowserWorkflowCaptureStore(join(root, "captures"));
+		await captureStore.initialize();
+		const manager = new BrowserSessionManager(
+			new FakeBrowserDriver(),
+			new BrowserProfileStore(root),
+			4,
+			undefined,
+			captureStore,
+		);
+		const session = await manager.create({
+			owner: { kind: "pi-session", id: "capture-close" },
+			workspace: { id: "project-main", root },
+			access: "loopback",
+		});
+		const capture = await manager.startCapture(session.id);
+		await manager.close(session.id);
+		expect(captureStore.get(capture.id)?.status).toBe("interrupted");
+		await manager.dispose();
 	});
 
 	test("keeps browser state bound to its explicit owner workspace", async () => {
@@ -143,6 +199,24 @@ describe("BrowserSessionManager", () => {
 
 		await manager.close(first.id);
 		await expect(manager.create(input)).resolves.toMatchObject({ status: "ready" });
+		await manager.dispose();
+	});
+
+	test("leases named profiles to one live session and releases the lease on close", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-browser-manager-"));
+		roots.push(root);
+		const manager = new BrowserSessionManager(new FakeBrowserDriver(), new BrowserProfileStore(root));
+		const input = {
+			owner: { kind: "pi-session" as const, id: "session-123" },
+			workspace: { id: "project-main", root },
+			access: "loopback" as const,
+			profile: { kind: "named" as const, id: "signed-in" },
+		};
+		const first = await manager.create(input);
+		await expect(manager.create(input)).rejects.toThrow("already in use");
+
+		await manager.close(first.id);
+		await expect(manager.create(input)).resolves.toMatchObject({ profile: { kind: "named", id: "signed-in" } });
 		await manager.dispose();
 	});
 

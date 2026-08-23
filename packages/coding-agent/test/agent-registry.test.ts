@@ -119,6 +119,32 @@ describe("AgentRegistry", () => {
 		).resolves.toMatchObject({ browser: { access: "public-web", profile: { kind: "named", id: "research" } } });
 	});
 
+	test("pins assigned browser workflows to an active validated version", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-agent-workflow-grant-"));
+		roots.push(root);
+		const agents = new AgentRegistry(root, {
+			browserWorkflowCatalog: (id, version) => id === "review-page" && version === 2,
+		});
+		const input = {
+			id: "browser-reviewer",
+			name: "Browser reviewer",
+			description: "Reviews a validated page flow",
+			tools: ["browser"],
+			memory: "none" as const,
+			persona: "Review carefully",
+			executor: "session" as const,
+			permissionPolicy: "read-only" as const,
+			schedules: [],
+			browser: { access: "loopback" as const, profile: { kind: "ephemeral" as const } },
+		};
+		await expect(agents.save({ ...input, browserWorkflows: [{ id: "review-page", version: 1 }] })).rejects.toThrow(
+			"version 1 is not active",
+		);
+		await expect(
+			agents.save({ ...input, browserWorkflows: [{ id: "review-page", version: 2 }] }),
+		).resolves.toMatchObject({ browserWorkflows: [{ id: "review-page", version: 2 }] });
+	});
+
 	test("keeps browser tool and access policy paired when Pi deploys an agent", async () => {
 		const { root, registry: agents } = await registry();
 		const deploy = createAgentRegistryTools(agents)[0]!;

@@ -19,6 +19,10 @@ This is a browser surface, not a remote desktop. Pi does not create a cloud VM,
 control arbitrary desktop applications, or attach to the user's normal Chrome
 profile in this delivery.
 
+Durable recording, semantic compilation, validated replay, assignment, and
+local-to-ECS portability follow the
+[portable browser workflow specification](pi-browser-workflow-spec.md).
+
 ## User outcome
 
 A frontend workflow should read as follows:

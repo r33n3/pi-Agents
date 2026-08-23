@@ -12,6 +12,14 @@ import type {
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
 import { AgentRunManager } from "../src/core/serve/agent-run-manager.ts";
 import { AgentTaskService } from "../src/core/serve/agent-task-service.ts";
+import { BrowserProfileStore } from "../src/core/serve/browser-profile-store.ts";
+import {
+	type BrowserDriver,
+	type BrowserDriverContext,
+	BrowserSessionManager,
+} from "../src/core/serve/browser-session-manager.ts";
+import { BrowserWorkflowRegistry } from "../src/core/serve/browser-workflow-registry.ts";
+import { BrowserWorkflowRunner } from "../src/core/serve/browser-workflow-runner.ts";
 import { WorkflowService } from "../src/core/serve/workflow-service.ts";
 
 const roots: string[] = [];
@@ -56,6 +64,61 @@ class ImmediateExecutor implements AgentExecutor {
 	[Symbol.asyncDispose](): Promise<void> {
 		return this.dispose();
 	}
+}
+
+class WorkflowNodeBrowserContext implements BrowserDriverContext {
+	url = "about:blank";
+	async setNavigationPolicy(): Promise<void> {}
+	async navigate(url: string) {
+		this.url = url;
+		return { url, title: "Ready" };
+	}
+	async goBack() {
+		return { url: this.url, title: "Ready" };
+	}
+	async goForward() {
+		return { url: this.url, title: "Ready" };
+	}
+	async reload() {
+		return { url: this.url, title: "Ready" };
+	}
+	async pointerClick(): Promise<void> {}
+	async typeText(): Promise<void> {}
+	async scroll(): Promise<void> {}
+	async snapshot() {
+		return { url: this.url, title: "Ready", elements: [] };
+	}
+	async elementAt(): Promise<undefined> {
+		return undefined;
+	}
+	async focusedElement(): Promise<undefined> {
+		return undefined;
+	}
+	async click(): Promise<void> {}
+	async fill(): Promise<void> {}
+	async select(): Promise<void> {}
+	async scrollIntoView(): Promise<void> {}
+	async press(): Promise<void> {}
+	async screenshot() {
+		return new Uint8Array([137, 80, 78, 71]);
+	}
+	async subscribeFrames() {
+		return async () => {};
+	}
+	diagnostics() {
+		return { console: [], networkFailures: [] };
+	}
+	downloads() {
+		return [];
+	}
+	async close(): Promise<void> {}
+}
+
+class WorkflowNodeBrowserDriver implements BrowserDriver {
+	async createContext(): Promise<BrowserDriverContext> {
+		return new WorkflowNodeBrowserContext();
+	}
+	async dispose(): Promise<void> {}
 }
 
 async function setup() {
@@ -139,6 +202,72 @@ describe("agent workflows and A2A", () => {
 		});
 		expect(() => adapter.validateVersion("0.3")).toThrow(A2aError);
 		await expect(adapter.listTasks("reviewer")).rejects.toMatchObject({ reason: "AGENT_NOT_FOUND" });
+		await tasks.dispose();
+	});
+
+	test("runs an exact canonical browser workflow version as a larger workflow node", async () => {
+		const { root, registry, tasks } = await setup();
+		const browserRegistry = new BrowserWorkflowRegistry(join(root, "browser-workflows"));
+		await browserRegistry.initialize();
+		const draft = await browserRegistry.saveDraft({
+			name: "Open fixture",
+			description: "Open the local fixture",
+			entry: {
+				urlTemplate: "http://127.0.0.1:4173/fixture",
+				allowedOrigins: ["http://127.0.0.1:4173"],
+				ready: [{ kind: "page-ready" }],
+			},
+			parameters: [],
+			steps: [],
+			completion: [{ kind: "page-ready" }],
+			requirements: {
+				profile: "none",
+				access: "loopback",
+				viewport: { width: 800, height: 600, deviceScaleFactor: 1 },
+			},
+			policy: { deadlineMs: 10_000, approval: "inherit" },
+			source: { kind: "manual" },
+		});
+		const compiled = await browserRegistry.setStatus(draft.id, draft.version, "compiled");
+		await browserRegistry.markValidated(compiled.id, compiled.version, {
+			id: "validation-node",
+			digest: compiled.digest,
+			completedAt: Date.now(),
+		});
+		await browserRegistry.activate(compiled.id, compiled.version);
+		const browserManager = new BrowserSessionManager(new WorkflowNodeBrowserDriver(), new BrowserProfileStore(root));
+		const browserRunner = new BrowserWorkflowRunner(browserRegistry, browserManager, join(root, "browser-runs"));
+		await browserRunner.initialize();
+		const workflows = new WorkflowService(join(root, "workflows"), registry, tasks, {
+			runner: browserRunner,
+			owner: { kind: "pi-session", id: "workflow-owner" },
+			workspace: { id: "project", root },
+		});
+		await workflows.initialize();
+		await workflows.save({
+			id: "browser-check",
+			name: "Browser check",
+			pattern: "sequential",
+			nodes: [
+				{
+					id: "open",
+					kind: "browser-workflow",
+					workflowId: compiled.id,
+					workflowVersion: compiled.version,
+					parameters: {},
+				},
+			],
+			edges: [],
+			maxConcurrency: 1,
+			maxDelegationDepth: 1,
+			failurePolicy: "stop",
+		});
+		const started = await workflows.start("browser-check", "Check the fixture");
+		await expect(workflows.waitForCompletion(started.id)).resolves.toMatchObject({
+			status: "completed",
+			browserRunIds: [expect.any(String)],
+		});
+		await browserManager.dispose();
 		await tasks.dispose();
 	});
 });

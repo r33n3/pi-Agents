@@ -4,6 +4,7 @@ import type { BrowserAccess } from "./browser-policy.ts";
 import type { BrowserProfile } from "./browser-profile-store.ts";
 import type {
 	BrowserOwner,
+	BrowserRuntimeKind,
 	BrowserSessionManager,
 	BrowserSessionSnapshot,
 	BrowserWorkspace,
@@ -28,6 +29,7 @@ export interface BrowserToolScope {
 	workspace: BrowserWorkspace;
 	access: Exclude<BrowserAccess, "disabled">;
 	profile?: BrowserProfile;
+	runtime?: BrowserRuntimeKind;
 	workspacePreview?: WorkspacePreviewServer;
 }
 

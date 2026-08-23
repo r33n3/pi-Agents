@@ -15,11 +15,32 @@ describe("PlaywrightBrowserDriver", () => {
 
 	beforeEach(async () => {
 		root = await mkdtemp(join(tmpdir(), "pi-playwright-browser-"));
-		server = createServer((_request, response) => {
+		server = createServer((request, response) => {
+			if (request.url === "/download") {
+				response
+					.writeHead(200, {
+						"content-type": "text/plain",
+						"content-disposition": 'attachment; filename="report.txt"',
+					})
+					.end("report");
+				return;
+			}
+			if (request.url === "/frame") {
+				response
+					.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+					.end("<button>Frame action</button>");
+				return;
+			}
+			if (request.url === "/popup") {
+				response
+					.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+					.end("<!doctype html><title>Popup fixture</title><button>Popup action</button>");
+				return;
+			}
 			response
 				.writeHead(200, { "content-type": "text/html; charset=utf-8" })
 				.end(
-					'<!doctype html><title>Browser fixture</title><input aria-label="Search"><button>Save</button><img src="https://example.com/blocked.png" alt=""><script>console.error("fixture console")</script>',
+					'<!doctype html><title>Browser fixture</title><input aria-label="Search"><button>Save</button><a href="/download" download>Download report</a><button onclick="window.open(\'/popup\')">Open popup</button><iframe name="fixture-frame" src="/frame"></iframe><img src="https://example.com/blocked.png" alt=""><script>console.error("fixture console")</script>',
 				);
 		});
 		await new Promise<void>((resolve, reject) => {
@@ -77,5 +98,28 @@ describe("PlaywrightBrowserDriver", () => {
 		]);
 		expect([...jpeg.subarray(0, 2)]).toEqual([255, 216]);
 		await unsubscribe();
+	});
+
+	test("tracks semantic iframe targets, downloads, and popup pages", async () => {
+		const session = await manager.create({
+			owner: { kind: "pi-session", id: "session-frames" },
+			workspace: { id: "fixture", root },
+			access: "loopback",
+		});
+		await manager.navigate(session.id, origin);
+		let snapshot = await manager.snapshot(session.id);
+		const frameAction = snapshot.elements.find((element) => element.name === "Frame action");
+		expect(frameAction?.frame).toEqual([expect.objectContaining({ name: "fixture-frame", url: `${origin}/frame` })]);
+		await manager.click(session.id, snapshot.revision, frameAction!.ref);
+
+		snapshot = await manager.snapshot(session.id);
+		const download = snapshot.elements.find((element) => element.name === "Download report");
+		await manager.click(session.id, snapshot.revision, download!.ref);
+		await expect.poll(() => manager.downloads(session.id)).toEqual([expect.objectContaining({ name: "report.txt" })]);
+
+		snapshot = await manager.snapshot(session.id);
+		const popup = snapshot.elements.find((element) => element.name === "Open popup");
+		await manager.click(session.id, snapshot.revision, popup!.ref);
+		await expect.poll(async () => (await manager.snapshot(session.id)).title).toBe("Popup fixture");
 	});
 });

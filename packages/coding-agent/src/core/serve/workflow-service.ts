@@ -3,15 +3,28 @@ import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/pro
 import { dirname, resolve } from "node:path";
 import type { AgentRegistry } from "./agent-registry.ts";
 import type { AgentTask, AgentTaskService } from "./agent-task-service.ts";
+import type { BrowserOwner, BrowserWorkspace } from "./browser-session-manager.ts";
+import type { BrowserWorkflowRunner } from "./browser-workflow-runner.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
 export type WorkflowPattern = "sequential" | "parallel" | "supervisor";
 
-export interface WorkflowNode {
+export interface AgentWorkflowNode {
 	id: string;
+	kind?: "agent";
 	agentId: string;
 	prompt: string;
 }
+
+export interface BrowserWorkflowNode {
+	id: string;
+	kind: "browser-workflow";
+	workflowId: string;
+	workflowVersion: number;
+	parameters: Record<string, string | number | boolean>;
+}
+
+export type WorkflowNode = AgentWorkflowNode | BrowserWorkflowNode;
 
 export interface WorkflowEdge {
 	from: string;
@@ -40,6 +53,16 @@ export interface WorkflowRun {
 	createdAt: number;
 	finishedAt?: number;
 	taskIds: string[];
+	browserRunIds: string[];
+	result?: string;
+	error?: string;
+}
+
+interface WorkflowNodeResult {
+	id: string;
+	label: string;
+	completed: boolean;
+	agentTaskId?: string;
 	result?: string;
 	error?: string;
 }
@@ -50,15 +73,22 @@ export class WorkflowService {
 	readonly #runsDir: string;
 	readonly #registry: AgentRegistry;
 	readonly #tasks: AgentTaskService;
+	readonly #browser: { runner: BrowserWorkflowRunner; owner: BrowserOwner; workspace: BrowserWorkspace } | undefined;
 	readonly #queue = new SerialOperationQueue();
 	readonly #definitions = new Map<string, WorkflowDefinition>();
 	readonly #runs = new Map<string, WorkflowRun>();
 
-	constructor(root: string, registry: AgentRegistry, tasks: AgentTaskService) {
+	constructor(
+		root: string,
+		registry: AgentRegistry,
+		tasks: AgentTaskService,
+		browser?: { runner: BrowserWorkflowRunner; owner: BrowserOwner; workspace: BrowserWorkspace },
+	) {
 		this.#definitionsDir = resolve(root, "definitions");
 		this.#runsDir = resolve(root, "runs");
 		this.#registry = registry;
 		this.#tasks = tasks;
+		this.#browser = browser;
 	}
 
 	async initialize(): Promise<void> {
@@ -157,6 +187,7 @@ export class WorkflowService {
 			prompt: trimmedPrompt,
 			createdAt: Date.now(),
 			taskIds: [],
+			browserRunIds: [],
 		};
 		this.#runs.set(run.id, run);
 		await this.#persistRun(run);
@@ -178,6 +209,7 @@ export class WorkflowService {
 		if (!run) throw new Error(`Workflow run ${runId} was not found`);
 		if (run.status !== "running") return cloneRun(run);
 		await Promise.all(run.taskIds.map((taskId) => this.#tasks.cancel(taskId).catch(() => undefined)));
+		await Promise.all(run.browserRunIds.map((runId) => this.#browser?.runner.cancel(runId).catch(() => undefined)));
 		run.status = "cancelled";
 		run.finishedAt = Date.now();
 		run.error = "Workflow was cancelled";
@@ -202,7 +234,7 @@ export class WorkflowService {
 					prompt: [
 						`Goal: ${run.prompt}`,
 						"Produce the final report from these delegated results. Include outcome, completed work, unresolved issues, and artifact references.",
-						...results.map((result) => `${result.agentId}: ${result.result ?? result.error ?? result.status}`),
+						...results.map((result) => `${result.label}: ${result.result ?? result.error ?? "failed"}`),
 					].join("\n\n"),
 				});
 				run.taskIds.push(task.id);
@@ -232,24 +264,12 @@ export class WorkflowService {
 		definition: WorkflowDefinition,
 		run: WorkflowRun,
 		ordered: WorkflowNode[],
-	): Promise<AgentTask[]> {
-		const results: AgentTask[] = [];
+	): Promise<WorkflowNodeResult[]> {
+		const results: WorkflowNodeResult[] = [];
 		for (const node of ordered) {
-			const prior = results.at(-1);
-			const task = await this.#tasks.submit({
-				agentId: node.agentId,
-				source: "workflow",
-				workflowRunId: run.id,
-				parentTaskId: prior?.id,
-				prompt: [run.prompt, node.prompt, prior?.result ? `Previous result:\n${prior.result}` : undefined]
-					.filter((value): value is string => value !== undefined)
-					.join("\n\n"),
-			});
-			run.taskIds.push(task.id);
-			await this.#persistRun(run);
-			const completed = await this.#tasks.waitForCompletion(task.id);
+			const completed = await this.#executeNode(node, run, results.at(-1));
 			results.push(completed);
-			if (completed.status !== "completed" && definition.failurePolicy === "stop") {
+			if (!completed.completed && definition.failurePolicy === "stop") {
 				throw new Error(completed.error ?? `Workflow node ${node.id} failed`);
 			}
 		}
@@ -260,44 +280,73 @@ export class WorkflowService {
 		definition: WorkflowDefinition,
 		run: WorkflowRun,
 		ordered: WorkflowNode[],
-	): Promise<AgentTask[]> {
-		const results: AgentTask[] = [];
+	): Promise<WorkflowNodeResult[]> {
+		const results: WorkflowNodeResult[] = [];
 		for (let offset = 0; offset < ordered.length; offset += definition.maxConcurrency) {
 			const batch = ordered.slice(offset, offset + definition.maxConcurrency);
-			const submitted = await Promise.all(
-				batch.map((node) =>
-					this.#tasks.submit({
-						agentId: node.agentId,
-						source: "workflow",
-						workflowRunId: run.id,
-						prompt: `${run.prompt}\n\n${node.prompt}`,
-					}),
-				),
-			);
-			run.taskIds.push(...submitted.map((task) => task.id));
-			await this.#persistRun(run);
-			const completed = await Promise.all(submitted.map((task) => this.#tasks.waitForCompletion(task.id)));
+			const completed = await Promise.all(batch.map((node) => this.#executeNode(node, run)));
 			results.push(...completed);
-			const failed = completed.find((task) => task.status !== "completed");
+			const failed = completed.find((result) => !result.completed);
 			if (failed && definition.failurePolicy === "stop")
 				throw new Error(failed.error ?? "Parallel workflow task failed");
 		}
 		return results;
 	}
 
+	async #executeNode(node: WorkflowNode, run: WorkflowRun, prior?: WorkflowNodeResult): Promise<WorkflowNodeResult> {
+		if (node.kind === "browser-workflow") {
+			if (!this.#browser) throw new Error("Browser workflow runtime is unavailable");
+			const execution = await this.#browser.runner.startExecute(
+				node.workflowId,
+				{ owner: this.#browser.owner, workspace: this.#browser.workspace, parameters: node.parameters },
+				node.workflowVersion,
+			);
+			run.browserRunIds.push(execution.runId);
+			await this.#persistRun(run);
+			const completed = await execution.completion;
+			return {
+				id: completed.id,
+				label: `${node.workflowId}@${node.workflowVersion}`,
+				completed: completed.status === "completed",
+				result: completed.status === "completed" ? JSON.stringify(completed) : undefined,
+				error: completed.error,
+			};
+		}
+		const task = await this.#tasks.submit({
+			agentId: node.agentId,
+			source: "workflow",
+			workflowRunId: run.id,
+			parentTaskId: prior?.agentTaskId,
+			prompt: [run.prompt, node.prompt, prior?.result ? `Previous result:\n${prior.result}` : undefined]
+				.filter((value): value is string => value !== undefined)
+				.join("\n\n"),
+		});
+		run.taskIds.push(task.id);
+		await this.#persistRun(run);
+		return workflowResult(await this.#tasks.waitForCompletion(task.id));
+	}
+
 	async #validateAgents(definition: WorkflowDefinition): Promise<void> {
+		for (const node of definition.nodes) {
+			if (node.kind !== "browser-workflow") continue;
+			if (!this.#browser?.runner.isActiveVersion(node.workflowId, node.workflowVersion)) {
+				throw new Error(`Browser workflow ${node.workflowId} version ${node.workflowVersion} is not active`);
+			}
+		}
 		for (const agentId of new Set([
-			...definition.nodes.map((node) => node.agentId),
+			...definition.nodes.filter(isAgentNode).map((node) => node.agentId),
 			...(definition.supervisorAgentId ? [definition.supervisorAgentId] : []),
 		])) {
 			if (!(await this.#registry.get(agentId))) throw new Error(`Workflow agent ${agentId} was not found`);
 		}
 		if (definition.pattern === "supervisor" && definition.supervisorAgentId) {
 			const supervisor = await this.#registry.get(definition.supervisorAgentId);
-			const unauthorized = definition.nodes.find(
-				(node) =>
-					node.agentId !== definition.supervisorAgentId && !supervisor?.delegateAgentIds.includes(node.agentId),
-			);
+			const unauthorized = definition.nodes
+				.filter(isAgentNode)
+				.find(
+					(node) =>
+						node.agentId !== definition.supervisorAgentId && !supervisor?.delegateAgentIds.includes(node.agentId),
+				);
 			if (unauthorized) {
 				throw new Error(`Supervisor ${definition.supervisorAgentId} may not delegate to ${unauthorized.agentId}`);
 			}
@@ -315,10 +364,28 @@ function normalizeWorkflow(value: unknown): WorkflowDefinition {
 	const id = input.id === undefined ? slugify(name) : requiredIdentifier(input.id, "workflow.id");
 	const pattern = oneOf(input.pattern, ["sequential", "parallel", "supervisor"], "workflow.pattern");
 	if (!Array.isArray(input.nodes) || input.nodes.length === 0) throw new Error("workflow.nodes must not be empty");
-	const nodes = input.nodes.map((entry, index) => {
+	const nodes = input.nodes.map((entry, index): WorkflowNode => {
 		const node = object(entry, `workflow.nodes[${index}]`);
+		const nodeId = requiredIdentifier(node.id, `workflow.nodes[${index}].id`);
+		if (node.kind === "browser-workflow") {
+			return {
+				id: nodeId,
+				kind: "browser-workflow",
+				workflowId: requiredIdentifier(node.workflowId, `workflow.nodes[${index}].workflowId`),
+				workflowVersion: positiveInteger(
+					node.workflowVersion,
+					`workflow.nodes[${index}].workflowVersion`,
+					Number.MAX_SAFE_INTEGER,
+				),
+				parameters: normalizeWorkflowParameters(node.parameters, `workflow.nodes[${index}].parameters`),
+			};
+		}
+		if (node.kind !== undefined && node.kind !== "agent") {
+			throw new Error(`workflow.nodes[${index}].kind must be agent or browser-workflow`);
+		}
 		return {
-			id: requiredIdentifier(node.id, `workflow.nodes[${index}].id`),
+			id: nodeId,
+			kind: "agent",
 			agentId: requiredIdentifier(node.agentId, `workflow.nodes[${index}].agentId`),
 			prompt: requiredString(node.prompt, `workflow.nodes[${index}].prompt`),
 		};
@@ -388,6 +455,12 @@ function parseWorkflowRun(value: unknown): WorkflowRun {
 	if (!Array.isArray(input.taskIds) || !input.taskIds.every((entry) => typeof entry === "string")) {
 		throw new Error("workflow run taskIds must be an array of strings");
 	}
+	if (
+		input.browserRunIds !== undefined &&
+		(!Array.isArray(input.browserRunIds) || !input.browserRunIds.every((entry) => typeof entry === "string"))
+	) {
+		throw new Error("workflow run browserRunIds must be an array of strings");
+	}
 	return {
 		id: requiredString(input.id, "workflow run id"),
 		workflowId: requiredString(input.workflowId, "workflow run workflowId"),
@@ -396,6 +469,7 @@ function parseWorkflowRun(value: unknown): WorkflowRun {
 		createdAt: requiredNumber(input.createdAt, "workflow run createdAt"),
 		finishedAt: typeof input.finishedAt === "number" ? input.finishedAt : undefined,
 		taskIds: [...input.taskIds],
+		browserRunIds: Array.isArray(input.browserRunIds) ? [...input.browserRunIds] : [],
 		result: typeof input.result === "string" ? input.result : undefined,
 		error: typeof input.error === "string" ? input.error : undefined,
 	};
@@ -404,13 +478,43 @@ function parseWorkflowRun(value: unknown): WorkflowRun {
 function cloneDefinition(definition: WorkflowDefinition): WorkflowDefinition {
 	return {
 		...definition,
-		nodes: definition.nodes.map((node) => ({ ...node })),
+		nodes: definition.nodes.map((node) =>
+			node.kind === "browser-workflow" ? { ...node, parameters: { ...node.parameters } } : { ...node },
+		),
 		edges: definition.edges.map((edge) => ({ ...edge })),
 	};
 }
 
 function cloneRun(run: WorkflowRun): WorkflowRun {
-	return { ...run, taskIds: [...run.taskIds] };
+	return { ...run, taskIds: [...run.taskIds], browserRunIds: [...run.browserRunIds] };
+}
+
+function workflowResult(task: AgentTask): WorkflowNodeResult {
+	return {
+		id: task.id,
+		label: task.agentId,
+		completed: task.status === "completed",
+		agentTaskId: task.id,
+		result: task.result,
+		error: task.error,
+	};
+}
+
+function isAgentNode(node: WorkflowNode): node is AgentWorkflowNode {
+	return node.kind !== "browser-workflow";
+}
+
+function normalizeWorkflowParameters(value: unknown, name: string): Record<string, string | number | boolean> {
+	const input = object(value, name);
+	const parameters: Record<string, string | number | boolean> = {};
+	for (const [parameter, entry] of Object.entries(input)) {
+		if (!/^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(parameter)) throw new Error(`${name} has an invalid parameter name`);
+		if (typeof entry !== "string" && typeof entry !== "number" && typeof entry !== "boolean") {
+			throw new Error(`${name}.${parameter} must be a string, number, or boolean`);
+		}
+		parameters[parameter] = entry;
+	}
+	return parameters;
 }
 
 async function writeAtomic(path: string, content: string): Promise<void> {

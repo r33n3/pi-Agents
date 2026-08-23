@@ -8,6 +8,12 @@ import { SerialOperationQueue } from "./serial-operation-queue.ts";
 export type RoutineTarget =
 	| { kind: "agent"; agentId: string }
 	| { kind: "workflow"; workflowId: string }
+	| {
+			kind: "browser-workflow";
+			workflowId: string;
+			workflowVersion: number;
+			parameters: Record<string, string | number | boolean>;
+	  }
 	| { kind: "acp"; connectionId: string }
 	| { kind: "skill"; skillName: string };
 
@@ -30,9 +36,11 @@ export type RoutineDefinitionInput = Omit<RoutineDefinition, "id"> & { id?: stri
 export class RoutineRegistry {
 	readonly #directory: string;
 	readonly #queue = new SerialOperationQueue();
+	readonly #browserWorkflowCatalog: ((id: string, version: number) => boolean) | undefined;
 
-	constructor(directory: string) {
+	constructor(directory: string, browserWorkflowCatalog?: (id: string, version: number) => boolean) {
 		this.#directory = resolve(directory);
+		this.#browserWorkflowCatalog = browserWorkflowCatalog;
 	}
 
 	async initialize(): Promise<void> {
@@ -60,6 +68,15 @@ export class RoutineRegistry {
 		return this.#queue.run(async () => {
 			await this.initialize();
 			const definition = normalizeRoutine(input);
+			if (
+				definition.target.kind === "browser-workflow" &&
+				this.#browserWorkflowCatalog &&
+				!this.#browserWorkflowCatalog(definition.target.workflowId, definition.target.workflowVersion)
+			) {
+				throw new Error(
+					`Browser workflow ${definition.target.workflowId} version ${definition.target.workflowVersion} is not active`,
+				);
+			}
 			const target = resolve(this.#directory, `${definition.id}.json`);
 			const temporary = resolve(dirname(target), `.${definition.id}.${randomUUID()}.tmp`);
 			await writeFile(temporary, `${JSON.stringify(definition, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
@@ -126,6 +143,19 @@ function normalizeTarget(value: unknown): RoutineTarget {
 			assertIdentifier(workflowId, "target workflow id");
 			return { kind: "workflow", workflowId };
 		}
+		case "browser-workflow": {
+			const workflowId = requiredString(target.workflowId, "target.workflowId");
+			assertIdentifier(workflowId, "target browser workflow id");
+			if (!Number.isSafeInteger(target.workflowVersion) || Number(target.workflowVersion) < 1) {
+				throw new Error("target.workflowVersion must be a positive integer");
+			}
+			return {
+				kind: "browser-workflow",
+				workflowId,
+				workflowVersion: Number(target.workflowVersion),
+				parameters: normalizeParameters(target.parameters),
+			};
+		}
 		case "acp": {
 			const connectionId = requiredString(target.connectionId, "target.connectionId");
 			assertIdentifier(connectionId, "target connection id");
@@ -139,8 +169,21 @@ function normalizeTarget(value: unknown): RoutineTarget {
 			return { kind: "skill", skillName };
 		}
 		default:
-			throw new Error("target.kind must be one of: agent, workflow, acp, skill");
+			throw new Error("target.kind must be one of: agent, workflow, browser-workflow, acp, skill");
 	}
+}
+
+function normalizeParameters(value: unknown): Record<string, string | number | boolean> {
+	const parameters = record(value, "target.parameters");
+	const normalized: Record<string, string | number | boolean> = {};
+	for (const [name, entry] of Object.entries(parameters)) {
+		if (!/^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(name)) throw new Error("target parameter name is invalid");
+		if (typeof entry !== "string" && typeof entry !== "number" && typeof entry !== "boolean") {
+			throw new Error(`target parameter ${name} must be a string, number, or boolean`);
+		}
+		normalized[name] = entry;
+	}
+	return normalized;
 }
 
 function normalizeModel(value: unknown): ModelRef {
