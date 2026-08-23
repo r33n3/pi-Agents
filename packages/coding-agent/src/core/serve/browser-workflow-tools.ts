@@ -86,7 +86,8 @@ export function createBrowserWorkflowTools(
 		{
 			name: "browser_workflow_validate",
 			label: "browser_workflow_validate",
-			description: "Replay one compiled browser workflow in a fresh managed Chromium context.",
+			description:
+				"Validate one explicitly identified compiled browser workflow in a fresh context. This replays saved actions; never use it to start a new recording.",
 			parameters: versionParameters,
 			executionMode: "sequential",
 			async execute(_toolCallId, input) {
@@ -118,7 +119,8 @@ export function createBrowserWorkflowTools(
 		{
 			name: "browser_workflow_run",
 			label: "browser_workflow_run",
-			description: "Execute an active browser workflow with named parameters in an isolated browser context.",
+			description:
+				"Replay an explicitly identified active browser workflow with named parameters. Use only when the user asks to run or replay that saved workflow; never use it for page review or recording.",
 			parameters: workflowParameters,
 			executionMode: "sequential",
 			async execute(_toolCallId, input) {

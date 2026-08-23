@@ -12,6 +12,9 @@ larger agent workflow, or a future ECS browser worker.
 
 The workflow is the authoritative executable artifact. Skills, routines,
 agents, and cloud jobs reference it rather than copying its browser steps.
+The distinction between immediate review, new recording, and saved replay is
+defined by the
+[browser review and recording specification](pi-browser-review-recording-spec.md).
 
 ## User outcome
 

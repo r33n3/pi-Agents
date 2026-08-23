@@ -37,7 +37,13 @@ export class BrowserPolicy {
 	/** Resolves every hostname before navigation so policy is not bypassed by private DNS answers. */
 	async assertResolvedNavigation(urlText: string): Promise<URL> {
 		const url = this.assertNavigation(urlText);
-		if (isIP(url.hostname.replace(/^\[|\]$/g, "")) !== 0) return url;
+		const literalAddress = url.hostname.replace(/^\[|\]$/g, "");
+		if (isIP(literalAddress) !== 0) {
+			if (!isResolvedAddressAllowed(literalAddress, this.#access)) {
+				throw new Error(`Browser policy ${this.#access} does not allow resolved address ${literalAddress}`);
+			}
+			return url;
+		}
 		const addresses = await lookup(url.hostname, { all: true, verbatim: true });
 		if (addresses.length === 0) throw new Error(`Browser could not resolve ${url.hostname}`);
 		for (const { address } of addresses) {
@@ -47,6 +53,24 @@ export class BrowserPolicy {
 		}
 		return url;
 	}
+}
+
+/** Selects the narrowest browser access class implied by an absolute HTTP(S) URL. */
+export function browserAccessForUrl(urlText: string): Exclude<BrowserAccess, "disabled"> {
+	let url: URL;
+	try {
+		url = new URL(urlText);
+	} catch {
+		throw new Error("Browser navigation requires an absolute URL");
+	}
+	if (url.protocol !== "http:" && url.protocol !== "https:") {
+		throw new Error("Browser navigation only supports http and https URLs");
+	}
+	if (isLoopbackHost(url.hostname)) return "loopback";
+	if (isPrivateAddress(url.hostname) || isPrivateIpv6(url.hostname.replace(/^\[|\]$/g, ""))) {
+		return "private-network";
+	}
+	return "public-web";
 }
 
 function isLoopbackHost(host: string): boolean {

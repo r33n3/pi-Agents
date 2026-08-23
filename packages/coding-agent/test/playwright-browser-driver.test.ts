@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { BrowserProfileStore } from "../src/core/serve/browser-profile-store.ts";
 import { BrowserSessionManager } from "../src/core/serve/browser-session-manager.ts";
+import { BrowserWorkflowCaptureStore } from "../src/core/serve/browser-workflow-capture.ts";
 import { PlaywrightBrowserDriver } from "../src/core/serve/playwright-browser-driver.ts";
 
 describe("PlaywrightBrowserDriver", () => {
@@ -40,7 +41,7 @@ describe("PlaywrightBrowserDriver", () => {
 			response
 				.writeHead(200, { "content-type": "text/html; charset=utf-8" })
 				.end(
-					'<!doctype html><title>Browser fixture</title><input aria-label="Search"><button>Save</button><a href="/download" download>Download report</a><button onclick="window.open(\'/popup\')">Open popup</button><iframe name="fixture-frame" src="/frame"></iframe><img src="https://example.com/blocked.png" alt=""><script>console.error("fixture console")</script>',
+					'<!doctype html><title>Browser fixture</title><style>#search{position:fixed;left:20px;top:20px;width:200px;height:40px}</style><input id="search" aria-label="Search"><button>Save</button><a href="/download" download>Download report</a><button onclick="window.open(\'/popup\')">Open popup</button><iframe name="fixture-frame" src="/frame"></iframe><img src="https://example.com/blocked.png" alt=""><script>console.error("fixture console")</script>',
 				);
 		});
 		await new Promise<void>((resolve, reject) => {
@@ -50,7 +51,15 @@ describe("PlaywrightBrowserDriver", () => {
 		const address = server.address();
 		if (!address || typeof address === "string") throw new Error("Expected TCP fixture listener");
 		origin = `http://127.0.0.1:${address.port}`;
-		manager = new BrowserSessionManager(new PlaywrightBrowserDriver(), new BrowserProfileStore(root));
+		const captureStore = new BrowserWorkflowCaptureStore(join(root, "captures"));
+		await captureStore.initialize();
+		manager = new BrowserSessionManager(
+			new PlaywrightBrowserDriver(),
+			new BrowserProfileStore(root),
+			4,
+			undefined,
+			captureStore,
+		);
 	});
 
 	afterEach(async () => {
@@ -121,5 +130,30 @@ describe("PlaywrightBrowserDriver", () => {
 		const popup = snapshot.elements.find((element) => element.name === "Open popup");
 		await manager.click(session.id, snapshot.revision, popup!.ref);
 		await expect.poll(async () => (await manager.snapshot(session.id)).title).toBe("Popup fixture");
+	});
+
+	test("captures semantic targets for shared-control clicks and typing", async () => {
+		const session = await manager.create({
+			owner: { kind: "pi-session", id: "session-recording" },
+			workspace: { id: "fixture", root },
+			access: "loopback",
+		});
+		await manager.navigate(session.id, origin);
+		await manager.startCapture(session.id);
+		manager.setControl(session.id, "user");
+		await manager.pointerClick(session.id, 100, 40);
+		await manager.typeText(session.id, "pi browser recording");
+		const capture = await manager.stopCapture(session.id);
+
+		expect(capture.steps).toHaveLength(2);
+		expect(capture.steps[0]?.action).toMatchObject({
+			kind: "click",
+			target: { tag: "input", name: "Search" },
+		});
+		expect(capture.steps[1]?.action).toMatchObject({
+			kind: "type",
+			target: { tag: "input", name: "Search" },
+			sensitive: false,
+		});
 	});
 });

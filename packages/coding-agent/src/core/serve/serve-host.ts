@@ -155,8 +155,9 @@ export class ServeHost implements AsyncDisposable {
 			...createBrowserTools(this.#browserSessionManager, {
 				owner: { kind: "pi-session", id: session.sessionId },
 				workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
-				access: "loopback",
+				access: ["loopback", "public-web"],
 				workspacePreview: this.#workspacePreviewServer,
+				workflowCompiler: browserWorkflowCompiler,
 			}),
 			...createBrowserWorkflowTools(browserWorkflowRegistry, browserWorkflowRunner, {
 				owner: { kind: "pi-session", id: session.sessionId },
@@ -218,6 +219,7 @@ export class ServeHost implements AsyncDisposable {
 							profile: definition.browser.profile,
 							runtime: definition.browser.runtime,
 							workspacePreview: this.#workspacePreviewServer,
+							workflowCompiler: browserWorkflowCompiler,
 						})
 					: [];
 			const browserWorkflowTools =
@@ -495,8 +497,9 @@ export class ServeHost implements AsyncDisposable {
 			const browserTools = createBrowserTools(this.#browserSessionManager!, {
 				owner: { kind: "pi-session", id: options.id },
 				workspace: { id: options.id, root: hostedCwd },
-				access: "loopback",
+				access: ["loopback", "public-web"],
 				workspacePreview: this.#workspacePreviewServer,
+				workflowCompiler: browserWorkflowCompiler,
 			});
 			const browserWorkflowTools = createBrowserWorkflowTools(browserWorkflowRegistry, browserWorkflowRunner, {
 				owner: { kind: "pi-session", id: options.id },

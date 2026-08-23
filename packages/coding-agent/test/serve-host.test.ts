@@ -35,6 +35,8 @@ describe("ServeHost", () => {
 		expect(response.status).toBe(200);
 		expect(await response.text()).toContain("<!doctype html>");
 		expect(harness.session.getActiveToolNames()).toContain("browser_open");
+		expect(harness.session.getActiveToolNames()).toContain("browser_record_start");
+		expect(harness.session.getActiveToolNames()).toContain("browser_record_stop");
 
 		await host.close();
 		await expect(host.close()).resolves.toBeUndefined();

@@ -1,6 +1,6 @@
 import Type from "typebox";
 import type { ToolDefinition } from "../extensions/types.ts";
-import type { BrowserAccess } from "./browser-policy.ts";
+import { type BrowserAccess, browserAccessForUrl } from "./browser-policy.ts";
 import type { BrowserProfile } from "./browser-profile-store.ts";
 import type {
 	BrowserOwner,
@@ -9,9 +9,15 @@ import type {
 	BrowserSessionSnapshot,
 	BrowserWorkspace,
 } from "./browser-session-manager.ts";
+import type { BrowserWorkflowCompiler } from "./browser-workflow-compiler.ts";
 import type { WorkspacePreviewServer } from "./workspace-preview-server.ts";
 
-const openParameters = Type.Object({ url: Type.String({ minLength: 1, maxLength: 4096 }) });
+const openParameters = Type.Object({
+	url: Type.String({ minLength: 1, maxLength: 4096 }),
+	access: Type.Optional(
+		Type.Union([Type.Literal("loopback"), Type.Literal("public-web"), Type.Literal("private-network")]),
+	),
+});
 const snapshotParameters = Type.Object({ sessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })) });
 const elementParameters = Type.Object({
 	sessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
@@ -27,26 +33,28 @@ const pressParameters = Type.Object({
 export interface BrowserToolScope {
 	owner: BrowserOwner;
 	workspace: BrowserWorkspace;
-	access: Exclude<BrowserAccess, "disabled">;
+	access: Exclude<BrowserAccess, "disabled"> | readonly Exclude<BrowserAccess, "disabled">[];
 	profile?: BrowserProfile;
 	runtime?: BrowserRuntimeKind;
 	workspacePreview?: WorkspacePreviewServer;
+	workflowCompiler?: BrowserWorkflowCompiler;
 }
 
-/** Creates browser tools whose access is fixed to one session or agent workspace. */
+/** Creates owner-bound browser tools whose immutable session policies are limited to explicit access grants. */
 export function createBrowserTools(manager: BrowserSessionManager, scope: BrowserToolScope): ToolDefinition[] {
 	return [
 		{
 			name: "browser_open",
 			label: "browser_open",
 			description:
-				"Open an HTTP(S) URL or an HTML file inside this session's workspace in the managed browser Preview.",
+				"Open an HTTP(S) URL or a workspace HTML file for direct review. This does not record or replay a saved workflow.",
 			promptSnippet:
-				"Use browser_open to render and review webpages. Pass a workspace HTML file path directly; it is served safely over loopback.",
+				"Use browser_open for immediate page review. Public sites use an isolated public-web session; workspace files use loopback. Use browser_record_start only when the user asks to record new actions.",
 			parameters: openParameters,
 			executionMode: "sequential",
-			async execute(_toolCallId, { url }) {
-				const session = await getOrCreateSession(manager, scope);
+			async execute(_toolCallId, { url, access }) {
+				const selectedAccess = selectAccess(scope, url, access);
+				const session = await getOrCreateSession(manager, scope, selectedAccess);
 				const target = /^https?:\/\//i.test(url)
 					? url
 					: await scope.workspacePreview?.urlFor(scope.workspace.root, url);
@@ -57,6 +65,57 @@ export function createBrowserTools(manager: BrowserSessionManager, scope: Browse
 				);
 			},
 		},
+		...(scope.workflowCompiler
+			? [
+					{
+						name: "browser_record_start",
+						label: "browser_record_start",
+						description:
+							"Start a new recording on the active managed browser session. Use only when the user asks to record or capture new browser actions; never replay an existing workflow first.",
+						promptSnippet:
+							"For a new recording: open the requested page, call browser_record_start, let the user take control and act, then call browser_record_stop. Do not list or run saved workflows.",
+						parameters: snapshotParameters,
+						executionMode: "sequential" as const,
+						async execute(_toolCallId: string, { sessionId }: { sessionId?: string }) {
+							const session = await getOwnedSession(manager, scope.owner, sessionId);
+							const capture = await manager.startCapture(session.id);
+							return textResult(
+								`Recording ${capture.id} started in browser session ${session.id}. The user may take control and perform the browser actions.`,
+							);
+						},
+					},
+					{
+						name: "browser_record_stop",
+						label: "browser_record_stop",
+						description:
+							"Stop the active browser recording and compile those newly captured actions into a new workflow draft. This does not validate, activate, or replay it.",
+						promptSnippet:
+							"Call browser_record_stop only after the user finishes a new recording. Report the new workflow ID, version, status, access, and compile issues.",
+						parameters: snapshotParameters,
+						executionMode: "sequential" as const,
+						async execute(_toolCallId: string, { sessionId }: { sessionId?: string }) {
+							const session = await getOwnedSession(manager, scope.owner, sessionId);
+							const capture = await manager.stopCapture(session.id);
+							const workflow = await scope.workflowCompiler!.compile(capture);
+							return textResult(
+								JSON.stringify(
+									{
+										captureId: capture.id,
+										workflowId: workflow.id,
+										version: workflow.version,
+										status: workflow.status,
+										access: workflow.requirements.access,
+										steps: workflow.steps.map((step) => ({ id: step.id, action: step.action })),
+										issues: workflow.compileIssues,
+									},
+									null,
+									2,
+								),
+							);
+						},
+					},
+				]
+			: []),
 		{
 			name: "browser_snapshot",
 			label: "browser_snapshot",
@@ -132,12 +191,50 @@ export function createBrowserTools(manager: BrowserSessionManager, scope: Browse
 async function getOrCreateSession(
 	manager: BrowserSessionManager,
 	scope: BrowserToolScope,
+	access: Exclude<BrowserAccess, "disabled">,
 ): Promise<BrowserSessionSnapshot> {
+	const runtime = scope.runtime ?? "managed-chromium";
+	const profile = scope.profile ?? { kind: "ephemeral" as const };
 	const existing = manager
 		.list(scope.owner)
-		.filter((session) => session.status === "ready" || session.status === "navigating")
+		.filter(
+			(session) =>
+				(session.status === "ready" || session.status === "navigating") &&
+				session.access === access &&
+				session.runtime === runtime &&
+				sameProfile(session.profile, profile),
+		)
 		.sort((left, right) => right.updatedAt - left.updatedAt)[0];
-	return existing ?? manager.create({ ...scope });
+	return (
+		existing ??
+		manager.create({
+			owner: scope.owner,
+			workspace: scope.workspace,
+			access,
+			profile: scope.profile,
+			runtime: scope.runtime,
+		})
+	);
+}
+
+function sameProfile(left: BrowserProfile, right: BrowserProfile): boolean {
+	return left.kind === right.kind && (left.kind === "ephemeral" || (right.kind === "named" && left.id === right.id));
+}
+
+function selectAccess(
+	scope: BrowserToolScope,
+	url: string,
+	requested: Exclude<BrowserAccess, "disabled"> | undefined,
+): Exclude<BrowserAccess, "disabled"> {
+	const grants = Array.isArray(scope.access) ? [...scope.access] : [scope.access];
+	if (requested) {
+		if (!grants.includes(requested)) throw new Error(`Browser access ${requested} is not granted to this owner`);
+		return requested;
+	}
+	const required = /^https?:\/\//i.test(url) ? browserAccessForUrl(url) : "loopback";
+	if (grants.includes(required)) return required;
+	if (required === "loopback" && grants.includes("private-network")) return "private-network";
+	throw new Error(`Browser target requires ${required} access, which is not granted to this owner`);
 }
 
 function getOwnedSession(

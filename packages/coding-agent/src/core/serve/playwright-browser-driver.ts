@@ -354,29 +354,6 @@ function browserFramePath(frame: Frame): BrowserPageFrame[] {
 }
 
 function inspectBrowserElement(input: BrowserElementInspection): BrowserPageElement | undefined {
-	const serialize = (node: unknown): BrowserPageElement => {
-		const element = node as BrowserDomElement;
-		const tag = element.tagName.toLowerCase();
-		const label = element.labels?.[0]?.textContent?.replace(/\s+/g, " ").trim();
-		const name =
-			element.getAttribute("aria-label") ||
-			label ||
-			element.placeholder ||
-			element.textContent ||
-			element.getAttribute("name") ||
-			"";
-		return {
-			role: element.getAttribute("role") ?? tag,
-			name: name.replace(/\s+/g, " ").trim().slice(0, 240),
-			tag,
-			label: label?.slice(0, 240),
-			testId: element.getAttribute("data-testid")?.slice(0, 240),
-			id: element.id?.slice(0, 240) || undefined,
-			inputType: element.type?.slice(0, 80),
-			visible: element.getClientRects().length > 0,
-			enabled: !element.disabled,
-		};
-	};
 	const browserDocument = (globalThis as unknown as { document: BrowserDocument }).document;
 	const node =
 		input.kind === "focused"
@@ -384,7 +361,27 @@ function inspectBrowserElement(input: BrowserElementInspection): BrowserPageElem
 			: browserDocument
 					.elementFromPoint(input.x ?? 0, input.y ?? 0)
 					?.closest("a, button, input, textarea, select, [role]");
-	return node ? serialize(node) : undefined;
+	if (!node) return undefined;
+	const tag = node.tagName.toLowerCase();
+	const label = node.labels?.[0]?.textContent?.replace(/\s+/g, " ").trim();
+	const name =
+		node.getAttribute("aria-label") ||
+		label ||
+		node.placeholder ||
+		node.textContent ||
+		node.getAttribute("name") ||
+		"";
+	return {
+		role: node.getAttribute("role") ?? tag,
+		name: name.replace(/\s+/g, " ").trim().slice(0, 240),
+		tag,
+		label: label?.slice(0, 240),
+		testId: node.getAttribute("data-testid")?.slice(0, 240),
+		id: node.id?.slice(0, 240) || undefined,
+		inputType: node.type?.slice(0, 80),
+		visible: node.getClientRects().length > 0,
+		enabled: !node.disabled,
+	};
 }
 
 function serializeBrowserElement(node: unknown): BrowserPageElement {

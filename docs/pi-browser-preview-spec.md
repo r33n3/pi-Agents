@@ -22,6 +22,8 @@ profile in this delivery.
 Durable recording, semantic compilation, validated replay, assignment, and
 local-to-ECS portability follow the
 [portable browser workflow specification](pi-browser-workflow-spec.md).
+Review, recording, replay intent, and access-scoped session selection follow
+the [browser review and recording specification](pi-browser-review-recording-spec.md).
 
 ## User outcome
 
