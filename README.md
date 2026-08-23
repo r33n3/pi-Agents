@@ -3,25 +3,102 @@
     <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
   </a>
 </p>
-<p align="center">
-  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Discord" src="https://img.shields.io/badge/discord-community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-  <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="npm" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
+
+# Pi Agents
+
+Pi Agents is a developer-focused fork of [earendil-works/pi](https://github.com/earendil-works/pi). It preserves Pi's CLI, agent runtime, multi-provider model support, and extension system while adding an authenticated local web workspace for running Pi sessions, deployed agents, browser automation, and coordinated workflows together.
+
+![Pi Agents desktop workspace](docs/images/pi-agents-desktop.png)
+
+## What this fork adds
+
+| Area | Added behavior |
+|---|---|
+| Web console | `pi --serve` launches a token-protected, responsive workspace with session tabs, model controls, usage telemetry, attachments, prompt history, and resizable panels. |
+| Multiple Pi sessions | Connect independent Pi processes and project directories in one console. Each process keeps its own model, transcript, tools, working directory, and stop state. |
+| Persistent agents | Create persona-backed agents with a project root, model, thinking level, executor, filesystem policy, browser policy, and explicit tool grants. Chat and run history survive restarts. |
+| Agent Builder | Build or edit an agent through a temporary chat tab while structured Profile, Model & Tools, Connections, and Automation settings remain available in the side workspace. |
+| Orchestration | Run sequential, parallel, and supervisor workflows. `pi-coordinator` executes dependency-aware work packages and exposes inspectable subagent progress without flooding the main chat. |
+| Routines | Define cron-backed agent or workflow runs with persisted schedules, results, artifacts, retries, and restart recovery. |
+| Managed browser | Pi and permitted agents can open local or remote pages in managed Chromium, inspect and operate them, share control with the user, record walkthroughs, and pop out the live view. |
+| Connections | Delegate tasks through model-selectable Claude Code, OpenAI, and Hermes connections; manage plugins, MCP servers, API endpoints, and per-agent capability grants. |
+| Interoperability | Expose selected agents through an authenticated A2A 1.0 HTTP+JSON boundary using the same persistent task service as local chat and workflows. |
+| Responsive access | Phone and unfolded Pixel Fold layouts keep chat primary and open Sessions or Browser/Agents/Agent Builder as dismissible side panels. |
+
+<table>
+  <tr>
+    <td><img alt="Pi Agents mobile chat" src="docs/images/pi-agents-mobile-chat.png"></td>
+    <td><img alt="Pi Agents mobile agent workspace" src="docs/images/pi-agents-mobile-agents.png"></td>
+    <td><img alt="Pi Agents unfolded foldable workspace" src="docs/images/pi-agents-fold.png"></td>
+  </tr>
+  <tr>
+    <td align="center">Mobile chat</td>
+    <td align="center">Mobile agents</td>
+    <td align="center">Unfolded Pixel Fold</td>
+  </tr>
+</table>
+
+## Start the web workspace
+
+Run Pi from the project it should operate on:
+
+```sh
+cd path/to/project
+pi --serve
+```
+
+Pi starts at port `4173` and selects the next available port when needed. It prints a process-scoped capability URL containing the authentication token. Open that exact URL in a browser.
+
+To run several projects, start one Pi process in each directory. Then use **Connect Pi** in any console and enter the complete capability URL printed by another process. The console can switch among those sessions while every Pi process and deployed agent continues independently.
+
+See [pi-Agents local console](docs/pi-agents-serve.md) for storage, executors, companion extensions, and focused verification commands.
+
+## Local network access
+
+Bind explicitly to the machine's network interfaces:
+
+```sh
+pi --serve --serve-host 0.0.0.0
+```
+
+Open the printed port from another device using the machine's LAN address:
+
+```text
+http://192.168.x.x:<port>/?token=<printed-token>
+```
+
+The token is a bearer capability: anyone who has the complete URL can control that Pi process with the permissions of the account that launched it. Use a trusted LAN, host firewall, or authenticated reverse proxy/VPN. Do not publish the URL or expose the port directly to the public Internet.
+
+## Agent and workflow model
+
+Pi remains the user-facing supervisor:
+
+- Pi handles ordinary work directly.
+- One bounded task can be delegated directly to one agent.
+- Large or explicitly multi-agent work is written as a durable specification and sent to `pi-coordinator`.
+- The coordinator chooses sequential or parallel execution from declared dependencies, bounds concurrency and delegation depth, and returns consolidated evidence.
+- Agent transcripts and private memory are not implicitly shared. Handoffs use explicit context, results, and validated artifact references.
+
+Agent chat, Pi delegation, routines, workflows, and A2A requests all use the same persisted task lifecycle. See the [agent workspace and orchestration specification](docs/pi-agent-workspace-spec.md) and [managed-browser specification](docs/pi-browser-preview-spec.md).
+
+## Security boundary
+
+The web token authenticates the console; it is not an operating-system sandbox. Pi and session-executor agents inherit the launching account's local permissions. Harness agents confine built-in file tools to their configured project root, but that is still not a container boundary. Use the documented container or sandbox patterns when stronger isolation is required.
+
+## Upstream Pi
+
+This fork tracks the upstream Pi project and retains its package structure and MIT license.
+
+<p>
+  <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Pi Discord" src="https://img.shields.io/badge/discord-upstream%20community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
+  <a href="https://www.npmjs.com/package/@earendil-works/pi-coding-agent"><img alt="Upstream Pi npm package" src="https://img.shields.io/npm/v/@earendil-works/pi-coding-agent?style=flat-square" /></a>
 </p>
 
-> New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
+- [Pi website](https://pi.dev)
+- [Pi documentation](https://pi.dev/docs/latest)
+- [Upstream repository](https://github.com/earendil-works/pi)
 
-# Pi Agent Harness
-
-This is the home of the Pi agent harness project including our self extensible coding agent.
-
-* **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
-* **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
-* **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
-
-To learn more about Pi:
-
-* [Visit pi.dev](https://pi.dev), the project website with demos
-* [Read the documentation](https://pi.dev/docs/latest), but you can also ask the agent to explain itself
+> Upstream contribution rules remain documented in [CONTRIBUTING.md](CONTRIBUTING.md). Fork-specific changes should be proposed against this repository.
 
 ## All Packages
 
