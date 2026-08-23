@@ -121,7 +121,10 @@ model.
 The managed browser remains a foundational console capability. It provides
 isolated Chromium sessions, semantic browser tools, shared user/agent control,
 browser evidence, and browser-specific LAN policy. See the
-[managed-browser specification](pi-browser-preview-spec.md).
+[managed-browser specification](pi-browser-preview-spec.md). Recorded browser
+automation, validated replay, agent and routine assignment, and the future ECS
+worker boundary follow the
+[portable browser workflow specification](pi-browser-workflow-spec.md).
 
 ## Acceptance criteria
 

@@ -31,6 +31,11 @@ strict. The default bind address is `127.0.0.1`; an explicit non-loopback
   installed, shows the same Chromium page controlled by the user and agent.
   See the [managed-browser specification](pi-browser-preview-spec.md) for the
   implementation contract.
+- Browser walkthroughs can be recorded, compiled into semantic targets,
+  validated in a fresh context, activated, and run by Pi or an explicitly
+  granted agent. Active versions can also be attached to routines, larger
+  workflows, generated skills, and project frontend tests. Run evidence and
+  screenshots remain available after restart.
 - Agents deployed through Pi and Agent Builder share one registry and appear
   without restarting the serve host.
 - Cron routines are configured in Agent Builder and their next/last task state
@@ -59,6 +64,11 @@ runs/<agent-id>/<run-id>/transcript.json
 workflows/definitions/<workflow-id>.json
 workflows/runs/<workflow-run-id>/run.json
 routines/<routine-id>.json
+browser/captures/<capture-id>.json
+browser/workflows/<workflow-id>/versions/<version>.json
+browser/runs/<run-id>.json
+browser/artifacts/<owner>/<artifact-id>.png
+browser/references/frontend-tests.json
 ```
 
 Definitions and workspace paths are validated before use. Interrupted run
@@ -77,6 +87,27 @@ remain listed and readable.
 Both executor forms use the same single-lease task service. Chat, Pi delegation,
 routine, workflow, and A2A tasks cannot overlap while mutating one agent project
 root, and abort waits for the session to become idle before releasing the lease.
+
+## Recorded browser workflows
+
+1. Ask Pi or an agent with browser access to open the application.
+2. Select Take control, start recording, and perform the walkthrough.
+3. Stop recording. Resolve any ambiguous semantic target in the workflow card.
+4. Validate the compiled version in a fresh managed Chromium context.
+5. Activate the validated version, then run or assign that exact version.
+
+Coordinates are capture evidence only. Replay uses roles, accessible names,
+labels, stable IDs, frame identity, and explicit assertions. Typed values become
+parameters; passwords and other sensitive values are not stored. Workflows that
+require approval cannot run until the caller supplies an explicit approval.
+
+Managed Chromium is the default. Agent Builder can select installed stable
+Chrome for compatibility testing, but Pi still creates an isolated browser
+context and never opens the user's normal Chrome profile. Named sign-in profiles
+are dedicated Pi profiles and permit one live session at a time.
+
+See the [portable browser workflow specification](pi-browser-workflow-spec.md)
+for lifecycle, versioning, security, and ECS portability details.
 
 ## Companion extensions
 
@@ -100,6 +131,8 @@ node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run \
   test/agent-task-service.test.ts test/cron-schedule.test.ts \
   test/agent-routine-scheduler.test.ts test/persona-catalog.test.ts \
   test/plugin-management-service.test.ts test/serve-agent-services.test.ts \
+  test/browser-workflow-registry.test.ts test/browser-workflow-runner.test.ts \
+  test/browser-workflow-reference-store.test.ts \
   test/serve-a2a-http.test.ts test/serve-page.test.ts \
   test/websocket-listener.test.ts
 ```

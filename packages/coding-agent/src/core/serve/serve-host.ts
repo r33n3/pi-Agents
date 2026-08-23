@@ -19,6 +19,12 @@ import { BrowserProfileStore } from "./browser-profile-store.ts";
 import { type BrowserOwner, BrowserSessionManager } from "./browser-session-manager.ts";
 import { BrowserStreamServer } from "./browser-stream-server.ts";
 import { createBrowserTools } from "./browser-tools.ts";
+import { BrowserWorkflowCaptureStore } from "./browser-workflow-capture.ts";
+import { BrowserWorkflowCompiler } from "./browser-workflow-compiler.ts";
+import { BrowserWorkflowReferenceStore } from "./browser-workflow-reference-store.ts";
+import { BrowserWorkflowRegistry } from "./browser-workflow-registry.ts";
+import { BrowserWorkflowRunner } from "./browser-workflow-runner.ts";
+import { createBrowserWorkflowTools } from "./browser-workflow-tools.ts";
 import { CapabilityCatalog } from "./capability-catalog.ts";
 import { CurrentSessionService } from "./current-session-service.ts";
 import { type ExternalConnectionDefinition, ExternalConnectionManager } from "./external-connection-manager.ts";
@@ -102,25 +108,65 @@ export class ServeHost implements AsyncDisposable {
 		const token = randomBytes(32).toString("base64url");
 		const serveRoot = join(agentDir, "serve");
 		const browserDriver = new PlaywrightBrowserDriver();
+		const browserCaptureStore = new BrowserWorkflowCaptureStore(join(serveRoot, "browser", "captures"));
+		await browserCaptureStore.initialize();
+		const browserWorkflowRegistry = new BrowserWorkflowRegistry(join(serveRoot, "browser", "workflows"));
+		await browserWorkflowRegistry.initialize();
+		const browserWorkflowCompiler = new BrowserWorkflowCompiler(browserWorkflowRegistry);
 		this.#workspacePreviewServer = new WorkspacePreviewServer();
+		const browserProfileStore = new BrowserProfileStore(join(serveRoot, "browser"));
+		const browserArtifactStore = new BrowserArtifactStore(join(serveRoot, "browser"));
 		this.#browserSessionManager = new BrowserSessionManager(
 			browserDriver,
-			new BrowserProfileStore(join(serveRoot, "browser")),
+			browserProfileStore,
 			4,
-			new BrowserArtifactStore(join(serveRoot, "browser")),
+			browserArtifactStore,
+			browserCaptureStore,
 		);
-		const browserConsole = new BrowserConsoleService(this.#browserSessionManager, () =>
-			browserDriver.installationStatus(),
+		const browserWorkflowRunner = new BrowserWorkflowRunner(
+			browserWorkflowRegistry,
+			this.#browserSessionManager,
+			join(serveRoot, "browser", "runs"),
+		);
+		await browserWorkflowRunner.initialize();
+		const browserWorkflowReferences = new BrowserWorkflowReferenceStore(
+			join(serveRoot, "browser", "references"),
+			join(agentDir, "skills"),
+			browserWorkflowRegistry,
+		);
+		await browserWorkflowReferences.initialize();
+		const browserConsole = new BrowserConsoleService(
+			this.#browserSessionManager,
+			() => browserDriver.installationStatus(),
+			browserWorkflowCompiler,
+			browserWorkflowRegistry,
+			browserWorkflowRunner,
+			{
+				owner: { kind: "pi-session", id: session.sessionId },
+				workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
+			},
+			browserCaptureStore,
+			browserProfileStore,
+			browserWorkflowReferences,
+			browserArtifactStore,
 		);
 		const browserStream = new BrowserStreamServer(browserConsole);
-		session.registerCustomTools(
-			createBrowserTools(this.#browserSessionManager, {
+		session.registerCustomTools([
+			...createBrowserTools(this.#browserSessionManager, {
 				owner: { kind: "pi-session", id: session.sessionId },
 				workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
 				access: "loopback",
 				workspacePreview: this.#workspacePreviewServer,
 			}),
-		);
+			...createBrowserWorkflowTools(browserWorkflowRegistry, browserWorkflowRunner, {
+				owner: { kind: "pi-session", id: session.sessionId },
+				workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
+				frontendTests: () =>
+					browserWorkflowReferences
+						.listFrontendTests(session.sessionManager.getCwd())
+						.map((reference) => ({ id: reference.workflowId, version: reference.workflowVersion })),
+			}),
+		]);
 		const agentRegistry = new AgentRegistry(serveRoot, {
 			catalogDirectory: join(agentDir, "agents"),
 			personaDirectory: join(agentDir, "personas"),
@@ -129,6 +175,7 @@ export class ServeHost implements AsyncDisposable {
 				session.modelRuntime
 					.getAvailableSnapshot()
 					.map((model) => ({ provider: model.provider, id: model.id, name: model.name })),
+			browserWorkflowCatalog: (id, version) => browserWorkflowRunner.isActiveVersion(id, version),
 		});
 		await agentRegistry.initialize();
 		session.registerCustomTools(createAgentRegistryTools(agentRegistry) as ToolDefinition[]);
@@ -169,15 +216,30 @@ export class ServeHost implements AsyncDisposable {
 							workspace: { id: definition.id, root: workspace },
 							access: definition.browser.access,
 							profile: definition.browser.profile,
+							runtime: definition.browser.runtime,
 							workspacePreview: this.#workspacePreviewServer,
 						})
 					: [];
-			const customTools = [...scopedTools, ...browserTools] as ToolDefinition[];
+			const browserWorkflowTools =
+				browserOwner && browserTools.length > 0
+					? createBrowserWorkflowTools(browserWorkflowRegistry, browserWorkflowRunner, {
+							owner: browserOwner,
+							workspace: { id: definition.id, root: workspace },
+							allowedWorkflows: definition.browserWorkflows,
+							profile: definition.browser?.profile,
+							runtime: definition.browser?.runtime,
+							frontendTests: () =>
+								browserWorkflowReferences
+									.listFrontendTests(workspace)
+									.map((reference) => ({ id: reference.workflowId, version: reference.workflowVersion })),
+						})
+					: [];
+			const customTools = [...scopedTools, ...browserTools, ...browserWorkflowTools] as ToolDefinition[];
 			const toolNames = isolated
 				? customTools.map((tool) => tool.name)
 				: definition.tools.flatMap((tool) =>
 						tool === "browser"
-							? browserTools.map((browserTool) => browserTool.name)
+							? [...browserTools, ...browserWorkflowTools].map((browserTool) => browserTool.name)
 							: [tool === "list" ? "ls" : tool],
 					);
 			const resourceLoader = new DefaultResourceLoader({
@@ -218,7 +280,11 @@ export class ServeHost implements AsyncDisposable {
 		await this.#agentRunManager.initialize();
 		this.#agentTaskService = new AgentTaskService(agentRegistry, this.#agentRunManager, serveRoot);
 		await this.#agentTaskService.initialize();
-		this.#workflowService = new WorkflowService(join(serveRoot, "workflows"), agentRegistry, this.#agentTaskService);
+		this.#workflowService = new WorkflowService(join(serveRoot, "workflows"), agentRegistry, this.#agentTaskService, {
+			runner: browserWorkflowRunner,
+			owner: { kind: "pi-session", id: session.sessionId },
+			workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
+		});
 		await this.#workflowService.initialize();
 		const a2aAdapter = new A2aAdapter(agentRegistry, this.#agentTaskService);
 
@@ -309,6 +375,7 @@ export class ServeHost implements AsyncDisposable {
 						executor: "session",
 						permissionPolicy: "workspace-write",
 						schedules: [],
+						browserWorkflows: [],
 						delegateAgentIds: [],
 						a2a: { enabled: false },
 					},
@@ -319,10 +386,32 @@ export class ServeHost implements AsyncDisposable {
 		);
 		await this.#externalConnectionManager.initialize();
 
-		const routineRegistry = new RoutineRegistry(join(serveRoot, "routines"));
+		const routineRegistry = new RoutineRegistry(join(serveRoot, "routines"), (id, version) =>
+			browserWorkflowRunner.isActiveVersion(id, version),
+		);
 		await routineRegistry.initialize();
 		this.#agentRoutineScheduler = new AgentRoutineScheduler(routineRegistry, {
 			start: async (definition) => {
+				if (definition.target.kind === "browser-workflow") {
+					const execution = await browserWorkflowRunner.startExecute(
+						definition.target.workflowId,
+						{
+							owner: { kind: "pi-session", id: session.sessionId },
+							workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
+							parameters: definition.target.parameters,
+						},
+						definition.target.workflowVersion,
+					);
+					return {
+						runId: execution.runId,
+						cancel: () => execution.cancel(),
+						completion: execution.completion.then((completed) =>
+							completed.status === "completed"
+								? {}
+								: { error: completed.error ?? `Browser workflow ${completed.status}` },
+						),
+					};
+				}
 				if (definition.target.kind === "agent") {
 					const task = await this.#agentTaskService!.submit({
 						agentId: definition.target.agentId,
@@ -409,6 +498,14 @@ export class ServeHost implements AsyncDisposable {
 				access: "loopback",
 				workspacePreview: this.#workspacePreviewServer,
 			});
+			const browserWorkflowTools = createBrowserWorkflowTools(browserWorkflowRegistry, browserWorkflowRunner, {
+				owner: { kind: "pi-session", id: options.id },
+				workspace: { id: options.id, root: hostedCwd },
+				frontendTests: () =>
+					browserWorkflowReferences
+						.listFrontendTests(hostedCwd)
+						.map((reference) => ({ id: reference.workflowId, version: reference.workflowVersion })),
+			});
 			return (
 				await createAgentSession({
 					cwd: hostedCwd,
@@ -416,7 +513,7 @@ export class ServeHost implements AsyncDisposable {
 					modelRuntime,
 					model: hostedModel,
 					thinkingLevel: options.thinkingLevel,
-					customTools: browserTools,
+					customTools: [...browserTools, ...browserWorkflowTools],
 					sessionManager: hostedSessionManager,
 				})
 			).session;

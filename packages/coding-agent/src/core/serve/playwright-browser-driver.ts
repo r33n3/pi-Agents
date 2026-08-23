@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import type { Browser, BrowserContext, CDPSession, Page } from "playwright";
+import type { Browser, BrowserContext, CDPSession, Frame, Locator, Page } from "playwright";
 import { chromium } from "playwright";
 import type {
 	BrowserDiagnostics,
@@ -7,29 +7,40 @@ import type {
 	BrowserDriverContext,
 	BrowserFrame,
 	BrowserPageElement,
+	BrowserPageFrame,
+	BrowserRuntimeKind,
 	BrowserViewport,
 } from "./browser-session-manager.ts";
 
 export interface BrowserInstallationStatus {
 	installed: boolean;
 	executablePath: string;
+	installedChrome?: boolean;
 }
 
 /** Playwright-backed Chromium driver. It launches lazily so `pi --serve` never requires a browser binary. */
 export class PlaywrightBrowserDriver implements BrowserDriver {
-	#browser: Browser | undefined;
+	#managedBrowser: Browser | undefined;
+	#installedChromeBrowser: Browser | undefined;
 	#disposed = false;
 
 	installationStatus(): BrowserInstallationStatus {
 		const executablePath = chromium.executablePath();
-		return { executablePath, installed: existsSync(executablePath) };
+		return { executablePath, installed: existsSync(executablePath), installedChrome: chromeIsInstalled() };
 	}
 
-	async createContext(input: { profilePath?: string; viewport: BrowserViewport }): Promise<BrowserDriverContext> {
+	async createContext(input: {
+		profilePath?: string;
+		viewport: BrowserViewport;
+		runtime: BrowserRuntimeKind;
+	}): Promise<BrowserDriverContext> {
 		if (this.#disposed) throw new Error("Playwright browser driver is disposed");
 		const status = this.installationStatus();
-		if (!status.installed) {
+		if (input.runtime === "managed-chromium" && !status.installed) {
 			throw new Error("Managed Chromium is not installed. Run: pi browser install chromium");
+		}
+		if (input.runtime === "installed-chrome" && !status.installedChrome) {
+			throw new Error("Installed Chrome compatibility mode was selected, but stable Chrome was not found");
 		}
 		const viewport = {
 			width: input.viewport.width,
@@ -37,6 +48,7 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
 		};
 		if (input.profilePath) {
 			const context = await chromium.launchPersistentContext(input.profilePath, {
+				channel: input.runtime === "installed-chrome" ? "chrome" : undefined,
 				headless: true,
 				viewport,
 				deviceScaleFactor: input.viewport.deviceScaleFactor,
@@ -46,7 +58,7 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
 			const page = context.pages()[0] ?? (await context.newPage());
 			return new PlaywrightBrowserContext(context, page);
 		}
-		const browser = await this.#sharedBrowser();
+		const browser = await this.#sharedBrowser(input.runtime);
 		const context = await browser.newContext({
 			viewport,
 			deviceScaleFactor: input.viewport.deviceScaleFactor,
@@ -58,23 +70,31 @@ export class PlaywrightBrowserDriver implements BrowserDriver {
 	async dispose(): Promise<void> {
 		if (this.#disposed) return;
 		this.#disposed = true;
-		await this.#browser?.close();
-		this.#browser = undefined;
+		await Promise.all([this.#managedBrowser?.close(), this.#installedChromeBrowser?.close()]);
+		this.#managedBrowser = undefined;
+		this.#installedChromeBrowser = undefined;
 	}
 
-	async #sharedBrowser(): Promise<Browser> {
-		if (this.#browser) return this.#browser;
-		this.#browser = await chromium.launch({
+	async #sharedBrowser(runtime: BrowserRuntimeKind): Promise<Browser> {
+		const existing = runtime === "installed-chrome" ? this.#installedChromeBrowser : this.#managedBrowser;
+		if (existing) return existing;
+		const browser = await chromium.launch({
+			channel: runtime === "installed-chrome" ? "chrome" : undefined,
 			headless: true,
 			env: browserEnvironment(),
 		});
-		return this.#browser;
+		if (runtime === "installed-chrome") this.#installedChromeBrowser = browser;
+		else this.#managedBrowser = browser;
+		return browser;
 	}
 }
 
 class PlaywrightBrowserContext implements BrowserDriverContext {
 	readonly #context: BrowserContext;
-	readonly #page: Page;
+	#page: Page;
+	#elementLocators: Locator[] = [];
+	readonly #attachedPages = new WeakSet<Page>();
+	readonly #downloads: Array<{ name: string; timestamp: number }> = [];
 	#history: string[] = [];
 	#historyIndex = -1;
 	readonly #diagnostics: BrowserDiagnostics = { console: [], networkFailures: [] };
@@ -84,6 +104,16 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 	constructor(context: BrowserContext, page: Page) {
 		this.#context = context;
 		this.#page = page;
+		this.#attachPage(page);
+		context.on("page", (opened) => {
+			this.#page = opened;
+			this.#attachPage(opened);
+		});
+	}
+
+	#attachPage(page: Page): void {
+		if (this.#attachedPages.has(page)) return;
+		this.#attachedPages.add(page);
 		page.on("console", (message) => {
 			appendBounded(this.#diagnostics.console, {
 				type: message.type(),
@@ -101,6 +131,9 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 				reason: policyReason ?? request.failure()?.errorText ?? "Request failed",
 				timestamp: Date.now(),
 			});
+		});
+		page.on("download", (download) => {
+			appendBounded(this.#downloads, { name: download.suggestedFilename().slice(0, 1_000), timestamp: Date.now() });
 		});
 	}
 
@@ -160,36 +193,76 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 	}
 
 	async snapshot(): Promise<{ url: string; title: string; elements: BrowserPageElement[] }> {
-		const selector = "a, button, input, textarea, select, [role=button], [role=link]";
-		const elements = await this.#page.locator(selector).evaluateAll((nodes) =>
-			nodes.map((node) => {
-				const element = node as unknown as {
-					getAttribute(name: string): string | null;
-					name?: string;
-					tagName: string;
-					textContent: string | null;
-					value?: string;
-				};
-				const role = element.getAttribute("role") ?? element.tagName.toLowerCase();
-				const value = element.value?.trim();
-				const name =
-					element.getAttribute("aria-label") ||
-					value ||
-					element.textContent ||
-					element.getAttribute("placeholder") ||
-					"";
-				return { role, name: name.replace(/\s+/g, " ").trim().slice(0, 240) };
-			}),
-		);
+		this.#elementLocators = [];
+		const elements: BrowserPageElement[] = [];
+		for (const frame of this.#page.frames()) {
+			const locators = await this.#interactiveElements(frame).all();
+			for (const locator of locators) {
+				if (elements.length >= 300) break;
+				const element = await locator.evaluate(serializeBrowserElement);
+				const framePath = browserFramePath(frame);
+				if (framePath.length > 0) element.frame = framePath;
+				this.#elementLocators.push(locator);
+				elements.push(element);
+			}
+			if (elements.length >= 300) break;
+		}
 		return { url: this.#page.url(), title: await this.#page.title(), elements };
 	}
 
+	async elementAt(x: number, y: number): Promise<BrowserPageElement | undefined> {
+		for (const frame of [...this.#page.frames()].reverse()) {
+			let localX = x;
+			let localY = y;
+			if (frame !== this.#page.mainFrame()) {
+				const box = await frame
+					.frameElement()
+					.then((element) => element.boundingBox())
+					.catch(() => null);
+				if (!box || x < box.x || y < box.y || x > box.x + box.width || y > box.y + box.height) continue;
+				localX -= box.x;
+				localY -= box.y;
+			}
+			const element = await frame.evaluate<BrowserPageElement | undefined, BrowserElementInspection>(
+				inspectBrowserElement,
+				{ kind: "point", x: localX, y: localY },
+			);
+			if (!element) continue;
+			const framePath = browserFramePath(frame);
+			if (framePath.length > 0) element.frame = framePath;
+			return element;
+		}
+		return undefined;
+	}
+
+	async focusedElement(): Promise<BrowserPageElement | undefined> {
+		for (const frame of [...this.#page.frames()].reverse()) {
+			const element = await frame.evaluate<BrowserPageElement | undefined, BrowserElementInspection>(
+				inspectBrowserElement,
+				{ kind: "focused" },
+			);
+			if (!element || !["a", "button", "input", "textarea", "select"].includes(element.tag ?? "")) continue;
+			const framePath = browserFramePath(frame);
+			if (framePath.length > 0) element.frame = framePath;
+			return element;
+		}
+		return undefined;
+	}
+
 	click(elementIndex: number): Promise<void> {
-		return this.#interactiveElements().nth(elementIndex).click();
+		return this.#requiredElement(elementIndex).click();
 	}
 
 	fill(elementIndex: number, text: string): Promise<void> {
-		return this.#interactiveElements().nth(elementIndex).fill(text);
+		return this.#requiredElement(elementIndex).fill(text);
+	}
+
+	async select(elementIndex: number, value: string): Promise<void> {
+		await this.#requiredElement(elementIndex).selectOption(value);
+	}
+
+	async scrollIntoView(elementIndex: number): Promise<void> {
+		await this.#requiredElement(elementIndex).scrollIntoViewIfNeeded();
 	}
 
 	press(key: string): Promise<void> {
@@ -241,17 +314,119 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 		};
 	}
 
+	downloads(): Array<{ name: string; timestamp: number }> {
+		return this.#downloads.map((entry) => ({ ...entry }));
+	}
+
 	close(): Promise<void> {
 		return this.#context.close();
 	}
 
-	#interactiveElements() {
-		return this.#page.locator("a, button, input, textarea, select, [role=button], [role=link]");
+	#interactiveElements(frame: Frame = this.#page.mainFrame()): Locator {
+		return frame.locator("a, button, input, textarea, select, [role=button], [role=link]");
+	}
+
+	#requiredElement(index: number): Locator {
+		const locator = this.#elementLocators[index];
+		if (!locator) throw new Error("Browser element snapshot is stale; request a fresh snapshot");
+		return locator;
 	}
 
 	async #pageDetails(): Promise<{ url: string; title: string }> {
 		return { url: this.#page.url(), title: await this.#page.title() };
 	}
+}
+
+interface BrowserElementInspection {
+	kind: "point" | "focused";
+	x?: number;
+	y?: number;
+}
+
+function browserFramePath(frame: Frame): BrowserPageFrame[] {
+	const path: BrowserPageFrame[] = [];
+	let current: Frame | null = frame;
+	while (current?.parentFrame()) {
+		path.unshift({ name: current.name().slice(0, 240), url: current.url().slice(0, 4_000) });
+		current = current.parentFrame();
+	}
+	return path;
+}
+
+function inspectBrowserElement(input: BrowserElementInspection): BrowserPageElement | undefined {
+	const serialize = (node: unknown): BrowserPageElement => {
+		const element = node as BrowserDomElement;
+		const tag = element.tagName.toLowerCase();
+		const label = element.labels?.[0]?.textContent?.replace(/\s+/g, " ").trim();
+		const name =
+			element.getAttribute("aria-label") ||
+			label ||
+			element.placeholder ||
+			element.textContent ||
+			element.getAttribute("name") ||
+			"";
+		return {
+			role: element.getAttribute("role") ?? tag,
+			name: name.replace(/\s+/g, " ").trim().slice(0, 240),
+			tag,
+			label: label?.slice(0, 240),
+			testId: element.getAttribute("data-testid")?.slice(0, 240),
+			id: element.id?.slice(0, 240) || undefined,
+			inputType: element.type?.slice(0, 80),
+			visible: element.getClientRects().length > 0,
+			enabled: !element.disabled,
+		};
+	};
+	const browserDocument = (globalThis as unknown as { document: BrowserDocument }).document;
+	const node =
+		input.kind === "focused"
+			? browserDocument.activeElement
+			: browserDocument
+					.elementFromPoint(input.x ?? 0, input.y ?? 0)
+					?.closest("a, button, input, textarea, select, [role]");
+	return node ? serialize(node) : undefined;
+}
+
+function serializeBrowserElement(node: unknown): BrowserPageElement {
+	const element = node as BrowserDomElement;
+	const tag = element.tagName.toLowerCase();
+	const label = element.labels?.[0]?.textContent?.replace(/\s+/g, " ").trim();
+	const name =
+		element.getAttribute("aria-label") ||
+		label ||
+		element.placeholder ||
+		element.textContent ||
+		element.getAttribute("name") ||
+		"";
+	return {
+		role: element.getAttribute("role") ?? tag,
+		name: name.replace(/\s+/g, " ").trim().slice(0, 240),
+		tag,
+		label: label?.slice(0, 240),
+		testId: element.getAttribute("data-testid")?.slice(0, 240),
+		id: element.id?.slice(0, 240) || undefined,
+		inputType: element.type?.slice(0, 80),
+		visible: element.getClientRects().length > 0,
+		enabled: !element.disabled,
+	};
+}
+
+interface BrowserDomElement {
+	tagName: string;
+	textContent: string | null;
+	id: string;
+	labels?: ArrayLike<{ textContent: string | null }>;
+	placeholder?: string;
+	type?: string;
+	disabled?: boolean;
+	getAttribute(name: string): string | null;
+	closest(selector: string): BrowserDomElement | null;
+	getClientRects(): ArrayLike<unknown>;
+}
+
+interface BrowserDocument {
+	activeElement: BrowserDomElement | null;
+	elementFromPoint(x: number, y: number): BrowserDomElement | null;
 }
 
 async function stopScreencast(session: CDPSession): Promise<void> {
@@ -280,6 +455,18 @@ function browserEnvironment(): NodeJS.ProcessEnv {
 		if (value !== undefined) environment[name] = value;
 	}
 	return environment;
+}
+
+function chromeIsInstalled(): boolean {
+	const candidates =
+		process.platform === "win32"
+			? [process.env.PROGRAMFILES, process.env["PROGRAMFILES(X86)"], process.env.LOCALAPPDATA]
+					.filter((root): root is string => root !== undefined)
+					.map((root) => `${root}\\Google\\Chrome\\Application\\chrome.exe`)
+			: process.platform === "darwin"
+				? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+				: ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"];
+	return candidates.some((candidate) => existsSync(candidate));
 }
 
 function appendBounded<T>(entries: T[], entry: T): void {

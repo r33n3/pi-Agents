@@ -85,6 +85,7 @@ export function createAgentRegistryTools(
 					schedules: existing?.schedules ?? [],
 					browser: {
 						access,
+						runtime: "managed-chromium",
 						profile: { kind: "ephemeral" },
 					},
 					delegateAgentIds: parameters.delegateAgentIds ?? existing?.delegateAgentIds ?? [],

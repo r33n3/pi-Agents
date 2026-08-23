@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { BrowserOwner } from "./browser-session-manager.ts";
 
@@ -52,6 +52,16 @@ export class BrowserArtifactStore {
 				};
 			}),
 		);
+	}
+
+	async read(owner: BrowserOwner, id: string): Promise<Uint8Array | undefined> {
+		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)) throw new Error("Browser artifact id is invalid");
+		try {
+			return new Uint8Array(await readFile(resolve(this.#ownerDirectory(owner), `${id}.png`)));
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+			throw error;
+		}
 	}
 
 	#ownerDirectory(owner: BrowserOwner): string {

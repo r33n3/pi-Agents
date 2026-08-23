@@ -73,6 +73,9 @@ const previewFrame = (() => {
 })();
 const { tabs: previewSessionTabs, popout: previewPopout } = installPreviewBrowserChrome();
 const { record: previewRecord, send: previewSendRecording, status: previewRecordingStatus } = createPreviewRecorder();
+const browserWorkflowList = createBrowserWorkflowReviewPanel();
+const browserProfileList = createBrowserProfilePanel();
+const agentBrowserWorkflowGrants = createAgentBrowserWorkflowGrants();
 const modelPicker = installThemedSelect(model);
 const agentModelPicker = installThemedSelect(agentModel);
 const externalModelPicker = installThemedSelect(externalModel);
@@ -104,9 +107,11 @@ let previewRefreshPromise: Promise<void> | undefined;
 let previewRefreshRequested = false;
 let cachedBrowserStatus: BrowserConsoleStatus | undefined;
 let periodicRefreshPromise: Promise<void> | undefined;
-let previewRecording = false;
-let previewRecordingSessionId: string | undefined;
-let recordedPreviewSteps: RecordedPreviewStep[] = [];
+let previewCapture: BrowserCaptureSummary | undefined;
+let recordedBrowserWorkflows: BrowserWorkflowSummary[] = [];
+let browserWorkflowRuns: BrowserWorkflowRunSummary[] = [];
+let lastBrowserWorkflowLoadAt = 0;
+const browserWorkflowReviews = new Map<string, BrowserWorkflowReview>();
 let selectedExternalConnectionId: string | undefined;
 let availableModels: ModelMetadata[] = [];
 let agentModelsInitialized = false;
@@ -210,6 +215,7 @@ interface ExternalRunSummary {
 interface BrowserConsoleStatus {
 	browser: "chromium";
 	installed: boolean;
+	installedChrome: boolean;
 	executablePath: string;
 	sessionCount: number;
 }
@@ -223,20 +229,76 @@ interface BrowserSessionSummary {
 	updatedAt: number;
 	lastError?: string;
 	controlOwner: "agent" | "user";
+	runtime: "managed-chromium" | "installed-chrome";
 	viewport: { width: number; height: number; deviceScaleFactor: number };
 	canGoBack: boolean;
 	canGoForward: boolean;
 }
 
-interface RecordedPreviewStep {
-	action: "open" | "navigate" | "back" | "forward" | "reload" | "click" | "type" | "scroll";
-	timestamp: number;
-	url?: string;
-	x?: number;
-	y?: number;
-	deltaX?: number;
-	deltaY?: number;
-	textLength?: number;
+interface BrowserCaptureSummary {
+	id: string;
+	sessionId: string;
+	status: "recording" | "stopped" | "interrupted";
+	steps: Array<{
+		action: {
+			kind: "navigate" | "back" | "forward" | "reload" | "click" | "type" | "scroll";
+			url?: string;
+			target?: { role: string; name: string; label?: string; testId?: string; id?: string };
+			textLength?: number;
+			sensitive?: boolean;
+		};
+	}>;
+}
+
+interface BrowserWorkflowSummary {
+	id: string;
+	version: number;
+	name: string;
+	status: "draft" | "needs-input" | "compiled" | "validated" | "active" | "superseded" | "invalid" | "disabled";
+	source: { kind: "recording" | "manual"; captureId?: string };
+	parameters: Array<{
+		name: string;
+		description: string;
+		type: "string" | "number" | "boolean" | "url" | "choice" | "secret-ref";
+		required: boolean;
+		sensitive: boolean;
+		choices?: string[];
+	}>;
+	compileIssues: Array<{ stepId: string; code: string; message: string }>;
+	policy: { deadlineMs: number; approval: "inherit" | "always" };
+}
+
+interface BrowserWorkflowReview {
+	workflow: BrowserWorkflowSummary;
+	issues: Array<{
+		stepId: string;
+		code: string;
+		message: string;
+		candidates: Array<{ index: number; role: string; name: string; label?: string; testId?: string; id?: string }>;
+	}>;
+}
+
+interface BrowserWorkflowRunSummary {
+	id: string;
+	kind: "validation" | "execution";
+	workflowId: string;
+	workflowVersion: number;
+	status: "running" | "completed" | "failed" | "cancelled" | "interrupted";
+	startedAt: number;
+	error?: string;
+	steps: Array<{
+		stepId: string;
+		status: "completed" | "failed";
+		url?: string;
+		error?: string;
+		artifacts: Array<{ id: string; kind: "screenshot"; size: number; phase: "before" | "after" | "failure" }>;
+	}>;
+}
+
+interface BrowserProfileSummary {
+	id: string;
+	createdAt: number;
+	updatedAt: number;
 }
 
 let externalConnections: ExternalConnectionSummary[] = [];
@@ -462,6 +524,161 @@ function createPreviewRecorder(): {
 	return { record, send, status };
 }
 
+function createBrowserWorkflowReviewPanel(): HTMLElement {
+	const browserPanel = element("browser");
+	const section = document.createElement("section");
+	section.className = "browser-workflow-section";
+	const heading = document.createElement("div");
+	heading.className = "browser-workflow-heading";
+	const title = document.createElement("strong");
+	title.textContent = "Recorded workflows";
+	const refresh = document.createElement("button");
+	refresh.type = "button";
+	refresh.title = "Refresh recorded workflows";
+	refresh.setAttribute("aria-label", "Refresh recorded workflows");
+	refresh.textContent = "↻";
+	refresh.addEventListener("click", () => {
+		void loadBrowserWorkflows(true).catch((error: unknown) =>
+			setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+		);
+	});
+	heading.append(title, refresh);
+	const list = document.createElement("div");
+	list.className = "browser-workflow-list";
+	section.append(heading, list);
+	browserPanel.append(section);
+	return list;
+}
+
+function createAgentBrowserWorkflowGrants(): HTMLElement {
+	const capabilityList = element("capability-list");
+	const details = document.createElement("details");
+	details.className = "capability-section";
+	const summary = document.createElement("summary");
+	const title = document.createElement("strong");
+	title.textContent = "Browser workflows";
+	summary.append(title);
+	const input = document.createElement("input");
+	input.id = "agent-browser-workflows";
+	input.type = "hidden";
+	input.setAttribute("form", "agent-form");
+	const list = document.createElement("div");
+	list.className = "agent-browser-workflow-grants";
+	details.append(summary, input, list);
+	capabilityList.after(details);
+	return list;
+}
+
+function createBrowserProfilePanel(): HTMLElement {
+	const browserPanel = element("browser");
+	const details = document.createElement("details");
+	details.className = "card browser-profiles";
+	const summary = document.createElement("summary");
+	summary.textContent = "Named browser profiles";
+	summary.title = "Dedicated Pi sign-in profiles; one live session may use each profile";
+	const list = document.createElement("div");
+	details.append(summary, list);
+	browserPanel.append(details);
+	details.addEventListener("toggle", () => {
+		if (details.open) void loadBrowserProfiles().catch((error: unknown) => setPreviewMessage(String(error), true));
+	});
+	return list;
+}
+
+async function loadBrowserProfiles(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/browser/profiles?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load browser profiles"));
+	const value: unknown = await response.json();
+	if (typeof value !== "object" || value === null || !("profiles" in value) || !Array.isArray(value.profiles)) {
+		throw new Error("Browser profile response is invalid");
+	}
+	const profiles = value.profiles.filter(
+		(entry): entry is BrowserProfileSummary =>
+			typeof entry === "object" &&
+			entry !== null &&
+			"id" in entry &&
+			typeof entry.id === "string" &&
+			"createdAt" in entry &&
+			typeof entry.createdAt === "number" &&
+			"updatedAt" in entry &&
+			typeof entry.updatedAt === "number",
+	);
+	browserProfileList.replaceChildren(
+		...profiles.map((profile) => {
+			const row = document.createElement("div");
+			row.className = "browser-profile-row";
+			const name = document.createElement("span");
+			name.textContent = profile.id;
+			name.title = `Last updated ${new Date(profile.updatedAt).toLocaleString()}`;
+			const clear = document.createElement("button");
+			clear.type = "button";
+			clear.textContent = "×";
+			clear.title = `Clear sign-in data for ${profile.id}`;
+			clear.setAttribute("aria-label", clear.title);
+			clear.addEventListener("click", () => {
+				if (!window.confirm(`Clear the dedicated browser profile "${profile.id}"?`)) return;
+				void clearBrowserProfile(profile.id).catch((error: unknown) => setPreviewMessage(String(error), true));
+			});
+			row.append(name, clear);
+			return row;
+		}),
+	);
+}
+
+async function clearBrowserProfile(id: string): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(
+		`/browser/profiles/${encodeURIComponent(id)}?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "DELETE",
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not clear browser profile"));
+	await loadBrowserProfiles();
+	setPreviewMessage(`Cleared browser profile ${id}`);
+}
+
+function renderAgentBrowserWorkflowGrants(): void {
+	const selected = new Set(
+		requiredElement<HTMLInputElement>("agent-browser-workflows")
+			.value.split(",")
+			.map((entry) => entry.trim())
+			.filter(Boolean),
+	);
+	agentBrowserWorkflowGrants.replaceChildren(
+		...recordedBrowserWorkflows
+			.filter((workflow) => workflow.status === "active")
+			.map((workflow) => {
+				const label = document.createElement("label");
+				const checkbox = document.createElement("input");
+				checkbox.type = "checkbox";
+				const reference = `${workflow.id}@${workflow.version}`;
+				checkbox.checked = selected.has(reference);
+				checkbox.disabled = activeSidebarAgent?.source === "pi-agent";
+				checkbox.addEventListener("change", () => {
+					if (checkbox.checked) selected.add(reference);
+					else selected.delete(reference);
+					requiredElement<HTMLInputElement>("agent-browser-workflows").value = [...selected].sort().join(",");
+					if (selected.size > 0) {
+						requiredElement<HTMLSelectElement>("agent-browser-access").value = "loopback";
+						updateAgentToolGrant("browser", true);
+					}
+				});
+				label.append(checkbox, `${workflow.name} · v${workflow.version}`);
+				return label;
+			}),
+	);
+}
+
+function updateAgentBrowserProfileFields(): void {
+	const kind = requiredElement<HTMLSelectElement>("agent-browser-profile-kind").value;
+	const label = element("agent-browser-profile-id-label");
+	const input = requiredElement<HTMLInputElement>("agent-browser-profile-id");
+	label.classList.toggle("hidden", kind !== "named");
+	input.required = kind === "named";
+}
+
 function createRoutineEditor(): {
 	form: HTMLFormElement;
 	id: HTMLInputElement;
@@ -469,6 +686,8 @@ function createRoutineEditor(): {
 	targetKind: HTMLSelectElement;
 	agent: HTMLSelectElement;
 	workflow: HTMLSelectElement;
+	browserWorkflow: HTMLSelectElement;
+	browserParameters: HTMLTextAreaElement;
 	acp: HTMLSelectElement;
 	skill: HTMLInputElement;
 	prompt: HTMLTextAreaElement;
@@ -483,6 +702,8 @@ function createRoutineEditor(): {
 	enabled: HTMLInputElement;
 	agentLabel: HTMLLabelElement;
 	workflowLabel: HTMLLabelElement;
+	browserWorkflowLabel: HTMLLabelElement;
+	browserParametersLabel: HTMLLabelElement;
 	acpLabel: HTMLLabelElement;
 	skillLabel: HTMLLabelElement;
 	cwdLabel: HTMLLabelElement;
@@ -506,6 +727,7 @@ function createRoutineEditor(): {
 	for (const [value, label] of [
 		["agent", "Local agent"],
 		["workflow", "Workflow"],
+		["browser-workflow", "Browser workflow"],
 		["acp", "ACP target"],
 		["skill", "Skill"],
 	] as const) {
@@ -516,6 +738,10 @@ function createRoutineEditor(): {
 	}
 	const agent = document.createElement("select");
 	const workflow = document.createElement("select");
+	const browserWorkflow = document.createElement("select");
+	const browserParameters = document.createElement("textarea");
+	browserParameters.value = "{}";
+	browserParameters.placeholder = '{ "projectId": "example" }';
 	const acp = document.createElement("select");
 	const skill = document.createElement("input");
 	skill.placeholder = "skill-name";
@@ -561,6 +787,8 @@ function createRoutineEditor(): {
 	};
 	const agentLabel = label("Agent", agent);
 	const workflowLabel = label("Workflow", workflow);
+	const browserWorkflowLabel = label("Browser workflow", browserWorkflow);
+	const browserParametersLabel = label("Parameters (JSON)", browserParameters);
 	const acpLabel = label("ACP target", acp);
 	const skillLabel = label("Skill name", skill);
 	const cwdLabel = label("Working directory", cwd);
@@ -588,6 +816,8 @@ function createRoutineEditor(): {
 		label("Run with", targetKind),
 		agentLabel,
 		workflowLabel,
+		browserWorkflowLabel,
+		browserParametersLabel,
 		acpLabel,
 		skillLabel,
 		label("Instructions", prompt),
@@ -611,6 +841,8 @@ function createRoutineEditor(): {
 		targetKind,
 		agent,
 		workflow,
+		browserWorkflow,
+		browserParameters,
 		acp,
 		skill,
 		prompt,
@@ -625,6 +857,8 @@ function createRoutineEditor(): {
 		enabled,
 		agentLabel,
 		workflowLabel,
+		browserWorkflowLabel,
+		browserParametersLabel,
 		acpLabel,
 		skillLabel,
 		cwdLabel,
@@ -1450,11 +1684,7 @@ function setPreviewMessage(message: string, error = false): void {
 
 function setPreviewControls(browserSession: BrowserSessionSummary | undefined): void {
 	const sessionId = browserSession?.id;
-	if (previewRecordingSessionId && previewRecordingSessionId !== sessionId) {
-		previewRecording = false;
-		previewRecordingSessionId = undefined;
-		recordedPreviewSteps = [];
-	}
+	if (previewCapture && previewCapture.sessionId !== sessionId) previewCapture = undefined;
 	const userControls = browserSession?.controlOwner === "user";
 	activePreviewSessionId = sessionId;
 	activePreviewSession = browserSession;
@@ -1475,7 +1705,8 @@ function setPreviewControls(browserSession: BrowserSessionSummary | undefined): 
 }
 
 function renderPreviewRecording(): void {
-	const stepCount = recordedPreviewSteps.length;
+	const stepCount = previewCapture?.steps.length ?? 0;
+	const previewRecording = previewCapture?.status === "recording";
 	previewRecord.disabled = activePreviewSessionId === undefined;
 	previewRecord.classList.toggle("recording", previewRecording);
 	setBrowserAction(
@@ -1493,76 +1724,345 @@ function renderPreviewRecording(): void {
 			: "";
 }
 
-function togglePreviewRecording(): void {
-	if (!activePreviewSessionId) return;
-	if (previewRecording) {
-		previewRecording = false;
+async function togglePreviewRecording(): Promise<void> {
+	if (!capabilityToken || !activePreviewSessionId) return;
+	const response = await fetch(
+		`/browser/sessions/${encodeURIComponent(activePreviewSessionId)}/capture?token=${encodeURIComponent(capabilityToken)}`,
+		{ method: previewCapture?.status === "recording" ? "DELETE" : "POST" },
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not update browser recording"));
+	const value: unknown = await response.json();
+	const capture = isBrowserCaptureSummary(value)
+		? value
+		: isBrowserCaptureStopResult(value)
+			? value.capture
+			: undefined;
+	if (!capture) throw new Error("Browser recording response is invalid");
+	previewCapture = capture;
+	if (isBrowserCaptureStopResult(value) && value.workflow) {
+		setPreviewMessage(
+			value.workflow.status === "compiled"
+				? `Workflow ${value.workflow.name} compiled and ready to validate`
+				: `Workflow ${value.workflow.name} needs ${value.workflow.compileIssues.length} clarification${value.workflow.compileIssues.length === 1 ? "" : "s"}`,
+			value.workflow.status === "needs-input",
+		);
+	}
+	renderPreviewRecording();
+	await loadBrowserWorkflows(true);
+}
+
+async function loadPreviewCapture(): Promise<void> {
+	if (!capabilityToken || !activePreviewSessionId) return;
+	const response = await fetch(
+		`/browser/sessions/${encodeURIComponent(activePreviewSessionId)}/capture?token=${encodeURIComponent(capabilityToken)}`,
+	);
+	if (response.status === 404) {
+		if (previewCapture?.status === "recording") previewCapture = undefined;
 		renderPreviewRecording();
 		return;
 	}
-	previewRecording = true;
-	previewRecordingSessionId = activePreviewSessionId;
-	recordedPreviewSteps = [];
-	if (activePreviewSession?.url) {
-		recordedPreviewSteps.push({ action: "open", url: activePreviewSession.url, timestamp: Date.now() });
-	}
+	if (!response.ok) throw new Error(await responseError(response, "Could not load browser recording"));
+	const value: unknown = await response.json();
+	if (!isBrowserCaptureSummary(value)) throw new Error("Browser recording response is invalid");
+	previewCapture = value;
 	renderPreviewRecording();
 }
 
-function recordPreviewStep(step: RecordedPreviewStep): void {
-	if (!previewRecording || previewRecordingSessionId !== activePreviewSessionId) return;
-	if (step.action === "scroll") {
-		const previous = recordedPreviewSteps.at(-1);
-		if (previous?.action === "scroll" && step.timestamp - previous.timestamp < 750) {
-			previous.deltaX = (previous.deltaX ?? 0) + (step.deltaX ?? 0);
-			previous.deltaY = (previous.deltaY ?? 0) + (step.deltaY ?? 0);
-			previous.timestamp = step.timestamp;
-			renderPreviewRecording();
-			return;
-		}
-	}
-	recordedPreviewSteps.push(step);
-	if (recordedPreviewSteps.length >= 100) previewRecording = false;
-	renderPreviewRecording();
-}
-
-function recordedStepText(step: RecordedPreviewStep, index: number): string {
+function recordedStepText(step: BrowserCaptureSummary["steps"][number], index: number): string {
 	const prefix = `${index + 1}.`;
-	switch (step.action) {
-		case "open":
+	const action = step.action;
+	switch (action.kind) {
 		case "navigate":
-			return `${prefix} ${step.action} ${step.url ?? "the current page"}`;
+			return `${prefix} navigate to ${action.url ?? "the current page"}`;
 		case "click":
-			return `${prefix} click viewport coordinate (${Math.round(step.x ?? 0)}, ${Math.round(step.y ?? 0)})`;
+			return `${prefix} click ${browserTargetText(action.target)}`;
 		case "type":
-			return `${prefix} type a redacted value (${step.textLength ?? 0} characters) into the focused field`;
+			return `${prefix} type a ${action.sensitive ? "sensitive " : ""}parameter (${action.textLength ?? 0} characters) into ${browserTargetText(action.target)}`;
 		case "scroll":
-			return `${prefix} scroll by (${Math.round(step.deltaX ?? 0)}, ${Math.round(step.deltaY ?? 0)})`;
 		case "back":
 		case "forward":
 		case "reload":
-			return `${prefix} ${step.action}`;
+			return `${prefix} ${action.kind}`;
 	}
 }
 
+function browserTargetText(target: BrowserCaptureSummary["steps"][number]["action"]["target"]): string {
+	if (!target) return "an unresolved element";
+	const name = target.name || target.label || target.testId || target.id;
+	return name ? `${target.role} "${name}"` : target.role;
+}
+
 async function sendPreviewRecordingToPi(): Promise<void> {
-	if (!session || session.snapshot?.phase !== "idle" || recordedPreviewSteps.length === 0) return;
-	previewRecording = false;
+	if (!session || session.snapshot?.phase !== "idle" || !previewCapture || previewCapture.steps.length === 0) return;
 	if (activePreviewSession?.controlOwner === "user") await setPreviewControl("agent");
-	const steps = recordedPreviewSteps.map(recordedStepText).join("\n");
-	recordedPreviewSteps = [];
-	previewRecordingSessionId = undefined;
+	const workflow = recordedBrowserWorkflows.find((entry) => entry.source.captureId === previewCapture?.id);
+	const steps = previewCapture.steps.map(recordedStepText).join("\n");
+	previewCapture = undefined;
 	renderPreviewRecording();
 	await session.prompt(
 		[
-			"Review this recorded managed-browser walkthrough and turn it into a robust browser workflow for an agent.",
-			"Do not replay viewport coordinates blindly. Navigate to the starting URL, use browser_snapshot, and translate each click into a semantic role/name target.",
-			"Typed values were intentionally redacted. Treat them as workflow parameters and ask for required values without requesting secrets in chat.",
-			"Report ambiguous or unnecessary steps before proposing the final workflow.",
+			workflow
+				? `Review canonical browser workflow ${workflow.id} version ${workflow.version} (${workflow.status}).`
+				: "Review this recorded managed-browser walkthrough and its compiled workflow.",
+			"Use browser_workflow_list to inspect the canonical definition. Resolve any needs-input items before validation.",
+			"Do not replace semantic targets with viewport coordinates. Typed values are parameters and secrets remain references.",
+			"When it is ready, validate it in a fresh browser and ask before activating it.",
 			"",
 			steps,
 		].join("\n"),
 	);
+}
+
+async function loadBrowserWorkflows(force = false): Promise<void> {
+	if (!capabilityToken) return;
+	if (!force && Date.now() - lastBrowserWorkflowLoadAt < 5_000) return;
+	const [response, runResponse] = await Promise.all([
+		fetch(`/browser/workflows?token=${encodeURIComponent(capabilityToken)}`),
+		fetch(`/browser/workflow-runs?token=${encodeURIComponent(capabilityToken)}`),
+	]);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load browser workflows"));
+	if (!runResponse.ok) throw new Error(await responseError(runResponse, "Could not load browser workflow runs"));
+	const value: unknown = await response.json();
+	const runValue: unknown = await runResponse.json();
+	if (!isBrowserWorkflowList(value)) throw new Error("Browser workflow response is invalid");
+	if (!isBrowserWorkflowRunList(runValue)) throw new Error("Browser workflow run response is invalid");
+	recordedBrowserWorkflows = value.workflows;
+	browserWorkflowRuns = runValue.runs;
+	lastBrowserWorkflowLoadAt = Date.now();
+	if (force) browserWorkflowReviews.clear();
+	await renderBrowserWorkflows();
+	renderAgentBrowserWorkflowGrants();
+	refreshRoutineEditorOptions();
+}
+
+async function renderBrowserWorkflows(): Promise<void> {
+	const openWorkflowKeys = new Set(
+		[...browserWorkflowList.querySelectorAll<HTMLDetailsElement>(".browser-workflow-card[open]")]
+			.map((entry) => entry.dataset.workflowKey)
+			.filter((entry): entry is string => entry !== undefined),
+	);
+	const cards: HTMLElement[] = [];
+	for (const workflow of recordedBrowserWorkflows) {
+		const card = document.createElement("details");
+		card.className = "browser-workflow-card";
+		card.dataset.workflowKey = `${workflow.id}@${workflow.version}`;
+		card.open = openWorkflowKeys.has(card.dataset.workflowKey);
+		const summary = document.createElement("summary");
+		const name = document.createElement("span");
+		name.textContent = workflow.name;
+		const state = document.createElement("span");
+		state.className = `browser-workflow-state state-${workflow.status}`;
+		state.textContent = workflow.status;
+		summary.append(name, state);
+		const body = document.createElement("div");
+		body.className = "browser-workflow-body";
+		const latestRun = browserWorkflowRuns.find(
+			(run) => run.workflowId === workflow.id && run.workflowVersion === workflow.version,
+		);
+		if (latestRun) {
+			const evidence = document.createElement("details");
+			evidence.className = "browser-workflow-evidence";
+			const evidenceSummary = document.createElement("summary");
+			evidenceSummary.textContent = `${latestRun.kind} · ${latestRun.status}`;
+			const evidenceBody = document.createElement("div");
+			if (latestRun.error) appendText(evidenceBody, latestRun.error, "run-error");
+			for (const step of latestRun.steps) {
+				appendText(
+					evidenceBody,
+					`${step.stepId} · ${step.status}${step.error ? ` · ${step.error}` : ""}${step.url ? ` · ${step.url}` : ""}`,
+					step.status === "failed" ? "run-error" : "muted",
+				);
+				for (const artifact of step.artifacts) {
+					const link = document.createElement("a");
+					link.href = `/browser/workflow-runs/${encodeURIComponent(latestRun.id)}/artifacts/${encodeURIComponent(artifact.id)}?token=${encodeURIComponent(capabilityToken ?? "")}`;
+					link.target = "_blank";
+					link.rel = "noopener";
+					link.textContent = `${step.stepId} ${artifact.phase} screenshot`;
+					link.title = "Open browser workflow evidence";
+					evidenceBody.append(link);
+				}
+			}
+			evidence.append(evidenceSummary, evidenceBody);
+			body.append(evidence);
+		}
+		if (workflow.compileIssues.length > 0) {
+			const review = await loadBrowserWorkflowReview(workflow.id, workflow.version);
+			for (const issue of review.issues) body.append(renderBrowserWorkflowIssue(workflow, issue));
+		}
+		const values = document.createElement("div");
+		values.className = "browser-workflow-values";
+		for (const parameter of workflow.parameters) {
+			const label = document.createElement("label");
+			label.textContent = parameter.name;
+			const field = document.createElement("input");
+			field.dataset.workflowParameter = parameter.name;
+			field.type = parameter.sensitive ? "password" : parameter.type === "number" ? "number" : "text";
+			field.placeholder = parameter.description;
+			field.required = parameter.required;
+			label.append(field);
+			values.append(label);
+		}
+		body.append(values);
+		const actions = document.createElement("div");
+		actions.className = "browser-workflow-actions";
+		if (workflow.status === "compiled") {
+			actions.append(
+				browserWorkflowAction("✓", "Validate workflow in a fresh browser", () =>
+					browserWorkflowRequest(workflow, "validate", workflowParameterValues(body)),
+				),
+			);
+		}
+		if (workflow.status === "validated") {
+			actions.append(
+				browserWorkflowAction("●", "Activate validated workflow", () =>
+					browserWorkflowRequest(workflow, "activate", {}),
+				),
+			);
+		}
+		if (workflow.status === "active") {
+			actions.append(
+				browserWorkflowAction("▶", "Run active workflow", () =>
+					browserWorkflowRequest(workflow, "run", workflowParameterValues(body)),
+				),
+				browserWorkflowAction("◇", "Create a reusable Pi skill reference", () =>
+					browserWorkflowReferenceRequest(workflow, "create-skill"),
+				),
+				browserWorkflowAction("⊞", "Use as a frontend test for this project", () =>
+					browserWorkflowReferenceRequest(workflow, "frontend-test"),
+				),
+			);
+		}
+		body.append(actions);
+		card.append(summary, body);
+		cards.push(card);
+	}
+	browserWorkflowList.replaceChildren(...cards);
+}
+
+function renderBrowserWorkflowIssue(
+	workflow: BrowserWorkflowSummary,
+	issue: BrowserWorkflowReview["issues"][number],
+): HTMLElement {
+	const row = document.createElement("div");
+	row.className = "browser-workflow-issue";
+	const label = document.createElement("span");
+	label.textContent = issue.message;
+	const select = document.createElement("select");
+	select.setAttribute("aria-label", `Target for ${issue.stepId}`);
+	const empty = document.createElement("option");
+	empty.value = "";
+	empty.textContent = "Select page element";
+	select.append(empty);
+	for (const candidate of issue.candidates) {
+		const option = document.createElement("option");
+		option.value = String(candidate.index);
+		option.textContent = `${candidate.role} · ${candidate.name || candidate.label || candidate.testId || candidate.id || "unnamed"}`;
+		select.append(option);
+	}
+	const apply = browserWorkflowAction("✓", "Use selected semantic target", async () => {
+		if (select.value === "") throw new Error("Select a page element first");
+		await browserWorkflowResolveTarget(workflow, issue.stepId, Number(select.value));
+	});
+	row.append(label, select, apply);
+	return row;
+}
+
+function browserWorkflowAction(label: string, title: string, action: () => Promise<void>): HTMLButtonElement {
+	const button = document.createElement("button");
+	button.type = "button";
+	button.textContent = label;
+	button.title = title;
+	button.setAttribute("aria-label", title);
+	button.addEventListener("click", () => {
+		button.disabled = true;
+		void action()
+			.then(() => loadBrowserWorkflows(true))
+			.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true))
+			.finally(() => {
+				button.disabled = false;
+			});
+	});
+	return button;
+}
+
+function workflowParameterValues(container: HTMLElement): Record<string, string | number | boolean> {
+	const values: Record<string, string | number | boolean> = {};
+	for (const field of container.querySelectorAll<HTMLInputElement>("[data-workflow-parameter]")) {
+		if (!field.dataset.workflowParameter || field.value === "") continue;
+		values[field.dataset.workflowParameter] = field.type === "number" ? Number(field.value) : field.value;
+	}
+	return values;
+}
+
+async function browserWorkflowRequest(
+	workflow: BrowserWorkflowSummary,
+	action: "validate" | "activate" | "run",
+	parameters: Record<string, string | number | boolean>,
+): Promise<void> {
+	if (!capabilityToken) return;
+	const approved =
+		action !== "run" ||
+		workflow.policy.approval !== "always" ||
+		window.confirm(`Run browser workflow "${workflow.name}"? It is configured to require approval.`);
+	if (!approved) return;
+	const response = await fetch(
+		`/browser/workflows/${encodeURIComponent(workflow.id)}/${action}?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ version: workflow.version, parameters, approved: action === "run" && approved }),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, `Could not ${action} browser workflow`));
+	setPreviewMessage(`${workflow.name}: ${action} completed`);
+}
+
+async function browserWorkflowReferenceRequest(
+	workflow: BrowserWorkflowSummary,
+	action: "create-skill" | "frontend-test",
+): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(
+		`/browser/workflows/${encodeURIComponent(workflow.id)}/${action}?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ version: workflow.version }),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not create browser workflow reference"));
+	setPreviewMessage(action === "create-skill" ? "Skill reference created" : "Frontend test attached to this project");
+}
+
+async function browserWorkflowResolveTarget(
+	workflow: BrowserWorkflowSummary,
+	stepId: string,
+	elementIndex: number,
+): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(
+		`/browser/workflows/${encodeURIComponent(workflow.id)}/resolve-target?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ version: workflow.version, stepId, elementIndex }),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not resolve browser workflow target"));
+}
+
+async function loadBrowserWorkflowReview(id: string, version: number): Promise<BrowserWorkflowReview> {
+	const key = `${id}:${version}`;
+	const cached = browserWorkflowReviews.get(key);
+	if (cached) return cached;
+	const response = await fetch(
+		`/browser/workflows/${encodeURIComponent(id)}/review?version=${version}&token=${encodeURIComponent(capabilityToken ?? "")}`,
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load browser workflow review"));
+	const value: unknown = await response.json();
+	if (!isBrowserWorkflowReview(value)) throw new Error("Browser workflow review response is invalid");
+	browserWorkflowReviews.set(key, value);
+	return value;
 }
 
 function ensurePreviewStream(sessionId: string): boolean {
@@ -1639,6 +2139,7 @@ function loadPreview(): Promise<void> {
 
 async function loadPreviewOnce(): Promise<void> {
 	if (!capabilityToken) return;
+	await loadBrowserWorkflows();
 	if (!session) {
 		previewSession.textContent = "No Pi session selected";
 		previewImage.removeAttribute("src");
@@ -1683,6 +2184,7 @@ async function loadPreviewOnce(): Promise<void> {
 	}
 	previewSession.textContent = `${browserOwnerLabel(browserSession)} · ${browserSession.controlOwner === "user" ? "User control" : "Agent control"}`;
 	setPreviewControls(browserSession);
+	await loadPreviewCapture();
 	if (browserSession.status === "failed") {
 		previewImage.removeAttribute("src");
 		setPreviewMessage(browserSession.lastError ?? "Browser session failed", true);
@@ -1762,7 +2264,6 @@ async function navigatePreview(url: string): Promise<void> {
 	if (!response.ok) throw new Error(await responseError(response, "Could not navigate managed browser"));
 	setPreviewMessage("Navigating managed browser…");
 	await loadPreview();
-	recordPreviewStep({ action: "navigate", url: activePreviewSession?.url ?? url, timestamp: Date.now() });
 }
 
 async function previewAction(action: "back" | "forward" | "reload"): Promise<void> {
@@ -1783,7 +2284,6 @@ async function previewAction(action: "back" | "forward" | "reload"): Promise<voi
 		);
 		if (!response.ok) throw new Error(await responseError(response, `Could not ${action} managed browser`));
 		await loadPreview();
-		recordPreviewStep({ action, timestamp: Date.now() });
 	} finally {
 		setPreviewControls(activePreviewSession);
 	}
@@ -1831,6 +2331,8 @@ function isBrowserConsoleStatus(value: unknown): value is BrowserConsoleStatus {
 		value.browser === "chromium" &&
 		"installed" in value &&
 		typeof value.installed === "boolean" &&
+		"installedChrome" in value &&
+		typeof value.installedChrome === "boolean" &&
 		"sessionCount" in value &&
 		typeof value.sessionCount === "number"
 	);
@@ -1874,6 +2376,138 @@ function isBrowserSessionList(value: unknown): value is { sessions: BrowserSessi
 			typeof entry.canGoForward === "boolean"
 		);
 	});
+}
+
+function isBrowserCaptureSummary(value: unknown): value is BrowserCaptureSummary {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"id" in value &&
+		typeof value.id === "string" &&
+		"sessionId" in value &&
+		typeof value.sessionId === "string" &&
+		"status" in value &&
+		(value.status === "recording" || value.status === "stopped" || value.status === "interrupted") &&
+		"steps" in value &&
+		Array.isArray(value.steps) &&
+		value.steps.every(
+			(step) =>
+				typeof step === "object" &&
+				step !== null &&
+				"action" in step &&
+				typeof step.action === "object" &&
+				step.action !== null &&
+				"kind" in step.action &&
+				typeof step.action.kind === "string",
+		)
+	);
+}
+
+function isBrowserCaptureStopResult(value: unknown): value is {
+	capture: BrowserCaptureSummary;
+	workflow?: { name: string; status: string; compileIssues: unknown[] };
+} {
+	if (
+		typeof value !== "object" ||
+		value === null ||
+		!("capture" in value) ||
+		!isBrowserCaptureSummary(value.capture)
+	) {
+		return false;
+	}
+	if (!("workflow" in value) || value.workflow === undefined) return true;
+	return (
+		typeof value.workflow === "object" &&
+		value.workflow !== null &&
+		"name" in value.workflow &&
+		typeof value.workflow.name === "string" &&
+		"status" in value.workflow &&
+		typeof value.workflow.status === "string" &&
+		"compileIssues" in value.workflow &&
+		Array.isArray(value.workflow.compileIssues)
+	);
+}
+
+function isBrowserWorkflowList(value: unknown): value is { workflows: BrowserWorkflowSummary[] } {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"workflows" in value &&
+		Array.isArray(value.workflows) &&
+		value.workflows.every(isBrowserWorkflowSummary)
+	);
+}
+
+function isBrowserWorkflowRunList(value: unknown): value is { runs: BrowserWorkflowRunSummary[] } {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"runs" in value &&
+		Array.isArray(value.runs) &&
+		value.runs.every(
+			(run) =>
+				typeof run === "object" &&
+				run !== null &&
+				"id" in run &&
+				typeof run.id === "string" &&
+				"workflowId" in run &&
+				typeof run.workflowId === "string" &&
+				"workflowVersion" in run &&
+				typeof run.workflowVersion === "number" &&
+				"status" in run &&
+				typeof run.status === "string" &&
+				"steps" in run &&
+				Array.isArray(run.steps) &&
+				run.steps.every(
+					(step: unknown) =>
+						typeof step === "object" && step !== null && "artifacts" in step && Array.isArray(step.artifacts),
+				),
+		)
+	);
+}
+
+function isBrowserWorkflowSummary(value: unknown): value is BrowserWorkflowSummary {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"id" in value &&
+		typeof value.id === "string" &&
+		"version" in value &&
+		typeof value.version === "number" &&
+		"name" in value &&
+		typeof value.name === "string" &&
+		"status" in value &&
+		typeof value.status === "string" &&
+		"source" in value &&
+		typeof value.source === "object" &&
+		value.source !== null &&
+		"parameters" in value &&
+		Array.isArray(value.parameters) &&
+		"compileIssues" in value &&
+		Array.isArray(value.compileIssues)
+	);
+}
+
+function isBrowserWorkflowReview(value: unknown): value is BrowserWorkflowReview {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"workflow" in value &&
+		isBrowserWorkflowSummary(value.workflow) &&
+		"issues" in value &&
+		Array.isArray(value.issues) &&
+		value.issues.every(
+			(issue) =>
+				typeof issue === "object" &&
+				issue !== null &&
+				"stepId" in issue &&
+				typeof issue.stepId === "string" &&
+				"message" in issue &&
+				typeof issue.message === "string" &&
+				"candidates" in issue &&
+				Array.isArray(issue.candidates),
+		)
+	);
 }
 
 function activeConnectionIsPrimary(): boolean {
@@ -2219,7 +2853,12 @@ interface AgentSummary {
 	projectRoot: string;
 	delegateAgentIds: string[];
 	a2a: { enabled: boolean };
-	browser?: { access: "disabled" | "loopback" | "public-web" | "private-network"; profile: { kind: "ephemeral" } };
+	browser?: {
+		access: "disabled" | "loopback" | "public-web" | "private-network";
+		runtime: "managed-chromium" | "installed-chrome";
+		profile: { kind: "ephemeral" } | { kind: "named"; id: string };
+	};
+	browserWorkflows: Array<{ id: string; version: number }>;
 	schedules: Array<{ id: string; prompt: string; intervalMinutes: number; enabled: boolean }>;
 }
 
@@ -2365,6 +3004,17 @@ function isAgentList(value: unknown): value is { agents: AgentSummary[] } {
 			typeof entry.projectRoot === "string" &&
 			"delegateAgentIds" in entry &&
 			Array.isArray(entry.delegateAgentIds) &&
+			"browserWorkflows" in entry &&
+			Array.isArray(entry.browserWorkflows) &&
+			entry.browserWorkflows.every(
+				(workflow: unknown) =>
+					typeof workflow === "object" &&
+					workflow !== null &&
+					"id" in workflow &&
+					typeof workflow.id === "string" &&
+					"version" in workflow &&
+					typeof workflow.version === "number",
+			) &&
 			"a2a" in entry &&
 			typeof entry.a2a === "object" &&
 			entry.a2a !== null &&
@@ -2818,6 +3468,9 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 		"agent-executor",
 		"agent-permissions",
 		"agent-browser-access",
+		"agent-browser-runtime",
+		"agent-browser-profile-kind",
+		"agent-browser-profile-id",
 		"agent-delegates",
 		"agent-a2a",
 	]) {
@@ -2834,6 +3487,14 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 	requiredElement<HTMLSelectElement>("agent-executor").value = agent?.executor ?? "harness";
 	requiredElement<HTMLSelectElement>("agent-permissions").value = agent?.permissionPolicy ?? "read-only";
 	requiredElement<HTMLSelectElement>("agent-browser-access").value = agent?.browser?.access ?? "disabled";
+	requiredElement<HTMLSelectElement>("agent-browser-runtime").value = agent?.browser?.runtime ?? "managed-chromium";
+	requiredElement<HTMLSelectElement>("agent-browser-profile-kind").value = agent?.browser?.profile.kind ?? "ephemeral";
+	requiredElement<HTMLInputElement>("agent-browser-profile-id").value =
+		agent?.browser?.profile.kind === "named" ? agent.browser.profile.id : "";
+	updateAgentBrowserProfileFields();
+	requiredElement<HTMLInputElement>("agent-browser-workflows").value =
+		agent?.browserWorkflows.map((workflow) => `${workflow.id}@${workflow.version}`).join(",") ?? "";
+	renderAgentBrowserWorkflowGrants();
 	requiredElement<HTMLSelectElement>("agent-thinking").value = agent?.thinking ?? "high";
 	requiredElement<HTMLInputElement>("agent-delegates").value = agent?.delegateAgentIds.join(", ") ?? "";
 	requiredElement<HTMLInputElement>("agent-a2a").checked = agent?.a2a.enabled ?? false;
@@ -3335,6 +3996,12 @@ interface RoutineSummary {
 	target:
 		| { kind: "agent"; agentId: string }
 		| { kind: "workflow"; workflowId: string }
+		| {
+				kind: "browser-workflow";
+				workflowId: string;
+				workflowVersion: number;
+				parameters: Record<string, string | number | boolean>;
+		  }
 		| { kind: "acp"; connectionId: string }
 		| { kind: "skill"; skillName: string };
 	model?: { provider: string; id: string };
@@ -3357,6 +4024,10 @@ function routineTargetLabel(routine: RoutineSummary): string {
 		case "workflow": {
 			const workflowId = routine.target.workflowId;
 			return `Workflow · ${workflows.find((entry) => entry.id === workflowId)?.name ?? workflowId}`;
+		}
+		case "browser-workflow": {
+			const workflowId = routine.target.workflowId;
+			return `Browser · ${recordedBrowserWorkflows.find((entry) => entry.id === workflowId)?.name ?? workflowId} · v${routine.target.workflowVersion}`;
 		}
 		case "acp": {
 			const connectionId = routine.target.connectionId;
@@ -3389,6 +4060,24 @@ function refreshRoutineEditorOptions(): void {
 		}),
 	);
 	if (workflows.some((entry) => entry.id === selectedWorkflow)) routineEditor.workflow.value = selectedWorkflow;
+	const selectedBrowserWorkflow = routineEditor.browserWorkflow.value;
+	routineEditor.browserWorkflow.replaceChildren(
+		...recordedBrowserWorkflows
+			.filter((entry) => entry.status === "active")
+			.map((entry) => {
+				const option = document.createElement("option");
+				option.value = `${entry.id}@${entry.version}`;
+				option.textContent = `${entry.name} · v${entry.version}`;
+				return option;
+			}),
+	);
+	if (
+		recordedBrowserWorkflows.some(
+			(entry) => `${entry.id}@${entry.version}` === selectedBrowserWorkflow && entry.status === "active",
+		)
+	) {
+		routineEditor.browserWorkflow.value = selectedBrowserWorkflow;
+	}
 	routineEditor.acp.replaceChildren(
 		...externalConnections.map((entry) => {
 			const option = document.createElement("option");
@@ -3429,9 +4118,14 @@ function updateRoutineTargetFields(): void {
 	const kind = routineEditor.targetKind.value;
 	routineEditor.agentLabel.classList.toggle("hidden", kind !== "agent");
 	routineEditor.workflowLabel.classList.toggle("hidden", kind !== "workflow");
+	routineEditor.browserWorkflowLabel.classList.toggle("hidden", kind !== "browser-workflow");
+	routineEditor.browserParametersLabel.classList.toggle("hidden", kind !== "browser-workflow");
 	routineEditor.acpLabel.classList.toggle("hidden", kind !== "acp");
 	routineEditor.skillLabel.classList.toggle("hidden", kind !== "skill");
-	routineEditor.cwdLabel.classList.toggle("hidden", kind === "agent" || kind === "workflow");
+	routineEditor.cwdLabel.classList.toggle(
+		"hidden",
+		kind === "agent" || kind === "workflow" || kind === "browser-workflow",
+	);
 	refreshRoutineModels("");
 }
 
@@ -3485,6 +4179,7 @@ function clearRoutineEditor(): void {
 	routineEditor.time.value = "09:00";
 	routineEditor.timezone.value = Intl.DateTimeFormat().resolvedOptions().timeZone;
 	routineEditor.maxDuration.value = "60";
+	routineEditor.browserParameters.value = "{}";
 	routineEditor.deleteButton.disabled = true;
 	routineEditor.runButton.disabled = true;
 	element("routine-editor-title").textContent = "New routine";
@@ -3508,7 +4203,10 @@ function editRoutine(routine: RoutineSummary): void {
 	routineEditor.targetKind.value = routine.target.kind;
 	if (routine.target.kind === "agent") routineEditor.agent.value = routine.target.agentId;
 	else if (routine.target.kind === "workflow") routineEditor.workflow.value = routine.target.workflowId;
-	else if (routine.target.kind === "acp") routineEditor.acp.value = routine.target.connectionId;
+	else if (routine.target.kind === "browser-workflow") {
+		routineEditor.browserWorkflow.value = `${routine.target.workflowId}@${routine.target.workflowVersion}`;
+		routineEditor.browserParameters.value = JSON.stringify(routine.target.parameters, null, 2);
+	} else if (routine.target.kind === "acp") routineEditor.acp.value = routine.target.connectionId;
 	else routineEditor.skill.value = routine.target.skillName;
 	routineEditor.cwd.value = routine.cwd ?? session?.snapshot?.cwd ?? "";
 	updateRoutineTargetFields();
@@ -3664,6 +4362,7 @@ function isRoutineList(value: unknown): value is { routines: RoutineSummary[] } 
 		return (
 			entry.target.kind === "agent" ||
 			entry.target.kind === "workflow" ||
+			entry.target.kind === "browser-workflow" ||
 			entry.target.kind === "acp" ||
 			entry.target.kind === "skill"
 		);
@@ -3980,7 +4679,11 @@ previewPopout.addEventListener("click", () => {
 		"popup=yes,width=1200,height=850,resizable=yes,scrollbars=yes",
 	);
 });
-previewRecord.addEventListener("click", togglePreviewRecording);
+previewRecord.addEventListener("click", () => {
+	void togglePreviewRecording().catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
+});
 previewSendRecording.addEventListener("click", () => {
 	void sendPreviewRecordingToPi().catch((error: unknown) =>
 		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
@@ -3993,42 +4696,35 @@ previewImage.addEventListener("click", (event) => {
 	if (bounds.width === 0 || bounds.height === 0) return;
 	const x = ((event.clientX - bounds.left) / bounds.width) * activePreviewSession.viewport.width;
 	const y = ((event.clientY - bounds.top) / bounds.height) * activePreviewSession.viewport.height;
-	void sendPreviewInput({ kind: "click", x, y })
-		.then(() => recordPreviewStep({ action: "click", x, y, timestamp: Date.now() }))
-		.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
+	void sendPreviewInput({ kind: "click", x, y }).catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
 });
 previewFrame.addEventListener("keydown", (event) => {
 	if (activePreviewSession?.controlOwner !== "user" || event.isComposing) return;
 	if (event.ctrlKey || event.metaKey || event.altKey || event.key.length !== 1) return;
 	event.preventDefault();
-	void sendPreviewInput({ kind: "type", text: event.key })
-		.then(() => recordPreviewStep({ action: "type", textLength: 1, timestamp: Date.now() }))
-		.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
+	void sendPreviewInput({ kind: "type", text: event.key }).catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
 });
 previewFrame.addEventListener("paste", (event) => {
 	if (activePreviewSession?.controlOwner !== "user") return;
 	const text = event.clipboardData?.getData("text/plain") ?? "";
 	if (!text) return;
 	event.preventDefault();
-	void sendPreviewInput({ kind: "type", text })
-		.then(() => recordPreviewStep({ action: "type", textLength: text.length, timestamp: Date.now() }))
-		.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
+	void sendPreviewInput({ kind: "type", text }).catch((error: unknown) =>
+		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+	);
 });
 previewImage.addEventListener(
 	"wheel",
 	(event) => {
 		if (activePreviewSession?.controlOwner !== "user") return;
 		event.preventDefault();
-		void sendPreviewInput({ kind: "scroll", deltaX: event.deltaX, deltaY: event.deltaY })
-			.then(() =>
-				recordPreviewStep({
-					action: "scroll",
-					deltaX: event.deltaX,
-					deltaY: event.deltaY,
-					timestamp: Date.now(),
-				}),
-			)
-			.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true));
+		void sendPreviewInput({ kind: "scroll", deltaX: event.deltaX, deltaY: event.deltaY }).catch((error: unknown) =>
+			setPreviewMessage(error instanceof Error ? error.message : String(error), true),
+		);
 	},
 	{ passive: false },
 );
@@ -4168,6 +4864,8 @@ agentForm.addEventListener("submit", (event) => {
 	const modelSeparator = selectedModel.indexOf("/");
 	const executor = value("agent-executor");
 	const browserAccess = value("agent-browser-access");
+	const browserRuntime = value("agent-browser-runtime");
+	const browserProfileKind = value("agent-browser-profile-kind");
 	const tools = value("agent-tools")
 		.split(",")
 		.map((entry) => entry.trim())
@@ -4196,8 +4894,20 @@ agentForm.addEventListener("submit", (event) => {
 		a2a: { enabled: requiredElement<HTMLInputElement>("agent-a2a").checked },
 		browser: {
 			access: browserAccess,
-			profile: { kind: "ephemeral" },
+			runtime: browserRuntime,
+			profile:
+				browserProfileKind === "named"
+					? { kind: "named" as const, id: value("agent-browser-profile-id") }
+					: { kind: "ephemeral" as const },
 		},
+		browserWorkflows: value("agent-browser-workflows")
+			.split(",")
+			.map((entry) => entry.trim())
+			.filter(Boolean)
+			.map((entry) => {
+				const separator = entry.lastIndexOf("@");
+				return { id: entry.slice(0, separator), version: Number(entry.slice(separator + 1)) };
+			}),
 		model:
 			modelSeparator > 0
 				? {
@@ -4254,6 +4964,10 @@ requiredElement<HTMLSelectElement>("agent-executor").addEventListener("change", 
 		setStatus(error instanceof Error ? error.message : String(error), true),
 	);
 });
+requiredElement<HTMLSelectElement>("agent-browser-profile-kind").addEventListener(
+	"change",
+	updateAgentBrowserProfileFields,
+);
 
 pluginForm.addEventListener("submit", (event) => {
 	event.preventDefault();
@@ -4313,14 +5027,37 @@ routineEditor.form.addEventListener("submit", (event) => {
 	event.preventDefault();
 	if (!capabilityToken) return;
 	const kind = routineEditor.targetKind.value;
+	let browserParameters: Record<string, string | number | boolean> = {};
+	if (kind === "browser-workflow") {
+		try {
+			browserParameters = parseRoutineBrowserParameters(routineEditor.browserParameters.value);
+		} catch (error) {
+			setStatus(error instanceof Error ? error.message : String(error), true);
+			return;
+		}
+	}
 	const target =
 		kind === "agent"
 			? { kind: "agent" as const, agentId: routineEditor.agent.value }
 			: kind === "workflow"
 				? { kind: "workflow" as const, workflowId: routineEditor.workflow.value }
-				: kind === "acp"
-					? { kind: "acp" as const, connectionId: routineEditor.acp.value }
-					: { kind: "skill" as const, skillName: routineEditor.skill.value.trim() };
+				: kind === "browser-workflow"
+					? {
+							kind: "browser-workflow" as const,
+							workflowId: routineEditor.browserWorkflow.value.slice(
+								0,
+								routineEditor.browserWorkflow.value.lastIndexOf("@"),
+							),
+							workflowVersion: Number(
+								routineEditor.browserWorkflow.value.slice(
+									routineEditor.browserWorkflow.value.lastIndexOf("@") + 1,
+								),
+							),
+							parameters: browserParameters,
+						}
+					: kind === "acp"
+						? { kind: "acp" as const, connectionId: routineEditor.acp.value }
+						: { kind: "skill" as const, skillName: routineEditor.skill.value.trim() };
 	const separator = routineEditor.model.value.indexOf("/");
 	const definition = {
 		name: routineEditor.name.value,
@@ -4337,7 +5074,10 @@ routineEditor.form.addEventListener("submit", (event) => {
 						id: routineEditor.model.value.slice(separator + 1),
 					}
 				: undefined,
-		cwd: kind === "agent" || kind === "workflow" ? undefined : routineEditor.cwd.value.trim() || undefined,
+		cwd:
+			kind === "agent" || kind === "workflow" || kind === "browser-workflow"
+				? undefined
+				: routineEditor.cwd.value.trim() || undefined,
 	};
 	const id = routineEditor.id.value;
 	void fetch(
@@ -4370,6 +5110,22 @@ routineEditor.form.addEventListener("submit", (event) => {
 		})
 		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
 });
+
+function parseRoutineBrowserParameters(value: string): Record<string, string | number | boolean> {
+	const parsed: unknown = JSON.parse(value || "{}");
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error("Browser workflow parameters must be a JSON object");
+	}
+	const parameters: Record<string, string | number | boolean> = {};
+	for (const [name, entry] of Object.entries(parsed)) {
+		if (!/^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(name)) throw new Error(`Invalid browser parameter ${name}`);
+		if (typeof entry !== "string" && typeof entry !== "number" && typeof entry !== "boolean") {
+			throw new Error(`Browser parameter ${name} must be a string, number, or boolean`);
+		}
+		parameters[name] = entry;
+	}
+	return parameters;
+}
 
 routineEditor.runButton.addEventListener("click", () => {
 	if (!capabilityToken || !routineEditor.id.value) return;

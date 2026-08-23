@@ -53,9 +53,21 @@ describe("createServePage", () => {
 			return { url: "http://localhost:4173/", title: "Fixture", elements: [] };
 		}
 
+		async elementAt(): Promise<undefined> {
+			return undefined;
+		}
+
+		async focusedElement(): Promise<undefined> {
+			return undefined;
+		}
+
 		async click(): Promise<void> {}
 
 		async fill(): Promise<void> {}
+
+		async select(): Promise<void> {}
+
+		async scrollIntoView(): Promise<void> {}
 
 		async press(): Promise<void> {}
 
@@ -69,6 +81,9 @@ describe("createServePage", () => {
 
 		diagnostics() {
 			return { console: [], networkFailures: [] };
+		}
+		downloads() {
+			return [];
 		}
 
 		async close(): Promise<void> {}
@@ -286,6 +301,9 @@ describe("createServePage", () => {
 			body: JSON.stringify({ url: "https://example.com/" }),
 		});
 		expect(denied.status).toBe(409);
+		await browser.close(created.id);
+		const closedStatus = await fetch(`${origin}/browser/status?token=secret-token`);
+		expect(await closedStatus.json()).toMatchObject({ sessionCount: 0 });
 	});
 
 	test("rejects writes and unknown paths", async () => {

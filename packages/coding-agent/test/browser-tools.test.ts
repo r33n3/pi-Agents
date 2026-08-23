@@ -58,6 +58,14 @@ class FixtureBrowserContext implements BrowserDriverContext {
 		};
 	}
 
+	async elementAt(): Promise<{ role: string; name: string }> {
+		return { role: "button", name: "Submit" };
+	}
+
+	async focusedElement(): Promise<{ role: string; name: string }> {
+		return { role: "textbox", name: "Search" };
+	}
+
 	async click(index: number): Promise<void> {
 		this.clicks.push(index);
 	}
@@ -65,6 +73,10 @@ class FixtureBrowserContext implements BrowserDriverContext {
 	async fill(index: number, text: string): Promise<void> {
 		this.fills.push({ index, text });
 	}
+
+	async select(): Promise<void> {}
+
+	async scrollIntoView(): Promise<void> {}
 
 	async press(): Promise<void> {}
 
@@ -78,6 +90,9 @@ class FixtureBrowserContext implements BrowserDriverContext {
 
 	diagnostics() {
 		return { console: [], networkFailures: [] };
+	}
+	downloads() {
+		return [];
 	}
 
 	async close(): Promise<void> {}

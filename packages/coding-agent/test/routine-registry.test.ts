@@ -48,4 +48,30 @@ describe("RoutineRegistry", () => {
 			}),
 		).rejects.toThrow("unsupported characters");
 	});
+
+	test("requires an active pinned browser workflow version", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-routine-registry-"));
+		roots.push(root);
+		const registry = new RoutineRegistry(root, (id, version) => id === "review-page" && version === 3);
+		const input = {
+			name: "Review page",
+			prompt: "Run the browser review",
+			enabled: true,
+			cron: "0 9 * * *",
+			timezone: "UTC",
+			maxDurationMinutes: 10,
+		};
+		await expect(
+			registry.save({
+				...input,
+				target: { kind: "browser-workflow", workflowId: "review-page", workflowVersion: 2, parameters: {} },
+			}),
+		).rejects.toThrow("version 2 is not active");
+		await expect(
+			registry.save({
+				...input,
+				target: { kind: "browser-workflow", workflowId: "review-page", workflowVersion: 3, parameters: {} },
+			}),
+		).resolves.toMatchObject({ target: { workflowId: "review-page", workflowVersion: 3 } });
+	});
 });
