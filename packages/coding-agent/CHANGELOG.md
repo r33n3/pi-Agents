@@ -15,6 +15,7 @@
 - Added a persistent `pi --serve` agent workspace with persona-backed definitions, durable conversations and tasks, cron routines, sequential/parallel/supervisor workflows, explicit plugin lifecycle approval, and per-agent capability grants.
 - Added an opt-in, authenticated A2A v1.0 HTTP+JSON boundary with Agent Cards, task operations, cancellation, and Server-Sent Event updates.
 - Added the `agent_deploy` Pi tool so agents created from a Pi session and Agent Builder share one validated registry and appear without a server restart.
+- Added a dependency-aware `pi-coordinator` workflow and live, inspectable subagent activity tabs in the web console.
 
 ### Changed
 
@@ -23,6 +24,7 @@
 ### Fixed
 
 - Fixed browser access-policy blocks appearing as unexplained generic Chromium network failures in managed-browser diagnostics.
+- Fixed slow web-console reconnects and agent saves by bounding transcript rendering, coalescing active-panel refreshes, and moving secondary agent catalog updates into the background.
 - Fixed managed-browser live frames being dropped by WebSocket state checks or blocked by the console content security policy.
 - Fixed writes to `auth.json` and `models-store.json` overriding administrator-managed file permissions and ACLs ([#7779](https://github.com/earendil-works/pi/issues/7779)).
 - Fixed UTF-8 BOM markers preventing frontmatter and user configuration files from loading ([#8337](https://github.com/earendil-works/pi/issues/8337)).

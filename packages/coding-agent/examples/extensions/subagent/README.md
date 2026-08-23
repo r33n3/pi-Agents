@@ -21,12 +21,16 @@ subagent/
 ├── agents/              # Sample agent definitions
 │   ├── scout.md         # Fast recon, returns compressed context
 │   ├── planner.md       # Creates implementation plans
+│   ├── pi-coordinator.md # Coordinates specification work packages
 │   ├── reviewer.md      # Code review
 │   └── worker.md        # General-purpose (full capabilities)
-└── prompts/             # Workflow presets (prompt templates)
+├── prompts/             # Workflow presets (prompt templates)
     ├── implement.md     # scout -> planner -> worker
     ├── scout-and-plan.md    # scout -> planner (no implementation)
-    └── implement-and-review.md  # worker -> reviewer -> worker
+    ├── implement-and-review.md  # worker -> reviewer -> worker
+    └── coordinate.md    # spec-build -> pi-coordinator
+└── skills/
+    └── spec-build/SKILL.md  # Durable specification and routing policy
 ```
 
 ## Installation
@@ -50,6 +54,10 @@ mkdir -p ~/.pi/agent/prompts
 for f in packages/coding-agent/examples/extensions/subagent/prompts/*.md; do
   ln -sf "$(pwd)/$f" ~/.pi/agent/prompts/$(basename "$f")
 done
+
+# Symlink the specification skill
+mkdir -p ~/.pi/agent/skills/spec-build
+ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/skills/spec-build/SKILL.md" ~/.pi/agent/skills/spec-build/SKILL.md
 ```
 
 ## Security Model
@@ -81,11 +89,19 @@ Run 2 scouts in parallel: one to find models, one to find providers
 Use a chain: first have scout find the read tool, then have planner suggest improvements
 ```
 
+### Coordinated delivery
+```
+/coordinate implement the approved multi-agent delivery
+```
+
+Pi writes a durable specification and delegates it once to `pi-coordinator`. The coordinator selects sequential, bounded-parallel, or staged execution from dependencies, workspace conflicts, and model capacity.
+
 ### Workflow prompts
 ```
 /implement add Redis caching to the session store
 /scout-and-plan refactor auth to support OAuth
 /implement-and-review add input validation to API endpoints
+/coordinate deliver the approved agent workspace specification
 ```
 
 ## Tool Modes
@@ -93,7 +109,7 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 | Mode | Parameter | Description |
 |------|-----------|-------------|
 | Single | `{ agent, task }` | One agent, one task |
-| Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
+| Parallel | `{ tasks: [...], maxConcurrency?: 1..4 }` | Multiple agents run with an explicit concurrency bound (max 8 tasks) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
 
 ## Output Display
@@ -153,6 +169,7 @@ Project agents override user agents with the same name when `agentScope: "both"`
 | `planner` | Implementation plans | Sonnet | read, grep, find, ls |
 | `reviewer` | Code review | Sonnet | read, grep, find, ls, bash |
 | `worker` | General-purpose | Sonnet | (all default) |
+| `pi-coordinator` | Dependency-aware orchestration | GPT-5.6 Luna | read-only coordination and subagents |
 
 ## Workflow Prompts
 
@@ -161,6 +178,7 @@ Project agents override user agents with the same name when `agentScope: "both"`
 | `/implement <query>` | scout → planner → worker |
 | `/scout-and-plan <query>` | scout → planner |
 | `/implement-and-review <query>` | worker → reviewer → worker |
+| `/coordinate <query>` | spec-build → pi-coordinator → bounded agent work |
 
 ## Error Handling
 
@@ -174,4 +192,4 @@ Project agents override user agents with the same name when `agentScope: "both"`
 - Output truncated to last 10 items in collapsed view (expand to see all)
 - Parallel model-visible output is capped at 50 KB per task; full results remain in tool details
 - Agents discovered fresh on each invocation (allows editing mid-session)
-- Parallel mode limited to 8 tasks, 4 concurrent
+- Parallel mode is limited to 8 tasks and at most 4 concurrent; callers can set a lower bound for constrained models.

@@ -198,6 +198,10 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("Pop out browser");
 		expect(bundleText).toContain("agent-session-tab");
 		expect(bundleText).toContain("Active agent conversation");
+		expect(bundleText).toContain("subagent-card");
+		expect(bundleText).toContain("subagent-session-tab");
+		expect(bundleText).toContain("Inspect agent run");
+		expect(bundleText).toContain("Subagent inspector is read-only");
 		expect(bundleText).not.toContain("No active browser");
 		expect(bundleText).not.toContain("Record a walkthrough, then send it to Pi for review.");
 		expect(bundleText).not.toContain("Ask Pi or an agent to open a permitted URL.");

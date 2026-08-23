@@ -8,6 +8,7 @@ import type {
 } from "@earendil-works/pi-protocol";
 import { createBrowserId } from "./browser-id.ts";
 import { installThemedSelect } from "./themed-select.ts";
+import { selectTranscriptWindow } from "./transcript-window.ts";
 import { createBrowserWebSocketTransport } from "./websocket-transport.ts";
 
 const pageUrl = new URL(location.href);
@@ -93,7 +94,10 @@ let unsubscribeBuilder: Unsubscribe | undefined;
 let activeSidebarAgent: AgentSummary | undefined;
 let activeTargetKey: string | undefined;
 let activeAgentId: string | undefined;
+let activeSubagentKey: string | undefined;
 const openAgentIds: string[] = [];
+const openSubagentKeys: string[] = [];
+const subagentActivityByKey = new Map<string, SubagentActivity>();
 const agentConversationIds = new Map<string, string>();
 const agentTasksByAgent = new Map<string, AgentTaskSummary[]>();
 let activePreviewSessionId: string | undefined;
@@ -102,6 +106,10 @@ let selectedPreviewSessionId = requestedPreviewSessionId;
 let previewStream: WebSocket | undefined;
 let previewStreamSessionId: string | undefined;
 let previewFrameUrl: string | undefined;
+let previewRefreshPromise: Promise<void> | undefined;
+let previewRefreshRequested = false;
+let cachedBrowserStatus: BrowserConsoleStatus | undefined;
+let periodicRefreshPromise: Promise<void> | undefined;
 let previewRecording = false;
 let previewRecordingSessionId: string | undefined;
 let recordedPreviewSteps: RecordedPreviewStep[] = [];
@@ -248,11 +256,19 @@ const streamingThinking = new Set<string>();
 const expandedToolActivity = new Map<string, boolean>();
 const promptHistoryBySession = new Map<string, PromptHistory>();
 const MAX_PROMPT_HISTORY = 5;
+const transcriptVisibleCountBySession = new Map<string, number>();
+const TRANSCRIPT_WINDOW_SIZE = 80;
 
 interface PromptHistory {
 	entries: string[];
 	index: number;
 	draft: string;
+}
+
+interface SubagentActivity {
+	key: string;
+	sessionId: string;
+	item: Extract<TranscriptItem, { role: "tool" }>;
 }
 
 function readSessionAliases(): Record<string, string> {
@@ -746,6 +762,7 @@ function setStatus(message: string, error = false): void {
 
 function setBusy(snapshot: SessionSnapshot): void {
 	const busy = snapshot.phase !== "idle";
+	send.disabled = false;
 	phase.textContent = snapshot.phase;
 	send.classList.toggle("is-stopping", busy);
 	send.setAttribute("aria-label", busy ? "Stop response" : "Send message");
@@ -757,20 +774,52 @@ function setBusy(snapshot: SessionSnapshot): void {
 }
 
 function render(snapshot: SessionSnapshot): void {
+	projectSubagentActivity(snapshot);
+	if (activeSubagentKey) {
+		const activity = subagentActivityByKey.get(activeSubagentKey);
+		if (activity) renderSubagentInspector(activity);
+		else closeSubagentTab(activeSubagentKey);
+		return;
+	}
 	if (activeAgentId) return;
 	const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
 	const previousScrollTop = transcript.scrollTop;
-	transcript.replaceChildren(...snapshot.transcript.map(renderItem));
+	const window = selectTranscriptWindow(
+		snapshot.transcript,
+		transcriptVisibleCountBySession.get(snapshot.id) ?? TRANSCRIPT_WINDOW_SIZE,
+		TRANSCRIPT_WINDOW_SIZE,
+	);
+	const earlier =
+		window.hiddenCount > 0 ? renderEarlierMessages(snapshot, window.hiddenCount, window.visibleCount) : [];
+	transcript.replaceChildren(...earlier, ...window.items.map(renderItem));
 	setBusy(snapshot);
 	model.value = `${snapshot.model.provider}/${snapshot.model.id}`;
 	modelPicker.refresh();
 	thinking.value = snapshot.thinkingLevel;
+	input.disabled = false;
 	input.placeholder = "Message Pi…";
 	input.setAttribute("aria-label", "Message Pi");
 	sessionPath.textContent = formatWorkingDirectory(snapshot.cwd);
 	sessionPath.title = snapshot.cwd;
 	renderSessionStats(snapshot);
 	transcript.scrollTop = nearBottom ? transcript.scrollHeight : previousScrollTop;
+}
+
+function renderEarlierMessages(
+	snapshot: SessionSnapshot,
+	hiddenCount: number,
+	visibleCount: number,
+): [HTMLButtonElement] {
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "transcript-earlier";
+	button.textContent = `Show ${Math.min(hiddenCount, TRANSCRIPT_WINDOW_SIZE)} earlier messages`;
+	button.title = `${hiddenCount} earlier messages are retained in this session`;
+	button.addEventListener("click", () => {
+		transcriptVisibleCountBySession.set(snapshot.id, visibleCount + TRANSCRIPT_WINDOW_SIZE);
+		render(snapshot);
+	});
+	return [button];
 }
 
 function renderSessionStats(snapshot: SessionSnapshot): void {
@@ -849,8 +898,9 @@ function renderItem(item: TranscriptItem): HTMLElement {
 		if (content.type === "text") appendText(article, content.text);
 		else if (item.role === "assistant" && content.type === "thinking") {
 			article.append(renderThinkingActivity(item, content.thinking, index));
-		} else if (content.type === "toolCall") appendText(article, `Using ${content.toolName}`, "tool-call");
-		else if (content.type === "image") appendText(article, `[image: ${content.mimeType}]`);
+		} else if (content.type === "toolCall" && content.toolName !== "subagent") {
+			appendText(article, `Using ${content.toolName}`, "tool-call");
+		} else if (content.type === "image") appendText(article, `[image: ${content.mimeType}]`);
 	}
 	return article;
 }
@@ -900,7 +950,8 @@ function renderThinkingActivity(
 	return details;
 }
 
-function renderToolActivity(item: Extract<TranscriptItem, { role: "tool" }>): HTMLDetailsElement {
+function renderToolActivity(item: Extract<TranscriptItem, { role: "tool" }>): HTMLElement {
+	if (item.toolName === "subagent") return renderSubagentCard(item);
 	const details = document.createElement("details");
 	details.className = "tool-activity";
 	details.open = expandedToolActivity.get(item.toolCallId) ?? item.status !== "complete";
@@ -939,6 +990,129 @@ function renderToolActivity(item: Extract<TranscriptItem, { role: "tool" }>): HT
 	}
 	details.append(summary, body);
 	return details;
+}
+
+function projectSubagentActivity(snapshot: SessionSnapshot): void {
+	for (const item of snapshot.transcript) {
+		if (item.role !== "tool" || item.toolName !== "subagent") continue;
+		const key = `${snapshot.id}:${item.toolCallId}`;
+		subagentActivityByKey.set(key, { key, sessionId: snapshot.id, item });
+	}
+}
+
+function renderSubagentCard(item: Extract<TranscriptItem, { role: "tool" }>): HTMLElement {
+	const key = `${session?.id ?? "session"}:${item.toolCallId}`;
+	const card = document.createElement("section");
+	card.className = "subagent-card";
+	card.dataset.status = item.status;
+	const header = document.createElement("div");
+	header.className = "subagent-card-header";
+	const indicator = document.createElement("i");
+	indicator.className = "subagent-status-dot";
+	const identity = document.createElement("div");
+	identity.className = "subagent-identity";
+	const name = document.createElement("strong");
+	name.textContent = subagentName(item.input);
+	const state = document.createElement("span");
+	state.textContent = item.status === "running" ? "Running" : item.status === "error" ? "Failed" : "Completed";
+	identity.append(name, state);
+	const actions = document.createElement("div");
+	actions.className = "subagent-card-actions";
+	const inspect = document.createElement("button");
+	inspect.type = "button";
+	const inspectorOpen = openSubagentKeys.includes(key);
+	inspect.className = "subagent-inspect";
+	inspect.title = inspectorOpen ? "Close agent run" : "Inspect agent run";
+	inspect.setAttribute("aria-label", inspect.title);
+	inspect.append(eyeIcon(inspectorOpen));
+	inspect.addEventListener("click", () => toggleSubagentInspector(key, item));
+	actions.append(inspect);
+	if (item.status === "running") {
+		const stop = document.createElement("button");
+		stop.type = "button";
+		stop.className = "subagent-stop";
+		stop.title = "Stop this delegation and the current Pi turn";
+		stop.setAttribute("aria-label", stop.title);
+		stop.textContent = "■";
+		stop.addEventListener("click", () => void session?.abort());
+		actions.append(stop);
+	}
+	header.append(indicator, identity, actions);
+	const task = document.createElement("div");
+	task.className = "subagent-task";
+	task.textContent = subagentTask(item.input);
+	const latest = document.createElement("div");
+	latest.className = "subagent-latest";
+	latest.textContent = subagentLatestAction(item) ?? (item.status === "running" ? "Starting agent…" : "Run finished");
+	card.append(header, task, latest);
+	return card;
+}
+
+function eyeIcon(open: boolean): SVGSVGElement {
+	const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+	icon.setAttribute("viewBox", "0 0 24 24");
+	icon.setAttribute("aria-hidden", "true");
+	const eye = document.createElementNS("http://www.w3.org/2000/svg", "path");
+	eye.setAttribute("d", "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Zm10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z");
+	icon.append(eye);
+	if (!open) {
+		const slash = document.createElementNS("http://www.w3.org/2000/svg", "path");
+		slash.setAttribute("d", "M4 4l16 16");
+		icon.append(slash);
+	}
+	return icon;
+}
+
+function subagentName(input: unknown): string {
+	const record = objectRecord(input);
+	if (typeof record?.agent === "string") return record.agent;
+	if (Array.isArray(record?.tasks)) return `${record.tasks.length} agents · parallel`;
+	if (Array.isArray(record?.chain)) return `${record.chain.length} agents · sequential`;
+	return "Subagent";
+}
+
+function subagentTask(input: unknown): string {
+	const record = objectRecord(input);
+	if (typeof record?.task === "string") return record.task;
+	const entries = Array.isArray(record?.tasks) ? record.tasks : Array.isArray(record?.chain) ? record.chain : [];
+	const tasks = entries.flatMap((entry) => {
+		const candidate = objectRecord(entry);
+		return typeof candidate?.task === "string" ? [candidate.task] : [];
+	});
+	return tasks.join(" · ") || "Delegated task";
+}
+
+function subagentLatestAction(item: Extract<TranscriptItem, { role: "tool" }>): string | undefined {
+	const details = objectRecord(item.details);
+	if (!Array.isArray(details?.results)) return item.content.find((part) => part.type === "text")?.text;
+	for (let resultIndex = details.results.length - 1; resultIndex >= 0; resultIndex--) {
+		const result = objectRecord(details.results[resultIndex]);
+		if (!Array.isArray(result?.messages)) continue;
+		for (let messageIndex = result.messages.length - 1; messageIndex >= 0; messageIndex--) {
+			const message = objectRecord(result.messages[messageIndex]);
+			if (message?.role === "toolResult" && typeof message.toolName === "string") {
+				return `Completed ${message.toolName}`;
+			}
+			if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+			for (let contentIndex = message.content.length - 1; contentIndex >= 0; contentIndex--) {
+				const part = objectRecord(message.content[contentIndex]);
+				if (part?.type === "toolCall" && typeof part.name === "string") return `Using ${part.name}`;
+				if (part?.type === "text" && typeof part.text === "string") return compactText(part.text);
+			}
+		}
+	}
+	return undefined;
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function compactText(value: string): string {
+	const compact = value.replace(/\s+/g, " ").trim();
+	return compact.length > 120 ? `${compact.slice(0, 117)}…` : compact;
 }
 
 function toolActivityTarget(input: unknown): string | undefined {
@@ -1082,11 +1256,11 @@ function renderSessionNavigation(): void {
 		...targets.map((target) => {
 			const wrapper = document.createElement("div");
 			wrapper.className = "session-tab-wrap";
-			wrapper.classList.toggle("active", !activeAgentId && target.key === activeTargetKey);
+			wrapper.classList.toggle("active", !activeAgentId && !activeSubagentKey && target.key === activeTargetKey);
 			const button = document.createElement("button");
 			button.type = "button";
 			button.className = "session-tab";
-			button.classList.toggle("active", !activeAgentId && target.key === activeTargetKey);
+			button.classList.toggle("active", !activeAgentId && !activeSubagentKey && target.key === activeTargetKey);
 			const sessionName = sessionDisplayName(target);
 			const connection = connections.get(target.connectionId);
 			button.textContent = connections.size > 1 && connection ? `${connection.label} · ${sessionName}` : sessionName;
@@ -1115,6 +1289,28 @@ function renderSessionNavigation(): void {
 			close.title = `Close ${agent.name} chat`;
 			close.setAttribute("aria-label", `Close ${agent.name} chat`);
 			close.addEventListener("click", () => closeAgentTab(agent.id));
+			wrapper.append(button, close);
+			return [wrapper];
+		}),
+		...openSubagentKeys.flatMap((key) => {
+			const activity = subagentActivityByKey.get(key);
+			if (!activity) return [];
+			const wrapper = document.createElement("div");
+			wrapper.className = "session-tab-wrap";
+			wrapper.classList.toggle("active", key === activeSubagentKey);
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "session-tab subagent-session-tab";
+			button.textContent = subagentName(activity.item.input);
+			button.title = `Inspect ${subagentName(activity.item.input)}`;
+			button.addEventListener("click", () => openSubagentInspector(key));
+			const close = document.createElement("button");
+			close.type = "button";
+			close.className = "session-tab-close";
+			close.textContent = "×";
+			close.title = `Close ${subagentName(activity.item.input)} inspector`;
+			close.setAttribute("aria-label", close.title);
+			close.addEventListener("click", () => closeSubagentTab(key));
 			wrapper.append(button, close);
 			return [wrapper];
 		}),
@@ -1169,6 +1365,7 @@ function renderSessionNavigation(): void {
 async function switchSession(target: SessionTarget): Promise<void> {
 	if (target.key === activeTargetKey && session?.attached) {
 		activeAgentId = undefined;
+		activeSubagentKey = undefined;
 		if (session.snapshot) render(session.snapshot);
 		renderSessionNavigation();
 		renderAttachments();
@@ -1176,12 +1373,16 @@ async function switchSession(target: SessionTarget): Promise<void> {
 	}
 	const entry = connections.get(target.connectionId);
 	if (!entry) throw new Error("Pi connection is unavailable");
+	setStatus(`Connecting to ${sessionDisplayName(target)}…`);
+	phase.textContent = "connecting";
+	input.disabled = true;
 	unsubscribeSession?.();
 	unsubscribeSession = undefined;
 	await session?.dispose().catch(() => {});
 	session = await entry.client.attachSession(target.session.id);
 	activeTargetKey = target.key;
 	activeAgentId = undefined;
+	activeSubagentKey = undefined;
 	populateModels(entry.client.snapshot?.models ?? []);
 	unsubscribeSession = session.subscribe(render);
 	if (session.snapshot) render(session.snapshot);
@@ -1374,7 +1575,21 @@ function handlePreviewStreamMessage(event: MessageEvent): void {
 	previewFrameUrl = nextUrl;
 }
 
-async function loadPreview(): Promise<void> {
+function loadPreview(): Promise<void> {
+	previewRefreshRequested = true;
+	if (previewRefreshPromise) return previewRefreshPromise;
+	previewRefreshPromise = (async () => {
+		do {
+			previewRefreshRequested = false;
+			await loadPreviewOnce();
+		} while (previewRefreshRequested);
+	})().finally(() => {
+		previewRefreshPromise = undefined;
+	});
+	return previewRefreshPromise;
+}
+
+async function loadPreviewOnce(): Promise<void> {
 	if (!capabilityToken) return;
 	if (!session) {
 		previewSession.textContent = "No Pi session selected";
@@ -1385,10 +1600,15 @@ async function loadPreview(): Promise<void> {
 		previewStream?.close();
 		return;
 	}
-	const statusResponse = await fetch(`/browser/status?token=${encodeURIComponent(capabilityToken)}`);
-	if (!statusResponse.ok) throw new Error(await responseError(statusResponse, "Could not load browser status"));
-	const browserStatus: unknown = await statusResponse.json();
-	if (!isBrowserConsoleStatus(browserStatus)) throw new Error("Browser status response is invalid");
+	let browserStatus = cachedBrowserStatus;
+	if (!browserStatus?.installed) {
+		const statusResponse = await fetch(`/browser/status?token=${encodeURIComponent(capabilityToken)}`);
+		if (!statusResponse.ok) throw new Error(await responseError(statusResponse, "Could not load browser status"));
+		const value: unknown = await statusResponse.json();
+		if (!isBrowserConsoleStatus(value)) throw new Error("Browser status response is invalid");
+		browserStatus = value;
+		cachedBrowserStatus = value;
+	}
 	if (!browserStatus.installed) {
 		previewSession.textContent = "Managed Chromium is not installed";
 		previewImage.removeAttribute("src");
@@ -1499,13 +1719,26 @@ async function navigatePreview(url: string): Promise<void> {
 
 async function previewAction(action: "back" | "forward" | "reload"): Promise<void> {
 	if (!capabilityToken || !activePreviewSessionId) return;
-	const response = await fetch(
-		`/browser/sessions/${encodeURIComponent(activePreviewSessionId)}/${action}?token=${encodeURIComponent(capabilityToken)}`,
-		{ method: "POST" },
-	);
-	if (!response.ok) throw new Error(await responseError(response, `Could not ${action} managed browser`));
-	await loadPreview();
-	recordPreviewStep({ action, timestamp: Date.now() });
+	const pendingMessage = {
+		back: "Going back in managed browser…",
+		forward: "Going forward in managed browser…",
+		reload: "Reloading managed browser…",
+	}[action];
+	setPreviewMessage(pendingMessage);
+	previewBack.disabled = true;
+	previewForward.disabled = true;
+	previewReload.disabled = true;
+	try {
+		const response = await fetch(
+			`/browser/sessions/${encodeURIComponent(activePreviewSessionId)}/${action}?token=${encodeURIComponent(capabilityToken)}`,
+			{ method: "POST" },
+		);
+		if (!response.ok) throw new Error(await responseError(response, `Could not ${action} managed browser`));
+		await loadPreview();
+		recordPreviewStep({ action, timestamp: Date.now() });
+	} finally {
+		setPreviewControls(activePreviewSession);
+	}
 }
 
 async function setPreviewControl(controlOwner: "agent" | "user"): Promise<void> {
@@ -1762,6 +1995,7 @@ async function removeConnection(id: string): Promise<void> {
 
 async function connect(): Promise<void> {
 	if (!capabilityToken) throw new Error("The capability token is missing");
+	setStatus("Connecting to Pi…");
 	const primary = await addConnection(location.href, true);
 	client = primary.client;
 	populateModels(primary.client.snapshot?.models ?? [], true);
@@ -1769,16 +2003,18 @@ async function connect(): Promise<void> {
 	if (!initial) throw new Error("The active Pi session is unavailable");
 	await switchSession(initial);
 	installAgentEvents();
-	await Promise.all([
-		loadAgents().catch(() => {}),
-		loadPersonas().catch(() => {}),
-		loadRoutines().catch(() => {}),
-		loadWorkflows().catch(() => {}),
-		loadCapabilities().catch(() => {}),
-		loadExternalConnections().catch((error: unknown) =>
-			setStatus(error instanceof Error ? error.message : String(error), true),
-		),
-	]);
+	window.setTimeout(() => {
+		void Promise.all([
+			loadAgents().catch(() => {}),
+			loadPersonas().catch(() => {}),
+			loadRoutines().catch(() => {}),
+			loadWorkflows().catch(() => {}),
+			loadCapabilities().catch(() => {}),
+			loadExternalConnections().catch((error: unknown) =>
+				setStatus(error instanceof Error ? error.message : String(error), true),
+			),
+		]);
+	}, 0);
 }
 
 function installAgentEvents(): void {
@@ -2368,6 +2604,7 @@ async function openAgent(agent?: AgentSummary): Promise<void> {
 	}
 	activeSidebarAgent = agent;
 	activeAgentId = agent.id;
+	activeSubagentKey = undefined;
 	if (!openAgentIds.includes(agent.id)) openAgentIds.push(agent.id);
 	selectedAgentTitle.textContent = agent.name;
 	selectedAgentMeta.textContent = `${agent.model ? `${agent.model.provider}/${agent.model.id}` : "Current Pi model"} · ${formatWorkingDirectory(agent.projectRoot)}`;
@@ -2377,6 +2614,122 @@ async function openAgent(agent?: AgentSummary): Promise<void> {
 	mobilePanelNone.checked = true;
 	renderSessionNavigation();
 	await loadSelectedAgent();
+}
+
+function toggleSubagentInspector(key: string, item: Extract<TranscriptItem, { role: "tool" }>): void {
+	if (openSubagentKeys.includes(key)) {
+		closeSubagentTab(key);
+		return;
+	}
+	subagentActivityByKey.set(key, { key, sessionId: session?.id ?? "", item });
+	openSubagentKeys.push(key);
+	openSubagentInspector(key);
+}
+
+function openSubagentInspector(key: string): void {
+	const activity = subagentActivityByKey.get(key);
+	if (!activity) return;
+	activeAgentId = undefined;
+	activeSubagentKey = key;
+	mobilePanelNone.checked = true;
+	renderSubagentInspector(activity);
+	renderSessionNavigation();
+}
+
+function closeSubagentTab(key: string): void {
+	const index = openSubagentKeys.indexOf(key);
+	if (index >= 0) openSubagentKeys.splice(index, 1);
+	if (activeSubagentKey !== key) {
+		renderSessionNavigation();
+		return;
+	}
+	activeSubagentKey = undefined;
+	if (session?.snapshot) render(session.snapshot);
+	renderSessionNavigation();
+	renderAttachments();
+}
+
+function renderSubagentInspector(activity: SubagentActivity): void {
+	const { item } = activity;
+	const heading = document.createElement("section");
+	heading.className = "subagent-inspector-heading";
+	const title = document.createElement("strong");
+	title.textContent = subagentName(item.input);
+	const state = document.createElement("span");
+	state.textContent = item.status === "running" ? "Running" : item.status === "error" ? "Failed" : "Completed";
+	const task = document.createElement("p");
+	task.textContent = subagentTask(item.input);
+	heading.append(title, state, task);
+	const timeline = document.createElement("section");
+	timeline.className = "subagent-timeline";
+	const details = objectRecord(item.details);
+	const results = Array.isArray(details?.results) ? details.results : [];
+	for (const entry of results) {
+		const result = objectRecord(entry);
+		if (!result) continue;
+		const agent = typeof result.agent === "string" ? result.agent : subagentName(item.input);
+		const group = document.createElement("section");
+		group.className = "subagent-result";
+		const agentLabel = document.createElement("strong");
+		agentLabel.textContent = agent;
+		group.append(agentLabel);
+		if (Array.isArray(result.messages)) appendSubagentMessages(group, result.messages);
+		if (typeof result.errorMessage === "string") appendText(group, result.errorMessage, "run-error");
+		timeline.append(group);
+	}
+	if (timeline.childElementCount === 0) {
+		const starting = document.createElement("div");
+		starting.className = "agent-running";
+		starting.append(document.createElement("i"), document.createTextNode("Starting agent…"));
+		timeline.append(starting);
+	}
+	transcript.replaceChildren(heading, timeline);
+	transcript.scrollTop = transcript.scrollHeight;
+	phase.textContent = item.status;
+	input.disabled = true;
+	input.placeholder = "Subagent inspector is read-only";
+	send.disabled = true;
+	model.disabled = true;
+	modelPicker.refresh();
+	thinking.disabled = true;
+	attachmentButton.disabled = true;
+	attachmentInput.disabled = true;
+	sessionStats.textContent = `${subagentName(item.input)} · ${item.status}`;
+	sessionStats.title = "Observable subagent activity";
+	setStatus("pi-coordinator delegation");
+}
+
+function appendSubagentMessages(parent: HTMLElement, messages: unknown[]): void {
+	for (const entry of messages) {
+		const message = objectRecord(entry);
+		if (!message) continue;
+		if (message.role === "assistant" && Array.isArray(message.content)) {
+			for (const contentEntry of message.content) {
+				const part = objectRecord(contentEntry);
+				if (part?.type === "text" && typeof part.text === "string") {
+					const body = document.createElement("div");
+					body.className = "agent-message-content";
+					appendAgentMarkdown(body, part.text);
+					parent.append(body);
+				} else if (part?.type === "toolCall" && typeof part.name === "string") {
+					parent.append(subagentEventDetails(`Using ${part.name}`, part.arguments));
+				}
+			}
+		} else if (message.role === "toolResult" && typeof message.toolName === "string") {
+			parent.append(subagentEventDetails(`Completed ${message.toolName}`, message.content));
+		}
+	}
+}
+
+function subagentEventDetails(label: string, value: unknown): HTMLDetailsElement {
+	const details = document.createElement("details");
+	details.className = "subagent-event";
+	const summary = document.createElement("summary");
+	summary.textContent = label;
+	const pre = document.createElement("pre");
+	pre.textContent = JSON.stringify(value, undefined, 2);
+	details.append(summary, pre);
+	return details;
 }
 
 function closeAgentTab(agentId: string): void {
@@ -2515,6 +2868,8 @@ function renderAgentConversation(
 	send.classList.toggle("is-stopping", Boolean(activeTask));
 	send.setAttribute("aria-label", activeTask ? `Stop ${agent.name}` : `Message ${agent.name}`);
 	input.placeholder = `Message ${agent.name}…`;
+	input.disabled = false;
+	send.disabled = false;
 	input.setAttribute("aria-label", `Message ${agent.name}`);
 	model.disabled = true;
 	thinking.disabled = true;
@@ -3390,6 +3745,7 @@ form.addEventListener("submit", (event) => {
 });
 
 async function submitComposer(): Promise<void> {
+	if (activeSubagentKey) return;
 	if (activeAgentId) {
 		await submitAgentComposer(activeAgentId);
 		return;
@@ -3609,6 +3965,7 @@ input.addEventListener("keydown", (event) => {
 		event.key !== "Enter" ||
 		event.shiftKey ||
 		event.isComposing ||
+		activeSubagentKey !== undefined ||
 		(!activeAgentId && session?.snapshot?.phase !== "idle")
 	)
 		return;
@@ -3726,6 +4083,7 @@ agentForm.addEventListener("submit", (event) => {
 		schedules: activeSidebarAgent?.schedules ?? [],
 	};
 	const path = id ? `/agents/${encodeURIComponent(id)}` : "/agents";
+	setStatus("Saving agent definition…");
 	void fetch(`${path}?token=${encodeURIComponent(capabilityToken)}`, {
 		method: id ? "PUT" : "POST",
 		headers: { "content-type": "application/json" },
@@ -3743,14 +4101,21 @@ agentForm.addEventListener("submit", (event) => {
 						: `HTTP ${response.status}`,
 				);
 			}
-			await loadAgents();
 			const saved: unknown = await response.json();
-			await Promise.all([loadRoutines(), loadWorkflows()]);
-			if (typeof saved === "object" && saved !== null && "id" in saved && typeof saved.id === "string") {
-				const agent = agents.find((entry) => entry.id === saved.id);
-				if (agent) await openAgent(agent);
-			}
 			setStatus("Agent definition saved");
+			void (async () => {
+				await loadAgents();
+				await Promise.all([loadRoutines(), loadWorkflows()]);
+				if (typeof saved === "object" && saved !== null && "id" in saved && typeof saved.id === "string") {
+					const agent = agents.find((entry) => entry.id === saved.id);
+					if (agent) await openAgent(agent);
+				}
+			})().catch((error: unknown) => {
+				setStatus(
+					`Agent saved; background refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+					true,
+				);
+			});
 		})
 		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
 });
@@ -4007,12 +4372,21 @@ workflowEditor.deleteButton.addEventListener("click", () => {
 });
 
 window.setInterval(() => {
-	if (activeSidebarAgent) void loadSelectedAgent().catch(() => {});
-	void loadRoutines().catch(() => {});
-	void loadWorkflows().catch(() => {});
-	void loadExternalRuns().catch(() => {});
-	if (document.querySelector('[data-tab="browser"]')?.classList.contains("active")) void loadPreview().catch(() => {});
-}, 1500);
+	if (document.visibilityState !== "visible" || periodicRefreshPromise) return;
+	const activeTab = document.querySelector<HTMLButtonElement>("[data-tab].active")?.dataset.tab;
+	periodicRefreshPromise = (async () => {
+		if (activeTab === "browser") await loadPreview();
+		if (activeTab === "agents-workspace") {
+			if (activeSidebarAgent) await loadSelectedAgent();
+			await loadExternalRuns();
+		}
+		if (activeTab === "agent-builder") await Promise.all([loadRoutines(), loadWorkflows()]);
+	})()
+		.catch(() => {})
+		.finally(() => {
+			periodicRefreshPromise = undefined;
+		});
+}, 2500);
 
 installPanelResizer("left-resizer", "--rail-width", "pi-serve-rail-width", 1, 190, 420);
 installPanelResizer("right-resizer", "--details-width", "pi-serve-details-width", -1, 280, 560);

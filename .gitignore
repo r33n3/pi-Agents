@@ -35,6 +35,8 @@ coverage/
 tui-debug.log
 compaction-results/
 .opencode/
+.playwright-cli/
+.codex-remote-attachments/
 syntax.jsonl
 out.jsonl
 pi-*.html

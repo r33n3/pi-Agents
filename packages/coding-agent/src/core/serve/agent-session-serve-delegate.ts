@@ -7,10 +7,17 @@ import type {
 	SessionPhase,
 	SessionSnapshot,
 	ThinkingLevel,
+	ToolTranscriptItem,
 	TranscriptItem,
 	UserTranscriptItem,
 } from "@earendil-works/pi-protocol";
-import type { PiSessionRuntimeEvent, PromptInput, SteerInput } from "@earendil-works/pi-server";
+import {
+	type PiSessionRuntimeEvent,
+	type PromptInput,
+	type SteerInput,
+	sanitizeProtocolDetails,
+	toProtocolJsonValue,
+} from "@earendil-works/pi-server";
 import type { AgentSession } from "../agent-session.ts";
 import type { LiveSessionDelegate } from "./live-session-runtime.ts";
 
@@ -20,6 +27,7 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 	private readonly createdAt: number;
 	private readonly onDispose: (() => void) | undefined;
 	private readonly itemIds = new WeakMap<object, string>();
+	private readonly runningTools = new Map<string, ToolTranscriptItem>();
 	private revision = 0;
 
 	constructor(session: AgentSession, createdAt = Date.now(), onDispose?: () => void) {
@@ -42,7 +50,10 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 			attached: true,
 			locked: !this.session.isIdle,
 			revision: this.revision,
-			transcript: this.session.messages.flatMap((message) => this.toTranscriptItem(message)),
+			transcript: [
+				...this.session.messages.flatMap((message) => this.toTranscriptItem(message)),
+				...this.runningTools.values(),
+			],
 			queuedSteer: this.session.getSteeringMessages().map((text) => ({
 				id: randomUUID(),
 				role: "user",
@@ -83,7 +94,37 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 	}
 
 	subscribe(listener: (event: PiSessionRuntimeEvent) => void): () => void {
-		return this.session.subscribe(() => {
+		return this.session.subscribe((event) => {
+			if (event.type === "tool_execution_start") {
+				this.runningTools.set(event.toolCallId, {
+					id: event.toolCallId,
+					role: "tool",
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					input: toProtocolJsonValue(event.args),
+					content: [],
+					status: "running",
+					isError: false,
+					timestamp: Date.now(),
+				});
+			} else if (event.type === "tool_execution_update") {
+				const current = this.runningTools.get(event.toolCallId);
+				const details = this.toolResultDetails(event.partialResult);
+				this.runningTools.set(event.toolCallId, {
+					id: current?.id ?? event.toolCallId,
+					role: "tool",
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					input: toProtocolJsonValue(event.args),
+					content: this.toolResultContent(event.partialResult),
+					...(details === undefined ? {} : { details }),
+					status: "running",
+					isError: false,
+					timestamp: current?.timestamp ?? Date.now(),
+				});
+			} else if (event.type === "tool_execution_end") {
+				this.runningTools.delete(event.toolCallId);
+			}
 			this.revision++;
 			listener({ type: "snapshot" });
 		});
@@ -114,13 +155,15 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 			case "assistant":
 				return [this.assistantItem(message)];
 			case "toolResult": {
+				const details = sanitizeProtocolDetails(message.details);
 				const common = {
 					id: this.idFor(message),
 					role: "tool" as const,
 					toolCallId: message.toolCallId,
 					toolName: message.toolName,
-					input: {},
+					input: this.toolInput(message.toolCallId),
 					content: message.content,
+					...(details === undefined ? {} : { details }),
 					usage: message.usage,
 					timestamp: message.timestamp,
 				};
@@ -161,6 +204,45 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 					},
 				];
 		}
+	}
+
+	private toolInput(toolCallId: string): ToolTranscriptItem["input"] {
+		for (let index = this.session.messages.length - 1; index >= 0; index--) {
+			const message = this.session.messages[index];
+			if (message?.role !== "assistant") continue;
+			const call = message.content.find((part) => part.type === "toolCall" && part.id === toolCallId);
+			if (call?.type === "toolCall") return toProtocolJsonValue(call.arguments);
+		}
+		return {};
+	}
+
+	private toolResultContent(value: unknown): ToolTranscriptItem["content"] {
+		if (typeof value !== "object" || value === null || !("content" in value) || !Array.isArray(value.content)) {
+			return [];
+		}
+		const content: ToolTranscriptItem["content"] = [];
+		for (const part of value.content) {
+			if (typeof part !== "object" || part === null || !("type" in part)) continue;
+			if (part.type === "text" && "text" in part && typeof part.text === "string") {
+				content.push({ type: "text", text: part.text });
+				continue;
+			}
+			if (
+				part.type === "image" &&
+				"data" in part &&
+				typeof part.data === "string" &&
+				"mimeType" in part &&
+				typeof part.mimeType === "string"
+			) {
+				content.push({ type: "image", data: part.data, mimeType: part.mimeType });
+			}
+		}
+		return content;
+	}
+
+	private toolResultDetails(value: unknown): ToolTranscriptItem["details"] {
+		if (typeof value !== "object" || value === null || !("details" in value)) return undefined;
+		return sanitizeProtocolDetails(value.details);
 	}
 
 	private assistantItem(message: Extract<AgentMessage, { role: "assistant" }>): AssistantTranscriptItem {

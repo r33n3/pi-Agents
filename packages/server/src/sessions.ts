@@ -59,7 +59,7 @@ export class LiveSessionManager {
 				};
 				const live = await this.acquire(id, () => this.options.service.createSession(options));
 				await this.attach(connection, live);
-				const session = this.forConnection(await this.broadcastSnapshot(live), connection);
+				const session = this.forConnection(await this.normalizedSnapshot(live), connection);
 				this.options.broadcastServerSnapshot();
 				return { command: "create" as const, session };
 			}
@@ -68,7 +68,7 @@ export class LiveSessionManager {
 					this.options.service.openSession(command.sessionId),
 				);
 				await this.attach(connection, live);
-				const session = this.forConnection(await this.broadcastSnapshot(live), connection);
+				const session = this.forConnection(await this.normalizedSnapshot(live), connection);
 				this.options.broadcastServerSnapshot();
 				return { command: "attach" as const, session };
 			}
