@@ -48,14 +48,6 @@ const workflowEditor = createWorkflowEditor();
 const personaSelect = requiredElement<HTMLSelectElement>("agent-persona-select");
 const personaImage = requiredElement<HTMLImageElement>("agent-persona-image");
 const pluginForm = requiredElement<HTMLFormElement>("plugin-form");
-const builderChat = element("builder-chat");
-const builderChatForm = requiredElement<HTMLFormElement>("builder-chat-form");
-const builderPrompt = requiredElement<HTMLTextAreaElement>("builder-prompt");
-const builderSubmit = (() => {
-	const value = builderChatForm.querySelector<HTMLButtonElement>('button[type="submit"]');
-	if (!value) throw new Error("Missing builder chat submit button");
-	return value;
-})();
 const sessionTabs = element("session-tabs");
 const connectionList = element("connection-list");
 const connectionForm = requiredElement<HTMLFormElement>("connection-form");
@@ -91,6 +83,8 @@ let session: PiSessionHandle | undefined;
 let unsubscribeSession: Unsubscribe | undefined;
 let builderSession: PiSessionHandle | undefined;
 let unsubscribeBuilder: Unsubscribe | undefined;
+let builderActive = false;
+let builderLabel = "Agent Builder";
 let activeSidebarAgent: AgentSummary | undefined;
 let activeTargetKey: string | undefined;
 let activeAgentId: string | undefined;
@@ -781,6 +775,7 @@ function render(snapshot: SessionSnapshot): void {
 		else closeSubagentTab(activeSubagentKey);
 		return;
 	}
+	if (builderActive) return;
 	if (activeAgentId) return;
 	const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
 	const previousScrollTop = transcript.scrollTop;
@@ -803,6 +798,29 @@ function render(snapshot: SessionSnapshot): void {
 	sessionPath.title = snapshot.cwd;
 	renderSessionStats(snapshot);
 	transcript.scrollTop = nearBottom ? transcript.scrollHeight : previousScrollTop;
+}
+
+function renderBuilderConversation(snapshot: SessionSnapshot): void {
+	if (!builderActive) return;
+	const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
+	transcript.replaceChildren(...snapshot.transcript.map(renderItem));
+	setBusy(snapshot);
+	model.value = `${snapshot.model.provider}/${snapshot.model.id}`;
+	modelPicker.refresh();
+	thinking.value = snapshot.thinkingLevel;
+	input.disabled = false;
+	input.placeholder = `Message ${builderLabel}…`;
+	input.setAttribute("aria-label", `Message ${builderLabel}`);
+	attachmentButton.disabled = true;
+	attachmentInput.disabled = true;
+	attachmentButton.title = "Agent Builder attachments are not available yet";
+	attachmentList.replaceChildren();
+	const projectRoot = requiredElement<HTMLInputElement>("agent-project-root").value;
+	sessionPath.textContent = projectRoot ? formatWorkingDirectory(projectRoot) : "Agent Builder";
+	sessionPath.title = projectRoot;
+	renderSessionStats(snapshot);
+	setStatus(projectRoot || "Configure and deploy a local agent");
+	if (nearBottom) transcript.scrollTop = transcript.scrollHeight;
 }
 
 function renderEarlierMessages(
@@ -1256,11 +1274,17 @@ function renderSessionNavigation(): void {
 		...targets.map((target) => {
 			const wrapper = document.createElement("div");
 			wrapper.className = "session-tab-wrap";
-			wrapper.classList.toggle("active", !activeAgentId && !activeSubagentKey && target.key === activeTargetKey);
+			wrapper.classList.toggle(
+				"active",
+				!builderActive && !activeAgentId && !activeSubagentKey && target.key === activeTargetKey,
+			);
 			const button = document.createElement("button");
 			button.type = "button";
 			button.className = "session-tab";
-			button.classList.toggle("active", !activeAgentId && !activeSubagentKey && target.key === activeTargetKey);
+			button.classList.toggle(
+				"active",
+				!builderActive && !activeAgentId && !activeSubagentKey && target.key === activeTargetKey,
+			);
 			const sessionName = sessionDisplayName(target);
 			const connection = connections.get(target.connectionId);
 			button.textContent = connections.size > 1 && connection ? `${connection.label} · ${sessionName}` : sessionName;
@@ -1270,6 +1294,7 @@ function renderSessionNavigation(): void {
 			wrapper.append(button);
 			return wrapper;
 		}),
+		...(builderSession ? [renderBuilderSessionTab()] : []),
 		...openAgentIds.flatMap((agentId) => {
 			const agent = agents.find((entry) => entry.id === agentId);
 			if (!agent) return [];
@@ -1341,7 +1366,7 @@ function renderSessionNavigation(): void {
 				const button = document.createElement("button");
 				button.type = "button";
 				button.className = "session-select";
-				button.classList.toggle("active", target.key === activeTargetKey);
+				button.classList.toggle("active", !builderActive && target.key === activeTargetKey);
 				const name = document.createElement("strong");
 				name.textContent = sessionDisplayName(target);
 				const cwd = document.createElement("span");
@@ -1362,8 +1387,30 @@ function renderSessionNavigation(): void {
 	);
 }
 
+function renderBuilderSessionTab(): HTMLDivElement {
+	const wrapper = document.createElement("div");
+	wrapper.className = "session-tab-wrap";
+	wrapper.classList.toggle("active", builderActive);
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "session-tab builder-session-tab";
+	button.textContent = builderLabel;
+	button.title = "Continue configuring this agent";
+	button.addEventListener("click", openBuilderChat);
+	const close = document.createElement("button");
+	close.type = "button";
+	close.className = "session-tab-close";
+	close.textContent = "×";
+	close.title = "Close Agent Builder";
+	close.setAttribute("aria-label", close.title);
+	close.addEventListener("click", () => void closeBuilderChat());
+	wrapper.append(button, close);
+	return wrapper;
+}
+
 async function switchSession(target: SessionTarget): Promise<void> {
 	if (target.key === activeTargetKey && session?.attached) {
+		builderActive = false;
 		activeAgentId = undefined;
 		activeSubagentKey = undefined;
 		if (session.snapshot) render(session.snapshot);
@@ -1381,6 +1428,7 @@ async function switchSession(target: SessionTarget): Promise<void> {
 	await session?.dispose().catch(() => {});
 	session = await entry.client.attachSession(target.session.id);
 	activeTargetKey = target.key;
+	builderActive = false;
 	activeAgentId = undefined;
 	activeSubagentKey = undefined;
 	populateModels(entry.client.snapshot?.models ?? []);
@@ -2502,7 +2550,7 @@ function resizeComposer(): void {
 }
 
 function activePromptHistory(): PromptHistory | undefined {
-	const key = activeAgentId ? `agent:${activeAgentId}` : session?.id;
+	const key = builderActive ? builderSession?.id : activeAgentId ? `agent:${activeAgentId}` : session?.id;
 	if (!key) return undefined;
 	let history = promptHistoryBySession.get(key);
 	if (!history) {
@@ -2603,6 +2651,7 @@ async function openAgent(agent?: AgentSummary): Promise<void> {
 		return;
 	}
 	activeSidebarAgent = agent;
+	builderActive = false;
 	activeAgentId = agent.id;
 	activeSubagentKey = undefined;
 	if (!openAgentIds.includes(agent.id)) openAgentIds.push(agent.id);
@@ -2629,6 +2678,7 @@ function toggleSubagentInspector(key: string, item: Extract<TranscriptItem, { ro
 function openSubagentInspector(key: string): void {
 	const activity = subagentActivityByKey.get(key);
 	if (!activity) return;
+	builderActive = false;
 	activeAgentId = undefined;
 	activeSubagentKey = key;
 	mobilePanelNone.checked = true;
@@ -2753,7 +2803,7 @@ function closeAgentTab(agentId: string): void {
 	renderAttachments();
 }
 
-async function openAgentBuilder(agent?: AgentSummary): Promise<void> {
+async function openAgentBuilder(agent?: AgentSummary, showConversation = true): Promise<void> {
 	activeSidebarAgent = agent;
 	agentForm.reset();
 	const catalogAgent = agent?.source === "pi-agent";
@@ -2804,21 +2854,54 @@ async function openAgentBuilder(agent?: AgentSummary): Promise<void> {
 			? `${agent.name} · Pi agent catalog`
 			: agent.name
 		: "Build a new agent";
+	builderLabel = agent ? `Edit ${agent.name}` : "Agent Builder";
 	activateTab("agent-builder");
-	activateBuilderTab("builder-chat-panel");
-	unsubscribeBuilder?.();
-	await builderSession?.dispose().catch(() => {});
-	builderChat.replaceChildren();
+	activateBuilderTab("builder-profile-panel");
+	await closeBuilderChat(false);
 	if (!client) return;
 	builderSession = await client.createSession({ name: agent ? `builder:${agent.id}` : "builder:new" });
+	builderActive = showConversation;
+	if (showConversation) {
+		activeAgentId = undefined;
+		activeSubagentKey = undefined;
+	}
 	unsubscribeBuilder = builderSession.subscribe((snapshot) => {
-		builderChat.replaceChildren(...snapshot.transcript.map(renderItem));
-		builderChat.scrollTop = builderChat.scrollHeight;
-		const busy = snapshot.phase !== "idle";
-		builderPrompt.disabled = busy;
-		builderSubmit.textContent = "Ask builder";
+		if (builderActive) renderBuilderConversation(snapshot);
 	});
+	if (showConversation && builderSession.snapshot) renderBuilderConversation(builderSession.snapshot);
+	if (showConversation) mobilePanelNone.checked = true;
+	renderSessionNavigation();
 	await loadCapabilities().catch(() => {});
+}
+
+function openBuilderChat(): void {
+	if (!builderSession?.snapshot) return;
+	builderActive = true;
+	activeAgentId = undefined;
+	activeSubagentKey = undefined;
+	activateTab("agent-builder");
+	mobilePanelNone.checked = true;
+	renderBuilderConversation(builderSession.snapshot);
+	renderSessionNavigation();
+}
+
+async function closeBuilderChat(restoreMainChat = true): Promise<void> {
+	const closingSession = builderSession;
+	builderSession = undefined;
+	builderActive = false;
+	unsubscribeBuilder?.();
+	unsubscribeBuilder = undefined;
+	if (closingSession && closingSession.snapshot?.phase !== "idle") await closingSession.abort().catch(() => {});
+	await closingSession?.dispose().catch(() => {});
+	if (!restoreMainChat) {
+		renderSessionNavigation();
+		return;
+	}
+	activeSidebarAgent = undefined;
+	activateTab("agents-workspace");
+	if (session?.snapshot) render(session.snapshot);
+	renderSessionNavigation();
+	renderAttachments();
 }
 
 async function loadSelectedAgent(): Promise<void> {
@@ -3746,6 +3829,10 @@ form.addEventListener("submit", (event) => {
 
 async function submitComposer(): Promise<void> {
 	if (activeSubagentKey) return;
+	if (builderActive) {
+		await submitBuilderComposer();
+		return;
+	}
 	if (activeAgentId) {
 		await submitAgentComposer(activeAgentId);
 		return;
@@ -3774,6 +3861,33 @@ async function submitComposer(): Promise<void> {
 	} else {
 		await session.prompt(text);
 	}
+}
+
+async function submitBuilderComposer(): Promise<void> {
+	const chatSession = builderSession;
+	if (!chatSession) return;
+	if (chatSession.snapshot?.phase !== "idle") {
+		await chatSession.abort();
+		return;
+	}
+	const prompt = input.value.trim();
+	if (!prompt) return;
+	recordPromptHistory(prompt);
+	input.value = "";
+	resizeComposer();
+	const message = [
+		"You are Agent Builder, a temporary specialist helping configure and deploy one local Pi agent.",
+		"Ask concise questions, recommend concrete settings, and keep the visible configuration form as the source of truth.",
+		"Do not claim that you changed a field. State the exact field values the user should save when the design is ready.",
+		`Current name: ${requiredElement<HTMLInputElement>("agent-name").value || "not set"}`,
+		`Current description: ${requiredElement<HTMLTextAreaElement>("agent-description").value || "not set"}`,
+		`Current project folder: ${requiredElement<HTMLInputElement>("agent-project-root").value || "not set"}`,
+		`Current persona: ${requiredElement<HTMLTextAreaElement>("agent-persona").value || "not set"}`,
+		`Current tools: ${requiredElement<HTMLInputElement>("agent-tools").value || "none"}`,
+		`Current model: ${agentModel.value || "inherit current session"}`,
+		`User request: ${prompt}`,
+	].join("\n");
+	await chatSession.prompt(message);
 }
 
 async function submitAgentComposer(agentId: string): Promise<void> {
@@ -3817,6 +3931,7 @@ attachmentButton.addEventListener("click", () => attachmentInput.click());
 attachmentInput.addEventListener("change", () => {
 	const files = [...(attachmentInput.files ?? [])];
 	attachmentInput.value = "";
+	if (builderActive) return;
 	if (files.length === 0) return;
 	void uploadFiles(files).catch((error: unknown) =>
 		setStatus(error instanceof Error ? error.message : String(error), true),
@@ -3918,6 +4033,7 @@ previewImage.addEventListener(
 	{ passive: false },
 );
 input.addEventListener("paste", (event) => {
+	if (builderActive) return;
 	const files = [...(event.clipboardData?.files ?? [])];
 	if (files.length > 0) {
 		event.preventDefault();
@@ -3935,6 +4051,7 @@ input.addEventListener("paste", (event) => {
 	);
 });
 form.addEventListener("dragover", (event) => {
+	if (builderActive) return;
 	if (!event.dataTransfer?.types.includes("Files")) return;
 	event.preventDefault();
 	form.classList.add("composer-drop");
@@ -3942,6 +4059,7 @@ form.addEventListener("dragover", (event) => {
 form.addEventListener("dragleave", () => form.classList.remove("composer-drop"));
 form.addEventListener("drop", (event) => {
 	form.classList.remove("composer-drop");
+	if (builderActive) return;
 	const files = event.dataTransfer?.files;
 	if (!files || files.length === 0) return;
 	event.preventDefault();
@@ -3966,7 +4084,7 @@ input.addEventListener("keydown", (event) => {
 		event.shiftKey ||
 		event.isComposing ||
 		activeSubagentKey !== undefined ||
-		(!activeAgentId && session?.snapshot?.phase !== "idle")
+		(!activeAgentId && (builderActive ? builderSession?.snapshot?.phase : session?.snapshot?.phase) !== "idle")
 	)
 		return;
 	event.preventDefault();
@@ -3974,17 +4092,19 @@ input.addEventListener("keydown", (event) => {
 });
 
 model.addEventListener("change", () => {
-	if (!session || activeAgentId) return;
 	const separator = model.value.indexOf("/");
 	if (separator < 1) return;
-	void session
+	const targetSession = builderActive ? builderSession : session;
+	if (!targetSession || activeAgentId) return;
+	void targetSession
 		.setModel({ provider: model.value.slice(0, separator), id: model.value.slice(separator + 1) })
 		.catch((error: unknown) => setStatus(String(error), true));
 });
 
 thinking.addEventListener("change", () => {
-	if (session && !activeAgentId)
-		void session
+	const targetSession = builderActive ? builderSession : session;
+	if (targetSession && !activeAgentId)
+		void targetSession
 			.setThinking(thinking.value as ThinkingLevel)
 			.catch((error: unknown) => setStatus(String(error), true));
 });
@@ -4002,16 +4122,21 @@ for (const button of document.querySelectorAll<HTMLButtonElement>("[data-tab]"))
 			void loadAgents()
 				.then(loadSelectedAgent)
 				.catch((error: unknown) => setStatus(String(error), true));
-		if (tab === "agent-builder") void loadCapabilities().catch((error: unknown) => setStatus(String(error), true));
+		if (tab === "agent-builder") {
+			if (builderSession) void loadCapabilities().catch((error: unknown) => setStatus(String(error), true));
+			else void openAgentBuilder(undefined, false).catch((error: unknown) => setStatus(String(error), true));
+		}
 	});
 }
 
 for (const button of document.querySelectorAll<HTMLButtonElement>("[data-builder-tab]")) {
-	button.addEventListener("click", () => activateBuilderTab(button.dataset.builderTab ?? "builder-chat-panel"));
+	button.addEventListener("click", () => activateBuilderTab(button.dataset.builderTab ?? "builder-profile-panel"));
 }
 
 newAgent.addEventListener("click", () => {
-	void openAgentBuilder();
+	void openAgentBuilder().catch((error: unknown) =>
+		setStatus(error instanceof Error ? error.message : String(error), true),
+	);
 });
 
 showConnectionForm.addEventListener("click", () => {
@@ -4108,7 +4233,10 @@ agentForm.addEventListener("submit", (event) => {
 				await Promise.all([loadRoutines(), loadWorkflows()]);
 				if (typeof saved === "object" && saved !== null && "id" in saved && typeof saved.id === "string") {
 					const agent = agents.find((entry) => entry.id === saved.id);
-					if (agent) await openAgent(agent);
+					if (agent) {
+						await closeBuilderChat(false);
+						await openAgent(agent);
+					}
 				}
 			})().catch((error: unknown) => {
 				setStatus(
@@ -4118,30 +4246,6 @@ agentForm.addEventListener("submit", (event) => {
 			});
 		})
 		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
-});
-
-builderChatForm.addEventListener("submit", (event) => {
-	event.preventDefault();
-	if (builderSession?.snapshot && builderSession.snapshot.phase !== "idle") {
-		void builderSession.abort().catch((error: unknown) => {
-			setStatus(error instanceof Error ? error.message : String(error), true);
-		});
-		return;
-	}
-	const prompt = builderPrompt.value.trim();
-	const chatSession = builderSession;
-	if (!prompt || !chatSession) return;
-	builderPrompt.value = "";
-	const message = [
-		`You are helping configure a local Pi agent. Ask concise questions and recommend values for the visible form.`,
-		`Current name: ${requiredElement<HTMLInputElement>("agent-name").value || "not set"}`,
-		`Current description: ${requiredElement<HTMLTextAreaElement>("agent-description").value || "not set"}`,
-		`Current persona: ${requiredElement<HTMLTextAreaElement>("agent-persona").value || "not set"}`,
-		`User: ${prompt}`,
-	].join("\n");
-	void chatSession.prompt(message).catch((error: unknown) => {
-		setStatus(error instanceof Error ? error.message : String(error), true);
-	});
 });
 
 personaSelect.addEventListener("change", () => updatePersonaPreview(true));

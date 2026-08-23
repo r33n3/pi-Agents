@@ -179,7 +179,10 @@ describe("createServePage", () => {
 		expect(html).toContain('data-tab="agent-builder"');
 		expect(html).toContain('class="card agent-run-history"');
 		expect(html).not.toContain('id="selected-agent-chat-form"');
-		expect(html).toContain('data-builder-tab="builder-chat-panel"');
+		expect(html).toContain('data-builder-tab="builder-profile-panel"');
+		expect(html).toContain("Save and deploy");
+		expect(html).not.toContain('id="builder-chat-panel"');
+		expect(html).not.toContain('id="builder-chat-form"');
 		expect(html).toContain('id="external-connection-list"');
 		expect(html).toContain('id="external-run-form"');
 		expect(html).not.toContain('id="preview-type-form"');
@@ -198,6 +201,9 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("Pop out browser");
 		expect(bundleText).toContain("agent-session-tab");
 		expect(bundleText).toContain("Active agent conversation");
+		expect(bundleText).toContain("builder-session-tab");
+		expect(bundleText).toContain("Continue configuring this agent");
+		expect(bundleText).toContain("Configure and deploy a local agent");
 		expect(bundleText).toContain("subagent-card");
 		expect(bundleText).toContain("subagent-session-tab");
 		expect(bundleText).toContain("Inspect agent run");
