@@ -12,6 +12,8 @@ import {
 	type BrowserDriverContext,
 	BrowserSessionManager,
 } from "../src/core/serve/browser-session-manager.ts";
+import { CapabilityBroker } from "../src/core/serve/capability-broker.ts";
+import { EverydayConfigurationRegistry } from "../src/core/serve/everyday-configuration-registry.ts";
 import { ExternalConnectionManager } from "../src/core/serve/external-connection-manager.ts";
 import { RoutineRegistry } from "../src/core/serve/routine-registry.ts";
 import { ServeAttachmentStore } from "../src/core/serve/serve-attachment-store.ts";
@@ -23,6 +25,8 @@ describe("createServePage", () => {
 	let root: string;
 	let attachmentStore: ServeAttachmentStore;
 	let browser: BrowserSessionManager;
+	let capabilityBroker: CapabilityBroker;
+	let everydayConfigurations: EverydayConfigurationRegistry;
 
 	class BrowserContext implements BrowserDriverContext {
 		async setNavigationPolicy(): Promise<void> {}
@@ -130,6 +134,40 @@ describe("createServePage", () => {
 		await routineScheduler.refresh();
 		attachmentStore = new ServeAttachmentStore();
 		browser = new BrowserSessionManager(new FixtureBrowserDriver(), new BrowserProfileStore(root));
+		capabilityBroker = new CapabilityBroker(join(root, "capabilities"), {
+			activeToolNames: () => ["fixture_search"],
+			definitions: [
+				{
+					id: "web.search",
+					version: 1,
+					name: "Web search",
+					description: "Fixture search",
+					category: "web",
+					effect: "read",
+					defaultApproval: "never",
+				},
+			],
+			manifests: [
+				{
+					id: "fixture-search",
+					name: "Fixture Search",
+					source: "fixture-search@1.0.0",
+					version: "1.0.0",
+					permissions: ["network read"],
+					bindings: [
+						{
+							capabilityId: "web.search",
+							capabilityVersion: 1,
+							toolName: "fixture_search",
+							executors: ["session"],
+						},
+					],
+				},
+			],
+		});
+		await capabilityBroker.initialize();
+		everydayConfigurations = new EverydayConfigurationRegistry(join(root, "everyday"));
+		await everydayConfigurations.initialize();
 		server = createServer(
 			createServePage(
 				"secret-token",
@@ -142,6 +180,16 @@ describe("createServePage", () => {
 				attachmentStore,
 				undefined,
 				new BrowserConsoleService(browser, () => ({ installed: false, executablePath: "managed-chromium" })),
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				capabilityBroker,
+				undefined,
+				undefined,
+				undefined,
+				everydayConfigurations,
 			),
 		);
 		await new Promise<void>((resolve, reject) => {
@@ -200,6 +248,10 @@ describe("createServePage", () => {
 		expect(html).not.toContain('id="builder-chat-form"');
 		expect(html).toContain('id="external-connection-list"');
 		expect(html).toContain('id="external-run-form"');
+		expect(html).toContain('id="capability-approval-list"');
+		expect(html).toContain('id="inbound-route-form"');
+		expect(html).toContain('id="site-monitor-form"');
+		expect(html).toContain('id="finance-watchlist-form"');
 		expect(html).not.toContain('id="preview-type-form"');
 		expect(html).not.toContain('class="brand"');
 
@@ -228,6 +280,38 @@ describe("createServePage", () => {
 		expect(bundleText).not.toContain("Ask Pi or an agent to open a permitted URL.");
 		expect(bundleText).not.toContain("Could not load browser diagnostics");
 		expect(bundleText).toContain("Send to Pi");
+	});
+
+	test("creates and removes everyday configurations through authenticated controls", async () => {
+		const monitor = await fetch(`${origin}/everyday-configurations/monitors?token=secret-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				id: "release-notes",
+				name: "Release notes",
+				url: "https://example.com/news",
+				enabled: true,
+			}),
+		});
+		expect(monitor.status).toBe(201);
+		const watchlist = await fetch(`${origin}/everyday-configurations/watchlists?token=secret-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ id: "markets", name: "Markets", symbols: ["msft", "AAPL"], enabled: true }),
+		});
+		expect(watchlist.status).toBe(201);
+		const listed = await fetch(`${origin}/everyday-configurations.json?token=secret-token`);
+		expect(await listed.json()).toMatchObject({
+			monitors: [{ id: "release-notes" }],
+			watchlists: [{ id: "markets", symbols: ["AAPL", "MSFT"] }],
+		});
+		expect(
+			(
+				await fetch(`${origin}/everyday-configurations/monitors/release-notes?token=secret-token`, {
+					method: "DELETE",
+				})
+			).status,
+		).toBe(200);
 	});
 
 	test("uploads, previews, renames, and removes attachments", async () => {
@@ -264,6 +348,30 @@ describe("createServePage", () => {
 		expect(await response.json()).toMatchObject({
 			connections: [{ id: "openai", defaultModel: { provider: "openai", id: "gpt-5.6-luna" } }],
 		});
+	});
+
+	test("requires review before enabling a capability provider over HTTP", async () => {
+		const enableBeforeReview = await fetch(
+			`${origin}/capability-providers/fixture-search/enable?token=secret-token`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ approved: true }),
+			},
+		);
+		expect(enableBeforeReview.status).toBe(400);
+		const review = await fetch(`${origin}/capability-providers/fixture-search/review?token=secret-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ approved: true }),
+		});
+		expect(await review.json()).toMatchObject({ trust: "reviewed" });
+		const enabled = await fetch(`${origin}/capability-providers/fixture-search/enable?token=secret-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ approved: true }),
+		});
+		expect(await enabled.json()).toMatchObject({ trust: "enabled", enabled: true });
 	});
 
 	test("lists managed browser state through the capability-token boundary", async () => {

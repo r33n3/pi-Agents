@@ -17,6 +17,7 @@ export interface AgentRoutineState extends RoutineDefinition {
 	lastRunId?: string;
 	lastError?: string;
 	activeRunId?: string;
+	availabilityError?: string;
 }
 
 /** Schedules target-agnostic routine definitions while preventing overlapping runs. */
@@ -47,17 +48,25 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 		const next = new Map<string, AgentRoutineState>();
 		for (const routine of await this.#registry.list()) {
 			const existing = this.#states.get(routine.id);
+			let availabilityError: string | undefined;
+			try {
+				await this.#registry.validate(routine);
+			} catch (error) {
+				availabilityError = error instanceof Error ? error.message : String(error);
+			}
 			next.set(routine.id, {
 				...routine,
-				nextRunAt: routine.enabled
-					? existing?.nextRunAt && existing.cron === routine.cron && existing.timezone === routine.timezone
-						? existing.nextRunAt
-						: nextCronRun(routine.cron, routine.timezone, now)
-					: undefined,
+				nextRunAt:
+					routine.enabled && !availabilityError
+						? existing?.nextRunAt && existing.cron === routine.cron && existing.timezone === routine.timezone
+							? existing.nextRunAt
+							: nextCronRun(routine.cron, routine.timezone, now)
+						: undefined,
 				lastRunAt: existing?.lastRunAt,
 				lastRunId: existing?.lastRunId,
 				lastError: existing?.lastError,
 				activeRunId: existing?.activeRunId,
+				availabilityError,
 			});
 		}
 		this.#states.clear();
@@ -75,6 +84,7 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 	async runNow(id: string, now = Date.now()): Promise<AgentRoutineState> {
 		const state = this.#states.get(id);
 		if (!state) throw new Error(`Routine ${id} was not found`);
+		if (state.availabilityError) throw new Error(state.availabilityError);
 		if (state.activeRunId) throw new Error(`Routine ${id} already has an active run`);
 		await this.#run(state, now);
 		return { ...state };

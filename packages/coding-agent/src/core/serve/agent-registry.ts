@@ -6,6 +6,7 @@ import { parseFrontmatter } from "../../utils/frontmatter.ts";
 import type { BrowserAccess } from "./browser-policy.ts";
 import type { BrowserProfile } from "./browser-profile-store.ts";
 import type { BrowserRuntimeKind } from "./browser-session-manager.ts";
+import type { AgentCapabilityGrant } from "./capability-broker.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
 export type AgentExecutorKind = "session" | "harness";
@@ -41,6 +42,7 @@ export interface AgentDefinition {
 	model?: ModelRef;
 	thinking?: ThinkingLevel;
 	tools: string[];
+	capabilities: AgentCapabilityGrant[];
 	memory: AgentMemoryKind;
 	persona: string;
 	projectRoot: string;
@@ -66,6 +68,7 @@ export type AgentDefinitionInput = Omit<
 	| "browserWorkflows"
 	| "browser"
 	| "a2a"
+	| "capabilities"
 > & {
 	id?: string;
 	personaId?: string;
@@ -75,6 +78,7 @@ export type AgentDefinitionInput = Omit<
 	browserWorkflows?: AgentBrowserWorkflowGrant[];
 	browser?: Omit<AgentBrowserPolicy, "runtime"> & { runtime?: BrowserRuntimeKind };
 	a2a?: { enabled: boolean };
+	capabilities?: AgentCapabilityGrant[];
 };
 
 export interface AgentRegistryOptions {
@@ -83,6 +87,7 @@ export interface AgentRegistryOptions {
 	defaultWorkspace?: string;
 	modelCatalog?: () => readonly AgentModelCatalogEntry[];
 	browserWorkflowCatalog?: (id: string, version: number) => boolean;
+	capabilityValidator?: (grants: readonly AgentCapabilityGrant[], executor: AgentExecutorKind) => void;
 }
 
 export interface AgentModelCatalogEntry extends ModelRef {
@@ -104,6 +109,9 @@ export class AgentRegistry {
 	readonly #defaultWorkspace: string;
 	readonly #modelCatalog: (() => readonly AgentModelCatalogEntry[]) | undefined;
 	readonly #browserWorkflowCatalog: ((id: string, version: number) => boolean) | undefined;
+	readonly #capabilityValidator:
+		| ((grants: readonly AgentCapabilityGrant[], executor: AgentExecutorKind) => void)
+		| undefined;
 	readonly #queue = new SerialOperationQueue();
 	readonly #listeners = new Set<(event: AgentRegistryEvent) => void>();
 
@@ -116,6 +124,7 @@ export class AgentRegistry {
 		this.#defaultWorkspace = resolve(options.defaultWorkspace ?? process.cwd());
 		this.#modelCatalog = options.modelCatalog;
 		this.#browserWorkflowCatalog = options.browserWorkflowCatalog;
+		this.#capabilityValidator = options.capabilityValidator;
 	}
 
 	async initialize(): Promise<void> {
@@ -152,6 +161,7 @@ export class AgentRegistry {
 			await this.initialize();
 			const normalized = normalizeDefinition(input, this.#defaultWorkspace);
 			this.#validateModel(normalized.model);
+			this.#capabilityValidator?.(normalized.capabilities, normalized.executor);
 			for (const workflow of normalized.browserWorkflows) {
 				if (this.#browserWorkflowCatalog && !this.#browserWorkflowCatalog(workflow.id, workflow.version)) {
 					throw new Error(`Browser workflow ${workflow.id} version ${workflow.version} is not active`);
@@ -283,6 +293,7 @@ export class AgentRegistry {
 			model: parseCatalogModel(frontmatter.model),
 			thinking: undefined,
 			tools,
+			capabilities: [],
 			memory: frontmatter.memory === "notes" ? "notes" : "none",
 			persona: requiredString(body, "agent prompt"),
 			projectRoot: this.#defaultWorkspace,
@@ -314,6 +325,7 @@ function normalizeDefinition(value: unknown, defaultWorkspace: string): AgentDef
 	);
 	if (projectRoot === parse(projectRoot).root) throw new Error("projectRoot must not be a filesystem root");
 	const tools = stringArray(input.tools, "tools");
+	const capabilities = normalizeCapabilityGrants(input.capabilities);
 	const unsupportedTool = tools.find((tool) => !/^[a-zA-Z0-9][a-zA-Z0-9:._-]{0,127}$/.test(tool));
 	if (unsupportedTool) throw new Error(`Unsupported agent tool name: ${unsupportedTool}`);
 	const permissionPolicy = oneOf(input.permissionPolicy, ["read-only", "workspace-write"], "permissionPolicy");
@@ -341,6 +353,7 @@ function normalizeDefinition(value: unknown, defaultWorkspace: string): AgentDef
 		model: normalizeModel(input.model),
 		thinking: normalizeThinking(input.thinking),
 		tools: [...new Set(tools)],
+		capabilities,
 		memory: oneOf(input.memory, ["none", "notes"], "memory"),
 		persona: requiredString(input.persona, "persona"),
 		projectRoot,
@@ -394,6 +407,41 @@ function normalizeBrowserWorkflows(value: unknown): AgentBrowserWorkflowGrant[] 
 	});
 	if (new Set(grants.map((grant) => `${grant.id}@${grant.version}`)).size !== grants.length) {
 		throw new Error("browserWorkflows must not contain duplicate grants");
+	}
+	return grants;
+}
+
+function normalizeCapabilityGrants(value: unknown): AgentCapabilityGrant[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) throw new Error("capabilities must be an array");
+	const grants = value.map((entry, index) => {
+		const input = record(entry, `capabilities[${index}]`);
+		const capabilityId = requiredString(input.capabilityId, `capabilities[${index}].capabilityId`);
+		if (!/^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+$/.test(capabilityId)) {
+			throw new Error(`capabilities[${index}].capabilityId is invalid`);
+		}
+		if (!Number.isSafeInteger(input.capabilityVersion) || Number(input.capabilityVersion) < 1) {
+			throw new Error(`capabilities[${index}].capabilityVersion must be a positive integer`);
+		}
+		return {
+			capabilityId,
+			capabilityVersion: Number(input.capabilityVersion),
+			providerId:
+				input.providerId === undefined
+					? undefined
+					: validatedIdentifier(input.providerId, `capabilities[${index}].providerId`),
+			approval:
+				input.approval === undefined
+					? undefined
+					: oneOf(input.approval, ["never", "per-run", "always"], `capabilities[${index}].approval`),
+			connectionId:
+				input.connectionId === undefined
+					? undefined
+					: requiredString(input.connectionId, `capabilities[${index}].connectionId`),
+		};
+	});
+	if (new Set(grants.map((grant) => grant.capabilityId)).size !== grants.length) {
+		throw new Error("capabilities must not contain duplicate grants");
 	}
 	return grants;
 }

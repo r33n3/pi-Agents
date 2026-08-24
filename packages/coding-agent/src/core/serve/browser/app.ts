@@ -48,6 +48,15 @@ const workflowEditor = createWorkflowEditor();
 const personaSelect = requiredElement<HTMLSelectElement>("agent-persona-select");
 const personaImage = requiredElement<HTMLImageElement>("agent-persona-image");
 const pluginForm = requiredElement<HTMLFormElement>("plugin-form");
+const capabilityConnectionForm = requiredElement<HTMLFormElement>("capability-connection-form");
+const capabilityConnectionList = element("capability-connection-list");
+const capabilityApprovalList = element("capability-approval-list");
+const inboundRouteForm = requiredElement<HTMLFormElement>("inbound-route-form");
+const inboundRouteList = element("inbound-route-list");
+const siteMonitorForm = requiredElement<HTMLFormElement>("site-monitor-form");
+const siteMonitorList = element("site-monitor-list");
+const financeWatchlistForm = requiredElement<HTMLFormElement>("finance-watchlist-form");
+const financeWatchlistList = element("finance-watchlist-list");
 const sessionTabs = element("session-tabs");
 const connectionList = element("connection-list");
 const connectionForm = requiredElement<HTMLFormElement>("connection-form");
@@ -118,6 +127,9 @@ let agentModelsInitialized = false;
 let agents: AgentSummary[] = [];
 let personas: PersonaSummary[] = [];
 let agentEvents: EventSource | undefined;
+let capabilitySearchTimer: number | undefined;
+let capabilityConnections: CapabilityConnectionSummary[] = [];
+let capabilitySnapshot: CapabilitySnapshot["broker"] | undefined;
 const attachmentsBySession = new Map<string, AttachmentSummary[]>();
 
 interface AttachmentSummary {
@@ -145,6 +157,90 @@ interface CapabilitySnapshot {
 	mcpServers: CapabilityEntry[];
 	acpConnections: CapabilityEntry[];
 	modelProviders: CapabilityEntry[];
+	broker: {
+		capabilities: BrokeredCapability[];
+		providers: CapabilityProvider[];
+	};
+}
+
+interface AgentCapabilityGrant {
+	capabilityId: string;
+	capabilityVersion: number;
+	providerId?: string;
+	approval?: "never" | "per-run" | "always";
+	connectionId?: string;
+}
+
+interface BrokeredCapability {
+	id: string;
+	version: number;
+	name: string;
+	description: string;
+	category: string;
+	effect: "read" | "write" | "execute" | "external-side-effect";
+	defaultApproval: "never" | "per-run" | "always";
+	defaultProviderId?: string;
+	providers: string[];
+	status: "active" | "available" | "unavailable";
+}
+
+interface CapabilityProvider {
+	id: string;
+	name: string;
+	source: string;
+	version: string;
+	trust: "unreviewed" | "quarantined" | "reviewed" | "enabled";
+	enabled: boolean;
+	health: "ready" | "degraded" | "missing-tools" | "passive";
+	missingTools: string[];
+	permissions: string[];
+	connectionRequired?: boolean;
+}
+
+interface CapabilityConnectionSummary {
+	id: string;
+	providerId: string;
+	accountLabel: string;
+	secretRef: string;
+	scopes: string[];
+	capabilityIds: string[];
+	status: "active" | "unhealthy" | "revoked";
+}
+
+interface CapabilityApprovalSummary {
+	id: string;
+	capabilityId: string;
+	providerId: string;
+	connectionId: string;
+	action: string;
+	target: string;
+	expiresAt: string;
+	state: "approved" | "started" | "completed" | "failed";
+}
+
+interface InboundRouteSummary {
+	id: string;
+	connectionId: string;
+	destination: { kind: "agent" | "session" | "coordinator"; id: string };
+	allowedSenders: string[];
+	maxEventsPerMinute: number;
+	enabled: boolean;
+}
+
+interface SiteMonitorSummary {
+	id: string;
+	name: string;
+	url: string;
+	enabled: boolean;
+}
+
+interface FinanceWatchlistSummary {
+	id: string;
+	name: string;
+	symbols: string[];
+	providerId?: string;
+	connectionId?: string;
+	enabled: boolean;
 }
 
 interface PersonaSummary {
@@ -2691,7 +2787,9 @@ async function connect(): Promise<void> {
 			loadPersonas().catch(() => {}),
 			loadRoutines().catch(() => {}),
 			loadWorkflows().catch(() => {}),
-			loadCapabilities().catch(() => {}),
+			loadCapabilityConnections()
+				.then(() => Promise.all([loadCapabilities(), loadWaveTwoControls()]))
+				.catch(() => {}),
 			loadExternalConnections().catch((error: unknown) =>
 				setStatus(error instanceof Error ? error.message : String(error), true),
 			),
@@ -2719,6 +2817,8 @@ async function loadCapabilities(): Promise<void> {
 	if (!response.ok) throw new Error(`Could not load capabilities: HTTP ${response.status}`);
 	const payload: unknown = await response.json();
 	if (!isCapabilitySnapshot(payload)) throw new Error("Capability catalog returned an invalid response");
+	capabilitySnapshot = payload.broker;
+	const query = ensureCapabilitySearch().value.trim().toLowerCase();
 	const groups: Array<["local" | "remote", string, CapabilityEntry[], boolean]> = [
 		["local", "Tools", payload.tools, true],
 		["local", "Skills", payload.skills, false],
@@ -2729,7 +2829,13 @@ async function loadCapabilities(): Promise<void> {
 		["remote", "Model providers", payload.modelProviders, false],
 	];
 	element("capability-list").replaceChildren(
+		...renderBrokeredCapabilities(payload.broker, query),
 		...groups.map(([location, label, entries, open]) => {
+			const visibleEntries = entries.filter((entry) =>
+				[entry.name, entry.description, entry.scope, entry.source ?? ""].some((value) =>
+					value.toLowerCase().includes(query),
+				),
+			);
 			const section = document.createElement("details");
 			section.className = "capability-section";
 			section.open = open;
@@ -2741,14 +2847,14 @@ async function loadCapabilities(): Promise<void> {
 			locationLabel.textContent = location;
 			const count = document.createElement("span");
 			count.className = "capability-count";
-			count.textContent = String(entries.length);
+			count.textContent = String(visibleEntries.length);
 			heading.append(headingLabel, locationLabel, count);
 			section.append(heading);
-			if (entries.length === 0) {
+			if (visibleEntries.length === 0) {
 				appendText(section, `No ${label.toLowerCase()} configured`, "muted");
 				return section;
 			}
-			for (const entry of [...entries].sort((left, right) => left.name.localeCompare(right.name))) {
+			for (const entry of [...visibleEntries].sort((left, right) => left.name.localeCompare(right.name))) {
 				const card = document.createElement("details");
 				card.className = "card capability-card";
 				const title = document.createElement("summary");
@@ -2800,6 +2906,273 @@ async function loadCapabilities(): Promise<void> {
 	);
 }
 
+async function loadCapabilityConnections(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/capability-connections.json?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load provider accounts"));
+	const payload: unknown = await response.json();
+	if (!isCapabilityConnectionList(payload)) throw new Error("Provider accounts returned an invalid response");
+	capabilityConnections = payload.connections;
+	capabilityConnectionList.replaceChildren(
+		...capabilityConnections.map((connection) => {
+			const card = document.createElement("div");
+			card.className = "card capability-connection-card";
+			const summary = document.createElement("div");
+			summary.className = "capability-connection-summary";
+			appendText(summary, connection.accountLabel);
+			appendText(summary, `${connection.providerId} · ${connection.status}`, "capability-status");
+			card.append(summary);
+			appendText(card, `${connection.capabilityIds.length} grants · ${connection.secretRef}`, "capability-meta");
+			if (connection.status !== "revoked") {
+				const actions = document.createElement("div");
+				actions.className = "routine-actions";
+				const edit = document.createElement("button");
+				edit.type = "button";
+				edit.textContent = connection.status === "unhealthy" ? "Reconnect" : "Edit";
+				edit.addEventListener("click", () => editCapabilityConnection(connection));
+				const revoke = document.createElement("button");
+				revoke.type = "button";
+				revoke.className = "danger";
+				revoke.textContent = "Revoke";
+				revoke.addEventListener("click", () => void revokeCapabilityConnection(connection));
+				actions.append(edit, revoke);
+				card.append(actions);
+			}
+			return card;
+		}),
+	);
+	refreshConnectionSelectors();
+}
+
+function isCapabilityConnectionList(value: unknown): value is { connections: CapabilityConnectionSummary[] } {
+	if (typeof value !== "object" || value === null || !("connections" in value) || !Array.isArray(value.connections)) {
+		return false;
+	}
+	return value.connections.every(
+		(entry) =>
+			typeof entry === "object" &&
+			entry !== null &&
+			"id" in entry &&
+			typeof entry.id === "string" &&
+			"providerId" in entry &&
+			typeof entry.providerId === "string" &&
+			"capabilityIds" in entry &&
+			Array.isArray(entry.capabilityIds),
+	);
+}
+
+async function revokeCapabilityConnection(connection: CapabilityConnectionSummary): Promise<void> {
+	if (!capabilityToken || !window.confirm(`Revoke ${connection.accountLabel}? Agents and routines will lose access.`))
+		return;
+	const response = await fetch(
+		`/capability-connections/${encodeURIComponent(connection.id)}?token=${encodeURIComponent(capabilityToken)}`,
+		{ method: "DELETE" },
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not revoke provider account"));
+	await Promise.all([loadCapabilityConnections(), loadCapabilities()]);
+}
+
+function editCapabilityConnection(connection: CapabilityConnectionSummary): void {
+	requiredElement<HTMLInputElement>("capability-connection-id").value = connection.id;
+	requiredElement<HTMLInputElement>("capability-connection-provider").value = connection.providerId;
+	requiredElement<HTMLInputElement>("capability-connection-label").value = connection.accountLabel;
+	requiredElement<HTMLInputElement>("capability-connection-secret-ref").value = connection.secretRef;
+	requiredElement<HTMLSelectElement>("capability-connection-status").value =
+		connection.status === "unhealthy" ? "active" : connection.status;
+	requiredElement<HTMLInputElement>("capability-connection-scopes").value = connection.scopes.join(", ");
+	requiredElement<HTMLInputElement>("capability-connection-capabilities").value = connection.capabilityIds.join(", ");
+	requiredElement<HTMLInputElement>("capability-connection-provider").focus();
+}
+
+function clearCapabilityConnectionForm(): void {
+	capabilityConnectionForm.reset();
+	requiredElement<HTMLInputElement>("capability-connection-id").value = "";
+}
+
+function refreshConnectionSelectors(): void {
+	const inbound = requiredElement<HTMLSelectElement>("inbound-route-connection");
+	const finance = requiredElement<HTMLSelectElement>("finance-watchlist-connection");
+	const selectedInbound = inbound.value;
+	const selectedFinance = finance.value;
+	inbound.replaceChildren();
+	finance.replaceChildren(new Option("None", ""));
+	for (const connection of capabilityConnections.filter((entry) => entry.status === "active")) {
+		const label = `${connection.accountLabel} · ${connection.providerId}`;
+		if (connection.capabilityIds.some((id) => id.startsWith("messaging.") || id.startsWith("email."))) {
+			inbound.append(new Option(label, connection.id));
+		}
+		if (connection.capabilityIds.some((id) => id.startsWith("finance."))) {
+			finance.append(new Option(label, connection.id));
+		}
+	}
+	if ([...inbound.options].some((option) => option.value === selectedInbound)) inbound.value = selectedInbound;
+	if ([...finance.options].some((option) => option.value === selectedFinance)) finance.value = selectedFinance;
+}
+
+async function loadWaveTwoControls(): Promise<void> {
+	await Promise.all([loadCapabilityApprovals(), loadInboundRoutes(), loadEverydayConfigurations()]);
+}
+
+async function loadCapabilityApprovals(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/capability-approvals.json?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load approvals"));
+	const payload: unknown = await response.json();
+	if (!isApprovalList(payload)) throw new Error("Approval history returned an invalid response");
+	capabilityApprovalList.replaceChildren(
+		...payload.approvals.slice(0, 20).map((approval) => {
+			const card = document.createElement("div");
+			card.className = "card capability-connection-card";
+			appendText(card, `${approval.action} · ${approval.target}`);
+			appendText(card, `${approval.capabilityId} · ${approval.state}`, "capability-meta");
+			appendText(card, `Expires ${new Date(approval.expiresAt).toLocaleString()}`, "muted");
+			return card;
+		}),
+	);
+	if (payload.approvals.length === 0) appendText(capabilityApprovalList, "No approval receipts", "muted");
+}
+
+async function loadInboundRoutes(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/capability-inbound-routes.json?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load inbound routes"));
+	const payload: unknown = await response.json();
+	if (!isInboundRouteList(payload)) throw new Error("Inbound routes returned an invalid response");
+	inboundRouteList.replaceChildren(
+		...payload.routes.map((route) => {
+			const card = document.createElement("div");
+			card.className = "card capability-connection-card";
+			appendText(card, route.id);
+			appendText(
+				card,
+				`${route.destination.kind}:${route.destination.id} · ${route.enabled ? "enabled" : "disabled"}`,
+				"capability-meta",
+			);
+			const remove = document.createElement("button");
+			remove.type = "button";
+			remove.className = "danger";
+			remove.textContent = "Delete";
+			remove.addEventListener(
+				"click",
+				() => void deleteWaveTwoConfiguration("capability-inbound-routes", route.id, loadInboundRoutes),
+			);
+			card.append(remove);
+			return card;
+		}),
+	);
+}
+
+async function loadEverydayConfigurations(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/everyday-configurations.json?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load monitor configuration"));
+	const payload: unknown = await response.json();
+	if (!isEverydayConfigurationList(payload)) throw new Error("Everyday configuration returned an invalid response");
+	siteMonitorList.replaceChildren(
+		...payload.monitors.map((monitor) =>
+			configurationCard(
+				monitor.name,
+				`${monitor.url} · ${monitor.enabled ? "enabled" : "disabled"}`,
+				() =>
+					void deleteWaveTwoConfiguration(
+						"everyday-configurations/monitors",
+						monitor.id,
+						loadEverydayConfigurations,
+					),
+			),
+		),
+	);
+	const financeReady = capabilitySnapshot?.capabilities.some(
+		(capability) => capability.id === "finance.quotes" && capability.status === "active",
+	);
+	financeWatchlistList.replaceChildren(
+		...payload.watchlists.map((watchlist) =>
+			configurationCard(
+				watchlist.name,
+				`${watchlist.symbols.join(", ")} · ${watchlist.enabled ? "enabled" : "disabled"}${financeReady ? "" : " · quote provider unavailable"}`,
+				() =>
+					void deleteWaveTwoConfiguration(
+						"everyday-configurations/watchlists",
+						watchlist.id,
+						loadEverydayConfigurations,
+					),
+			),
+		),
+	);
+}
+
+function configurationCard(name: string, description: string, removeAction: () => void): HTMLElement {
+	const card = document.createElement("div");
+	card.className = "card capability-connection-card";
+	appendText(card, name);
+	appendText(card, description, "capability-meta");
+	const remove = document.createElement("button");
+	remove.type = "button";
+	remove.className = "danger";
+	remove.textContent = "Delete";
+	remove.addEventListener("click", removeAction);
+	card.append(remove);
+	return card;
+}
+
+async function deleteWaveTwoConfiguration(path: string, id: string, reload: () => Promise<void>): Promise<void> {
+	if (!capabilityToken || !window.confirm(`Delete ${id}?`)) return;
+	const response = await fetch(`/${path}/${encodeURIComponent(id)}?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "DELETE",
+	});
+	if (!response.ok) throw new Error(await responseError(response, `Could not delete ${id}`));
+	await reload();
+}
+
+function isApprovalList(value: unknown): value is { approvals: CapabilityApprovalSummary[] } {
+	return objectList(value, "approvals", ["id", "capabilityId", "target", "state", "expiresAt"]);
+}
+
+function isInboundRouteList(value: unknown): value is { routes: InboundRouteSummary[] } {
+	return objectList(value, "routes", ["id", "connectionId", "destination"]);
+}
+
+function isEverydayConfigurationList(
+	value: unknown,
+): value is { monitors: SiteMonitorSummary[]; watchlists: FinanceWatchlistSummary[] } {
+	return (
+		objectList(value, "monitors", ["id", "name", "url", "enabled"]) &&
+		objectList(value, "watchlists", ["id", "name", "symbols", "enabled"])
+	);
+}
+
+function objectList(value: unknown, key: string, fields: string[]): boolean {
+	if (typeof value !== "object" || value === null || !(key in value)) return false;
+	const list = (value as Record<string, unknown>)[key];
+	return (
+		Array.isArray(list) &&
+		list.every((entry) => typeof entry === "object" && entry !== null && fields.every((field) => field in entry))
+	);
+}
+
+function ensureCapabilitySearch(): HTMLInputElement {
+	const existing = document.getElementById("capability-search");
+	if (existing instanceof HTMLInputElement) return existing;
+	const label = document.createElement("label");
+	label.textContent = "Find capabilities";
+	const input = document.createElement("input");
+	input.id = "capability-search";
+	input.type = "search";
+	input.placeholder = "Search capabilities and providers";
+	input.addEventListener("input", () => {
+		if (capabilitySearchTimer !== undefined) window.clearTimeout(capabilitySearchTimer);
+		capabilitySearchTimer = window.setTimeout(() => {
+			capabilitySearchTimer = undefined;
+			void loadCapabilities().catch((error: unknown) =>
+				setStatus(error instanceof Error ? error.message : String(error), true),
+			);
+		}, 150);
+	});
+	label.append(input);
+	element("capability-list").before(label);
+	return input;
+}
+
 async function changePlugin(action: "install" | "update" | "remove", source: string, scope: string): Promise<void> {
 	if (!capabilityToken || !source) return;
 	if (!window.confirm(`${action[0]?.toUpperCase()}${action.slice(1)} plugin ${source}?`)) return;
@@ -2815,9 +3188,194 @@ async function changePlugin(action: "install" | "update" | "remove", source: str
 
 function isCapabilitySnapshot(value: unknown): value is CapabilitySnapshot {
 	if (typeof value !== "object" || value === null) return false;
-	return ["tools", "skills", "extensions", "plugins", "mcpServers", "acpConnections", "modelProviders"].every(
-		(key) => key in value && Array.isArray(value[key as keyof typeof value]),
+	return (
+		["tools", "skills", "extensions", "plugins", "mcpServers", "acpConnections", "modelProviders"].every(
+			(key) => key in value && Array.isArray(value[key as keyof typeof value]),
+		) &&
+		"broker" in value &&
+		typeof value.broker === "object" &&
+		value.broker !== null &&
+		"capabilities" in value.broker &&
+		Array.isArray(value.broker.capabilities) &&
+		"providers" in value.broker &&
+		Array.isArray(value.broker.providers)
 	);
+}
+
+function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query: string): HTMLElement[] {
+	const grants = selectedAgentCapabilities();
+	const capabilities = broker.capabilities.filter((capability) =>
+		[capability.name, capability.description, capability.category, capability.id].some((value) =>
+			value.toLowerCase().includes(query),
+		),
+	);
+	const providers = broker.providers.filter((provider) =>
+		[provider.name, provider.source, provider.id].some((value) => value.toLowerCase().includes(query)),
+	);
+	const capabilitySection = document.createElement("details");
+	capabilitySection.className = "capability-section";
+	capabilitySection.open = true;
+	const capabilityHeading = document.createElement("summary");
+	capabilityHeading.innerHTML = `<strong>Agent capabilities</strong><span class="capability-count">${capabilities.length}</span>`;
+	capabilitySection.append(capabilityHeading);
+	for (const capability of capabilities) {
+		const card = document.createElement("div");
+		card.className = "card capability-card";
+		const grant = document.createElement("label");
+		const checkbox = document.createElement("input");
+		checkbox.type = "checkbox";
+		checkbox.checked = grants.some((entry) => entry.capabilityId === capability.id);
+		const defaultProvider = broker.providers.find((provider) => provider.id === capability.defaultProviderId);
+		const connectionReady =
+			!defaultProvider?.connectionRequired ||
+			capabilityConnections.some(
+				(connection) =>
+					connection.status === "active" &&
+					connection.providerId === defaultProvider.id &&
+					connection.capabilityIds.includes(capability.id),
+			);
+		checkbox.disabled = capability.status !== "active" || !connectionReady;
+		checkbox.title =
+			capability.status !== "active"
+				? "Review and enable a healthy provider first"
+				: !connectionReady
+					? "Configure an active provider account with this grant"
+					: "Grant capability";
+		checkbox.addEventListener("change", () => updateAgentCapabilityGrant(capability, checkbox.checked));
+		const label = document.createElement("span");
+		label.textContent = capability.name;
+		grant.append(checkbox, label);
+		card.append(grant);
+		appendText(card, capability.description, "muted");
+		appendText(
+			card,
+			`${capability.category} · ${capability.effect} · ${capability.defaultProviderId ?? "no default provider"}`,
+			"capability-meta",
+		);
+		const availableProviders = capability.providers
+			.map((id) => broker.providers.find((provider) => provider.id === id))
+			.filter((provider): provider is CapabilityProvider => provider?.enabled === true);
+		if (availableProviders.length > 0) {
+			const providerLabel = document.createElement("label");
+			providerLabel.textContent = "Default provider";
+			const providerSelect = document.createElement("select");
+			for (const provider of availableProviders) {
+				const option = document.createElement("option");
+				option.value = provider.id;
+				option.textContent = `${provider.name} · ${provider.health}`;
+				option.selected = provider.id === capability.defaultProviderId;
+				providerSelect.append(option);
+			}
+			providerSelect.addEventListener(
+				"change",
+				() => void changeDefaultCapabilityProvider(capability.id, providerSelect.value),
+			);
+			providerLabel.append(providerSelect);
+			card.append(providerLabel);
+		}
+		capabilitySection.append(card);
+	}
+
+	const providerSection = document.createElement("details");
+	providerSection.className = "capability-section";
+	const providerHeading = document.createElement("summary");
+	providerHeading.innerHTML = `<strong>Providers</strong><span class="capability-count">${providers.length}</span>`;
+	providerSection.append(providerHeading);
+	for (const provider of providers) {
+		const card = document.createElement("details");
+		card.className = "card capability-card";
+		const summary = document.createElement("summary");
+		summary.textContent = `${provider.name} · ${provider.trust}`;
+		const body = document.createElement("div");
+		body.className = "capability-body";
+		appendText(body, `${provider.source}@${provider.version}`, "muted");
+		appendText(body, `Health: ${provider.health}`, "capability-meta");
+		appendText(body, `Permissions: ${provider.permissions.join(", ")}`, "capability-meta");
+		if (provider.missingTools.length > 0) appendText(body, `Missing: ${provider.missingTools.join(", ")}`, "muted");
+		const actions = document.createElement("div");
+		actions.className = "routine-actions";
+		if (provider.trust === "quarantined" || provider.trust === "unreviewed") {
+			actions.append(capabilityProviderButton("Review", () => changeCapabilityProvider(provider.id, "review")));
+		} else if (provider.enabled) {
+			actions.append(capabilityProviderButton("Disable", () => changeCapabilityProvider(provider.id, "disable")));
+		} else {
+			const enable = capabilityProviderButton("Enable", () => changeCapabilityProvider(provider.id, "enable"));
+			enable.disabled = provider.health === "missing-tools";
+			actions.append(enable);
+		}
+		body.append(actions);
+		card.append(summary, body);
+		providerSection.append(card);
+	}
+	return [capabilitySection, providerSection];
+}
+
+function capabilityProviderButton(label: string, action: () => void): HTMLButtonElement {
+	const button = document.createElement("button");
+	button.type = "button";
+	button.textContent = label;
+	button.addEventListener("click", action);
+	return button;
+}
+
+async function changeCapabilityProvider(providerId: string, operation: "review" | "enable" | "disable"): Promise<void> {
+	if (!capabilityToken || !window.confirm(`${operation} capability provider ${providerId}?`)) return;
+	const response = await fetch(
+		`/capability-providers/${encodeURIComponent(providerId)}/${operation}?token=${encodeURIComponent(capabilityToken)}`,
+		{ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ approved: true }) },
+	);
+	if (!response.ok) throw new Error(await responseError(response, `Could not ${operation} provider`));
+	await loadCapabilities();
+}
+
+async function changeDefaultCapabilityProvider(capabilityId: string, providerId: string): Promise<void> {
+	if (!capabilityToken || !window.confirm(`Use ${providerId} by default for ${capabilityId}?`)) return;
+	const response = await fetch(
+		`/capability-providers/${encodeURIComponent(providerId)}/default?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ capabilityId, approved: true }),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not change the default provider"));
+	await loadCapabilities();
+}
+
+function selectedAgentCapabilities(): AgentCapabilityGrant[] {
+	const value = requiredElement<HTMLInputElement>("agent-capabilities").value;
+	if (!value) return [];
+	const parsed: unknown = JSON.parse(value);
+	if (!Array.isArray(parsed)) throw new Error("Agent capability grants are invalid");
+	return parsed.filter(
+		(entry): entry is AgentCapabilityGrant =>
+			typeof entry === "object" &&
+			entry !== null &&
+			"capabilityId" in entry &&
+			typeof entry.capabilityId === "string" &&
+			"capabilityVersion" in entry &&
+			typeof entry.capabilityVersion === "number",
+	);
+}
+
+function updateAgentCapabilityGrant(capability: BrokeredCapability, enabled: boolean): void {
+	const grants = selectedAgentCapabilities().filter((entry) => entry.capabilityId !== capability.id);
+	if (enabled) {
+		const connection = capabilityConnections.find(
+			(entry) =>
+				entry.status === "active" &&
+				entry.providerId === capability.defaultProviderId &&
+				entry.capabilityIds.includes(capability.id),
+		);
+		grants.push({
+			capabilityId: capability.id,
+			capabilityVersion: capability.version,
+			providerId: capability.defaultProviderId,
+			approval: capability.defaultApproval,
+			connectionId: connection?.id,
+		});
+	}
+	requiredElement<HTMLInputElement>("agent-capabilities").value = JSON.stringify(grants);
 }
 
 function selectedAgentTools(): Set<string> {
@@ -2844,6 +3402,7 @@ interface AgentSummary {
 	name: string;
 	description: string;
 	tools: string[];
+	capabilities: AgentCapabilityGrant[];
 	memory: "none" | "notes";
 	persona: string;
 	executor: "session" | "harness";
@@ -3483,6 +4042,7 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 	personaSelect.value = agent?.personaId ?? "";
 	requiredElement<HTMLTextAreaElement>("agent-persona").value = agent?.persona ?? "";
 	requiredElement<HTMLInputElement>("agent-tools").value = agent?.tools.join(",") ?? "";
+	requiredElement<HTMLInputElement>("agent-capabilities").value = JSON.stringify(agent?.capabilities ?? []);
 	requiredElement<HTMLSelectElement>("agent-memory").value = agent?.memory ?? "none";
 	requiredElement<HTMLSelectElement>("agent-executor").value = agent?.executor ?? "harness";
 	requiredElement<HTMLSelectElement>("agent-permissions").value = agent?.permissionPolicy ?? "read-only";
@@ -4011,6 +4571,7 @@ interface RoutineSummary {
 	lastRunId?: string;
 	activeRunId?: string;
 	lastError?: string;
+	availabilityError?: string;
 }
 
 let routines: RoutineSummary[] = [];
@@ -4235,7 +4796,17 @@ async function loadRoutines(): Promise<void> {
 			const state = document.createElement("div");
 			state.className = "routine-state";
 			appendText(state, routine.name);
-			appendText(state, routine.activeRunId ? "Running" : routine.enabled ? "Active" : "Paused", "routine-target");
+			appendText(
+				state,
+				routine.availabilityError
+					? "Unavailable"
+					: routine.activeRunId
+						? "Running"
+						: routine.enabled
+							? "Active"
+							: "Paused",
+				"routine-target",
+			);
 			const menu = document.createElement("details");
 			menu.className = "routine-menu";
 			const summary = document.createElement("summary");
@@ -4245,7 +4816,7 @@ async function loadRoutines(): Promise<void> {
 			const run = document.createElement("button");
 			run.type = "button";
 			run.textContent = "Run now";
-			run.disabled = routine.activeRunId !== undefined;
+			run.disabled = routine.activeRunId !== undefined || routine.availabilityError !== undefined;
 			run.addEventListener("click", (event) => {
 				event.stopPropagation();
 				void runRoutine(routine.id).catch((error: unknown) =>
@@ -4286,6 +4857,7 @@ async function loadRoutines(): Promise<void> {
 			);
 			appendText(card, routine.prompt, "muted");
 			if (routine.lastError) appendText(card, routine.lastError, "run-error");
+			if (routine.availabilityError) appendText(card, routine.availabilityError, "run-error");
 			card.addEventListener("click", () => editRoutine(routine));
 			return card;
 		}),
@@ -4826,7 +5398,19 @@ for (const button of document.querySelectorAll<HTMLButtonElement>("[data-tab]"))
 }
 
 for (const button of document.querySelectorAll<HTMLButtonElement>("[data-builder-tab]")) {
-	button.addEventListener("click", () => activateBuilderTab(button.dataset.builderTab ?? "builder-profile-panel"));
+	button.addEventListener("click", () => {
+		const panel = button.dataset.builderTab ?? "builder-profile-panel";
+		activateBuilderTab(panel);
+		if (panel === "builder-connections-panel") {
+			void loadCapabilityConnections()
+				.then(loadWaveTwoControls)
+				.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+		}
+		if (panel === "builder-automation-panel")
+			void loadEverydayConfigurations().catch((error: unknown) =>
+				setStatus(error instanceof Error ? error.message : String(error), true),
+			);
+	});
 }
 
 newAgent.addEventListener("click", () => {
@@ -4882,6 +5466,7 @@ agentForm.addEventListener("submit", (event) => {
 		description: value("agent-description"),
 		projectRoot: value("agent-project-root"),
 		tools,
+		capabilities: selectedAgentCapabilities(),
 		memory: value("agent-memory"),
 		persona: value("agent-persona"),
 		executor,
@@ -4977,6 +5562,130 @@ pluginForm.addEventListener("submit", (event) => {
 		setStatus(error instanceof Error ? error.message : String(error), true),
 	);
 });
+
+capabilityConnectionForm.addEventListener("submit", (event) => {
+	event.preventDefault();
+	if (!capabilityToken) return;
+	const value = (id: string) => requiredElement<HTMLInputElement>(id).value.trim();
+	const providerId = value("capability-connection-provider");
+	const id = value("capability-connection-id");
+	const accountLabel = value("capability-connection-label");
+	const secretRef = value("capability-connection-secret-ref");
+	const list = (id: string) =>
+		value(id)
+			.split(",")
+			.map((entry) => entry.trim())
+			.filter(Boolean);
+	void fetch(
+		`${id ? `/capability-connections/${encodeURIComponent(id)}` : "/capability-connections.json"}?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: id ? "PUT" : "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				providerId,
+				accountLabel,
+				secretRef,
+				status: requiredElement<HTMLSelectElement>("capability-connection-status").value,
+				scopes: list("capability-connection-scopes"),
+				capabilityIds: list("capability-connection-capabilities"),
+			}),
+		},
+	)
+		.then(async (response) => {
+			if (!response.ok) throw new Error(await responseError(response, "Could not save provider account"));
+			clearCapabilityConnectionForm();
+			await Promise.all([loadCapabilityConnections(), loadCapabilities(), loadWaveTwoControls()]);
+			setStatus("Provider account saved");
+		})
+		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+});
+
+requiredElement<HTMLButtonElement>("capability-connection-clear").addEventListener(
+	"click",
+	clearCapabilityConnectionForm,
+);
+
+inboundRouteForm.addEventListener("submit", (event) => {
+	event.preventDefault();
+	if (!capabilityToken) return;
+	const list = (id: string) =>
+		requiredElement<HTMLInputElement>(id)
+			.value.split(",")
+			.map((entry) => entry.trim())
+			.filter(Boolean);
+	void fetch(`/capability-inbound-routes.json?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({
+			id: requiredElement<HTMLInputElement>("inbound-route-id").value.trim(),
+			connectionId: requiredElement<HTMLSelectElement>("inbound-route-connection").value,
+			destination: {
+				kind: requiredElement<HTMLSelectElement>("inbound-route-kind").value,
+				id: requiredElement<HTMLInputElement>("inbound-route-destination").value.trim(),
+			},
+			allowedSenders: list("inbound-route-senders"),
+			maxEventsPerMinute: Number(requiredElement<HTMLInputElement>("inbound-route-rate").value),
+			enabled: requiredElement<HTMLInputElement>("inbound-route-enabled").checked,
+		}),
+	})
+		.then(async (response) => {
+			if (!response.ok) throw new Error(await responseError(response, "Could not save inbound route"));
+			inboundRouteForm.reset();
+			await loadInboundRoutes();
+			setStatus("Inbound route saved");
+		})
+		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+});
+
+siteMonitorForm.addEventListener("submit", (event) => {
+	event.preventDefault();
+	void saveEverydayConfiguration(
+		"monitors",
+		{
+			id: requiredElement<HTMLInputElement>("site-monitor-id").value.trim(),
+			name: requiredElement<HTMLInputElement>("site-monitor-name").value.trim(),
+			url: requiredElement<HTMLInputElement>("site-monitor-url").value.trim(),
+			enabled: requiredElement<HTMLInputElement>("site-monitor-enabled").checked,
+		},
+		siteMonitorForm,
+	).catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+});
+
+financeWatchlistForm.addEventListener("submit", (event) => {
+	event.preventDefault();
+	void saveEverydayConfiguration(
+		"watchlists",
+		{
+			id: requiredElement<HTMLInputElement>("finance-watchlist-id").value.trim(),
+			name: requiredElement<HTMLInputElement>("finance-watchlist-name").value.trim(),
+			symbols: requiredElement<HTMLInputElement>("finance-watchlist-symbols")
+				.value.split(",")
+				.map((entry) => entry.trim())
+				.filter(Boolean),
+			providerId: requiredElement<HTMLInputElement>("finance-watchlist-provider").value.trim() || undefined,
+			connectionId: requiredElement<HTMLSelectElement>("finance-watchlist-connection").value || undefined,
+			enabled: requiredElement<HTMLInputElement>("finance-watchlist-enabled").checked,
+		},
+		financeWatchlistForm,
+	).catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+});
+
+async function saveEverydayConfiguration(
+	kind: "monitors" | "watchlists",
+	definition: Record<string, unknown>,
+	targetForm: HTMLFormElement,
+): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/everyday-configurations/${kind}?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(definition),
+	});
+	if (!response.ok) throw new Error(await responseError(response, `Could not save ${kind}`));
+	targetForm.reset();
+	await loadEverydayConfigurations();
+	setStatus(kind === "monitors" ? "Site monitor saved" : "Finance watchlist saved");
+}
 
 externalRunForm.addEventListener("submit", (event) => {
 	event.preventDefault();

@@ -97,6 +97,33 @@ describe("AgentRegistry", () => {
 		).rejects.toThrow("Select a model from the active Pi model catalog");
 	});
 
+	test("persists capability grants only after broker validation", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-agent-capabilities-"));
+		roots.push(root);
+		const agents = new AgentRegistry(root, {
+			capabilityValidator: (grants, executor) => {
+				if (executor !== "session" || grants.some((grant) => grant.capabilityId !== "web.search")) {
+					throw new Error("Capability grant is unavailable");
+				}
+			},
+		});
+		const input = {
+			id: "web-researcher",
+			name: "Web researcher",
+			description: "Researches the public web",
+			tools: [],
+			memory: "none" as const,
+			persona: "Cite sources",
+			permissionPolicy: "read-only" as const,
+			schedules: [],
+			capabilities: [{ capabilityId: "web.search", capabilityVersion: 1 }],
+		};
+		await expect(agents.save({ ...input, executor: "harness" })).rejects.toThrow("unavailable");
+		await expect(agents.save({ ...input, executor: "session" })).resolves.toMatchObject({
+			capabilities: [{ capabilityId: "web.search", capabilityVersion: 1 }],
+		});
+	});
+
 	test("requires an explicit policy when an agent enables browser tools", async () => {
 		const { registry: agents } = await registry();
 		const input = {

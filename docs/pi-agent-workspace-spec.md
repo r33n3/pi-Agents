@@ -268,6 +268,10 @@ path for package management.
 - A scheduled task encountering an unavailable connection records an explicit
   failure; it does not silently use stale data.
 
+Canonical capability IDs, provider selection, trust review, conflict handling,
+productivity connections, and the two delivery waves follow the
+[capability platform specification](pi-capability-platform-spec.md).
+
 ## Persistent conversations and tasks
 
 ### Contract

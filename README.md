@@ -23,6 +23,7 @@ Pi Agents is a developer-focused fork of [earendil-works/pi](https://github.com/
 | Managed browser | Pi and permitted agents can open local or remote pages in managed Chromium, inspect and operate them, share control with the user, record walkthroughs, and pop out the live view. |
 | Portable browser workflows | Compile recorded walkthroughs into versioned semantic automation, validate them in a fresh browser, and assign exact active versions to Pi, agents, skills, routines, larger workflows, or frontend tests with persistent run evidence. |
 | Connections | Delegate tasks through model-selectable Claude Code, OpenAI, and Hermes connections; manage plugins, MCP servers, API endpoints, and per-agent capability grants. |
+| Capability broker | Review and enable canonical providers, bind agent grants to revocable secret-reference accounts, run weather/feed/site monitors, require target-bound receipts for external writes, and route signed inbound messages to a fixed Pi session or agent. |
 | Interoperability | Expose selected agents through an authenticated A2A 1.0 HTTP+JSON boundary using the same persistent task service as local chat and workflows. |
 | Responsive access | Phone and unfolded Pixel Fold layouts keep chat primary and open Sessions or Browser/Agents/Agent Builder as dismissible side panels. |
 
@@ -81,6 +82,16 @@ Pi remains the user-facing supervisor:
 - Agent transcripts and private memory are not implicitly shared. Handoffs use explicit context, results, and validated artifact references.
 
 Agent chat, Pi delegation, routines, workflows, and A2A requests all use the same persisted task lifecycle. See the [agent workspace and orchestration specification](docs/pi-agent-workspace-spec.md), [managed-browser specification](docs/pi-browser-preview-spec.md), and [portable browser workflow specification](docs/pi-browser-workflow-spec.md).
+
+The reviewed extension, canonical capability, connection, approval, monitoring,
+and inbound-routing layers are defined in the
+[capability platform specification](docs/pi-capability-platform-spec.md).
+Agent Builder exposes provider accounts and health, capability defaults,
+approval history, fixed inbound routes, site monitors, and finance watchlists;
+all definitions persist across `pi --serve` restarts.
+Productivity provider cards remain unavailable until their reviewed connector
+tools and account authorization are configured; raw consequential tools do not
+bypass the broker's receipt requirement.
 
 ## Security boundary
 

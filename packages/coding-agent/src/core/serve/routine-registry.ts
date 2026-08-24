@@ -37,10 +37,16 @@ export class RoutineRegistry {
 	readonly #directory: string;
 	readonly #queue = new SerialOperationQueue();
 	readonly #browserWorkflowCatalog: ((id: string, version: number) => boolean) | undefined;
+	readonly #validator: ((definition: RoutineDefinition) => Promise<void> | void) | undefined;
 
-	constructor(directory: string, browserWorkflowCatalog?: (id: string, version: number) => boolean) {
+	constructor(
+		directory: string,
+		browserWorkflowCatalog?: (id: string, version: number) => boolean,
+		validator?: (definition: RoutineDefinition) => Promise<void> | void,
+	) {
 		this.#directory = resolve(directory);
 		this.#browserWorkflowCatalog = browserWorkflowCatalog;
+		this.#validator = validator;
 	}
 
 	async initialize(): Promise<void> {
@@ -68,21 +74,26 @@ export class RoutineRegistry {
 		return this.#queue.run(async () => {
 			await this.initialize();
 			const definition = normalizeRoutine(input);
-			if (
-				definition.target.kind === "browser-workflow" &&
-				this.#browserWorkflowCatalog &&
-				!this.#browserWorkflowCatalog(definition.target.workflowId, definition.target.workflowVersion)
-			) {
-				throw new Error(
-					`Browser workflow ${definition.target.workflowId} version ${definition.target.workflowVersion} is not active`,
-				);
-			}
+			await this.validate(definition);
 			const target = resolve(this.#directory, `${definition.id}.json`);
 			const temporary = resolve(dirname(target), `.${definition.id}.${randomUUID()}.tmp`);
 			await writeFile(temporary, `${JSON.stringify(definition, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
 			await rename(temporary, target);
 			return definition;
 		});
+	}
+
+	async validate(definition: RoutineDefinition): Promise<void> {
+		if (
+			definition.target.kind === "browser-workflow" &&
+			this.#browserWorkflowCatalog &&
+			!this.#browserWorkflowCatalog(definition.target.workflowId, definition.target.workflowVersion)
+		) {
+			throw new Error(
+				`Browser workflow ${definition.target.workflowId} version ${definition.target.workflowVersion} is not active`,
+			);
+		}
+		await this.#validator?.(definition);
 	}
 
 	async delete(id: string): Promise<boolean> {

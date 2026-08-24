@@ -43,4 +43,25 @@ describe("ServeAttachmentStore", () => {
 			await store.dispose();
 		}
 	});
+
+	test("removes rejected files before exposing them to a session", async () => {
+		let scannedPath: string | undefined;
+		const store = new ServeAttachmentStore(async (attachment) => {
+			scannedPath = attachment.path;
+			throw new Error("malware scan rejected the attachment");
+		});
+		try {
+			await expect(
+				store.save({
+					sessionId: "session",
+					name: "unsafe.bin",
+					data: Buffer.from("fixture").toString("base64"),
+				}),
+			).rejects.toThrow("malware scan rejected");
+			expect(scannedPath).toBeDefined();
+			expect(store.getForSession("session", [])).toEqual([]);
+		} finally {
+			await store.dispose();
+		}
+	});
 });

@@ -74,4 +74,24 @@ describe("RoutineRegistry", () => {
 			}),
 		).resolves.toMatchObject({ target: { workflowId: "review-page", workflowVersion: 3 } });
 	});
+
+	test("runs policy validation before persisting a routine", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-routine-registry-"));
+		roots.push(root);
+		const registry = new RoutineRegistry(root, undefined, (definition) => {
+			if (definition.target.kind === "agent") throw new Error("unattended write grant is not allowed");
+		});
+		await expect(
+			registry.save({
+				name: "Unsafe send",
+				prompt: "Send the report",
+				enabled: true,
+				cron: "0 9 * * *",
+				timezone: "UTC",
+				maxDurationMinutes: 10,
+				target: { kind: "agent", agentId: "messenger" },
+			}),
+		).rejects.toThrow("unattended write grant");
+		expect(await registry.list()).toEqual([]);
+	});
 });
