@@ -298,13 +298,13 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 				height: payload.metadata.deviceHeight,
 				timestamp: payload.metadata.timestamp ? payload.metadata.timestamp * 1_000 : lastFrameAt,
 			});
+			void session.send("Page.screencastFrameAck", { sessionId: payload.sessionId }).catch(() => {});
 		};
 		const onFrame = (payload: {
 			data: string;
 			metadata: { deviceWidth: number; deviceHeight: number; timestamp?: number };
 			sessionId: number;
 		}) => {
-			void session.send("Page.screencastFrameAck", { sessionId: payload.sessionId }).catch(() => {});
 			if (stopped) return;
 			pending = payload;
 			if (!timer) timer = setTimeout(flush, Math.max(0, 100 - (Date.now() - lastFrameAt)));

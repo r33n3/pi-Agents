@@ -1,3 +1,6 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+
 let timer;
 
 process.on("message", (message) => {
@@ -10,8 +13,14 @@ process.on("message", (message) => {
 	}
 	if (message?.type !== "start") return;
 	process.send?.({ type: "event", message: "started" });
-	timer = setTimeout(() => {
-		process.send?.({ type: "result", output: message.context.prompt, transcript: [] });
+	timer = setTimeout(async () => {
+		const transcript =
+			message.context.prompt === "large"
+				? [{ role: "assistant", content: [{ type: "text", text: "x".repeat(2_000_000) }] }]
+				: [];
+		await mkdir(dirname(message.resultPath), { recursive: true });
+		await writeFile(message.resultPath, JSON.stringify({ output: message.context.prompt, transcript }));
+		process.send?.({ type: "result" });
 		process.disconnect?.();
 	}, message.context.prompt === "slow" ? 5_000 : 10);
 });

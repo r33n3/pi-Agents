@@ -1,5 +1,8 @@
 import { type ChildProcess, fork } from "node:child_process";
+import { readFile, unlink } from "node:fs/promises";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ModelRef } from "@earendil-works/pi-protocol";
 import { killProcessTree } from "../../utils/shell.ts";
 import type {
@@ -9,7 +12,7 @@ import type {
 	AgentExecutionResult,
 	AgentExecutor,
 } from "./agent-executor.ts";
-import type { AgentWorkerRequest, AgentWorkerResponse } from "./agent-worker-protocol.ts";
+import type { AgentWorkerRequest, AgentWorkerResponse, AgentWorkerResultArtifact } from "./agent-worker-protocol.ts";
 
 export interface ChildProcessAgentExecutorOptions {
 	agentDir: string;
@@ -40,6 +43,13 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 			context.definition.model || !this.#options.defaultModel
 				? context
 				: { ...context, definition: { ...context.definition, model: this.#options.defaultModel } };
+		const resultPath = resolve(
+			this.#options.serveRoot,
+			"runs",
+			effectiveContext.definition.id,
+			effectiveContext.runId,
+			"worker-result.json",
+		);
 		const execution = new ChildProcessExecution(
 			workerPath,
 			{
@@ -47,8 +57,10 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 				context: effectiveContext,
 				agentDir: this.#options.agentDir,
 				serveRoot: this.#options.serveRoot,
+				resultPath,
 				capabilityToolNames: this.#options.capabilityToolNames(effectiveContext),
 			},
+			resultPath,
 			this.#options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
 			() => this.#executions.delete(execution),
 		);
@@ -73,6 +85,7 @@ class ChildProcessExecution implements AgentExecution {
 	readonly #child: ChildProcess;
 	readonly #listeners = new Set<AgentExecutionListener>();
 	readonly #onDispose: () => void;
+	readonly #resultPath: string;
 	readonly #timeout: NodeJS.Timeout;
 	#resolve: (result: AgentExecutionResult) => void = () => {};
 	#reject: (error: Error) => void = () => {};
@@ -80,8 +93,15 @@ class ChildProcessExecution implements AgentExecution {
 	#disposed = false;
 	#stderr = "";
 
-	constructor(workerPath: string, start: AgentWorkerRequest, timeoutMs: number, onDispose: () => void) {
+	constructor(
+		workerPath: string,
+		start: AgentWorkerRequest,
+		resultPath: string,
+		timeoutMs: number,
+		onDispose: () => void,
+	) {
 		this.#onDispose = onDispose;
+		this.#resultPath = resultPath;
 		this.result = new Promise((resolve, reject) => {
 			this.#resolve = resolve;
 			this.#reject = reject;
@@ -160,19 +180,36 @@ class ChildProcessExecution implements AgentExecution {
 		if (this.#settled) return;
 		this.#settled = true;
 		clearTimeout(this.#timeout);
-		this.#resolve({ output: value.output, transcript: value.transcript });
+		void readWorkerResult(this.#resultPath).then(this.#resolve, this.#reject);
 	}
 
 	#fail(error: Error): void {
 		if (this.#settled) return;
 		this.#settled = true;
 		clearTimeout(this.#timeout);
+		void unlink(this.#resultPath).catch(() => {});
 		this.#reject(error);
 	}
 
 	#terminate(): void {
 		const pid = this.#child.pid;
 		if (pid !== undefined) killProcessTree(pid);
+	}
+}
+
+async function readWorkerResult(path: string): Promise<AgentExecutionResult> {
+	try {
+		const value: unknown = JSON.parse(await readFile(path, "utf8"));
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			throw new Error("Agent worker result artifact is invalid");
+		}
+		const artifact = value as Partial<AgentWorkerResultArtifact>;
+		if (typeof artifact.output !== "string" || !Array.isArray(artifact.transcript)) {
+			throw new Error("Agent worker result artifact is invalid");
+		}
+		return { output: artifact.output, transcript: artifact.transcript as AgentMessage[] };
+	} finally {
+		await unlink(path).catch(() => {});
 	}
 }
 

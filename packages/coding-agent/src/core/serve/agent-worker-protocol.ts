@@ -6,6 +6,7 @@ export interface AgentWorkerStartMessage {
 	context: AgentExecutionContext;
 	agentDir: string;
 	serveRoot: string;
+	resultPath: string;
 	capabilityToolNames: string[];
 }
 
@@ -22,6 +23,9 @@ export interface AgentWorkerEventMessage {
 
 export interface AgentWorkerResultMessage {
 	type: "result";
+}
+
+export interface AgentWorkerResultArtifact {
 	output: string;
 	transcript: AgentMessage[];
 }

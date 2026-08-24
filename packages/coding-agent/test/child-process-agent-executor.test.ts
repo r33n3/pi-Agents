@@ -1,5 +1,8 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import type { AgentExecutionContext } from "../src/core/serve/agent-executor.ts";
 import { ChildProcessAgentExecutor } from "../src/core/serve/child-process-agent-executor.ts";
 
@@ -33,10 +36,20 @@ function context(prompt: string): AgentExecutionContext {
 }
 
 describe("ChildProcessAgentExecutor", () => {
+	let serveRoot: string;
+
+	beforeEach(async () => {
+		serveRoot = await mkdtemp(join(tmpdir(), "pi-agent-worker-result-"));
+	});
+
+	afterEach(async () => {
+		await rm(serveRoot, { recursive: true, force: true });
+	});
+
 	test("returns progress and results over IPC", async () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
-			serveRoot: process.cwd(),
+			serveRoot,
 			capabilityToolNames: () => [],
 			workerPath,
 		});
@@ -49,10 +62,25 @@ describe("ChildProcessAgentExecutor", () => {
 		await executor.dispose();
 	});
 
+	test("returns a large transcript through the durable result artifact", async () => {
+		const executor = new ChildProcessAgentExecutor({
+			agentDir: process.cwd(),
+			serveRoot,
+			capabilityToolNames: () => [],
+			workerPath,
+		});
+		const execution = await executor.start(context("large"));
+		const result = await execution.result;
+		expect(result.output).toBe("large");
+		expect(JSON.stringify(result.transcript).length).toBeGreaterThan(2_000_000);
+		await execution.dispose();
+		await executor.dispose();
+	});
+
 	test("aborts an unresponsive child", async () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
-			serveRoot: process.cwd(),
+			serveRoot,
 			capabilityToolNames: () => [],
 			workerPath,
 		});
@@ -69,7 +97,7 @@ describe("ChildProcessAgentExecutor", () => {
 		try {
 			const executor = new ChildProcessAgentExecutor({
 				agentDir: process.cwd(),
-				serveRoot: process.cwd(),
+				serveRoot,
 				capabilityToolNames: () => [],
 				workerPath,
 			});

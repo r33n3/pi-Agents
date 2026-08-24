@@ -1,10 +1,16 @@
-import { join } from "node:path";
+import { mkdir, rename, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentSession } from "../agent-session.ts";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../agent-session-services.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import { SessionManager } from "../session-manager.ts";
-import type { AgentWorkerRequest, AgentWorkerResponse, AgentWorkerStartMessage } from "./agent-worker-protocol.ts";
+import type {
+	AgentWorkerRequest,
+	AgentWorkerResponse,
+	AgentWorkerResultArtifact,
+	AgentWorkerStartMessage,
+} from "./agent-worker-protocol.ts";
 import { BrowserArtifactStore } from "./browser-artifact-store.ts";
 import { BrowserProfileStore } from "./browser-profile-store.ts";
 import { BrowserSessionManager } from "./browser-session-manager.ts";
@@ -163,7 +169,9 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 			customTools: customTools.length > 0 ? customTools : undefined,
 		});
 		activeSession = created.session;
-		const unsubscribe = activeSession.subscribe((event) => send({ type: "event", message: event.type }));
+		const unsubscribe = activeSession.subscribe((event) => {
+			void send({ type: "event", message: event.type }).catch(() => {});
+		});
 		cleanups.unshift(async () => {
 			unsubscribe();
 			activeSession?.dispose();
@@ -178,22 +186,32 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 			`Task: ${request.context.prompt}`,
 		].join("\n\n");
 		await activeSession.prompt(instructions, { source: "rpc" });
-		response = {
-			type: "result",
+		await writeResultArtifact(request.resultPath, {
 			output: lastAssistantText(activeSession.messages),
 			transcript: [...activeSession.messages],
-		};
+		});
+		response = { type: "result" };
 	} catch (error) {
 		response = { type: "error", error: error instanceof Error ? error.message : String(error) };
 	} finally {
 		for (const cleanup of cleanups) await cleanup().catch(() => undefined);
-		if (response) send(response);
+		if (response) await send(response).catch(() => undefined);
 		process.disconnect?.();
 	}
 }
 
-function send(message: AgentWorkerResponse): void {
-	if (process.connected) process.send?.(message);
+function send(message: AgentWorkerResponse): Promise<void> {
+	if (!process.connected || !process.send) return Promise.reject(new Error("Agent worker IPC channel is closed"));
+	return new Promise((resolve, reject) => {
+		process.send?.(message, (error) => (error ? reject(error) : resolve()));
+	});
+}
+
+async function writeResultArtifact(path: string, artifact: AgentWorkerResultArtifact): Promise<void> {
+	await mkdir(dirname(path), { recursive: true });
+	const temporaryPath = `${path}.${process.pid}.tmp`;
+	await writeFile(temporaryPath, `${JSON.stringify(artifact)}\n`, "utf8");
+	await rename(temporaryPath, path);
 }
 
 function isRequest(value: unknown): value is AgentWorkerRequest {
