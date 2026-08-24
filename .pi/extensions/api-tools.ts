@@ -9,8 +9,8 @@ const MAX_ERROR_CHARACTERS = 2_000;
 
 type JsonRequestOptions = {
 	provider: string;
-	apiKey: string;
-	authorization: "bearer" | "token" | "finnhub";
+	apiKey?: string;
+	authorization: "none" | "bearer" | "token" | "finnhub";
 	method?: "GET" | "POST";
 	body?: unknown;
 	signal?: AbortSignal;
@@ -107,7 +107,26 @@ function textResult(provider: string, value: unknown) {
 
 export default function (pi: ExtensionAPI) {
 	const firecrawlApiKey = toolCredential("FIRECRAWL_API_KEY");
-	if (firecrawlApiKey) {
+	const firecrawlBaseUrlValue = toolCredential("FIRECRAWL_BASE_URL");
+	if (firecrawlApiKey || firecrawlBaseUrlValue) {
+		const firecrawlBaseUrl = new URL(firecrawlBaseUrlValue ?? "https://api.firecrawl.dev");
+		if (
+			firecrawlBaseUrl.username ||
+			firecrawlBaseUrl.password ||
+			firecrawlBaseUrl.pathname !== "/" ||
+			firecrawlBaseUrl.search ||
+			firecrawlBaseUrl.hash
+		) {
+			throw new Error("FIRECRAWL_BASE_URL must be an HTTP or HTTPS origin without credentials or a path");
+		}
+		if (firecrawlBaseUrl.protocol !== "https:") {
+			const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(firecrawlBaseUrl.hostname);
+			if (firecrawlBaseUrl.protocol !== "http:" || !loopback) {
+				throw new Error("Insecure FIRECRAWL_BASE_URL values are allowed only on loopback");
+			}
+		}
+		const firecrawlAuthorization = firecrawlBaseUrlValue ? "none" : "bearer";
+		const firecrawlEndpoint = (path: string) => new URL(path, firecrawlBaseUrl);
 		pi.registerTool(
 			defineTool({
 				name: "firecrawl_search",
@@ -119,10 +138,10 @@ export default function (pi: ExtensionAPI) {
 				}),
 				executionMode: "parallel",
 				async execute(_toolCallId, params, signal) {
-					const result = await requestJson(new URL("https://api.firecrawl.dev/v2/search"), {
+					const result = await requestJson(firecrawlEndpoint("/v2/search"), {
 						provider: "Firecrawl",
 						apiKey: firecrawlApiKey,
-						authorization: "bearer",
+						authorization: firecrawlAuthorization,
 						method: "POST",
 						body: { query: params.query, limit: params.limit ?? 5, sources: ["web"] },
 						signal,
@@ -146,12 +165,44 @@ export default function (pi: ExtensionAPI) {
 					if (target.protocol !== "http:" && target.protocol !== "https:") {
 						throw new Error("Firecrawl only accepts HTTP or HTTPS URLs");
 					}
-					const result = await requestJson(new URL("https://api.firecrawl.dev/v2/scrape"), {
+					const result = await requestJson(firecrawlEndpoint("/v2/scrape"), {
 						provider: "Firecrawl",
 						apiKey: firecrawlApiKey,
-						authorization: "bearer",
+						authorization: firecrawlAuthorization,
 						method: "POST",
 						body: { url: target.href, formats: ["markdown"], onlyMainContent: true },
+						signal,
+					});
+					return textResult("firecrawl", result);
+				},
+			}),
+		);
+
+		pi.registerTool(
+			defineTool({
+				name: "firecrawl_crawl",
+				label: "Firecrawl Crawl",
+				description: "Start a bounded Firecrawl crawl and return its job ID and status URL.",
+				parameters: Type.Object({
+					url: Type.String({ description: "Public HTTP or HTTPS site URL to crawl" }),
+					limit: Type.Optional(Type.Integer({ description: "Maximum pages", minimum: 1, maximum: 100 })),
+				}),
+				executionMode: "parallel",
+				async execute(_toolCallId, params, signal) {
+					const target = new URL(params.url);
+					if (target.protocol !== "http:" && target.protocol !== "https:") {
+						throw new Error("Firecrawl only accepts HTTP or HTTPS URLs");
+					}
+					const result = await requestJson(firecrawlEndpoint("/v2/crawl"), {
+						provider: "Firecrawl",
+						apiKey: firecrawlApiKey,
+						authorization: firecrawlAuthorization,
+						method: "POST",
+						body: {
+							url: target.href,
+							limit: params.limit ?? 25,
+							scrapeOptions: { formats: ["markdown"], onlyMainContent: true },
+						},
 						signal,
 					});
 					return textResult("firecrawl", result);

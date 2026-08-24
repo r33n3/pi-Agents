@@ -188,6 +188,21 @@ const WAVE_ONE_DEFINITIONS: readonly CapabilityDefinition[] = [
 
 const WAVE_ONE_MANIFESTS: readonly CapabilityProviderManifest[] = [
 	{
+		id: "pi-searxng",
+		name: "SearXNG",
+		source: "builtin:pi-searxng",
+		version: "1",
+		permissions: ["configured SearXNG network read"],
+		bindings: [
+			{
+				capabilityId: "web.search",
+				capabilityVersion: 1,
+				toolName: "searxng_search",
+				executors: ["session"],
+			},
+		],
+	},
+	{
 		id: "rpiv-web-tools",
 		name: "RPIV Web Tools",
 		source: "@juicesharp/rpiv-web-tools",
@@ -468,16 +483,6 @@ export class CapabilityBroker {
 				throw new Error(`Provider ${providerId} is missing loaded tools: ${view.missingTools.join(", ")}`);
 			}
 			const activeTools = new Set(this.#activeToolNames());
-			for (const binding of manifest.bindings.filter((entry) =>
-				this.#bindingReady(manifest, entry.capabilityId, activeTools),
-			)) {
-				const conflicting = this.#state.defaults[binding.capabilityId];
-				if (conflicting && conflicting !== providerId) {
-					throw new Error(
-						`Capability ${binding.capabilityId} already defaults to ${conflicting}; change the default explicitly`,
-					);
-				}
-			}
 			this.#state.providers[providerId] = {
 				...state,
 				trust: "enabled",

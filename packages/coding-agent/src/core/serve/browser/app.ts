@@ -30,6 +30,8 @@ const mobilePanelNone = requiredElement<HTMLInputElement>("mobile-panel-none");
 const attachmentInput = requiredElement<HTMLInputElement>("attachment-input");
 const attachmentButton = requiredElement<HTMLButtonElement>("attachment-button");
 const attachmentList = element("attachment-list");
+attachmentInput.classList.remove("hidden");
+attachmentInput.classList.add("file-picker-input");
 const model = requiredElement<HTMLSelectElement>("model");
 const agentModel = requiredElement<HTMLSelectElement>("agent-model");
 const thinking = requiredElement<HTMLSelectElement>("thinking");
@@ -85,6 +87,7 @@ const { record: previewRecord, send: previewSendRecording, status: previewRecord
 const browserWorkflowList = createBrowserWorkflowReviewPanel();
 const browserProfileList = createBrowserProfilePanel();
 const agentBrowserWorkflowGrants = createAgentBrowserWorkflowGrants();
+installAgentBuilderToolsLayout(agentBrowserWorkflowGrants);
 const modelPicker = installThemedSelect(model);
 const agentModelPicker = installThemedSelect(agentModel);
 const externalModelPicker = installThemedSelect(externalModel);
@@ -665,6 +668,90 @@ function createAgentBrowserWorkflowGrants(): HTMLElement {
 	return list;
 }
 
+function installAgentBuilderToolsLayout(browserWorkflowGrants: HTMLElement): void {
+	const panel = element("builder-tools-panel");
+	const capabilityList = element("capability-list");
+	const pluginSection = pluginForm.closest("details");
+	const browserWorkflowSection = browserWorkflowGrants.closest("details");
+	if (!pluginSection || !browserWorkflowSection) throw new Error("Agent Builder tool sections are incomplete");
+	const stack = document.createElement("div");
+	stack.className = "builder-settings-stack";
+	stack.append(
+		builderSettingsGroup(
+			"Runtime",
+			"Choose the model and reasoning depth.",
+			[fieldLabel("agent-model"), fieldLabel("agent-thinking")],
+			true,
+		),
+		builderSettingsGroup(
+			"Execution",
+			"Control isolation and file access.",
+			[fieldLabel("agent-executor"), fieldLabel("agent-permissions")],
+			false,
+		),
+		builderSettingsGroup(
+			"Browser",
+			"Configure web access, profiles, and recorded workflows.",
+			[
+				fieldLabel("agent-browser-access"),
+				fieldLabel("agent-browser-runtime"),
+				fieldLabel("agent-browser-profile-kind"),
+				fieldLabel("agent-browser-profile-id"),
+				browserWorkflowSection,
+			],
+			false,
+		),
+		builderSettingsGroup(
+			"Capabilities",
+			"Grant only the tools this agent needs.",
+			[capabilityList],
+			true,
+			"agent-capability-summary",
+		),
+		builderSettingsGroup("Plugins", "Install and manage optional capability packages.", [pluginSection], false),
+	);
+	panel.prepend(stack);
+}
+
+function builderSettingsGroup(
+	title: string,
+	description: string,
+	contents: HTMLElement[],
+	open: boolean,
+	statusId?: string,
+): HTMLDetailsElement {
+	const details = document.createElement("details");
+	details.className = "builder-settings-group";
+	details.open = open;
+	const summary = document.createElement("summary");
+	const copy = document.createElement("span");
+	copy.className = "builder-settings-summary-copy";
+	appendText(copy, title, "builder-settings-title");
+	appendText(copy, description, "builder-settings-description");
+	summary.append(copy);
+	if (statusId) {
+		const status = document.createElement("span");
+		status.id = statusId;
+		status.className = "builder-settings-status";
+		status.textContent = "0 selected";
+		summary.append(status);
+	}
+	const body = document.createElement("div");
+	body.className = "builder-settings-body";
+	const grid = document.createElement("div");
+	grid.className = "builder-settings-grid";
+	grid.append(...contents);
+	body.append(grid);
+	details.append(summary, body);
+	return details;
+}
+
+function fieldLabel(id: string): HTMLLabelElement {
+	const label = requiredElement<HTMLElement>(id).closest("label");
+	if (!(label instanceof HTMLLabelElement)) throw new Error(`Agent Builder field ${id} is missing its label`);
+	return label;
+}
+
 function createBrowserProfilePanel(): HTMLElement {
 	const browserPanel = element("browser");
 	const details = document.createElement("details");
@@ -1184,17 +1271,37 @@ function renderSessionStats(snapshot: SessionSnapshot): void {
 			latestAssistantUsage = item.usage;
 		}
 	}
-	const parts: string[] = [];
-	if (totals.input) parts.push(`↑${formatTokens(totals.input)}`);
-	if (totals.output) parts.push(`↓${formatTokens(totals.output)}`);
-	if (totals.cacheRead) parts.push(`R${formatTokens(totals.cacheRead)}`);
-	if (totals.cacheWrite) parts.push(`W${formatTokens(totals.cacheWrite)}`);
+	const totalsLabel = document.createElement("span");
+	totalsLabel.className = "session-stat-totals";
+	const appendStat = (symbol: string, value: string, title: string, className?: string): void => {
+		const stat = document.createElement("span");
+		stat.className = `session-stat${className ? ` ${className}` : ""}`;
+		stat.title = title;
+		const prefix = document.createElement("span");
+		prefix.className = "session-stat-symbol";
+		prefix.textContent = symbol;
+		stat.append(prefix, document.createTextNode(value));
+		totalsLabel.append(stat);
+	};
+	if (totals.input) appendStat("↑", formatTokens(totals.input), "Input tokens", "session-stat-input");
+	if (totals.output) appendStat("↓", formatTokens(totals.output), "Output tokens", "session-stat-output");
+	if (totals.cacheRead) appendStat("R", formatTokens(totals.cacheRead), "Cache-read tokens");
+	if (totals.cacheWrite) appendStat("W", formatTokens(totals.cacheWrite), "Cache-write tokens");
 	if (latestAssistantUsage && (totals.cacheRead > 0 || totals.cacheWrite > 0)) {
 		const promptTokens =
 			latestAssistantUsage.input + latestAssistantUsage.cacheRead + latestAssistantUsage.cacheWrite;
-		if (promptTokens > 0) parts.push(`CH${((latestAssistantUsage.cacheRead / promptTokens) * 100).toFixed(1)}%`);
+		if (promptTokens > 0) {
+			appendStat(
+				"CH",
+				`${((latestAssistantUsage.cacheRead / promptTokens) * 100).toFixed(1)}%`,
+				"Latest request cache-hit rate",
+			);
+		}
 	}
-	if (totals.cost) parts.push(`$${totals.cost.toFixed(3)}`);
+	if (totals.cost)
+		appendStat("$", totals.cost.toFixed(3), "Estimated session cost in US dollars", "session-stat-cost");
+	const children: HTMLElement[] = [];
+	if (totalsLabel.childElementCount > 0) children.push(totalsLabel);
 	const currentModel = availableModels.find(
 		(entry) => entry.provider === snapshot.model.provider && entry.id === snapshot.model.id,
 	);
@@ -1206,12 +1313,23 @@ function renderSessionStats(snapshot: SessionSnapshot): void {
 					latestAssistantUsage.cacheRead +
 					latestAssistantUsage.cacheWrite
 			: 0;
-		parts.push(
-			`${((contextTokens / currentModel.contextWindow) * 100).toFixed(1)}%/${formatTokens(currentModel.contextWindow)} (auto)`,
-		);
+		const contextPercent = Math.min(100, (contextTokens / currentModel.contextWindow) * 100);
+		const remainingTokens = Math.max(0, currentModel.contextWindow - contextTokens);
+		const contextMeter = document.createElement("span");
+		contextMeter.className = "context-meter";
+		contextMeter.style.setProperty("--context-used", `${contextPercent}%`);
+		contextMeter.dataset.level = contextPercent >= 90 ? "critical" : contextPercent >= 70 ? "warning" : "normal";
+		contextMeter.title = `${formatTokens(remainingTokens)} tokens remaining · ${formatTokens(contextTokens)} used · ${contextPercent.toFixed(1)}% of ${formatTokens(currentModel.contextWindow)} · automatic compaction`;
+		contextMeter.setAttribute("role", "progressbar");
+		contextMeter.setAttribute("aria-label", contextMeter.title);
+		contextMeter.setAttribute("aria-valuemin", "0");
+		contextMeter.setAttribute("aria-valuemax", currentModel.contextWindow.toString());
+		contextMeter.setAttribute("aria-valuenow", Math.min(contextTokens, currentModel.contextWindow).toString());
+		contextMeter.tabIndex = 0;
+		children.push(contextMeter);
 	}
-	sessionStats.textContent = parts.join(" ");
-	sessionStats.title = "Input · output · cache read · cache write · cache hit · cost · context";
+	sessionStats.replaceChildren(...children);
+	sessionStats.title = "";
 }
 
 function formatTokens(count: number): string {
@@ -1264,7 +1382,6 @@ function renderThinkingActivity(
 	details.dataset.thinkingId = thinkingId;
 	if (item.status === "streaming") {
 		streamingThinking.add(thinkingId);
-		expandedThinking.set(thinkingId, true);
 	}
 	details.open = expandedThinking.get(thinkingId) ?? false;
 	details.addEventListener("toggle", () => expandedThinking.set(thinkingId, details.open));
@@ -1302,7 +1419,7 @@ function renderToolActivity(item: Extract<TranscriptItem, { role: "tool" }>): HT
 	if (item.toolName === "subagent") return renderSubagentCard(item);
 	const details = document.createElement("details");
 	details.className = "tool-activity";
-	details.open = expandedToolActivity.get(item.toolCallId) ?? item.status !== "complete";
+	details.open = expandedToolActivity.get(item.toolCallId) ?? false;
 	details.addEventListener("toggle", () => expandedToolActivity.set(item.toolCallId, details.open));
 
 	const summary = document.createElement("summary");
@@ -2820,11 +2937,11 @@ async function loadCapabilities(): Promise<void> {
 	capabilitySnapshot = payload.broker;
 	const query = ensureCapabilitySearch().value.trim().toLowerCase();
 	const groups: Array<["local" | "remote", string, CapabilityEntry[], boolean]> = [
-		["local", "Tools", payload.tools, true],
+		["local", "Tools", payload.tools, false],
 		["local", "Skills", payload.skills, false],
-		["local", "Plugins", payload.plugins, true],
+		["local", "Plugins", payload.plugins, false],
 		["local", "Extensions", payload.extensions, false],
-		["remote", "MCP servers", payload.mcpServers, true],
+		["remote", "MCP servers", payload.mcpServers, false],
 		["remote", "ACP connectors", payload.acpConnections, false],
 		["remote", "Model providers", payload.modelProviders, false],
 	];
@@ -2904,6 +3021,7 @@ async function loadCapabilities(): Promise<void> {
 			return section;
 		}),
 	);
+	updateBuilderCapabilitySummary();
 }
 
 async function loadCapabilityConnections(): Promise<void> {
@@ -3219,9 +3337,11 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 	capabilityHeading.innerHTML = `<strong>Agent capabilities</strong><span class="capability-count">${capabilities.length}</span>`;
 	capabilitySection.append(capabilityHeading);
 	for (const capability of capabilities) {
-		const card = document.createElement("div");
+		const card = document.createElement("details");
 		card.className = "card capability-card";
+		const summary = document.createElement("summary");
 		const grant = document.createElement("label");
+		grant.className = "capability-grant";
 		const checkbox = document.createElement("input");
 		checkbox.type = "checkbox";
 		checkbox.checked = grants.some((entry) => entry.capabilityId === capability.id);
@@ -3242,13 +3362,19 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 					? "Configure an active provider account with this grant"
 					: "Grant capability";
 		checkbox.addEventListener("change", () => updateAgentCapabilityGrant(capability, checkbox.checked));
+		checkbox.addEventListener("click", (event) => event.stopPropagation());
 		const label = document.createElement("span");
 		label.textContent = capability.name;
 		grant.append(checkbox, label);
-		card.append(grant);
-		appendText(card, capability.description, "muted");
+		const state = document.createElement("span");
+		state.className = "capability-status";
+		state.textContent = capability.status;
+		summary.append(grant, state);
+		const body = document.createElement("div");
+		body.className = "capability-body";
+		appendText(body, capability.description, "muted");
 		appendText(
-			card,
+			body,
 			`${capability.category} · ${capability.effect} · ${capability.defaultProviderId ?? "no default provider"}`,
 			"capability-meta",
 		);
@@ -3271,8 +3397,9 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 				() => void changeDefaultCapabilityProvider(capability.id, providerSelect.value),
 			);
 			providerLabel.append(providerSelect);
-			card.append(providerLabel);
+			body.append(providerLabel);
 		}
+		card.append(summary, body);
 		capabilitySection.append(card);
 	}
 
@@ -3376,6 +3503,7 @@ function updateAgentCapabilityGrant(capability: BrokeredCapability, enabled: boo
 		});
 	}
 	requiredElement<HTMLInputElement>("agent-capabilities").value = JSON.stringify(grants);
+	updateBuilderCapabilitySummary();
 }
 
 function selectedAgentTools(): Set<string> {
@@ -3392,6 +3520,14 @@ function updateAgentToolGrant(tool: string, enabled: boolean): void {
 	if (enabled) tools.add(tool);
 	else tools.delete(tool);
 	requiredElement<HTMLInputElement>("agent-tools").value = [...tools].sort().join(",");
+	updateBuilderCapabilitySummary();
+}
+
+function updateBuilderCapabilitySummary(): void {
+	const summary = document.getElementById("agent-capability-summary");
+	if (!summary) return;
+	const count = selectedAgentCapabilities().length + selectedAgentTools().size;
+	summary.textContent = `${count} selected`;
 }
 
 interface AgentSummary {
@@ -4043,6 +4179,7 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 	requiredElement<HTMLTextAreaElement>("agent-persona").value = agent?.persona ?? "";
 	requiredElement<HTMLInputElement>("agent-tools").value = agent?.tools.join(",") ?? "";
 	requiredElement<HTMLInputElement>("agent-capabilities").value = JSON.stringify(agent?.capabilities ?? []);
+	updateBuilderCapabilitySummary();
 	requiredElement<HTMLSelectElement>("agent-memory").value = agent?.memory ?? "none";
 	requiredElement<HTMLSelectElement>("agent-executor").value = agent?.executor ?? "harness";
 	requiredElement<HTMLSelectElement>("agent-permissions").value = agent?.permissionPolicy ?? "read-only";
@@ -5198,7 +5335,13 @@ input.addEventListener("input", () => {
 	history.index = history.entries.length;
 	history.draft = input.value;
 });
-attachmentButton.addEventListener("click", () => attachmentInput.click());
+attachmentButton.addEventListener("click", () => {
+	try {
+		attachmentInput.showPicker();
+	} catch {
+		attachmentInput.click();
+	}
+});
 attachmentInput.addEventListener("change", () => {
 	const files = [...(attachmentInput.files ?? [])];
 	attachmentInput.value = "";

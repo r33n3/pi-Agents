@@ -83,6 +83,40 @@ describe("CapabilityBroker", () => {
 		expect(audit).toContain('"action":"provider.enable"');
 	});
 
+	test("keeps multiple providers enabled while changing the explicit default", async () => {
+		activeTools = ["fixture_search", "alternate_search"];
+		const alternate: CapabilityProviderManifest = {
+			...manifests[0]!,
+			id: "alternate-search",
+			name: "Alternate Search",
+			source: "alternate-search@1.0.0",
+			bindings: [
+				{ capabilityId: "web.search", capabilityVersion: 1, toolName: "alternate_search", executors: ["session"] },
+			],
+		};
+		const providers = new CapabilityBroker(root, {
+			activeToolNames: () => activeTools,
+			definitions,
+			manifests: [...manifests, alternate],
+		});
+		await providers.initialize();
+		await providers.reviewProvider("fixture-search", true);
+		await providers.enableProvider("fixture-search", true);
+		await providers.reviewProvider("alternate-search", true);
+		await providers.enableProvider("alternate-search", true);
+
+		expect(providers.snapshot()).toMatchObject({
+			capabilities: [{ defaultProviderId: "fixture-search", status: "active" }],
+			providers: [
+				{ id: "fixture-search", enabled: true },
+				{ id: "alternate-search", enabled: true },
+			],
+		});
+
+		await providers.setDefaultProvider("web.search", "alternate-search", true);
+		expect(providers.snapshot().capabilities[0]).toMatchObject({ defaultProviderId: "alternate-search" });
+	});
+
 	test("requires explicit approval for provider state changes", async () => {
 		await expect(broker.reviewProvider("fixture-search", false)).rejects.toThrow("explicit approval");
 		await expect(broker.disableProvider("fixture-search", false)).rejects.toThrow("explicit approval");
@@ -180,5 +214,19 @@ describe("CapabilityBroker", () => {
 		expect(() =>
 			writes.validateUnattendedGrants([{ capabilityId: "email.send", capabilityVersion: 1 }], "session"),
 		).toThrow("interactive approval is required");
+	});
+
+	test("advertises the built-in SearXNG provider when its tool is loaded", async () => {
+		const defaults = new CapabilityBroker(root, { activeToolNames: () => ["searxng_search"] });
+		await defaults.initialize();
+		const snapshot = defaults.snapshot();
+		expect(snapshot.capabilities.find((entry) => entry.id === "web.search")).toMatchObject({
+			id: "web.search",
+			status: "available",
+		});
+		expect(snapshot.providers.find((entry) => entry.id === "pi-searxng")).toMatchObject({
+			id: "pi-searxng",
+			health: "ready",
+		});
 	});
 });

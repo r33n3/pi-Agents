@@ -39,6 +39,7 @@ import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
 import { PluginManagementService } from "./plugin-management-service.ts";
 import { RoutineRegistry } from "./routine-registry.ts";
 import { createScopedAgentTools } from "./scoped-agent-tools.ts";
+import { createSearxngTools } from "./searxng-tools.ts";
 import { ServeAttachmentStore } from "./serve-attachment-store.ts";
 import { createServePage } from "./serve-page.ts";
 import { WebSocketListener } from "./websocket-listener.ts";
@@ -192,7 +193,8 @@ export class ServeHost implements AsyncDisposable {
 			join(serveRoot, "capabilities", "everyday-data"),
 			everydayConfigurations,
 		);
-		session.registerCustomTools(everydayDataTools);
+		const brokeredTools = [...everydayDataTools, ...createSearxngTools(process.env.SEARXNG_BASE_URL)];
+		session.registerCustomTools(brokeredTools);
 		const capabilityConnections = new CapabilityConnectionRegistry(join(serveRoot, "capabilities", "connections"));
 		await capabilityConnections.initialize();
 		const capabilityApprovals = new CapabilityApprovalService(join(serveRoot, "capabilities", "approvals"));
@@ -283,7 +285,7 @@ export class ServeHost implements AsyncDisposable {
 						})
 					: [];
 			const capabilityTools = capabilityBroker.resolveToolNames(definition.capabilities, definition.executor);
-			const brokerTools = everydayDataTools.filter((tool) => capabilityTools.includes(tool.name));
+			const brokerTools = brokeredTools.filter((tool) => capabilityTools.includes(tool.name));
 			const customTools = [
 				...scopedTools,
 				...browserTools,
