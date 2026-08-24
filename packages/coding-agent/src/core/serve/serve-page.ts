@@ -6,11 +6,16 @@ import type { AgentRunManager } from "./agent-run-manager.ts";
 import type { AgentTaskService } from "./agent-task-service.ts";
 import { SERVE_BROWSER_BUNDLE } from "./browser-bundle.generated.ts";
 import type { BrowserConsoleService } from "./browser-console-service.ts";
+import type { CapabilityApprovalRequest, CapabilityApprovalService } from "./capability-approval-service.ts";
+import type { CapabilityBroker } from "./capability-broker.ts";
 import type { CapabilityCatalog } from "./capability-catalog.ts";
+import type { CapabilityConnectionInput, CapabilityConnectionRegistry } from "./capability-connection-registry.ts";
 import { matchesCapabilityToken } from "./capability-token.ts";
 import { nextCronRun } from "./cron-schedule.ts";
 import type { CurrentSessionService } from "./current-session-service.ts";
+import type { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
 import type { ExternalConnectionManager } from "./external-connection-manager.ts";
+import type { InboundRoute, InboundRoutingService } from "./inbound-routing-service.ts";
 import type { PersonaCatalog } from "./persona-catalog.ts";
 import type { PluginManagementService } from "./plugin-management-service.ts";
 import type { RoutineDefinitionInput, RoutineRegistry } from "./routine-registry.ts";
@@ -42,6 +47,11 @@ export function createServePage(
 	personaCatalog?: PersonaCatalog,
 	a2aAdapter?: A2aAdapter,
 	pluginManagement?: PluginManagementService,
+	capabilityBroker?: CapabilityBroker,
+	capabilityConnections?: CapabilityConnectionRegistry,
+	capabilityApprovals?: CapabilityApprovalService,
+	inboundRouting?: InboundRoutingService,
+	everydayConfigurations?: EverydayConfigurationRegistry,
 ): (request: IncomingMessage, response: ServerResponse) => void {
 	return (request, response) => {
 		void serveRequest(
@@ -62,12 +72,19 @@ export function createServePage(
 			personaCatalog,
 			a2aAdapter,
 			pluginManagement,
+			capabilityBroker,
+			capabilityConnections,
+			capabilityApprovals,
+			inboundRouting,
+			everydayConfigurations,
 		).catch((error: unknown) => {
 			if (response.headersSent) {
 				response.end();
 				return;
 			}
-			json(response, 500, { error: error instanceof Error ? error.message : "Internal server error" });
+			json(response, 500, {
+				error: error instanceof Error ? error.message : "Internal server error",
+			});
 		});
 	};
 }
@@ -90,8 +107,17 @@ async function serveRequest(
 	personaCatalog: PersonaCatalog | undefined,
 	a2aAdapter: A2aAdapter | undefined,
 	pluginManagement: PluginManagementService | undefined,
+	capabilityBroker: CapabilityBroker | undefined,
+	capabilityConnections: CapabilityConnectionRegistry | undefined,
+	capabilityApprovals: CapabilityApprovalService | undefined,
+	inboundRouting: InboundRoutingService | undefined,
+	everydayConfigurations: EverydayConfigurationRegistry | undefined,
 ): Promise<void> {
 	const url = new URL(request.url ?? "/", "http://localhost");
+	if (url.pathname.startsWith("/capability-webhooks/")) {
+		await serveInboundWebhook(request, response, url, inboundRouting, currentSessionService, agentTaskService);
+		return;
+	}
 	const bearer = bearerToken(request.headers.authorization);
 	if (
 		!matchesCapabilityToken(token, url.searchParams.get("token")) &&
@@ -110,6 +136,26 @@ async function serveRequest(
 	}
 	if (url.pathname === "/plugins.json" || url.pathname.startsWith("/plugins/")) {
 		await servePlugins(request, response, url, pluginManagement);
+		return;
+	}
+	if (url.pathname.startsWith("/capability-providers/")) {
+		await serveCapabilityProviders(request, response, url, capabilityBroker, pluginManagement);
+		return;
+	}
+	if (url.pathname === "/capability-connections.json" || url.pathname.startsWith("/capability-connections/")) {
+		await serveCapabilityConnections(request, response, url, capabilityConnections, agentRoutineScheduler);
+		return;
+	}
+	if (url.pathname === "/capability-approvals.json") {
+		await serveCapabilityApprovals(request, response, capabilityApprovals);
+		return;
+	}
+	if (url.pathname === "/capability-inbound-routes.json" || url.pathname.startsWith("/capability-inbound-routes/")) {
+		await serveInboundRoutes(request, response, url, inboundRouting);
+		return;
+	}
+	if (url.pathname === "/everyday-configurations.json" || url.pathname.startsWith("/everyday-configurations/")) {
+		await serveEverydayConfigurations(request, response, url, everydayConfigurations);
 		return;
 	}
 	if (url.pathname === "/personas.json" || url.pathname.startsWith("/personas/")) {
@@ -145,7 +191,9 @@ async function serveRequest(
 	if (url.pathname === "/external-connections.json") {
 		if (!externalConnectionManager) json(response, 503, { error: "External connections are unavailable" });
 		else if (request.method === "GET") {
-			json(response, 200, { connections: externalConnectionManager.listConnections() });
+			json(response, 200, {
+				connections: externalConnectionManager.listConnections(),
+			});
 		} else response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET" }).end();
 		return;
 	}
@@ -192,7 +240,10 @@ async function serveRequest(
 	}
 	if (url.pathname === "/browser-client.js") {
 		response
-			.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/javascript; charset=utf-8" })
+			.writeHead(200, {
+				...SECURITY_HEADERS,
+				"content-type": "text/javascript; charset=utf-8",
+			})
 			.end(SERVE_BROWSER_BUNDLE);
 		return;
 	}
@@ -201,7 +252,10 @@ async function serveRequest(
 		return;
 	}
 	response
-		.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/html; charset=utf-8" })
+		.writeHead(200, {
+			...SECURITY_HEADERS,
+			"content-type": "text/html; charset=utf-8",
+		})
 		.end(renderPage(encodeURIComponent(token)));
 }
 
@@ -215,7 +269,11 @@ function serveAgentEvents(
 		response.writeHead(registry && tasks ? 405 : 503, SECURITY_HEADERS).end();
 		return;
 	}
-	response.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/event-stream", connection: "keep-alive" });
+	response.writeHead(200, {
+		...SECURITY_HEADERS,
+		"content-type": "text/event-stream",
+		connection: "keep-alive",
+	});
 	response.write(": connected\n\n");
 	const send = (event: unknown) => response.write(`data: ${JSON.stringify(event)}\n\n`);
 	const unsubscribeRegistry = registry.subscribe(send);
@@ -227,6 +285,316 @@ function serveAgentEvents(
 		unsubscribeRegistry();
 		unsubscribeTasks();
 	});
+}
+
+async function serveCapabilityProviders(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	broker: CapabilityBroker | undefined,
+	plugins: PluginManagementService | undefined,
+): Promise<void> {
+	if (!broker) {
+		json(response, 503, { error: "Capability broker is unavailable" });
+		return;
+	}
+	if (request.method !== "POST") {
+		response.writeHead(405, { ...SECURITY_HEADERS, allow: "POST" }).end();
+		return;
+	}
+	const segments = url.pathname.split("/").filter(Boolean);
+	if (segments.length !== 3) {
+		json(response, 404, { error: "Capability provider operation not found" });
+		return;
+	}
+	try {
+		const providerId = decodeURIComponent(segments[1]);
+		const operation = segments[2];
+		const body = object(await readJsonBody(request), "capability provider operation");
+		const approved = body.approved === true;
+		if (operation === "review") json(response, 200, await broker.reviewProvider(providerId, approved));
+		else if (operation === "enable") {
+			const configured = configuredProviderPlugin(broker, plugins, providerId);
+			if (configured) await plugins?.setActive(configured.source, configured.scope, true, approved);
+			try {
+				json(response, 200, await broker.enableProvider(providerId, approved));
+			} catch (error) {
+				if (configured) await plugins?.setActive(configured.source, configured.scope, false, approved);
+				throw error;
+			}
+		} else if (operation === "disable") {
+			const configured = configuredProviderPlugin(broker, plugins, providerId);
+			const result = await broker.disableProvider(providerId, approved);
+			if (configured) await plugins?.setActive(configured.source, configured.scope, false, approved);
+			json(response, 200, result);
+		} else if (operation === "default") {
+			await broker.setDefaultProvider(requiredString(body.capabilityId, "capabilityId"), providerId, approved);
+			json(response, 200, broker.snapshot());
+		} else json(response, 404, { error: "Capability provider operation not found" });
+	} catch (error) {
+		json(response, 400, {
+			error: error instanceof Error ? error.message : "Capability provider operation failed",
+		});
+	}
+}
+
+async function serveCapabilityConnections(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	registry: CapabilityConnectionRegistry | undefined,
+	scheduler: AgentRoutineScheduler | undefined,
+): Promise<void> {
+	if (!registry) {
+		json(response, 503, { error: "Capability connections are unavailable" });
+		return;
+	}
+	const suffix =
+		url.pathname === "/capability-connections.json"
+			? ""
+			: decodeURIComponent(url.pathname.slice("/capability-connections/".length));
+	try {
+		if (request.method === "GET" && suffix === "") {
+			json(response, 200, { connections: registry.snapshot() });
+			return;
+		}
+		if (request.method === "POST" && suffix === "") {
+			const saved = await registry.save((await readJsonBody(request)) as CapabilityConnectionInput);
+			json(response, 201, saved);
+			return;
+		}
+		if (request.method === "PUT" && suffix !== "") {
+			const input = (await readJsonBody(request)) as CapabilityConnectionInput;
+			if (input.id !== undefined && input.id !== suffix)
+				throw new Error("Connection id does not match the request path");
+			json(response, 200, await registry.save({ ...input, id: suffix }));
+			return;
+		}
+		if (request.method === "DELETE" && suffix !== "") {
+			if (url.searchParams.get("purge") === "true") {
+				const deleted = await registry.deleteRevoked(suffix);
+				await scheduler?.refresh();
+				json(response, deleted ? 200 : 404, deleted ? { deleted: true } : { error: "Connection not found" });
+				return;
+			}
+			const revoked = await registry.revoke(suffix);
+			await scheduler?.refresh();
+			json(response, 200, revoked);
+			return;
+		}
+		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST, PUT, DELETE" }).end();
+	} catch (error) {
+		json(response, 400, {
+			error: error instanceof Error ? error.message : "Capability connection operation failed",
+		});
+	}
+}
+
+async function serveCapabilityApprovals(
+	request: IncomingMessage,
+	response: ServerResponse,
+	approvals: CapabilityApprovalService | undefined,
+): Promise<void> {
+	if (!approvals) {
+		json(response, 503, { error: "Capability approvals are unavailable" });
+		return;
+	}
+	if (request.method === "GET") {
+		json(response, 200, { approvals: approvals.list() });
+		return;
+	}
+	if (request.method !== "POST") {
+		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+		return;
+	}
+	try {
+		const body = object(await readJsonBody(request), "capability approval request");
+		const approval: CapabilityApprovalRequest = {
+			capabilityId: requiredString(body.capabilityId, "capabilityId"),
+			providerId: requiredString(body.providerId, "providerId"),
+			connectionId: requiredString(body.connectionId, "connectionId"),
+			action: requiredString(body.action, "action"),
+			target: requiredString(body.target, "target"),
+			expiresInSeconds:
+				body.expiresInSeconds === undefined
+					? undefined
+					: positiveInteger(body.expiresInSeconds, "expiresInSeconds"),
+		};
+		json(response, 201, await approvals.issue(approval, body.approved === true));
+	} catch (error) {
+		json(response, 400, {
+			error: error instanceof Error ? error.message : "Capability approval failed",
+		});
+	}
+}
+
+async function serveInboundRoutes(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	routing: InboundRoutingService | undefined,
+): Promise<void> {
+	if (!routing) {
+		json(response, 503, { error: "Inbound routing is unavailable" });
+		return;
+	}
+	const suffix =
+		url.pathname === "/capability-inbound-routes.json"
+			? ""
+			: decodeURIComponent(url.pathname.slice("/capability-inbound-routes/".length));
+	if (request.method === "GET" && suffix === "") {
+		json(response, 200, { routes: routing.listRoutes() });
+		return;
+	}
+	if (request.method === "DELETE" && suffix !== "") {
+		const deleted = await routing.deleteRoute(suffix);
+		json(response, deleted ? 200 : 404, deleted ? { deleted: true } : { error: "Inbound route not found" });
+		return;
+	}
+	if (request.method !== "POST" || suffix !== "") {
+		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST, DELETE" }).end();
+		return;
+	}
+	try {
+		const body = object(await readJsonBody(request), "inbound route");
+		const destination = object(body.destination, "destination");
+		if (!Array.isArray(body.allowedSenders)) throw new Error("allowedSenders must be a list");
+		const route: InboundRoute = {
+			id: requiredString(body.id, "id"),
+			connectionId: requiredString(body.connectionId, "connectionId"),
+			destination: {
+				kind: oneOf(destination.kind, ["agent", "session", "coordinator"], "destination.kind"),
+				id: requiredString(destination.id, "destination.id"),
+			},
+			allowedSenders: body.allowedSenders.map((entry) => requiredString(entry, "allowed sender")),
+			maxEventsPerMinute: positiveInteger(body.maxEventsPerMinute, "maxEventsPerMinute"),
+			enabled: body.enabled === true,
+		};
+		json(response, 201, await routing.saveRoute(route));
+	} catch (error) {
+		json(response, 400, { error: error instanceof Error ? error.message : "Inbound route is invalid" });
+	}
+}
+
+async function serveEverydayConfigurations(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	registry: EverydayConfigurationRegistry | undefined,
+): Promise<void> {
+	if (!registry) {
+		json(response, 503, { error: "Everyday configurations are unavailable" });
+		return;
+	}
+	if (url.pathname === "/everyday-configurations.json" && request.method === "GET") {
+		json(response, 200, registry.snapshot());
+		return;
+	}
+	const segments = url.pathname.split("/").filter(Boolean);
+	const kind = segments[1];
+	const id = segments[2] === undefined ? undefined : decodeURIComponent(segments[2]);
+	if ((kind !== "monitors" && kind !== "watchlists") || segments.length > 3) {
+		json(response, 404, { error: "Everyday configuration operation not found" });
+		return;
+	}
+	try {
+		if (
+			(request.method === "POST" || request.method === "PUT") &&
+			(request.method === "POST") === (id !== undefined)
+		) {
+			json(response, 400, { error: "Configuration path does not match the requested operation" });
+			return;
+		}
+		if (request.method === "POST" || request.method === "PUT") {
+			const body = object(await readJsonBody(request), "everyday configuration");
+			const configurationId = id ?? requiredString(body.id, "id");
+			if (kind === "monitors") {
+				json(
+					response,
+					request.method === "POST" ? 201 : 200,
+					await registry.saveMonitor({
+						id: configurationId,
+						name: requiredString(body.name, "name"),
+						url: requiredString(body.url, "url"),
+						enabled: body.enabled === true,
+					}),
+				);
+			} else {
+				if (!Array.isArray(body.symbols)) throw new Error("symbols must be a list");
+				json(
+					response,
+					request.method === "POST" ? 201 : 200,
+					await registry.saveWatchlist({
+						id: configurationId,
+						name: requiredString(body.name, "name"),
+						symbols: body.symbols.map((symbol) => requiredString(symbol, "symbol")),
+						providerId: optionalString(body.providerId, "providerId"),
+						connectionId: optionalString(body.connectionId, "connectionId"),
+						enabled: body.enabled === true,
+					}),
+				);
+			}
+			return;
+		}
+		if (request.method === "DELETE" && id) {
+			const deleted = kind === "monitors" ? await registry.deleteMonitor(id) : await registry.deleteWatchlist(id);
+			json(response, deleted ? 200 : 404, deleted ? { deleted: true } : { error: "Configuration not found" });
+			return;
+		}
+		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST, PUT, DELETE" }).end();
+	} catch (error) {
+		json(response, 400, { error: error instanceof Error ? error.message : "Everyday configuration is invalid" });
+	}
+}
+
+async function serveInboundWebhook(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	routing: InboundRoutingService | undefined,
+	sessions: CurrentSessionService | undefined,
+	tasks: AgentTaskService | undefined,
+): Promise<void> {
+	if (request.method !== "POST" || !routing) {
+		response.writeHead(routing ? 405 : 503, SECURITY_HEADERS).end();
+		return;
+	}
+	try {
+		const routeId = decodeURIComponent(url.pathname.slice("/capability-webhooks/".length));
+		const timestamp = requiredString(request.headers["x-pi-timestamp"], "x-pi-timestamp");
+		const signature = requiredString(request.headers["x-pi-signature"], "x-pi-signature");
+		const event = await routing.accept(routeId, timestamp, signature, await readBody(request, 256 * 1024));
+		if (!event) {
+			json(response, 200, { duplicate: true });
+			return;
+		}
+		const prompt = `Inbound message from ${event.sender}:\n\n${event.text}`;
+		if (event.route.destination.kind === "session") {
+			if (!sessions) throw new Error("Pi session routing is unavailable");
+			void sessions.promptWithAttachments(event.route.destination.id, prompt, []).catch(() => {});
+		} else {
+			if (!tasks) throw new Error("Agent routing is unavailable");
+			await tasks.submit({ agentId: event.route.destination.id, prompt, source: "a2a" });
+		}
+		json(response, 202, { accepted: true, eventId: event.id });
+	} catch (error) {
+		json(response, 401, { error: error instanceof Error ? error.message : "Inbound message was rejected" });
+	}
+}
+
+function configuredProviderPlugin(
+	broker: CapabilityBroker,
+	plugins: PluginManagementService | undefined,
+	providerId: string,
+): { source: string; scope: "user" | "project" } | undefined {
+	const provider = broker.snapshot().providers.find((entry) => entry.id === providerId);
+	if (!provider || !plugins) return undefined;
+	const configured = plugins
+		.list()
+		.find((entry) => entry.source === provider.source || entry.source.startsWith(`${provider.source}@`));
+	return configured && (configured.scope === "user" || configured.scope === "project")
+		? { source: configured.source, scope: configured.scope }
+		: undefined;
 }
 
 async function servePlugins(
@@ -254,7 +622,9 @@ async function servePlugins(
 			return;
 		}
 		if (request.method === "POST" && url.pathname === "/plugins/remove") {
-			json(response, 200, { removed: await service.remove(source, scope, approved) });
+			json(response, 200, {
+				removed: await service.remove(source, scope, approved),
+			});
 			return;
 		}
 		if (request.method === "POST" && url.pathname === "/plugins/update") {
@@ -264,7 +634,9 @@ async function servePlugins(
 		}
 		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
 	} catch (error) {
-		json(response, 400, { error: error instanceof Error ? error.message : "Plugin operation failed" });
+		json(response, 400, {
+			error: error instanceof Error ? error.message : "Plugin operation failed",
+		});
 	}
 }
 
@@ -286,7 +658,13 @@ async function servePersonas(
 		const id = decodeURIComponent(url.pathname.slice("/personas/".length, -"/image".length));
 		const image = await catalog.readImage(id);
 		if (!image) response.writeHead(404, SECURITY_HEADERS).end();
-		else response.writeHead(200, { ...SECURITY_HEADERS, "content-type": image.contentType }).end(image.data);
+		else
+			response
+				.writeHead(200, {
+					...SECURITY_HEADERS,
+					"content-type": image.contentType,
+				})
+				.end(image.data);
 		return;
 	}
 	response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET" }).end();
@@ -303,7 +681,9 @@ async function serveAgentTasks(
 		return;
 	}
 	if (request.method === "GET" && url.pathname === "/agent-conversations.json") {
-		json(response, 200, { conversations: service.listConversations(url.searchParams.get("agentId") ?? undefined) });
+		json(response, 200, {
+			conversations: service.listConversations(url.searchParams.get("agentId") ?? undefined),
+		});
 		return;
 	}
 	if (
@@ -315,7 +695,9 @@ async function serveAgentTasks(
 		try {
 			json(response, 200, { messages: await service.listMessages(id) });
 		} catch (error) {
-			json(response, 404, { error: error instanceof Error ? error.message : "Conversation not found" });
+			json(response, 404, {
+				error: error instanceof Error ? error.message : "Conversation not found",
+			});
 		}
 		return;
 	}
@@ -352,7 +734,9 @@ async function serveAgentTasks(
 				}),
 			);
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Invalid agent task request" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid agent task request",
+			});
 		}
 		return;
 	}
@@ -360,7 +744,9 @@ async function serveAgentTasks(
 		try {
 			json(response, 200, await service.cancel(suffix.slice(0, -"/cancel".length)));
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Could not cancel task" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Could not cancel task",
+			});
 		}
 		return;
 	}
@@ -373,7 +759,9 @@ async function serveAgentTasks(
 				await service.continue(suffix.slice(0, -"/continue".length), requiredString(body.message, "message")),
 			);
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Could not continue task" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Could not continue task",
+			});
 		}
 		return;
 	}
@@ -395,14 +783,19 @@ async function serveWorkflows(
 			? ""
 			: decodeURIComponent(url.pathname.slice("/workflows/".length));
 	if (request.method === "GET" && suffix === "") {
-		json(response, 200, { workflows: service.listDefinitions(), runs: service.listRuns() });
+		json(response, 200, {
+			workflows: service.listDefinitions(),
+			runs: service.listRuns(),
+		});
 		return;
 	}
 	if (request.method === "POST" && suffix === "") {
 		try {
 			json(response, 201, await service.save((await readJsonBody(request)) as WorkflowDefinitionInput));
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Invalid workflow" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid workflow",
+			});
 		}
 		return;
 	}
@@ -411,7 +804,9 @@ async function serveWorkflows(
 			const input = (await readJsonBody(request)) as WorkflowDefinitionInput;
 			json(response, 200, await service.save({ ...input, id: suffix }));
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Invalid workflow" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid workflow",
+			});
 		}
 		return;
 	}
@@ -424,7 +819,9 @@ async function serveWorkflows(
 				await service.start(suffix.slice(0, -"/run".length), requiredString(body.prompt, "prompt")),
 			);
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Could not start workflow" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Could not start workflow",
+			});
 		}
 		return;
 	}
@@ -433,7 +830,9 @@ async function serveWorkflows(
 			const deleted = await service.delete(suffix);
 			json(response, deleted ? 200 : 404, deleted ? { deleted: true } : { error: "Workflow not found" });
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Could not delete workflow" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Could not delete workflow",
+			});
 		}
 		return;
 	}
@@ -509,7 +908,11 @@ async function streamA2aTask(
 	agentId: string,
 	task: A2aTask,
 ): Promise<void> {
-	response.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/event-stream", connection: "keep-alive" });
+	response.writeHead(200, {
+		...SECURITY_HEADERS,
+		"content-type": "text/event-stream",
+		connection: "keep-alive",
+	});
 	response.write(`data: ${JSON.stringify({ task })}\n\n`);
 	if (["TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"].includes(task.status.state)) {
 		response.end();
@@ -545,7 +948,11 @@ function a2aError(response: ServerResponse, error: A2aError): void {
 							: "INTERNAL",
 			message: error.message,
 			details: [
-				{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", reason: error.reason, domain: "a2a-protocol.org" },
+				{
+					"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+					reason: error.reason,
+					domain: "a2a-protocol.org",
+				},
 			],
 		},
 	});
@@ -586,7 +993,9 @@ async function serveBrowser(
 		const ownerKind = url.searchParams.get("ownerKind");
 		const ownerId = url.searchParams.get("ownerId");
 		if ((ownerKind === null) !== (ownerId === null)) {
-			json(response, 400, { error: "ownerKind and ownerId must be supplied together" });
+			json(response, 400, {
+				error: "ownerKind and ownerId must be supplied together",
+			});
 			return;
 		}
 		if (
@@ -618,9 +1027,13 @@ async function serveBrowser(
 		}
 		try {
 			const id = decodeURIComponent(url.pathname.slice("/browser/profiles/".length));
-			json(response, (await browserConsole.clearProfile(id)) ? 200 : 404, { cleared: true });
+			json(response, (await browserConsole.clearProfile(id)) ? 200 : 404, {
+				cleared: true,
+			});
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Could not clear browser profile" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Could not clear browser profile",
+			});
 		}
 		return;
 	}
@@ -637,7 +1050,9 @@ async function serveBrowser(
 			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET" }).end();
 			return;
 		}
-		json(response, 200, { runs: browserConsole.listWorkflowRuns(url.searchParams.get("workflowId") ?? undefined) });
+		json(response, 200, {
+			runs: browserConsole.listWorkflowRuns(url.searchParams.get("workflowId") ?? undefined),
+		});
 		return;
 	}
 	if (url.pathname.startsWith("/browser/workflow-runs/")) {
@@ -744,7 +1159,9 @@ async function serveBrowser(
 			}
 			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Browser workflow request failed" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Browser workflow request failed",
+			});
 		}
 		return;
 	}
@@ -755,7 +1172,9 @@ async function serveBrowser(
 			const body = object(await readJsonBody(request), "browser navigation request");
 			json(response, 200, await browserConsole.navigate(id, requiredString(body.url, "url")));
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Could not navigate browser session" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Could not navigate browser session",
+			});
 		}
 		return;
 	}
@@ -766,7 +1185,9 @@ async function serveBrowser(
 			const controlOwner = oneOf(body.controlOwner, ["agent", "user"], "controlOwner");
 			json(response, 200, browserConsole.setControl(id, controlOwner));
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Could not change browser control" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Could not change browser control",
+			});
 		}
 		return;
 	}
@@ -785,7 +1206,9 @@ async function serveBrowser(
 						: await browserConsole.reload(id);
 			json(response, 200, snapshot);
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : `Could not ${action} browser session` });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : `Could not ${action} browser session`,
+			});
 		}
 		return;
 	}
@@ -803,7 +1226,9 @@ async function serveBrowser(
 			}
 			json(response, 202, { accepted: true });
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Could not send browser input" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Could not send browser input",
+			});
 		}
 		return;
 	}
@@ -825,7 +1250,9 @@ async function serveBrowser(
 			}
 			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST, DELETE" }).end();
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Could not update browser capture" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Could not update browser capture",
+			});
 		}
 		return;
 	}
@@ -858,7 +1285,9 @@ async function serveBrowser(
 			.writeHead(200, { ...SECURITY_HEADERS, "content-type": "image/png" })
 			.end(await browserConsole.screenshot(id));
 	} catch (error) {
-		json(response, 409, { error: error instanceof Error ? error.message : "Could not capture browser screenshot" });
+		json(response, 409, {
+			error: error instanceof Error ? error.message : "Could not capture browser screenshot",
+		});
 	}
 }
 
@@ -885,7 +1314,9 @@ async function serveAttachments(
 			});
 			json(response, 201, publicAttachment(attachment));
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Invalid attachment" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid attachment",
+			});
 		}
 		return;
 	}
@@ -909,7 +1340,9 @@ async function serveAttachments(
 			const body = object(await readJsonBody(request), "attachment request");
 			json(response, 200, publicAttachment(await store.rename(id, requiredString(body.name, "name"))));
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Could not rename attachment" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Could not rename attachment",
+			});
 		}
 		return;
 	}
@@ -954,7 +1387,9 @@ async function serveSessionPrompt(
 			.finally(() => Promise.all(attachments.map((attachment) => store.delete(attachment.id))));
 		json(response, 202, { accepted: true });
 	} catch (error) {
-		json(response, 400, { error: error instanceof Error ? error.message : "Invalid session prompt" });
+		json(response, 400, {
+			error: error instanceof Error ? error.message : "Invalid session prompt",
+		});
 	}
 }
 
@@ -1004,7 +1439,9 @@ async function serveRoutines(
 			}
 			json(response, 200, { next });
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Invalid cron schedule" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid cron schedule",
+			});
 		}
 		return;
 	}
@@ -1014,7 +1451,9 @@ async function serveRoutines(
 			await scheduler.refresh();
 			json(response, 201, saved);
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Invalid routine definition" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid routine definition",
+			});
 		}
 		return;
 	}
@@ -1027,7 +1466,9 @@ async function serveRoutines(
 			await scheduler.refresh();
 			json(response, 200, saved);
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Invalid routine definition" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid routine definition",
+			});
 		}
 		return;
 	}
@@ -1041,7 +1482,9 @@ async function serveRoutines(
 		try {
 			json(response, 202, await scheduler.runNow(suffix.slice(0, -"/run".length)));
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Could not start routine" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Could not start routine",
+			});
 		}
 		return;
 	}
@@ -1069,7 +1512,13 @@ async function serveExternalRuns(
 	if (request.method === "GET" && suffix.endsWith("/result")) {
 		const result = await manager.readResult(suffix.slice(0, -"/result".length));
 		if (result === undefined) response.writeHead(404, SECURITY_HEADERS).end();
-		else response.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/markdown; charset=utf-8" }).end(result);
+		else
+			response
+				.writeHead(200, {
+					...SECURITY_HEADERS,
+					"content-type": "text/markdown; charset=utf-8",
+				})
+				.end(result);
 		return;
 	}
 	if (request.method === "GET" && suffix !== "") {
@@ -1097,7 +1546,9 @@ async function serveExternalRuns(
 				}),
 			);
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Invalid external run request" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid external run request",
+			});
 		}
 		return;
 	}
@@ -1105,7 +1556,9 @@ async function serveExternalRuns(
 		try {
 			json(response, 200, await manager.abort(suffix.slice(0, -"/abort".length)));
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Could not abort external run" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Could not abort external run",
+			});
 		}
 		return;
 	}
@@ -1133,7 +1586,13 @@ async function serveRuns(
 	if (request.method === "GET" && suffix.endsWith("/result")) {
 		const result = await runManager.readResult(suffix.slice(0, -"/result".length));
 		if (result === undefined) response.writeHead(404, SECURITY_HEADERS).end();
-		else response.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/markdown; charset=utf-8" }).end(result);
+		else
+			response
+				.writeHead(200, {
+					...SECURITY_HEADERS,
+					"content-type": "text/markdown; charset=utf-8",
+				})
+				.end(result);
 		return;
 	}
 	if (request.method === "GET" && suffix !== "") {
@@ -1150,7 +1609,9 @@ async function serveRuns(
 				await runManager.start(requiredString(body.agentId, "agentId"), requiredString(body.prompt, "prompt")),
 			);
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Invalid run request" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid run request",
+			});
 		}
 		return;
 	}
@@ -1158,7 +1619,9 @@ async function serveRuns(
 		try {
 			json(response, 200, await runManager.abort(suffix.slice(0, -"/abort".length)));
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Could not abort run" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Could not abort run",
+			});
 		}
 		return;
 	}
@@ -1202,7 +1665,9 @@ async function serveAgents(
 			const saved = await agentRegistry.save({ ...input, id: id ?? input.id });
 			json(response, request.method === "POST" ? 201 : 200, saved);
 		} catch (error) {
-			json(response, 400, { error: error instanceof Error ? error.message : "Invalid agent definition" });
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid agent definition",
+			});
 		}
 		return;
 	}
@@ -1211,14 +1676,25 @@ async function serveAgents(
 			const deleted = await agentRegistry.delete(id);
 			json(response, deleted ? 200 : 404, deleted ? { deleted: true } : { error: "Agent not found" });
 		} catch (error) {
-			json(response, 409, { error: error instanceof Error ? error.message : "Could not delete agent" });
+			json(response, 409, {
+				error: error instanceof Error ? error.message : "Could not delete agent",
+			});
 		}
 		return;
 	}
-	response.writeHead(405, { ...SECURITY_HEADERS, allow: id ? "GET, PUT" : "GET, POST" }).end();
+	response
+		.writeHead(405, {
+			...SECURITY_HEADERS,
+			allow: id ? "GET, PUT" : "GET, POST",
+		})
+		.end();
 }
 
 async function readJsonBody(request: IncomingMessage, maximumBytes = 64 * 1024): Promise<unknown> {
+	return JSON.parse((await readBody(request, maximumBytes)).toString("utf8"));
+}
+
+async function readBody(request: IncomingMessage, maximumBytes: number): Promise<Buffer> {
 	let length = 0;
 	const chunks: Buffer[] = [];
 	for await (const chunk of request) {
@@ -1228,12 +1704,15 @@ async function readJsonBody(request: IncomingMessage, maximumBytes = 64 * 1024):
 		chunks.push(buffer);
 	}
 	if (length === 0) throw new Error("Request body is required");
-	return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+	return Buffer.concat(chunks);
 }
 
 function json(response: ServerResponse, status: number, value: unknown): void {
 	response
-		.writeHead(status, { ...SECURITY_HEADERS, "content-type": "application/json; charset=utf-8" })
+		.writeHead(status, {
+			...SECURITY_HEADERS,
+			"content-type": "application/json; charset=utf-8",
+		})
 		.end(`${JSON.stringify(value)}\n`);
 }
 
@@ -1312,6 +1791,7 @@ function renderPage(token: string): string {
 .mobile-panel-state{position:fixed;opacity:0;pointer-events:none}.mobile-panel-toggle,.mobile-panel-close,.mobile-panel-scrim{display:none}@media(max-width:1024px),(max-width:1366px) and (hover:none) and (pointer:coarse){body{display:block}main{height:100dvh}.resizer{display:none!important}.rail,.details{display:flex!important;position:fixed;z-index:50;top:0;bottom:0;width:min(88vw,360px);height:100dvh;box-shadow:0 0 48px rgba(0,0,0,.62);transition:transform .2s ease,visibility .2s;visibility:hidden}.rail{left:0;transform:translateX(-105%)}.details{right:0;transform:translateX(105%)}#mobile-panel-left:checked~.rail,#mobile-panel-right:checked~.details{transform:translateX(0);visibility:visible}.mobile-panel-scrim{position:fixed;z-index:40;inset:0;background:rgba(0,0,0,.58);backdrop-filter:blur(2px)}#mobile-panel-left:checked~.mobile-panel-scrim,#mobile-panel-right:checked~.mobile-panel-scrim{display:block}.mobile-panel-toggle,.mobile-panel-close{align-items:center;justify-content:center;width:44px;height:44px;border:1px solid var(--line);border-radius:10px;color:var(--text);background:var(--surface);cursor:pointer}.mobile-panel-toggle{display:flex;flex:0 0 44px}.mobile-panel-toggle svg,.mobile-panel-close svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.mobile-panel-close{position:fixed;z-index:60;top:8px}.mobile-panel-close-left{left:min(calc(88vw - 52px),308px)}.mobile-panel-close-right{right:8px}#mobile-panel-left:checked~.mobile-panel-close-left,#mobile-panel-right:checked~.mobile-panel-close-right{display:flex}.rail>.section-title{padding-right:48px;margin-top:12px}.details>.tabs{padding-right:48px}.header{padding:7px 10px;min-height:59px}.session-tabs{flex:1}#session-path{margin-left:0;max-width:28%}}@media(max-width:620px){#session-path{display:none}.session-tab{max-width:140px}.rail,.details{width:min(92vw,360px)}.mobile-panel-close-left{left:min(calc(92vw - 52px),308px)}}
 body.browser-popout{display:block}body.browser-popout>.mobile-panel-state,body.browser-popout>.mobile-panel-scrim,body.browser-popout>.mobile-panel-close,body.browser-popout .mobile-panel-toggle{display:none!important}body.browser-popout>.rail,body.browser-popout>.resizer,body.browser-popout>main{display:none}body.browser-popout>.details{position:fixed;inset:0;display:flex!important;width:auto;height:100dvh;padding:0;background:var(--bg);transform:none;visibility:visible}body.browser-popout>.details>.tabs{display:none}body.browser-popout>.details>[data-panel]{display:none}body.browser-popout>.details>#browser{display:block!important;flex:1;overflow:auto}body.browser-popout .preview-card{min-height:100%;margin:0;padding:12px;border:0;border-radius:0}body.browser-popout .preview-frame{min-height:calc(100vh - 275px)}body.browser-popout .preview-frame img{max-height:calc(100vh - 275px)}
 .agent-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.agent-entry-card{position:relative;min-width:0}.agent-grid .agent-entry{display:grid;width:100%;min-height:112px;place-items:center;margin:0;text-align:center}.agent-grid .agent-icon{width:52px;height:52px}.agent-menu{position:absolute;z-index:3;top:5px;right:5px}.agent-menu>summary{display:grid;width:28px;height:28px;place-items:center;border-radius:50%;color:var(--muted);cursor:pointer;list-style:none}.agent-menu>summary::-webkit-details-marker{display:none}.agent-menu[open]>summary{background:var(--surface2);color:var(--text)}.agent-menu>div{position:absolute;top:30px;right:0;display:grid;width:108px;padding:5px;border:1px solid var(--line);border-radius:8px;background:#151519;box-shadow:0 12px 30px #000}.agent-menu button{border:0;border-radius:5px;background:transparent;color:var(--text);padding:7px;text-align:left}.agent-menu button:hover{background:var(--surface2)}.agent-menu button.danger{color:var(--danger)}.agent-menu button:disabled{opacity:.4}.agent-workspace-actions{display:flex;justify-content:flex-end}.agent-workspace-actions button{width:32px;height:32px;border:1px solid var(--line);border-radius:50%;background:var(--surface2);color:var(--text)}.agent-chat-card{display:grid;gap:8px}.agent-chat{display:grid;gap:8px;max-height:360px;overflow:auto}.agent-chat-message{padding:9px 11px;border-radius:10px;background:#151519;white-space:pre-wrap}.agent-chat-message.user{margin-left:16%;background:#202d3d}.agent-chat-message.agent{margin-right:10%}#selected-agent-chat-form{display:flex;gap:6px}#selected-agent-prompt{min-width:0;flex:1;resize:vertical;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:9px}#selected-agent-send{width:36px;height:36px;align-self:end;border:0;border-radius:50%;background:var(--text);color:var(--bg)}.builder-panel>label,.workflow-editor label,#routine-editor label{display:grid;gap:5px;margin:9px 0;color:var(--muted);font-size:11px}.builder-panel>label input,.builder-panel>label textarea,.builder-panel>label select,#plugin-form input,#plugin-form select,.workflow-editor input,.workflow-editor textarea,.workflow-editor select,#routine-editor input,#routine-editor textarea,#routine-editor select{width:100%;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}.workflow-editor textarea{min-height:88px;font-family:ui-monospace,monospace}.persona-preview{display:block;width:84px;height:84px;margin:8px auto;border-radius:12px;object-fit:cover}#agent-form{display:flex;justify-content:flex-end;margin-top:10px}#agent-form button,#plugin-form button{border:0;border-radius:8px;background:var(--pi);color:#07101b;padding:9px 13px;font-weight:700}#plugin-form{display:grid;gap:8px;padding:10px}#plugin-form label{display:grid;gap:5px;color:var(--muted);font-size:11px}
+.agent-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.agent-entry-card{position:relative;min-width:0}.agent-grid .agent-entry{display:grid;width:100%;min-height:112px;place-items:center;margin:0;text-align:center}.agent-grid .agent-icon{width:52px;height:52px}.agent-menu{position:absolute;z-index:3;top:5px;right:5px}.agent-menu>summary{display:grid;width:28px;height:28px;place-items:center;border-radius:50%;color:var(--muted);cursor:pointer;list-style:none}.agent-menu>summary::-webkit-details-marker{display:none}.agent-menu[open]>summary{background:var(--surface2);color:var(--text)}.agent-menu>div{position:absolute;top:30px;right:0;display:grid;width:108px;padding:5px;border:1px solid var(--line);border-radius:8px;background:#151519;box-shadow:0 12px 30px #000}.agent-menu button{border:0;border-radius:5px;background:transparent;color:var(--text);padding:7px;text-align:left}.agent-menu button:hover{background:var(--surface2)}.agent-menu button.danger{color:var(--danger)}.agent-menu button:disabled{opacity:.4}.agent-workspace-actions{display:flex;justify-content:flex-end}.agent-workspace-actions button{width:32px;height:32px;border:1px solid var(--line);border-radius:50%;background:var(--surface2);color:var(--text)}.agent-chat-card{display:grid;gap:8px}.agent-chat{display:grid;gap:8px;max-height:360px;overflow:auto}.agent-chat-message{padding:9px 11px;border-radius:10px;background:#151519;white-space:pre-wrap}.agent-chat-message.user{margin-left:16%;background:#202d3d}.agent-chat-message.agent{margin-right:10%}#selected-agent-chat-form{display:flex;gap:6px}#selected-agent-prompt{min-width:0;flex:1;resize:vertical;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:9px}#selected-agent-send{width:36px;height:36px;align-self:end;border:0;border-radius:50%;background:var(--text);color:var(--bg)}.builder-panel>label,.workflow-editor label,#routine-editor label{display:grid;gap:5px;margin:9px 0;color:var(--muted);font-size:11px}.builder-panel>label input,.builder-panel>label textarea,.builder-panel>label select,#plugin-form input,#plugin-form select,.configuration-form input,.configuration-form select,.workflow-editor input,.workflow-editor textarea,.workflow-editor select,#routine-editor input,#routine-editor textarea,#routine-editor select{width:100%;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}.workflow-editor textarea{min-height:88px;font-family:ui-monospace,monospace}.persona-preview{display:block;width:84px;height:84px;margin:8px auto;border-radius:12px;object-fit:cover}#agent-form{display:flex;justify-content:flex-end;margin-top:10px}#agent-form button,#plugin-form button,.configuration-form button{border:0;border-radius:8px;background:var(--pi);color:#07101b;padding:9px 13px;font-weight:700}#plugin-form,.configuration-form{display:grid;gap:8px;padding:10px}#plugin-form label,.configuration-form label{display:grid;gap:5px;color:var(--muted);font-size:11px}.capability-connection-summary{display:flex;align-items:center;justify-content:space-between;gap:8px}.capability-connection-card .danger{border:1px solid var(--danger);background:transparent;color:var(--danger)}
 .browser-profiles>summary{cursor:pointer}.browser-profile-row{display:flex;align-items:center;justify-content:space-between;padding:7px 2px;border-top:1px solid var(--line)}.browser-profile-row button{width:28px;height:28px;border:1px solid var(--line);border-radius:50%;background:transparent;color:var(--muted)}
 .builder-tabs{overflow-x:auto;scrollbar-width:none}.builder-tabs::-webkit-scrollbar{display:none}.builder-tabs button{flex:0 0 auto;min-width:max-content;padding-inline:9px;font-size:10px;white-space:nowrap}.builder-panel{max-width:100%;overflow-x:hidden}#agent-builder>.card{max-width:100%;overflow:hidden}#routine-editor{min-width:0}.routine-actions{min-width:0;flex-wrap:wrap}.routine-actions button{min-width:calc(50% - 4px)}
 .session-tab-wrap{display:flex;align-items:center;min-width:0;border:1px solid transparent;border-radius:8px}.session-tab-wrap.active{background:var(--surface);border-color:var(--line)}.session-tab-wrap .session-tab{border:0;background:transparent}.agent-session-tab,.builder-session-tab{color:var(--pi)}.session-tab-close{display:grid;width:26px;height:26px;flex:0 0 26px;place-items:center;border:0;border-radius:50%;background:transparent;color:var(--muted)}.session-tab-close:hover{background:var(--surface2);color:var(--text)}.agent-summary-card{display:grid;gap:4px}.agent-summary-card strong{margin:0}.agent-summary-card span{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-run-history>summary{cursor:pointer}.agent-history-entry{margin-top:8px;border:1px solid var(--line);border-radius:8px;background:#151519}.agent-history-entry>summary{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:7px;align-items:center;padding:9px;cursor:pointer;list-style:none}.agent-history-entry>summary::-webkit-details-marker{display:none}.agent-history-status{width:7px;height:7px;border-radius:50%;background:var(--muted)}.agent-history-entry[data-status="running"] .agent-history-status,.agent-history-entry[data-status="queued"] .agent-history-status{background:var(--pi)}.agent-history-entry[data-status="failed"] .agent-history-status{background:var(--danger)}.agent-history-prompt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-history-time{font-size:9px;color:var(--muted)}.agent-history-body{display:grid;gap:8px;padding:0 9px 9px;white-space:pre-wrap;overflow-wrap:anywhere}.agent-history-body button{justify-self:start;border:1px solid var(--danger);border-radius:6px;background:transparent;color:var(--danger);padding:5px 8px}.agent-message-content{display:grid;gap:9px;overflow-wrap:anywhere}.agent-message-content p,.agent-message-content pre,.agent-message-content ul,.agent-message-content ol{margin:0}.agent-message-content pre{overflow:auto;padding:10px;border:1px solid var(--line);border-radius:8px;background:#121216;font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre}.agent-message-content code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.agent-message-content :not(pre)>code{padding:1px 4px;border-radius:4px;background:var(--surface2)}.agent-message-content h2,.agent-message-content h3{margin:6px 0 0;font-size:1em}.agent-running{display:flex;align-items:center;gap:8px;color:var(--muted);font-style:italic}.agent-running i{width:6px;height:6px;border-radius:50%;background:var(--pi);animation:pulse 1s infinite alternate}
@@ -1322,6 +1802,6 @@ body.browser-popout{display:block}body.browser-popout>.mobile-panel-state,body.b
 <div id="left-resizer" class="resizer left-resizer" role="separator" aria-label="Resize navigation" aria-orientation="vertical" tabindex="0"></div>
 <main><header class="header"><label class="mobile-panel-toggle" for="mobile-panel-left" title="Sessions" aria-label="Open sessions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg></label><div id="session-tabs" class="session-tabs" role="tablist" aria-label="Open Pi sessions"></div><span id="session-path">Starting Pi…</span><label class="mobile-panel-toggle" for="mobile-panel-right" title="Workspace" aria-label="Open Browser, Agents, and Agent Builder"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></label></header><section id="transcript" aria-live="polite"></section><div class="chat-dock"><div class="controls"><label>Model <select id="model"></select></label><label>Thinking <select id="thinking"><option>off</option><option>minimal</option><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label><span id="phase">idle</span></div><div id="attachment-list" aria-live="polite"></div><form id="composer"><input id="attachment-input" class="hidden" type="file" multiple><button id="attachment-button" type="button" aria-label="Attach files" title="Attach files">+</button><textarea id="prompt" aria-label="Message Pi" placeholder="Message Pi…" rows="1"></textarea><button id="composer-action" type="submit" aria-label="Send message"><svg class="send-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg><span class="stop-icon" aria-hidden="true"></span></button></form><div class="composer-meta"><span id="status" aria-live="polite">Connecting…</span><span id="session-stats"></span></div></div></main>
 <div id="right-resizer" class="resizer right-resizer" role="separator" aria-label="Resize details" aria-orientation="vertical" tabindex="0"></div>
-<aside class="details"><nav class="tabs" aria-label="Agent workspace"><button class="active" data-tab="browser">Browser</button><button data-tab="agents-workspace">Agents</button><button data-tab="agent-builder">Agent Builder</button></nav><section id="browser" data-panel><div class="card preview-card"><strong>Browser</strong><form id="preview-form"><button id="preview-back" type="button" title="Back" aria-label="Back" disabled>←</button><button id="preview-forward" type="button" title="Forward" aria-label="Forward" disabled>→</button><input id="preview-address" type="url" placeholder="Open a permitted URL" aria-label="Managed browser address" disabled><button id="preview-reload" type="button" title="Reload" aria-label="Reload managed browser" disabled>↻</button></form><span id="preview-session" class="preview-session"></span><button id="preview-control" type="button" disabled>Take control</button><nav class="preview-tabs" aria-label="Active browsers"></nav><section data-preview-panel="page"><div class="preview-frame"><img id="preview-image" alt="Latest managed browser viewport"></div></section><span id="preview-status" class="preview-status"></span></div></section><section id="agents-workspace" data-panel class="hidden"><div class="agent-workspace-actions"><button id="new-agent" type="button" title="Build a new agent" aria-label="Build a new agent">+</button></div><div id="agent-list" class="agent-grid"></div><section id="selected-agent" class="hidden"><div class="card agent-summary-card"><strong id="selected-agent-title"></strong><span id="selected-agent-meta" class="muted"></span></div><details class="card agent-run-history"><summary>Run history</summary><div id="agent-task-list"></div></details></section><details class="card"><summary>Delegation connections</summary><div id="external-connection-list"></div><div id="external-delegate" class="hidden"><strong id="external-title">External connection</strong><p id="external-description" class="muted"></p><p id="external-warning" class="external-warning"></p><form id="external-run-form"><input id="external-id" type="hidden"><label id="external-prompt-label">Task<textarea id="external-prompt" required></textarea></label><label>Working directory<input id="external-cwd" required></label><label>Model<select id="external-model"></select></label><button type="submit">Delegate</button></form><div id="external-run-list"></div></div></details></section><section id="agent-builder" data-panel class="hidden"><div class="card"><strong id="builder-title">Build a new agent</strong><nav class="builder-tabs"><button class="active" type="button" data-builder-tab="builder-profile-panel">Profile</button><button type="button" data-builder-tab="builder-tools-panel">Model &amp; Tools</button><button type="button" data-builder-tab="builder-connections-panel">Connections</button><button type="button" data-builder-tab="builder-automation-panel">Automation</button></nav><section id="builder-profile-panel" class="builder-panel" data-builder-panel><input id="agent-id" form="agent-form" type="hidden"><label>Name<input id="agent-name" form="agent-form" required></label><label>Description<textarea id="agent-description" form="agent-form" required></textarea></label><label>Project folder<input id="agent-project-root" form="agent-form" required></label><label>Persona<select id="agent-persona-select" form="agent-form"><option value="">Custom</option></select></label><img id="agent-persona-image" class="persona-preview hidden" alt=""><label>Persona instructions<textarea id="agent-persona" form="agent-form" required></textarea></label></section><section id="builder-tools-panel" class="builder-panel hidden" data-builder-panel><label>Model<select id="agent-model" form="agent-form"></select></label><label>Thinking<select id="agent-thinking" form="agent-form"><option>off</option><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></label><label>Executor<select id="agent-executor" form="agent-form"><option value="harness">Isolated harness</option><option value="session">Pi session</option></select></label><label>Permissions<select id="agent-permissions" form="agent-form"><option value="read-only">Read only</option><option value="workspace-write">Workspace write</option></select></label><label>Browser access<select id="agent-browser-access" form="agent-form"><option value="disabled">Disabled</option><option value="loopback">Local development only</option><option value="public-web">Public web</option><option value="private-network">Private network</option></select></label><label>Browser engine<select id="agent-browser-runtime" form="agent-form"><option value="managed-chromium">Managed Chromium (recommended)</option><option value="installed-chrome">Installed Chrome compatibility</option></select></label><label>Browser profile<select id="agent-browser-profile-kind" form="agent-form"><option value="ephemeral">Fresh for every run</option><option value="named">Named sign-in profile</option></select></label><label id="agent-browser-profile-id-label" class="hidden">Profile name<input id="agent-browser-profile-id" form="agent-form" pattern="[a-z0-9][a-z0-9-]{0,63}" placeholder="signed-in"></label><label class="hidden">Memory<select id="agent-memory" form="agent-form"><option value="none">None</option><option value="notes">Notes</option></select></label><input id="agent-tools" form="agent-form" type="hidden"><div id="capability-list"></div><details class="capability-section"><summary><strong>Plugin management</strong></summary><form id="plugin-form"><label>Source<input id="plugin-source" placeholder="package@version" required></label><label>Scope<select id="plugin-scope"><option value="user">User</option><option value="project">Project</option></select></label><button type="submit">Install</button></form></details></section><section id="builder-connections-panel" class="builder-panel hidden" data-builder-panel><label>May delegate to agents<input id="agent-delegates" form="agent-form" placeholder="researcher, reviewer"></label><label><input id="agent-a2a" form="agent-form" type="checkbox"> Expose through authenticated A2A</label></section><section id="builder-automation-panel" class="builder-panel hidden" data-builder-panel><div id="routines"><div id="routine-list"></div></div><div id="workflows"><div id="workflow-list"></div></div></section><form id="agent-form"><button type="submit">Save and deploy</button></form></div></section></aside>
+<aside class="details"><nav class="tabs" aria-label="Agent workspace"><button class="active" data-tab="browser">Browser</button><button data-tab="agents-workspace">Agents</button><button data-tab="agent-builder">Agent Builder</button></nav><section id="browser" data-panel><div class="card preview-card"><strong>Browser</strong><form id="preview-form"><button id="preview-back" type="button" title="Back" aria-label="Back" disabled>←</button><button id="preview-forward" type="button" title="Forward" aria-label="Forward" disabled>→</button><input id="preview-address" type="url" placeholder="Open a permitted URL" aria-label="Managed browser address" disabled><button id="preview-reload" type="button" title="Reload" aria-label="Reload managed browser" disabled>↻</button></form><span id="preview-session" class="preview-session"></span><button id="preview-control" type="button" disabled>Take control</button><nav class="preview-tabs" aria-label="Active browsers"></nav><section data-preview-panel="page"><div class="preview-frame"><img id="preview-image" alt="Latest managed browser viewport"></div></section><span id="preview-status" class="preview-status"></span></div></section><section id="agents-workspace" data-panel class="hidden"><div class="agent-workspace-actions"><button id="new-agent" type="button" title="Build a new agent" aria-label="Build a new agent">+</button></div><div id="agent-list" class="agent-grid"></div><section id="selected-agent" class="hidden"><div class="card agent-summary-card"><strong id="selected-agent-title"></strong><span id="selected-agent-meta" class="muted"></span></div><details class="card agent-run-history"><summary>Run history</summary><div id="agent-task-list"></div></details></section><details class="card"><summary>Delegation connections</summary><div id="external-connection-list"></div><div id="external-delegate" class="hidden"><strong id="external-title">External connection</strong><p id="external-description" class="muted"></p><p id="external-warning" class="external-warning"></p><form id="external-run-form"><input id="external-id" type="hidden"><label id="external-prompt-label">Task<textarea id="external-prompt" required></textarea></label><label>Working directory<input id="external-cwd" required></label><label>Model<select id="external-model"></select></label><button type="submit">Delegate</button></form><div id="external-run-list"></div></div></details></section><section id="agent-builder" data-panel class="hidden"><div class="card"><strong id="builder-title">Build a new agent</strong><nav class="builder-tabs"><button class="active" type="button" data-builder-tab="builder-profile-panel">Profile</button><button type="button" data-builder-tab="builder-tools-panel">Model &amp; Tools</button><button type="button" data-builder-tab="builder-connections-panel">Connections</button><button type="button" data-builder-tab="builder-automation-panel">Automation</button></nav><section id="builder-profile-panel" class="builder-panel" data-builder-panel><input id="agent-id" form="agent-form" type="hidden"><label>Name<input id="agent-name" form="agent-form" required></label><label>Description<textarea id="agent-description" form="agent-form" required></textarea></label><label>Project folder<input id="agent-project-root" form="agent-form" required></label><label>Persona<select id="agent-persona-select" form="agent-form"><option value="">Custom</option></select></label><img id="agent-persona-image" class="persona-preview hidden" alt=""><label>Persona instructions<textarea id="agent-persona" form="agent-form" required></textarea></label></section><section id="builder-tools-panel" class="builder-panel hidden" data-builder-panel><label>Model<select id="agent-model" form="agent-form"></select></label><label>Thinking<select id="agent-thinking" form="agent-form"><option>off</option><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></label><label>Executor<select id="agent-executor" form="agent-form"><option value="harness">Isolated harness</option><option value="session">Pi session</option></select></label><label>Permissions<select id="agent-permissions" form="agent-form"><option value="read-only">Read only</option><option value="workspace-write">Workspace write</option></select></label><label>Browser access<select id="agent-browser-access" form="agent-form"><option value="disabled">Disabled</option><option value="loopback">Local development only</option><option value="public-web">Public web</option><option value="private-network">Private network</option></select></label><label>Browser engine<select id="agent-browser-runtime" form="agent-form"><option value="managed-chromium">Managed Chromium (recommended)</option><option value="installed-chrome">Installed Chrome compatibility</option></select></label><label>Browser profile<select id="agent-browser-profile-kind" form="agent-form"><option value="ephemeral">Fresh for every run</option><option value="named">Named sign-in profile</option></select></label><label id="agent-browser-profile-id-label" class="hidden">Profile name<input id="agent-browser-profile-id" form="agent-form" pattern="[a-z0-9][a-z0-9-]{0,63}" placeholder="signed-in"></label><label class="hidden">Memory<select id="agent-memory" form="agent-form"><option value="none">None</option><option value="notes">Notes</option></select></label><input id="agent-tools" form="agent-form" type="hidden"><input id="agent-capabilities" form="agent-form" type="hidden"><div id="capability-list"></div><details class="capability-section"><summary><strong>Plugin management</strong></summary><form id="plugin-form"><label>Source<input id="plugin-source" placeholder="package@version" required></label><label>Scope<select id="plugin-scope"><option value="user">User</option><option value="project">Project</option></select></label><button type="submit">Install</button></form></details></section><section id="builder-connections-panel" class="builder-panel hidden" data-builder-panel><label>May delegate to agents<input id="agent-delegates" form="agent-form" placeholder="researcher, reviewer"></label><label><input id="agent-a2a" form="agent-form" type="checkbox"> Expose through authenticated A2A</label><details class="capability-section" open><summary><strong>Provider accounts</strong></summary><div id="capability-connection-list"></div><form id="capability-connection-form" class="configuration-form"><input id="capability-connection-id" type="hidden"><label>Provider ID<input id="capability-connection-provider" placeholder="google-workspace" pattern="[a-z0-9][a-z0-9-]{0,63}" required></label><label>Account label<input id="capability-connection-label" placeholder="Work" required></label><label>Secret reference<input id="capability-connection-secret-ref" placeholder="managed:google/work" required></label><label>Status<select id="capability-connection-status"><option value="active">Active</option><option value="unhealthy">Unhealthy</option></select></label><label>Scopes<input id="capability-connection-scopes" placeholder="mail.read, calendar.read"></label><label>Capability grants<input id="capability-connection-capabilities" placeholder="email.search, email.read" required></label><div class="routine-actions"><button type="submit">Save account</button><button id="capability-connection-clear" type="button">Clear</button></div></form></details><details class="capability-section"><summary><strong>Approvals</strong></summary><div id="capability-approval-list"></div></details><details class="capability-section"><summary><strong>Inbound routes</strong></summary><div id="inbound-route-list"></div><form id="inbound-route-form" class="configuration-form"><label>Route ID<input id="inbound-route-id" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,127}" required></label><label>Provider account<select id="inbound-route-connection" required></select></label><label>Destination<select id="inbound-route-kind"><option value="agent">Agent</option><option value="coordinator">Coordinator</option><option value="session">Pi session</option></select></label><label>Destination ID<input id="inbound-route-destination" required></label><label>Allowed senders<input id="inbound-route-senders" placeholder="user@example.com, U123"></label><label>Events per minute<input id="inbound-route-rate" type="number" min="1" max="120" value="10" required></label><label><input id="inbound-route-enabled" type="checkbox" checked> Enabled</label><button type="submit">Save route</button></form></details></section><section id="builder-automation-panel" class="builder-panel hidden" data-builder-panel><details class="capability-section"><summary><strong>Site monitors</strong></summary><div id="site-monitor-list"></div><form id="site-monitor-form" class="configuration-form"><label>ID<input id="site-monitor-id" pattern="[a-z0-9][a-z0-9-]{0,63}" required></label><label>Name<input id="site-monitor-name" required></label><label>Public URL<input id="site-monitor-url" type="url" required></label><label><input id="site-monitor-enabled" type="checkbox" checked> Enabled</label><button type="submit">Save monitor</button></form></details><details class="capability-section"><summary><strong>Finance watchlists</strong></summary><div id="finance-watchlist-list"></div><form id="finance-watchlist-form" class="configuration-form"><label>ID<input id="finance-watchlist-id" pattern="[a-z0-9][a-z0-9-]{0,63}" required></label><label>Name<input id="finance-watchlist-name" required></label><label>Symbols<input id="finance-watchlist-symbols" placeholder="AAPL, MSFT" required></label><label>Provider ID<input id="finance-watchlist-provider" placeholder="Optional"></label><label>Provider account<select id="finance-watchlist-connection"><option value="">None</option></select></label><label><input id="finance-watchlist-enabled" type="checkbox" checked> Enabled</label><button type="submit">Save watchlist</button></form></details><div id="routines"><div id="routine-list"></div></div><div id="workflows"><div id="workflow-list"></div></div></section><form id="agent-form"><button type="submit">Save and deploy</button></form></div></section></aside>
 <script src="/browser-client.js?token=${token}"></script></body></html>`;
 }

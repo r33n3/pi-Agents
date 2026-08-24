@@ -25,9 +25,15 @@ import { BrowserWorkflowReferenceStore } from "./browser-workflow-reference-stor
 import { BrowserWorkflowRegistry } from "./browser-workflow-registry.ts";
 import { BrowserWorkflowRunner } from "./browser-workflow-runner.ts";
 import { createBrowserWorkflowTools } from "./browser-workflow-tools.ts";
+import { CapabilityApprovalService } from "./capability-approval-service.ts";
+import { CapabilityBroker } from "./capability-broker.ts";
 import { CapabilityCatalog } from "./capability-catalog.ts";
+import { CapabilityConnectionRegistry } from "./capability-connection-registry.ts";
 import { CurrentSessionService } from "./current-session-service.ts";
+import { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
+import { createEverydayDataTools } from "./everyday-data-tools.ts";
 import { type ExternalConnectionDefinition, ExternalConnectionManager } from "./external-connection-manager.ts";
+import { InboundRoutingService } from "./inbound-routing-service.ts";
 import { PersonaCatalog, resolvePersonaProject } from "./persona-catalog.ts";
 import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
 import { PluginManagementService } from "./plugin-management-service.ts";
@@ -143,7 +149,10 @@ export class ServeHost implements AsyncDisposable {
 			browserWorkflowRunner,
 			{
 				owner: { kind: "pi-session", id: session.sessionId },
-				workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
+				workspace: {
+					id: session.sessionId,
+					root: session.sessionManager.getCwd(),
+				},
 			},
 			browserCaptureStore,
 			browserProfileStore,
@@ -154,29 +163,65 @@ export class ServeHost implements AsyncDisposable {
 		session.registerCustomTools([
 			...createBrowserTools(this.#browserSessionManager, {
 				owner: { kind: "pi-session", id: session.sessionId },
-				workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
+				workspace: {
+					id: session.sessionId,
+					root: session.sessionManager.getCwd(),
+				},
 				access: ["loopback", "public-web"],
 				workspacePreview: this.#workspacePreviewServer,
 				workflowCompiler: browserWorkflowCompiler,
 			}),
 			...createBrowserWorkflowTools(browserWorkflowRegistry, browserWorkflowRunner, {
 				owner: { kind: "pi-session", id: session.sessionId },
-				workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
+				workspace: {
+					id: session.sessionId,
+					root: session.sessionManager.getCwd(),
+				},
 				frontendTests: () =>
-					browserWorkflowReferences
-						.listFrontendTests(session.sessionManager.getCwd())
-						.map((reference) => ({ id: reference.workflowId, version: reference.workflowVersion })),
+					browserWorkflowReferences.listFrontendTests(session.sessionManager.getCwd()).map((reference) => ({
+						id: reference.workflowId,
+						version: reference.workflowVersion,
+					})),
 			}),
 		]);
+		const everydayConfigurations = new EverydayConfigurationRegistry(
+			join(serveRoot, "capabilities", "everyday-data"),
+		);
+		await everydayConfigurations.initialize();
+		const everydayDataTools = createEverydayDataTools(
+			join(serveRoot, "capabilities", "everyday-data"),
+			everydayConfigurations,
+		);
+		session.registerCustomTools(everydayDataTools);
+		const capabilityConnections = new CapabilityConnectionRegistry(join(serveRoot, "capabilities", "connections"));
+		await capabilityConnections.initialize();
+		const capabilityApprovals = new CapabilityApprovalService(join(serveRoot, "capabilities", "approvals"));
+		await capabilityApprovals.initialize();
+		const capabilityBroker = new CapabilityBroker(join(serveRoot, "capabilities"), {
+			activeToolNames: () => session.getAllTools().map((tool) => tool.name),
+			activeProviderSources: () =>
+				session.resourceLoader
+					.getExtensions()
+					.extensions.flatMap((extension) => [
+						extension.path,
+						extension.resolvedPath,
+						extension.sourceInfo?.source ?? "",
+					]),
+			connectionResolver: (connectionId) => capabilityConnections.find(connectionId),
+		});
+		await capabilityBroker.initialize();
 		const agentRegistry = new AgentRegistry(serveRoot, {
 			catalogDirectory: join(agentDir, "agents"),
 			personaDirectory: join(agentDir, "personas"),
 			defaultWorkspace: session.sessionManager.getCwd(),
 			modelCatalog: () =>
-				session.modelRuntime
-					.getAvailableSnapshot()
-					.map((model) => ({ provider: model.provider, id: model.id, name: model.name })),
+				session.modelRuntime.getAvailableSnapshot().map((model) => ({
+					provider: model.provider,
+					id: model.id,
+					name: model.name,
+				})),
 			browserWorkflowCatalog: (id, version) => browserWorkflowRunner.isActiveVersion(id, version),
+			capabilityValidator: (grants, executor) => capabilityBroker.validateGrants(grants, executor),
 		});
 		await agentRegistry.initialize();
 		session.registerCustomTools(createAgentRegistryTools(agentRegistry) as ToolDefinition[]);
@@ -231,19 +276,30 @@ export class ServeHost implements AsyncDisposable {
 							profile: definition.browser?.profile,
 							runtime: definition.browser?.runtime,
 							frontendTests: () =>
-								browserWorkflowReferences
-									.listFrontendTests(workspace)
-									.map((reference) => ({ id: reference.workflowId, version: reference.workflowVersion })),
+								browserWorkflowReferences.listFrontendTests(workspace).map((reference) => ({
+									id: reference.workflowId,
+									version: reference.workflowVersion,
+								})),
 						})
 					: [];
-			const customTools = [...scopedTools, ...browserTools, ...browserWorkflowTools] as ToolDefinition[];
+			const capabilityTools = capabilityBroker.resolveToolNames(definition.capabilities, definition.executor);
+			const brokerTools = everydayDataTools.filter((tool) => capabilityTools.includes(tool.name));
+			const customTools = [
+				...scopedTools,
+				...browserTools,
+				...browserWorkflowTools,
+				...brokerTools,
+			] as ToolDefinition[];
 			const toolNames = isolated
 				? customTools.map((tool) => tool.name)
-				: definition.tools.flatMap((tool) =>
-						tool === "browser"
-							? [...browserTools, ...browserWorkflowTools].map((browserTool) => browserTool.name)
-							: [tool === "list" ? "ls" : tool],
-					);
+				: [
+						...definition.tools.flatMap((tool) =>
+							tool === "browser"
+								? [...browserTools, ...browserWorkflowTools].map((browserTool) => browserTool.name)
+								: [tool === "list" ? "ls" : tool],
+						),
+						...capabilityTools,
+					];
 			const resourceLoader = new DefaultResourceLoader({
 				cwd: workspace,
 				agentDir,
@@ -285,14 +341,19 @@ export class ServeHost implements AsyncDisposable {
 		this.#workflowService = new WorkflowService(join(serveRoot, "workflows"), agentRegistry, this.#agentTaskService, {
 			runner: browserWorkflowRunner,
 			owner: { kind: "pi-session", id: session.sessionId },
-			workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
+			workspace: {
+				id: session.sessionId,
+				root: session.sessionManager.getCwd(),
+			},
 		});
 		await this.#workflowService.initialize();
 		const a2aAdapter = new A2aAdapter(agentRegistry, this.#agentTaskService);
 
-		const availableModels = modelRuntime
-			.getAvailableSnapshot()
-			.map((model) => ({ provider: model.provider, id: model.id, name: model.name }));
+		const availableModels = modelRuntime.getAvailableSnapshot().map((model) => ({
+			provider: model.provider,
+			id: model.id,
+			name: model.name,
+		}));
 		const openAiModels = availableModels.filter((model) => model.provider === "openai");
 		const luna = { provider: "openai", id: "gpt-5.6-luna" };
 		const sonnet = { provider: "anthropic", id: "claude-sonnet-5" };
@@ -302,7 +363,11 @@ export class ServeHost implements AsyncDisposable {
 		}
 		const hermesModels = [...availableModels];
 		if (!hermesModels.some((model) => model.provider === "ollama" && model.id === "qwen3.6:latest")) {
-			hermesModels.push({ provider: "ollama", id: "qwen3.6:latest", name: "Qwen 3.6 (Hermes local)" });
+			hermesModels.push({
+				provider: "ollama",
+				id: "qwen3.6:latest",
+				name: "Qwen 3.6 (Hermes local)",
+			});
 		}
 		const externalConnections: ExternalConnectionDefinition[] = [
 			{
@@ -366,6 +431,7 @@ export class ServeHost implements AsyncDisposable {
 							: isHermes
 								? ["hermes_agent"]
 								: ["read", "grep", "find", "ls", "bash", "write", "edit"],
+						capabilities: [],
 						memory: "none",
 						persona: isClaude
 							? "Delegate through the claude_code tool immediately and report its returned data."
@@ -388,8 +454,15 @@ export class ServeHost implements AsyncDisposable {
 		);
 		await this.#externalConnectionManager.initialize();
 
-		const routineRegistry = new RoutineRegistry(join(serveRoot, "routines"), (id, version) =>
-			browserWorkflowRunner.isActiveVersion(id, version),
+		const routineRegistry = new RoutineRegistry(
+			join(serveRoot, "routines"),
+			(id, version) => browserWorkflowRunner.isActiveVersion(id, version),
+			async (definition) => {
+				if (definition.target.kind !== "agent") return;
+				const target = await agentRegistry.get(definition.target.agentId);
+				if (!target) throw new Error(`Routine agent ${definition.target.agentId} was not found`);
+				capabilityBroker.validateUnattendedGrants(target.capabilities, target.executor);
+			},
 		);
 		await routineRegistry.initialize();
 		this.#agentRoutineScheduler = new AgentRoutineScheduler(routineRegistry, {
@@ -399,7 +472,10 @@ export class ServeHost implements AsyncDisposable {
 						definition.target.workflowId,
 						{
 							owner: { kind: "pi-session", id: session.sessionId },
-							workspace: { id: session.sessionId, root: session.sessionManager.getCwd() },
+							workspace: {
+								id: session.sessionId,
+								root: session.sessionManager.getCwd(),
+							},
 							parameters: definition.target.parameters,
 						},
 						definition.target.workflowVersion,
@@ -410,11 +486,16 @@ export class ServeHost implements AsyncDisposable {
 						completion: execution.completion.then((completed) =>
 							completed.status === "completed"
 								? {}
-								: { error: completed.error ?? `Browser workflow ${completed.status}` },
+								: {
+										error: completed.error ?? `Browser workflow ${completed.status}`,
+									},
 						),
 					};
 				}
 				if (definition.target.kind === "agent") {
+					const target = await agentRegistry.get(definition.target.agentId);
+					if (!target) throw new Error(`Routine agent ${definition.target.agentId} was not found`);
+					capabilityBroker.validateUnattendedGrants(target.capabilities, target.executor);
 					const task = await this.#agentTaskService!.submit({
 						agentId: definition.target.agentId,
 						prompt: definition.prompt,
@@ -429,7 +510,9 @@ export class ServeHost implements AsyncDisposable {
 						completion: this.#agentTaskService!.waitForCompletion(task.id).then((completed) =>
 							completed.status === "completed"
 								? {}
-								: { error: completed.error ?? `Agent task ${completed.status}` },
+								: {
+										error: completed.error ?? `Agent task ${completed.status}`,
+									},
 						),
 					};
 				}
@@ -443,7 +526,9 @@ export class ServeHost implements AsyncDisposable {
 						completion: this.#workflowService!.waitForCompletion(run.id).then((completed) =>
 							completed.status === "completed"
 								? {}
-								: { error: completed.error ?? `Workflow ${completed.status}` },
+								: {
+										error: completed.error ?? `Workflow ${completed.status}`,
+									},
 						),
 					};
 				}
@@ -466,7 +551,9 @@ export class ServeHost implements AsyncDisposable {
 					completion: this.#externalConnectionManager!.waitForCompletion(run.id).then((completed) =>
 						completed.status === "succeeded"
 							? {}
-							: { error: completed.error ?? `Delegated run ${completed.status}` },
+							: {
+									error: completed.error ?? `Delegated run ${completed.status}`,
+								},
 					),
 				};
 			},
@@ -479,7 +566,9 @@ export class ServeHost implements AsyncDisposable {
 				const definition = await agentRegistry.get(agentId);
 				if (!definition) throw new Error(`Agent ${agentId} was not found`);
 				const workspace = agentRegistry.workspacePath(definition);
-				const agentSessionManager = SessionManager.inMemory(workspace, { id: options.id });
+				const agentSessionManager = SessionManager.inMemory(workspace, {
+					id: options.id,
+				});
 				agentSessionManager.appendSessionInfo(`agent:${definition.id}`);
 				return createConfiguredAgentSession(definition, workspace, agentSessionManager, {
 					kind: "pi-session",
@@ -492,7 +581,9 @@ export class ServeHost implements AsyncDisposable {
 				: session.model;
 			if (!hostedModel) throw new Error("No model is available for the browser helper session");
 			const hostedCwd = options.cwd ?? session.sessionManager.getCwd();
-			const hostedSessionManager = SessionManager.inMemory(hostedCwd, { id: options.id });
+			const hostedSessionManager = SessionManager.inMemory(hostedCwd, {
+				id: options.id,
+			});
 			if (options.name) hostedSessionManager.appendSessionInfo(options.name);
 			const browserTools = createBrowserTools(this.#browserSessionManager!, {
 				owner: { kind: "pi-session", id: options.id },
@@ -505,9 +596,10 @@ export class ServeHost implements AsyncDisposable {
 				owner: { kind: "pi-session", id: options.id },
 				workspace: { id: options.id, root: hostedCwd },
 				frontendTests: () =>
-					browserWorkflowReferences
-						.listFrontendTests(hostedCwd)
-						.map((reference) => ({ id: reference.workflowId, version: reference.workflowVersion })),
+					browserWorkflowReferences.listFrontendTests(hostedCwd).map((reference) => ({
+						id: reference.workflowId,
+						version: reference.workflowVersion,
+					})),
 			});
 			return (
 				await createAgentSession({
@@ -521,6 +613,16 @@ export class ServeHost implements AsyncDisposable {
 				})
 			).session;
 		});
+		const inboundRouting = new InboundRoutingService(
+			join(serveRoot, "capabilities", "inbound"),
+			capabilityConnections,
+			(reference) => {
+				if (!reference.startsWith("env:")) return undefined;
+				const name = reference.slice("env:".length);
+				return /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name) ? process.env[name] : undefined;
+			},
+		);
+		await inboundRouting.initialize();
 		this.#attachmentStore = new ServeAttachmentStore();
 		const pluginManagement = new PluginManagementService(session, session.sessionManager.getCwd(), agentDir);
 		const capabilityCatalog = new CapabilityCatalog(
@@ -528,6 +630,7 @@ export class ServeHost implements AsyncDisposable {
 			this.#externalConnectionManager,
 			browserConsole,
 			pluginManagement,
+			capabilityBroker,
 		);
 		const listener = new WebSocketListener({
 			host,
@@ -550,6 +653,11 @@ export class ServeHost implements AsyncDisposable {
 				personaCatalog,
 				a2aAdapter,
 				pluginManagement,
+				capabilityBroker,
+				capabilityConnections,
+				capabilityApprovals,
+				inboundRouting,
+				everydayConfigurations,
 			),
 			auxiliary: {
 				path: "/browser-stream",
@@ -567,13 +675,19 @@ export class ServeHost implements AsyncDisposable {
 
 		const diagnostics: ServeHostDiagnostic[] = [];
 		if (requestedPort !== 0 && boundPort !== requestedPort) {
-			diagnostics.push({ type: "info", message: `Port ${requestedPort} was in use; Pi selected ${boundPort}` });
+			diagnostics.push({
+				type: "info",
+				message: `Port ${requestedPort} was in use; Pi selected ${boundPort}`,
+			});
 		}
 		const serveUrl = new URL(listenerAddress);
 		serveUrl.protocol = serveUrl.protocol === "wss:" ? "https:" : "http:";
 		serveUrl.pathname = "/";
 		serveUrl.searchParams.set("token", token);
-		diagnostics.push({ type: "info", message: `Pi web control: ${serveUrl.href}` });
+		diagnostics.push({
+			type: "info",
+			message: `Pi web control: ${serveUrl.href}`,
+		});
 		return { url: serveUrl.href, port: boundPort, diagnostics };
 	}
 

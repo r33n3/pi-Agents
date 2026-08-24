@@ -22,10 +22,17 @@ export interface ServeAttachmentInput {
 	data: string;
 }
 
+export type ServeAttachmentScanner = (attachment: ServeAttachment) => Promise<void>;
+
 /** Owns short-lived, process-local files uploaded through the web console. */
 export class ServeAttachmentStore {
 	readonly #rootPromise = mkdtemp(join(tmpdir(), "pi-serve-attachments-"));
 	readonly #attachments = new Map<string, ServeAttachment>();
+	readonly #scanner: ServeAttachmentScanner | undefined;
+
+	constructor(scanner?: ServeAttachmentScanner) {
+		this.#scanner = scanner;
+	}
 
 	async save(input: ServeAttachmentInput): Promise<ServeAttachment> {
 		const sessionId = requiredSegment(input.sessionId, "sessionId");
@@ -41,6 +48,12 @@ export class ServeAttachmentStore {
 		const path = join(directory, `${id}${extname(name).slice(0, 16)}`);
 		await writeFile(path, data, { flag: "wx" });
 		const attachment = { id, sessionId, name, mimeType, size: data.length, path };
+		try {
+			await this.#scanner?.(attachment);
+		} catch (error) {
+			await rm(path, { force: true });
+			throw error;
+		}
 		this.#attachments.set(id, attachment);
 		return attachment;
 	}

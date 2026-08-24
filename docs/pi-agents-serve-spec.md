@@ -29,6 +29,9 @@ watermark instead of a product-title block.
 The consolidated agent workspace, registry, persistent-task model,
 orchestration, persona catalog, cron scheduling, and A2A boundary follow the
 [agent workspace specification](pi-agent-workspace-spec.md).
+Reviewed plugin providers, canonical capability grants, and the web and
+productivity delivery waves follow the
+[capability platform specification](pi-capability-platform-spec.md).
 
 ## Security and lifecycle invariants
 
