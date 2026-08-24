@@ -99,6 +99,7 @@ for (const entry of [
 	join(codingAgentDistDir, "rpc-entry.js"),
 	join(codingAgentDistDir, "client", "index.js"),
 	join(codingAgentDistDir, "utils", "image-resize-worker.js"),
+	join(codingAgentDistDir, "core", "serve", "agent-worker.js"),
 	join(aiDistDir, "api", "bedrock-converse-stream.js"),
 	join(aiDistDir, "auth", "oauth", "anthropic.js"),
 ]) {
@@ -127,6 +128,10 @@ const mainResult = await build({
 const bedrockLoaderOutput = findContainingOutput(mainResult.metafile, "packages/ai/dist/api/bedrock-converse-stream.lazy.js");
 const oauthLoaderOutput = findContainingOutput(mainResult.metafile, "packages/ai/dist/auth/oauth/load.js");
 const imageResizeOutput = findContainingOutput(mainResult.metafile, "packages/coding-agent/dist/utils/image-resize.js");
+const agentExecutorOutput = findContainingOutput(
+	mainResult.metafile,
+	"packages/coding-agent/dist/core/serve/child-process-agent-executor.js",
+);
 if (dirname(bedrockLoaderOutput) !== dirname(oauthLoaderOutput)) {
 	throw new Error("Bedrock and OAuth lazy loaders were emitted into different directories");
 }
@@ -156,11 +161,22 @@ const imageResizeWorkerOutput = resolve(dirname(bedrockLoaderOutput), "image-res
 if (dirname(imageResizeOutput) !== dirname(imageResizeWorkerOutput)) {
 	throw new Error("Image resize implementation and worker were emitted into different directories");
 }
+const agentWorkerResult = await build({
+	...commonBuildOptions(),
+	entryNames: "agent-worker",
+	entryPoints: [join(codingAgentDistDir, "core", "serve", "agent-worker.js")],
+	outdir: dirname(agentExecutorOutput),
+	splitting: false,
+});
 
-validateExternalImports([mainResult.metafile, lazyResult.metafile]);
+validateExternalImports([mainResult.metafile, lazyResult.metafile, agentWorkerResult.metafile]);
 chmodSync(join(bundleDir, "cli.js"), 0o755);
 chmodSync(join(bundleDir, "rpc-entry.js"), 0o755);
 
-const files = new Set([...Object.keys(mainResult.metafile.outputs), ...Object.keys(lazyResult.metafile.outputs)]).size;
-const mib = outputBytes([mainResult.metafile, lazyResult.metafile]) / (1024 * 1024);
+const files = new Set([
+	...Object.keys(mainResult.metafile.outputs),
+	...Object.keys(lazyResult.metafile.outputs),
+	...Object.keys(agentWorkerResult.metafile.outputs),
+]).size;
+const mib = outputBytes([mainResult.metafile, lazyResult.metafile, agentWorkerResult.metafile]) / (1024 * 1024);
 console.log(`Built ${relative(repoRoot, bundleDir)} (${files} files, ${mib.toFixed(1)} MiB)`);

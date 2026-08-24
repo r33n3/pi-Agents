@@ -29,6 +29,7 @@ import { CapabilityApprovalService } from "./capability-approval-service.ts";
 import { CapabilityBroker } from "./capability-broker.ts";
 import { CapabilityCatalog } from "./capability-catalog.ts";
 import { CapabilityConnectionRegistry } from "./capability-connection-registry.ts";
+import { ChildProcessAgentExecutor } from "./child-process-agent-executor.ts";
 import { CurrentSessionService } from "./current-session-service.ts";
 import { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
 import { createEverydayDataTools } from "./everyday-data-tools.ts";
@@ -335,7 +336,13 @@ export class ServeHost implements AsyncDisposable {
 				kind: "agent-run",
 				id: context.runId,
 			});
-		const executor = new AgentSessionExecutor(createExecutionSession);
+		const executor = new ChildProcessAgentExecutor({
+			agentDir,
+			serveRoot,
+			defaultModel: session.model ? { provider: session.model.provider, id: session.model.id } : undefined,
+			capabilityToolNames: (context) =>
+				capabilityBroker.resolveToolNames(context.definition.capabilities, context.definition.executor),
+		});
 		this.#agentRunManager = new AgentRunManager(agentRegistry, executor, join(serveRoot, "runs"));
 		await this.#agentRunManager.initialize();
 		this.#agentTaskService = new AgentTaskService(agentRegistry, this.#agentRunManager, serveRoot);

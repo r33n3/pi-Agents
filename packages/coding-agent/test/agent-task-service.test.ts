@@ -123,4 +123,29 @@ describe("AgentTaskService", () => {
 		await tasks.cancel(task.id);
 		await tasks.dispose();
 	});
+
+	test("queues same-workspace work and starts it after the lease is released", async () => {
+		const { registry, executor, tasks } = await setup();
+		await registry.save({
+			id: "reviewer",
+			name: "Reviewer",
+			description: "Reviews",
+			tools: ["read"],
+			memory: "none",
+			persona: "Careful",
+			executor: "harness",
+			permissionPolicy: "read-only",
+			schedules: [],
+		});
+		const first = await tasks.submit({ agentId: "researcher", prompt: "Research", source: "chat" });
+		const second = await tasks.submit({ agentId: "reviewer", prompt: "Review", source: "chat" });
+		expect(second.status).toBe("queued");
+		expect(executor.executions).toHaveLength(1);
+		executor.executions[0]!.resolve({ output: "Research done", transcript: [] });
+		await expect.poll(() => executor.executions.length).toBe(2);
+		executor.executions[1]!.resolve({ output: "Review done", transcript: [] });
+		await expect(tasks.waitForCompletion(first.id)).resolves.toMatchObject({ status: "completed" });
+		await expect(tasks.waitForCompletion(second.id)).resolves.toMatchObject({ status: "completed" });
+		await tasks.dispose();
+	});
 });

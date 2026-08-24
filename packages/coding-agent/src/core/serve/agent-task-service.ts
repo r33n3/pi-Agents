@@ -77,6 +77,11 @@ interface ActiveTask {
 	completion: Promise<void>;
 }
 
+interface TaskCompletion {
+	promise: Promise<void>;
+	resolve: () => void;
+}
+
 /** Owns durable agent conversations and maps each task to one executor attempt. */
 export class AgentTaskService implements AsyncDisposable {
 	readonly #registry: AgentRegistry;
@@ -89,6 +94,7 @@ export class AgentTaskService implements AsyncDisposable {
 	readonly #conversationByAgent = new Map<string, string>();
 	readonly #tasks = new Map<string, AgentTask>();
 	readonly #active = new Map<string, ActiveTask>();
+	readonly #completions = new Map<string, TaskCompletion>();
 	readonly #listeners = new Set<AgentTaskListener>();
 	#disposed = false;
 
@@ -205,33 +211,12 @@ export class AgentTaskService implements AsyncDisposable {
 			attemptIds: [],
 		};
 		this.#tasks.set(task.id, task);
+		this.#completions.set(task.id, createCompletion());
 		await this.#persistTask(task);
 		await this.#appendMessage(conversation, task, "user", prompt);
 		await this.#emit(task, "task.queued");
-		try {
-			const run = await this.#runs.start(
-				request.agentId,
-				prompt,
-				taskSourceToRunSource(request.source),
-				request.model,
-			);
-			task.status = "running";
-			task.startedAt = run.startedAt ?? Date.now();
-			task.attemptIds.push(run.id);
-			await this.#persistTask(task);
-			await this.#emit(task, "task.started");
-			const active: ActiveTask = { task, runId: run.id, completion: Promise.resolve() };
-			this.#active.set(task.id, active);
-			active.completion = this.#settle(active);
-			return cloneTask(task);
-		} catch (error) {
-			task.status = "failed";
-			task.finishedAt = Date.now();
-			task.error = error instanceof Error ? error.message : String(error);
-			await this.#persistTask(task);
-			await this.#emit(task, "task.failed", task.error);
-			throw error;
-		}
+		await this.#schedule();
+		return cloneTask(task);
 	}
 
 	continue(taskId: string, message: string): Promise<AgentTask> {
@@ -250,15 +235,25 @@ export class AgentTaskService implements AsyncDisposable {
 
 	async cancel(taskId: string): Promise<AgentTask> {
 		const active = this.#active.get(taskId);
-		if (!active) throw new Error(`Task ${taskId} is not active`);
+		if (!active) {
+			const queued = this.#tasks.get(taskId);
+			if (!queued) throw new Error(`Task ${taskId} was not found`);
+			if (queued.status !== "queued") return cloneTask(queued);
+			queued.status = "cancelled";
+			queued.finishedAt = Date.now();
+			await this.#persistTask(queued);
+			await this.#emit(queued, "task.cancelled");
+			this.#completions.get(taskId)?.resolve();
+			return cloneTask(queued);
+		}
 		await this.#runs.abort(active.runId);
 		await active.completion;
 		return cloneTask(active.task);
 	}
 
 	waitForCompletion(taskId: string): Promise<AgentTask> {
-		const active = this.#active.get(taskId);
-		return (active?.completion ?? Promise.resolve()).then(() => {
+		const completion = this.#completions.get(taskId)?.promise ?? this.#active.get(taskId)?.completion;
+		return (completion ?? Promise.resolve()).then(() => {
 			const task = this.#tasks.get(taskId);
 			if (!task) throw new Error(`Task ${taskId} was not found`);
 			return cloneTask(task);
@@ -324,6 +319,43 @@ export class AgentTaskService implements AsyncDisposable {
 			await this.#emit(task, "task.failed", task.error);
 		}
 		this.#active.delete(task.id);
+		this.#completions.get(task.id)?.resolve();
+		void this.#schedule();
+	}
+
+	async #schedule(): Promise<void> {
+		await this.#queue.run(async () => {
+			if (this.#disposed) return;
+			const queued = [...this.#tasks.values()]
+				.filter((task) => task.status === "queued")
+				.sort((left, right) => left.createdAt - right.createdAt);
+			for (const task of queued) {
+				if ((await this.#runs.availability(task.agentId)) !== "available") continue;
+				try {
+					const run = await this.#runs.start(
+						task.agentId,
+						task.prompt,
+						taskSourceToRunSource(task.source),
+						task.model,
+					);
+					task.status = "running";
+					task.startedAt = run.startedAt ?? Date.now();
+					task.attemptIds.push(run.id);
+					await this.#persistTask(task);
+					await this.#emit(task, "task.started");
+					const active: ActiveTask = { task, runId: run.id, completion: Promise.resolve() };
+					this.#active.set(task.id, active);
+					active.completion = this.#settle(active);
+				} catch (error) {
+					task.status = "failed";
+					task.finishedAt = Date.now();
+					task.error = error instanceof Error ? error.message : String(error);
+					await this.#persistTask(task);
+					await this.#emit(task, "task.failed", task.error);
+					this.#completions.get(task.id)?.resolve();
+				}
+			}
+		});
 	}
 
 	async #appendMessage(
@@ -385,6 +417,14 @@ function taskSourceToRunSource(source: AgentTaskSource): AgentRunRecord["source"
 
 function cloneTask(task: AgentTask): AgentTask {
 	return { ...task, model: task.model ? { ...task.model } : undefined, attemptIds: [...task.attemptIds] };
+}
+
+function createCompletion(): TaskCompletion {
+	let resolve: () => void = () => {};
+	const promise = new Promise<void>((settled) => {
+		resolve = settled;
+	});
+	return { promise, resolve };
 }
 
 async function writeAtomic(path: string, content: string): Promise<void> {

@@ -106,7 +106,11 @@ describe("AgentRunManager", () => {
 
 		const restored = new AgentRunManager(registry, new FakeExecutor(), join(root, "artifacts"));
 		await restored.initialize();
-		expect(restored.get(run.id)).toMatchObject({ status: "succeeded", artifactDirectory: run.artifactDirectory });
+		expect(restored.get(run.id)).toMatchObject({
+			status: "succeeded",
+			agentRevision: 1,
+			artifactDirectory: run.artifactDirectory,
+		});
 	});
 
 	test("aborts and waits for cleanup", async () => {
@@ -134,7 +138,48 @@ describe("AgentRunManager", () => {
 		await expect(runs.start("review", "Review")).rejects.toThrow("already has an active run");
 		executor.executions[0]!.resolve({ output: "Done", transcript: [] });
 		await runs.waitForCompletion(active.id);
-		await expect(runs.start("review", "Review after release")).resolves.toMatchObject({ agentId: "review" });
+		const review = await runs.start("review", "Review after release");
+		expect(review).toMatchObject({ agentId: "review" });
 		executor.executions[1]!.resolve({ output: "Done", transcript: [] });
+		await runs.waitForCompletion(review.id);
+	});
+
+	test("leases named browser profiles across different projects", async () => {
+		const { root, registry, executor, runs } = await setup();
+		const browser = {
+			access: "public-web" as const,
+			runtime: "managed-chromium" as const,
+			profile: { kind: "named" as const, id: "shared" },
+		};
+		await registry.save({
+			id: "browser-one",
+			name: "Browser one",
+			description: "Browses",
+			projectRoot: join(root, "one"),
+			tools: ["browser"],
+			memory: "none",
+			persona: "Careful",
+			executor: "harness",
+			permissionPolicy: "read-only",
+			schedules: [],
+			browser,
+		});
+		await registry.save({
+			id: "browser-two",
+			name: "Browser two",
+			description: "Browses",
+			projectRoot: join(root, "two"),
+			tools: ["browser"],
+			memory: "none",
+			persona: "Careful",
+			executor: "harness",
+			permissionPolicy: "read-only",
+			schedules: [],
+			browser,
+		});
+		const first = await runs.start("browser-one", "Browse");
+		await expect(runs.start("browser-two", "Browse too")).rejects.toThrow("browser-profile:shared");
+		executor.executions[0]!.resolve({ output: "Done", transcript: [] });
+		await runs.waitForCompletion(first.id);
 	});
 });

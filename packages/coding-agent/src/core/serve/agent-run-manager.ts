@@ -3,7 +3,7 @@ import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ModelRef } from "@earendil-works/pi-protocol";
 import type { AgentExecution, AgentExecutor } from "./agent-executor.ts";
-import type { AgentRegistry } from "./agent-registry.ts";
+import type { AgentDefinition, AgentRegistry } from "./agent-registry.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
 export type AgentRunStatus = "starting" | "running" | "succeeded" | "failed" | "aborted";
@@ -21,6 +21,7 @@ export interface AgentRunRecord {
 	artifactDirectory: string;
 	error?: string;
 	model?: ModelRef;
+	agentRevision: number;
 }
 
 interface ActiveRun {
@@ -28,6 +29,7 @@ interface ActiveRun {
 	execution: AgentExecution;
 	workspaceKey: string;
 	abortRequested: boolean;
+	resourceKeys: string[];
 	completion?: Promise<void>;
 }
 
@@ -41,12 +43,18 @@ export class AgentRunManager implements AsyncDisposable {
 	readonly #activeByAgent = new Map<string, ActiveRun>();
 	readonly #activeByWorkspace = new Map<string, ActiveRun>();
 	readonly #activeByRun = new Map<string, ActiveRun>();
+	readonly #activeByResource = new Map<string, ActiveRun>();
+	readonly #maxConcurrentRuns: number;
 	#disposed = false;
 
-	constructor(registry: AgentRegistry, executor: AgentExecutor, artifactsRoot: string) {
+	constructor(registry: AgentRegistry, executor: AgentExecutor, artifactsRoot: string, maxConcurrentRuns = 4) {
+		if (!Number.isSafeInteger(maxConcurrentRuns) || maxConcurrentRuns < 1) {
+			throw new Error("Agent maxConcurrentRuns must be positive");
+		}
 		this.#registry = registry;
 		this.#executor = executor;
 		this.#artifactsRoot = resolve(artifactsRoot);
+		this.#maxConcurrentRuns = maxConcurrentRuns;
 	}
 
 	async initialize(): Promise<void> {
@@ -82,6 +90,17 @@ export class AgentRunManager implements AsyncDisposable {
 		return this.#records.get(runId);
 	}
 
+	async availability(agentId: string): Promise<"available" | "agent-busy" | "workspace-busy" | "capacity"> {
+		if (this.#activeByAgent.has(agentId)) return "agent-busy";
+		if (this.#activeByRun.size >= this.#maxConcurrentRuns) return "capacity";
+		const definition = await this.#registry.get(agentId);
+		if (!definition) throw new Error(`Agent ${agentId} was not found`);
+		const workspace = this.#registry.workspacePath(definition);
+		const workspaceKey = process.platform === "win32" ? resolve(workspace).toLowerCase() : resolve(workspace);
+		if (this.#activeByWorkspace.has(workspaceKey)) return "workspace-busy";
+		return resourceKeys(definition).some((key) => this.#activeByResource.has(key)) ? "workspace-busy" : "available";
+	}
+
 	async readResult(runId: string): Promise<string | undefined> {
 		const record = this.#records.get(runId);
 		if (!record || record.status !== "succeeded") return undefined;
@@ -104,12 +123,16 @@ export class AgentRunManager implements AsyncDisposable {
 			if (prompt.trim() === "") throw new Error("Agent run prompt is required");
 			const definition = await this.#registry.get(agentId);
 			if (!definition) throw new Error(`Agent ${agentId} was not found`);
+			if (this.#activeByRun.size >= this.#maxConcurrentRuns) throw new Error("Agent run capacity is reached");
 			if (this.#activeByAgent.has(agentId)) throw new Error(`Agent ${agentId} already has an active run`);
 			const workspace = this.#registry.workspacePath(definition);
 			const workspaceKey = process.platform === "win32" ? resolve(workspace).toLowerCase() : resolve(workspace);
 			if (this.#activeByWorkspace.has(workspaceKey)) {
 				throw new Error(`Agent project ${workspace} already has an active run`);
 			}
+			const requiredResources = resourceKeys(definition);
+			const busyResource = requiredResources.find((key) => this.#activeByResource.has(key));
+			if (busyResource) throw new Error(`Agent resource ${busyResource} already has an active run`);
 			const runId = randomUUID();
 			const artifactDirectory = resolve(this.#artifactsRoot, agentId, runId);
 			const record: AgentRunRecord = {
@@ -121,6 +144,7 @@ export class AgentRunManager implements AsyncDisposable {
 				createdAt: Date.now(),
 				artifactDirectory,
 				model,
+				agentRevision: definition.revision,
 			};
 			this.#records.set(runId, record);
 			await this.#persistRecord(record);
@@ -133,10 +157,17 @@ export class AgentRunManager implements AsyncDisposable {
 				});
 				record.status = "running";
 				record.startedAt = Date.now();
-				const active: ActiveRun = { record, execution, workspaceKey, abortRequested: false };
+				const active: ActiveRun = {
+					record,
+					execution,
+					workspaceKey,
+					abortRequested: false,
+					resourceKeys: requiredResources,
+				};
 				this.#activeByAgent.set(agentId, active);
 				this.#activeByWorkspace.set(workspaceKey, active);
 				this.#activeByRun.set(runId, active);
+				for (const key of requiredResources) this.#activeByResource.set(key, active);
 				await this.#persistRecord(record);
 				active.completion = this.#settle(active);
 				return { ...record };
@@ -152,7 +183,11 @@ export class AgentRunManager implements AsyncDisposable {
 
 	async abort(runId: string): Promise<AgentRunRecord> {
 		const active = this.#activeByRun.get(runId);
-		if (!active) throw new Error(`Run ${runId} is not active`);
+		if (!active) {
+			const record = this.#records.get(runId);
+			if (!record) throw new Error(`Run ${runId} was not found`);
+			return { ...record };
+		}
 		active.abortRequested = true;
 		await active.execution.abort();
 		await active.completion;
@@ -203,6 +238,7 @@ export class AgentRunManager implements AsyncDisposable {
 			this.#activeByAgent.delete(record.agentId);
 			this.#activeByWorkspace.delete(active.workspaceKey);
 			this.#activeByRun.delete(record.id);
+			for (const key of active.resourceKeys) this.#activeByResource.delete(key);
 			await execution.dispose();
 		}
 	}
@@ -211,6 +247,10 @@ export class AgentRunManager implements AsyncDisposable {
 		await mkdir(record.artifactDirectory, { recursive: true });
 		await writeFile(resolve(record.artifactDirectory, "run.json"), `${JSON.stringify(record, null, 2)}\n`, "utf8");
 	}
+}
+
+function resourceKeys(definition: AgentDefinition): string[] {
+	return definition.browser?.profile.kind === "named" ? [`browser-profile:${definition.browser.profile.id}`] : [];
 }
 
 function parseRunRecord(value: unknown, artifactDirectory: string): AgentRunRecord {
@@ -235,6 +275,12 @@ function parseRunRecord(value: unknown, artifactDirectory: string): AgentRunReco
 		artifactDirectory,
 		error: typeof record.error === "string" ? record.error : undefined,
 		model: record.model === undefined ? undefined : modelRef(record.model),
+		agentRevision:
+			typeof record.agentRevision === "number" &&
+			Number.isSafeInteger(record.agentRevision) &&
+			record.agentRevision > 0
+				? record.agentRevision
+				: 1,
 	};
 }
 

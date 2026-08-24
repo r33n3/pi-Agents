@@ -276,6 +276,29 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 	async subscribeFrames(listener: (frame: BrowserFrame) => void): Promise<() => Promise<void>> {
 		const session = await this.#context.newCDPSession(this.#page);
 		let stopped = false;
+		let pending:
+			| {
+					data: string;
+					metadata: { deviceWidth: number; deviceHeight: number; timestamp?: number };
+					sessionId: number;
+			  }
+			| undefined;
+		let timer: NodeJS.Timeout | undefined;
+		let lastFrameAt = 0;
+		const flush = () => {
+			timer = undefined;
+			const payload = pending;
+			pending = undefined;
+			if (stopped || !payload) return;
+			lastFrameAt = Date.now();
+			const jpeg = Buffer.from(payload.data, "base64");
+			listener({
+				jpeg: new Uint8Array(jpeg.buffer, jpeg.byteOffset, jpeg.byteLength),
+				width: payload.metadata.deviceWidth,
+				height: payload.metadata.deviceHeight,
+				timestamp: payload.metadata.timestamp ? payload.metadata.timestamp * 1_000 : lastFrameAt,
+			});
+		};
 		const onFrame = (payload: {
 			data: string;
 			metadata: { deviceWidth: number; deviceHeight: number; timestamp?: number };
@@ -283,13 +306,8 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 		}) => {
 			void session.send("Page.screencastFrameAck", { sessionId: payload.sessionId }).catch(() => {});
 			if (stopped) return;
-			const jpeg = Buffer.from(payload.data, "base64");
-			listener({
-				jpeg: new Uint8Array(jpeg.buffer, jpeg.byteOffset, jpeg.byteLength),
-				width: payload.metadata.deviceWidth,
-				height: payload.metadata.deviceHeight,
-				timestamp: payload.metadata.timestamp ? payload.metadata.timestamp * 1_000 : Date.now(),
-			});
+			pending = payload;
+			if (!timer) timer = setTimeout(flush, Math.max(0, 100 - (Date.now() - lastFrameAt)));
 		};
 		session.on("Page.screencastFrame", onFrame);
 		await session.send("Page.startScreencast", {
@@ -297,11 +315,13 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 			quality: 72,
 			maxWidth: 1440,
 			maxHeight: 960,
-			everyNthFrame: 1,
+			everyNthFrame: 2,
 		});
 		return async () => {
 			if (stopped) return;
 			stopped = true;
+			pending = undefined;
+			if (timer) clearTimeout(timer);
 			session.off("Page.screencastFrame", onFrame);
 			await stopScreencast(session);
 		};
