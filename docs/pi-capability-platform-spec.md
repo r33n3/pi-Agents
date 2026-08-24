@@ -329,7 +329,7 @@ to most Pi and frontend-development sessions.
 
 | Canonical capability | Initial provider direction | Default effects |
 |---|---|---|
-| `web.search` | reviewed `@juicesharp/rpiv-web-tools` adapter; SearXNG may be the local default | `read-remote` |
+| `web.search` | built-in SearXNG adapter when `SEARXNG_BASE_URL` is configured; reviewed `@juicesharp/rpiv-web-tools` remains optional | `read-remote` |
 | `web.fetch` | same provider layer | `read-remote` |
 | `web.scrape` | reviewed `@narumitw/pi-firecrawl` adapter | `read-remote`, `credential-use` |
 | `web.crawl` | reviewed Firecrawl adapter with strict bounds | `read-remote`, `credential-use` |
@@ -338,9 +338,9 @@ to most Pi and frontend-development sessions.
 | `notifications.send` | reviewed platform notification adapter | `send-external` or local notification |
 | `browser.annotate` | optional reviewed annotation bridge | `browser-control`, `read-local` |
 
-`rpiv-web-tools` and Firecrawl are complementary: the first owns routine search
-and fetch provider selection; Firecrawl supplies advanced scrape, map, and
-bounded crawl operations. `pi-web-access`, Tavily-specific extensions, and
+SearXNG owns routine search when its explicit base URL is configured. Firecrawl
+supplies advanced scrape, map, and bounded crawl operations, while
+`rpiv-web-tools` remains an optional search/fetch provider. `pi-web-access`, Tavily-specific extensions, and
 other packages that register the same raw tools are comparison fixtures, not
 simultaneous defaults. Existing managed browser control remains authoritative;
 Chrome/CDP extensions are not installed beside it unless a separately

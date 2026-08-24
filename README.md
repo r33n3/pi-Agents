@@ -93,6 +93,12 @@ Productivity provider cards remain unavailable until their reviewed connector
 tools and account authorization are configured; raw consequential tools do not
 bypass the broker's receipt requirement.
 
+Set `SEARXNG_BASE_URL` in `.env.local` to the root URL of a trusted SearXNG
+instance. `pi --serve` then registers `searxng_search`; review and enable the
+SearXNG provider under Agent Builder > Model & Tools > Capabilities before
+granting `web.search` to an agent. Firecrawl remains the escalation path for
+scraping and bounded crawling.
+
 ## Security boundary
 
 The web token authenticates the console; it is not an operating-system sandbox. Pi and session-executor agents inherit the launching account's local permissions. Harness agents confine built-in file tools to their configured project root, but that is still not a container boundary. Use the documented container or sandbox patterns when stronger isolation is required.
