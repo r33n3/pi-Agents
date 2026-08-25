@@ -248,7 +248,7 @@ describe("browser tools", () => {
 		await execute("browser_open", { url: "http://localhost:4173/" });
 		await execute("browser_record_start", {});
 		const session = manager.list(owner)[0]!;
-		manager.setControl(session.id, "user");
+		await manager.setControl(session.id, "user");
 		await manager.pointerClick(session.id, 10, 10);
 		const stopped = await execute("browser_record_stop", { sessionId: session.id });
 		const content = stopped.content[0];

@@ -144,6 +144,57 @@ describe("AgentRunManager", () => {
 		await runs.waitForCompletion(review.id);
 	});
 
+	test("runs agents in separate projects concurrently and stopping one does not affect the other", async () => {
+		const { root, registry, executor, runs } = await setup();
+		await registry.save({
+			id: "review",
+			name: "Review",
+			description: "Reviews",
+			projectRoot: join(root, "review-workspace"),
+			tools: ["read"],
+			memory: "none",
+			persona: "Careful",
+			executor: "harness",
+			permissionPolicy: "read-only",
+			schedules: [],
+		});
+		const research = await runs.start("research", "Research");
+		const review = await runs.start("review", "Review");
+		expect(executor.contexts.map((entry) => entry.workspace)).toEqual([
+			registry.workspacePath((await registry.get("research"))!),
+			registry.workspacePath((await registry.get("review"))!),
+		]);
+		await runs.abort(research.id);
+		expect(runs.get(research.id)?.status).toBe("aborted");
+		expect(runs.get(review.id)?.status).toBe("running");
+		expect(executor.executions[1].aborted).toBe(false);
+		executor.executions[1].resolve({ output: "Reviewed", transcript: [] });
+		await expect(runs.waitForCompletion(review.id)).resolves.toMatchObject({ status: "succeeded" });
+	});
+
+	test("dispose aborts every active worker and waits for lease cleanup", async () => {
+		const { root, registry, executor, runs } = await setup();
+		await registry.save({
+			id: "review",
+			name: "Review",
+			description: "Reviews",
+			projectRoot: join(root, "review-workspace"),
+			tools: ["read"],
+			memory: "none",
+			persona: "Careful",
+			executor: "harness",
+			permissionPolicy: "read-only",
+			schedules: [],
+		});
+		const first = await runs.start("research", "Research");
+		const second = await runs.start("review", "Review");
+		await runs.dispose();
+		expect(executor.executions.every((execution) => execution.aborted)).toBe(true);
+		expect(runs.get(first.id)?.status).toBe("aborted");
+		expect(runs.get(second.id)?.status).toBe("aborted");
+		await expect(runs.start("research", "After disposal")).rejects.toThrow("Operation queue is closed");
+	});
+
 	test("leases named browser profiles across different projects", async () => {
 		const { root, registry, executor, runs } = await setup();
 		const browser = {

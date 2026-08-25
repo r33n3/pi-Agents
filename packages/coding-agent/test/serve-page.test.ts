@@ -15,6 +15,7 @@ import {
 import { CapabilityBroker } from "../src/core/serve/capability-broker.ts";
 import { EverydayConfigurationRegistry } from "../src/core/serve/everyday-configuration-registry.ts";
 import { ExternalConnectionManager } from "../src/core/serve/external-connection-manager.ts";
+import { ProviderEnvironmentStore } from "../src/core/serve/provider-environment-store.ts";
 import { RoutineRegistry } from "../src/core/serve/routine-registry.ts";
 import { ServeAttachmentStore } from "../src/core/serve/serve-attachment-store.ts";
 import { createServePage } from "../src/core/serve/serve-page.ts";
@@ -27,6 +28,7 @@ describe("createServePage", () => {
 	let browser: BrowserSessionManager;
 	let capabilityBroker: CapabilityBroker;
 	let everydayConfigurations: EverydayConfigurationRegistry;
+	let providerEnvironment: ProviderEnvironmentStore;
 
 	class BrowserContext implements BrowserDriverContext {
 		async setNavigationPolicy(): Promise<void> {}
@@ -134,8 +136,10 @@ describe("createServePage", () => {
 		await routineScheduler.refresh();
 		attachmentStore = new ServeAttachmentStore();
 		browser = new BrowserSessionManager(new FixtureBrowserDriver(), new BrowserProfileStore(root));
+		const environment: NodeJS.ProcessEnv = {};
 		capabilityBroker = new CapabilityBroker(join(root, "capabilities"), {
 			activeToolNames: () => ["fixture_search"],
+			environmentValue: (name) => environment[name],
 			definitions: [
 				{
 					id: "web.search",
@@ -154,6 +158,10 @@ describe("createServePage", () => {
 					source: "fixture-search@1.0.0",
 					version: "1.0.0",
 					permissions: ["network read"],
+					authentication: {
+						kind: "environment",
+						fields: [{ env: "FIXTURE_TOKEN", label: "Fixture token", required: true, secret: true }],
+					},
 					bindings: [
 						{
 							capabilityId: "web.search",
@@ -166,6 +174,11 @@ describe("createServePage", () => {
 			],
 		});
 		await capabilityBroker.initialize();
+		providerEnvironment = new ProviderEnvironmentStore(
+			root,
+			(providerId) => capabilityBroker.authenticationManifest(providerId),
+			environment,
+		);
 		everydayConfigurations = new EverydayConfigurationRegistry(join(root, "everyday"));
 		await everydayConfigurations.initialize();
 		server = createServer(
@@ -190,6 +203,7 @@ describe("createServePage", () => {
 				undefined,
 				undefined,
 				everydayConfigurations,
+				providerEnvironment,
 			),
 		);
 		await new Promise<void>((resolve, reject) => {
@@ -225,12 +239,23 @@ describe("createServePage", () => {
 		expect(html).toContain('id="connection-form"');
 		expect(html).toContain('class="rail-heading"');
 		expect(html).toContain('aria-label="Connect another Pi session"');
+		expect(html).toContain('id="open-settings"');
+		expect(html).toContain('title="Settings" aria-label="Open Settings"');
+		expect(html).toContain('id="settings-workspace"');
+		expect(html).toContain('aria-label="Settings workspace"');
+		expect(html).toContain('data-settings-section="models"');
+		expect(html).toContain('data-settings-section="connections"');
+		expect(html).toContain('data-settings-section="capabilities"');
+		expect(html).toContain('data-settings-section="plugins"');
+		expect(html).toContain('data-settings-section="security"');
+		expect(html).toContain('id="settings-connection-advanced"');
 		expect(html).toContain('class="pi-watermark"');
 		expect(html).toContain('id="left-resizer"');
 		expect(html).toContain('id="composer-action"');
 		expect(html).toContain('id="session-path"');
 		expect(html).toContain('id="session-stats"');
 		expect(html).toContain(".context-meter");
+		expect(html).toContain(".message{min-width:0;overflow-wrap:anywhere}");
 		expect(html).toContain(".session-stat-input");
 		expect(html).toContain(".session-stat-output");
 		expect(html).toContain(".session-stat-cost");
@@ -283,7 +308,14 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("Configure and deploy a local agent");
 		expect(bundleText).toContain("builder-settings-stack");
 		expect(bundleText).toContain("Choose the model and reasoning depth.");
-		expect(bundleText).toContain("Grant only the tools this agent needs.");
+		expect(bundleText).toContain("Grant only resources that are ready in Settings.");
+		expect(bundleText).toContain("Runtime");
+		expect(bundleText).toContain("Delegation");
+		expect(bundleText).toContain("Capabilities");
+		expect(bundleText).toContain("#settings/");
+		expect(bundleText).toContain("Setup required");
+		expect(bundleText).toContain("Ready to connect");
+		expect(bundleText).toContain("Needs attention");
 		expect(bundleText).toContain("agent-capability-summary");
 		expect(bundleText).toContain("capability-grant");
 		expect(bundleText).toContain("subagent-card");
@@ -375,6 +407,23 @@ describe("createServePage", () => {
 			},
 		);
 		expect(enableBeforeReview.status).toBe(400);
+		const configured = await fetch(`${origin}/capability-providers/fixture-search/configuration?token=secret-token`, {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ values: { FIXTURE_TOKEN: "secret-value" } }),
+		});
+		expect(await configured.json()).toMatchObject({
+			providerId: "fixture-search",
+			configured: true,
+			fields: [{ env: "FIXTURE_TOKEN", configured: true }],
+		});
+		expect(
+			JSON.stringify(
+				await (
+					await fetch(`${origin}/capability-providers/fixture-search/configuration?token=secret-token`)
+				).json(),
+			),
+		).not.toContain("secret-value");
 		const review = await fetch(`${origin}/capability-providers/fixture-search/review?token=secret-token`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },

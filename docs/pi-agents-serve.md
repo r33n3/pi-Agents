@@ -25,8 +25,11 @@ strict. The default bind address is `127.0.0.1`; an explicit non-loopback
   during a turn. Enter sends; Shift+Enter inserts a newline.
 - The right workspace contains Browser, Agents, and Agent Builder. Selecting an
   agent opens its persistent chat and its manual, scheduled, and workflow run
-  history. Agent Builder owns persona, model, built-in tools, plugins, MCP/API
-  connections, per-agent grants, workflows, and cron automation.
+  history. Agent Builder owns Profile, Runtime, Capabilities, Delegation, and
+  Automation for one agent.
+- The gear beside Sessions opens deployment Settings for Models, Connections,
+  Capabilities, Plugins & MCP, and Security. Provider credentials and account
+  authorization are configured there rather than duplicated in Agent Builder.
 - Browser, when the managed-browser milestone is
   installed, shows the same Chromium page controlled by the user and agent.
   See the [managed-browser specification](pi-browser-preview-spec.md) for the
@@ -69,6 +72,7 @@ browser/workflows/<workflow-id>/versions/<version>.json
 browser/runs/<run-id>.json
 browser/artifacts/<owner>/<artifact-id>.png
 browser/references/frontend-tests.json
+audit/serve-audit.jsonl
 ```
 
 Definitions and workspace paths are validated before use. Interrupted run
@@ -77,16 +81,17 @@ remain listed and readable.
 
 ## Executors
 
-- `harness` creates a fresh in-process `AgentSession` with a dedicated cwd and
-  path-confined `read`, `list`, and optional `write` tools. It is isolated from
-  the active Pi transcript and from other agent workspaces. It is not an OS or
-  container security boundary.
-- `session` creates a fresh local Pi session with the selected standard tools.
+- `harness` creates a fresh child-process `AgentSession` with a dedicated cwd
+  and host-mediated, path-confined `read`, `list`, and optional `write` tools.
+  It is isolated from the active Pi transcript and other agent processes. It is
+  not an OS or container security boundary.
+- `session` creates a fresh child-process Pi session with the selected standard tools.
   Use it for trusted interactive local work that needs normal Pi path behavior.
 
-Both executor forms use the same single-lease task service. Chat, Pi delegation,
-routine, workflow, and A2A tasks cannot overlap while mutating one agent project
-root, and abort waits for the session to become idle before releasing the lease.
+Both executor forms use isolated run queues and deterministic process-tree
+termination. Chat, Pi delegation, routine, workflow, and A2A tasks cannot
+overlap while mutating one agent project root, and stopping one run does not
+stop unrelated agents or Pi sessions.
 
 ## Recorded browser workflows
 

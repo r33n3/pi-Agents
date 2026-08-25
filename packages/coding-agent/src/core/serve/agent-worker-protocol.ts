@@ -14,7 +14,27 @@ export interface AgentWorkerAbortMessage {
 	type: "abort";
 }
 
-export type AgentWorkerRequest = AgentWorkerStartMessage | AgentWorkerAbortMessage;
+export type AgentWorkerHostAction =
+	| { family: "filesystem.read"; path: string }
+	| { family: "filesystem.list"; path: string }
+	| { family: "filesystem.write"; path: string; content: string };
+
+export type AgentWorkerHostActionResult =
+	| { family: "filesystem.read"; content: string }
+	| { family: "filesystem.list"; entries: Array<{ kind: "directory" | "file"; name: string }> }
+	| { family: "filesystem.write"; bytesWritten: number };
+
+export interface AgentWorkerHostActionResponseMessage {
+	type: "host-action-response";
+	requestId: string;
+	result?: AgentWorkerHostActionResult;
+	error?: { code: string; message: string };
+}
+
+export type AgentWorkerRequest =
+	| AgentWorkerStartMessage
+	| AgentWorkerAbortMessage
+	| AgentWorkerHostActionResponseMessage;
 
 export interface AgentWorkerEventMessage {
 	type: "event";
@@ -35,4 +55,14 @@ export interface AgentWorkerErrorMessage {
 	error: string;
 }
 
-export type AgentWorkerResponse = AgentWorkerEventMessage | AgentWorkerResultMessage | AgentWorkerErrorMessage;
+export interface AgentWorkerHostActionRequestMessage {
+	type: "host-action-request";
+	requestId: string;
+	action: AgentWorkerHostAction;
+}
+
+export type AgentWorkerResponse =
+	| AgentWorkerEventMessage
+	| AgentWorkerResultMessage
+	| AgentWorkerErrorMessage
+	| AgentWorkerHostActionRequestMessage;

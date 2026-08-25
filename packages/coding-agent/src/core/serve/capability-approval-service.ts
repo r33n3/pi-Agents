@@ -83,6 +83,8 @@ export class CapabilityApprovalService {
 			if (Date.parse(receipt.expiresAt) <= Date.now() && receipt.state === "approved") {
 				throw new Error(`Approval receipt ${receiptId} has expired`);
 			}
+			if (receipt.state === "failed") throw new Error(`Approval receipt ${receiptId} previously failed`);
+			if (receipt.state === "started") throw new Error(`Approval receipt ${receiptId} is already in progress`);
 			if (receipt.state === "approved") receipt.state = "started";
 			await this.#persist();
 			return receipt;

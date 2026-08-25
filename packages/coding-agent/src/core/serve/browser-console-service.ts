@@ -123,7 +123,7 @@ export class BrowserConsoleService {
 		return this.#manager.reload(id, "user");
 	}
 
-	setControl(id: string, controlOwner: "agent" | "user"): BrowserSessionSnapshot {
+	setControl(id: string, controlOwner: "agent" | "user"): Promise<BrowserSessionSnapshot> {
 		return this.#manager.setControl(id, controlOwner);
 	}
 

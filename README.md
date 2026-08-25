@@ -17,7 +17,8 @@ Pi Agents is a developer-focused fork of [earendil-works/pi](https://github.com/
 | Web console | `pi --serve` launches a token-protected, responsive workspace with session tabs, model controls, usage telemetry, attachments, prompt history, and resizable panels. |
 | Multiple Pi sessions | Connect independent Pi processes and project directories in one console. Each process keeps its own model, transcript, tools, working directory, and stop state. |
 | Persistent agents | Create persona-backed agents with a project root, model, thinking level, executor, filesystem policy, browser policy, and explicit tool grants. Chat and run history survive restarts. |
-| Agent Builder | Build or edit an agent through a temporary chat tab while structured Profile, Model & Tools, Connections, and Automation settings remain available in the side workspace. |
+| Agent Builder | Build or edit an agent through a temporary chat tab while structured Profile, Runtime, Capabilities, Delegation, and Automation settings remain available in the side workspace. |
+| Deployment Settings | A gear beside Sessions opens project-scoped Models, Connections, Capabilities, Plugins & MCP, and Security settings without replacing the active chat. |
 | Orchestration | Run sequential, parallel, and supervisor workflows. `pi-coordinator` executes dependency-aware work packages and exposes inspectable subagent progress without flooding the main chat. |
 | Routines | Define cron-backed agent or workflow runs with persisted schedules, results, artifacts, retries, and restart recovery. |
 | Managed browser | Pi and permitted agents can open local or remote pages in managed Chromium, inspect and operate them, share control with the user, record walkthroughs, and pop out the live view. |
@@ -86,22 +87,24 @@ Agent chat, Pi delegation, routines, workflows, and A2A requests all use the sam
 The reviewed extension, canonical capability, connection, approval, monitoring,
 and inbound-routing layers are defined in the
 [capability platform specification](docs/pi-capability-platform-spec.md).
-Agent Builder exposes provider accounts and health, capability defaults,
-approval history, fixed inbound routes, site monitors, and finance watchlists;
-all definitions persist across `pi --serve` restarts.
+Settings exposes provider accounts and health, deployment capability defaults,
+approval history, fixed inbound routes, site monitors, and finance watchlists.
+Agent Builder consumes those configured resources and grants only the selected
+accounts and capabilities to each agent. All definitions persist across
+`pi --serve` restarts.
 Productivity provider cards remain unavailable until their reviewed connector
 tools and account authorization are configured; raw consequential tools do not
 bypass the broker's receipt requirement.
 
 Set `SEARXNG_BASE_URL` in `.env.local` to the root URL of a trusted SearXNG
 instance. `pi --serve` then registers `searxng_search`; review and enable the
-SearXNG provider under Agent Builder > Model & Tools > Capabilities before
+SearXNG provider under Settings > Capabilities before
 granting `web.search` to an agent. Firecrawl remains the escalation path for
 scraping and bounded crawling.
 
 ## Security boundary
 
-The web token authenticates the console; it is not an operating-system sandbox. Pi and session-executor agents inherit the launching account's local permissions. Harness agents confine built-in file tools to their configured project root, but that is still not a container boundary. Use the documented container or sandbox patterns when stronger isolation is required.
+The web token authenticates the console; it is not an operating-system sandbox. Deployed agents run in separate child processes with isolated queues and working directories. Child environments exclude provider, OAuth, and API-key secrets; harness filesystem actions are path-confined and mediated by the host. The launching operating-system account remains the ultimate local authority, so use the documented container or sandbox patterns when stronger isolation is required.
 
 ## Upstream Pi
 

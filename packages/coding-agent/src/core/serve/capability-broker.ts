@@ -43,6 +43,28 @@ export interface CapabilityProviderBinding {
 	executors: AgentExecutorKind[];
 }
 
+export interface ProviderConfigurationField {
+	env: string;
+	label: string;
+	required: boolean;
+	secret: boolean;
+	format?: "text" | "url";
+	operatorEditable?: boolean;
+}
+
+export interface ProviderAuthenticationManifest {
+	kind: "environment" | "oauth2";
+	fields: ProviderConfigurationField[];
+	capabilityGroups?: ProviderCapabilityGroup[];
+	defaultCapabilityIds?: string[];
+}
+
+export interface ProviderCapabilityGroup {
+	id: string;
+	label: string;
+	capabilityIds: string[];
+}
+
 export interface CapabilityProviderManifest {
 	id: string;
 	name: string;
@@ -50,7 +72,16 @@ export interface CapabilityProviderManifest {
 	version: string;
 	permissions: string[];
 	connectionRequired?: boolean;
+	authentication?: ProviderAuthenticationManifest;
 	bindings: CapabilityProviderBinding[];
+}
+
+export interface ProviderAuthenticationView {
+	kind: "environment" | "oauth2";
+	configured: boolean;
+	fields: Array<ProviderConfigurationField & { configured: boolean }>;
+	capabilityGroups?: ProviderCapabilityGroup[];
+	defaultCapabilityIds?: string[];
 }
 
 export interface CapabilityProviderView extends CapabilityProviderManifest {
@@ -59,6 +90,7 @@ export interface CapabilityProviderView extends CapabilityProviderManifest {
 	enabled: boolean;
 	health: "ready" | "degraded" | "missing-tools" | "passive";
 	missingTools: string[];
+	authentication?: ProviderAuthenticationView;
 }
 
 export interface BrokeredCapabilityView extends CapabilityDefinition {
@@ -95,6 +127,8 @@ export interface CapabilityAuditEvent {
 export interface CapabilityBrokerOptions {
 	activeToolNames: () => readonly string[];
 	activeProviderSources?: () => readonly string[];
+	environmentValue?: (name: string) => string | undefined;
+	providerConnectionAvailable?: (providerId: string) => boolean;
 	connectionResolver?: (
 		connectionId: string,
 	) => { providerId: string; capabilityIds: readonly string[]; status: string } | undefined;
@@ -193,6 +227,18 @@ const WAVE_ONE_MANIFESTS: readonly CapabilityProviderManifest[] = [
 		source: "builtin:pi-searxng",
 		version: "1",
 		permissions: ["configured SearXNG network read"],
+		authentication: {
+			kind: "environment",
+			fields: [
+				{
+					env: "SEARXNG_BASE_URL",
+					label: "SearXNG URL",
+					required: true,
+					secret: false,
+					format: "url",
+				},
+			],
+		},
 		bindings: [
 			{
 				capabilityId: "web.search",
@@ -229,6 +275,13 @@ const WAVE_ONE_MANIFESTS: readonly CapabilityProviderManifest[] = [
 		source: "@narumitw/pi-firecrawl",
 		version: "review-required",
 		permissions: ["public network read", "Firecrawl credential"],
+		authentication: {
+			kind: "environment",
+			fields: [
+				{ env: "FIRECRAWL_BASE_URL", label: "Firecrawl URL", required: false, secret: false, format: "url" },
+				{ env: "FIRECRAWL_API_KEY", label: "Firecrawl API key", required: true, secret: true },
+			],
+		},
 		bindings: [
 			{
 				capabilityId: "web.search",
@@ -362,6 +415,7 @@ const WAVE_TWO_MANIFESTS: readonly CapabilityProviderManifest[] = [
 		"calendar",
 		"contacts",
 		"cloud-files",
+		"messaging",
 	]),
 	productivityManifest("microsoft-365", "Microsoft 365", "microsoft_365", [
 		"email",
@@ -377,7 +431,6 @@ const WAVE_TWO_MANIFESTS: readonly CapabilityProviderManifest[] = [
 	productivityManifest("clickup", "ClickUp", "clickup", ["tasks"]),
 	productivityManifest("slack", "Slack", "slack", ["messaging"]),
 	productivityManifest("microsoft-teams", "Microsoft Teams", "microsoft_teams", ["messaging"]),
-	productivityManifest("google-chat", "Google Chat", "google_chat", ["messaging"]),
 	productivityManifest("telegram", "Telegram", "telegram", ["messaging"]),
 ];
 
@@ -390,6 +443,8 @@ export class CapabilityBroker {
 	readonly #manifests: Map<string, CapabilityProviderManifest>;
 	readonly #activeToolNames: () => readonly string[];
 	readonly #activeProviderSources: () => readonly string[];
+	readonly #environmentValue: (name: string) => string | undefined;
+	readonly #providerConnectionAvailable: (providerId: string) => boolean;
 	readonly #connectionResolver:
 		| ((connectionId: string) =>
 				| {
@@ -408,6 +463,8 @@ export class CapabilityBroker {
 		this.#auditPath = resolve(this.#root, "audit.jsonl");
 		this.#activeToolNames = options.activeToolNames;
 		this.#activeProviderSources = options.activeProviderSources ?? (() => []);
+		this.#environmentValue = options.environmentValue ?? ((name) => process.env[name]);
+		this.#providerConnectionAvailable = options.providerConnectionAvailable ?? (() => false);
 		this.#connectionResolver = options.connectionResolver;
 		this.#definitions = new Map(
 			(options.definitions ?? [...WAVE_ONE_DEFINITIONS, ...WAVE_TWO_DEFINITIONS]).map((entry) => [entry.id, entry]),
@@ -454,6 +511,13 @@ export class CapabilityBroker {
 		return { capabilities, providers };
 	}
 
+	authenticationManifest(providerId: string): ProviderAuthenticationManifest | undefined {
+		const authentication = this.#provider(providerId).authentication;
+		return authentication
+			? { ...authentication, fields: authentication.fields.map((field) => ({ ...field })) }
+			: undefined;
+	}
+
 	async reviewProvider(providerId: string, approved: boolean): Promise<CapabilityProviderView> {
 		assertApproval(approved);
 		return this.#mutate(async () => {
@@ -479,6 +543,12 @@ export class CapabilityBroker {
 				throw new Error(`Provider ${providerId} must be reviewed at its current digest before enabling`);
 			}
 			const view = this.#providerView(manifest, new Set(this.#activeToolNames()));
+			if (view.authentication && !view.authentication.configured) {
+				throw new Error(`Provider ${providerId} requires configuration before enabling`);
+			}
+			if (manifest.connectionRequired && !this.#providerConnectionAvailable(providerId)) {
+				throw new Error(`Provider ${providerId} requires an active connection before enabling`);
+			}
 			if (view.health === "missing-tools") {
 				throw new Error(`Provider ${providerId} is missing loaded tools: ${view.missingTools.join(", ")}`);
 			}
@@ -649,16 +719,34 @@ export class CapabilityBroker {
 							? "missing-tools"
 							: "degraded",
 			missingTools,
+			authentication: manifest.authentication
+				? {
+						...manifest.authentication,
+						configured: manifest.authentication.fields
+							.filter((field) => field.required)
+							.every((field) => Boolean(this.#environmentValue(field.env)?.trim())),
+						fields: manifest.authentication.fields.map((field) => ({
+							...field,
+							configured: Boolean(this.#environmentValue(field.env)?.trim()),
+						})),
+					}
+				: undefined,
 		};
 	}
 
 	#bindingReady(
-		provider: Pick<CapabilityProviderManifest, "bindings" | "source" | "connectionRequired">,
+		provider: Pick<CapabilityProviderManifest, "authentication" | "bindings" | "source" | "connectionRequired">,
 		capabilityId: string,
 		activeTools: ReadonlySet<string>,
 	): boolean {
 		const binding = provider.bindings.find((entry) => entry.capabilityId === capabilityId);
 		if (!binding) return false;
+		if (
+			provider.authentication?.fields
+				.filter((field) => field.required)
+				.some((field) => !this.#environmentValue(field.env)?.trim())
+		)
+			return false;
 		const definition = this.#definitions.get(capabilityId);
 		if (provider.connectionRequired && definition?.effect !== "read" && !binding.approvalEnforced) return false;
 		if (binding.toolName) return activeTools.has(binding.toolName);
@@ -689,6 +777,43 @@ export class CapabilityBroker {
 
 	#validateCatalog(): void {
 		for (const manifest of this.#manifests.values()) {
+			const environmentNames = new Set<string>();
+			for (const field of manifest.authentication?.fields ?? []) {
+				if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(field.env)) {
+					throw new Error(`Provider ${manifest.id} has an invalid environment field`);
+				}
+				if (isDangerousEnvironmentName(field.env)) {
+					throw new Error(`Provider ${manifest.id} declares a prohibited environment field`);
+				}
+				if (environmentNames.has(field.env)) {
+					throw new Error(`Provider ${manifest.id} declares ${field.env} more than once`);
+				}
+				environmentNames.add(field.env);
+			}
+			const groupedCapabilities = new Set<string>();
+			for (const group of manifest.authentication?.capabilityGroups ?? []) {
+				if (
+					!/^[a-z0-9][a-z0-9-]{0,63}$/.test(group.id) ||
+					!group.label.trim() ||
+					group.capabilityIds.length === 0
+				) {
+					throw new Error(`Provider ${manifest.id} has an invalid authentication capability group`);
+				}
+				for (const capabilityId of group.capabilityIds) {
+					if (groupedCapabilities.has(capabilityId)) {
+						throw new Error(`Provider ${manifest.id} groups ${capabilityId} more than once`);
+					}
+					if (!manifest.bindings.some((binding) => binding.capabilityId === capabilityId)) {
+						throw new Error(`Provider ${manifest.id} groups an unbound capability: ${capabilityId}`);
+					}
+					groupedCapabilities.add(capabilityId);
+				}
+			}
+			for (const capabilityId of manifest.authentication?.defaultCapabilityIds ?? []) {
+				if (!groupedCapabilities.has(capabilityId)) {
+					throw new Error(`Provider ${manifest.id} defaults an ungrouped capability: ${capabilityId}`);
+				}
+			}
 			for (const binding of manifest.bindings) {
 				const definition = this.#definitions.get(binding.capabilityId);
 				if (!definition || definition.version !== binding.capabilityVersion) {
@@ -789,6 +914,24 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 	return error instanceof Error && "code" in error;
 }
 
+function isDangerousEnvironmentName(name: string): boolean {
+	return (
+		[
+			"COMSPEC",
+			"HOME",
+			"NODE_OPTIONS",
+			"NODE_PATH",
+			"PATH",
+			"PATHEXT",
+			"SHELL",
+			"SYSTEMROOT",
+			"TEMP",
+			"TMP",
+			"USERPROFILE",
+		].includes(name) || name.startsWith("NPM_CONFIG_")
+	);
+}
+
 function readDefinitions(group: string, actions: readonly string[]): CapabilityDefinition[] {
 	return actions.map((action) => ({
 		id: `${group}.${action}`,
@@ -838,13 +981,74 @@ function productivityManifest(
 		version: "1",
 		permissions: ["connected account data", "provider API access"],
 		connectionRequired: true,
+		authentication:
+			id === "google-workspace"
+				? {
+						kind: "oauth2",
+						capabilityGroups: [
+							googleCapabilityGroup("gmail", "Gmail", "email", capabilityIds),
+							googleCapabilityGroup("calendar", "Calendar", "calendar", capabilityIds),
+							googleCapabilityGroup("drive", "Drive", "cloud-files", capabilityIds),
+							googleCapabilityGroup("contacts", "Contacts", "contacts", capabilityIds),
+							googleCapabilityGroup("chat", "Google Chat", "messaging", capabilityIds),
+						],
+						defaultCapabilityIds: ["email.search", "email.read", "email.draft"],
+						fields: [
+							{ env: "GOOGLE_CLIENT_ID", label: "Google OAuth client ID", required: true, secret: false },
+							{
+								env: "GOOGLE_CLIENT_SECRET",
+								label: "Google OAuth client secret",
+								required: true,
+								secret: true,
+							},
+							{
+								env: "GOOGLE_OAUTH_REDIRECT_URI",
+								label: "Google OAuth redirect URI",
+								required: false,
+								secret: false,
+								format: "url",
+							},
+							{
+								env: "GOOGLE_OAUTH_ACCESS_TOKEN",
+								label: "Google OAuth access token",
+								required: false,
+								secret: true,
+								operatorEditable: false,
+							},
+							{
+								env: "GOOGLE_OAUTH_REFRESH_TOKEN",
+								label: "Google OAuth refresh token",
+								required: false,
+								secret: true,
+								operatorEditable: false,
+							},
+							{
+								env: "GOOGLE_OAUTH_EXPIRES_AT",
+								label: "Google OAuth expiry",
+								required: false,
+								secret: false,
+								operatorEditable: false,
+							},
+						],
+					}
+				: undefined,
 		bindings: capabilityIds.map((capabilityId) => ({
 			capabilityId,
 			capabilityVersion: 1,
 			toolName: `${toolPrefix}_${capabilityId.replace(/[.-]/g, "_")}`,
-			executors: ["session"],
+			approvalEnforced: WAVE_TWO_DEFINITIONS.find((definition) => definition.id === capabilityId)?.effect !== "read",
+			executors: ["session", "harness"],
 		})),
 	};
+}
+
+function googleCapabilityGroup(
+	id: string,
+	label: string,
+	prefix: string,
+	capabilityIds: readonly string[],
+): ProviderCapabilityGroup {
+	return { id, label, capabilityIds: capabilityIds.filter((capabilityId) => capabilityId.startsWith(`${prefix}.`)) };
 }
 
 function categoryFor(group: string): CapabilityCategory {

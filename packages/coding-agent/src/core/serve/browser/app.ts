@@ -64,6 +64,20 @@ const connectionList = element("connection-list");
 const connectionForm = requiredElement<HTMLFormElement>("connection-form");
 const connectionUrl = requiredElement<HTMLInputElement>("connection-url");
 const showConnectionForm = requiredElement<HTMLButtonElement>("show-connection-form");
+const openSettingsButton = requiredElement<HTMLButtonElement>("open-settings");
+const settingsWorkspace = element("settings-workspace");
+const settingsClose = requiredElement<HTMLButtonElement>("settings-close");
+const settingsProjectName = element("settings-project-name");
+const settingsProjectPath = element("settings-project-path");
+const settingsModelList = element("settings-model-list");
+const settingsConnectionList = element("settings-connection-list");
+const settingsCapabilityList = element("settings-capability-list");
+const settingsCapabilitySearch = requiredElement<HTMLInputElement>("settings-capability-search");
+const settingsPluginList = element("settings-plugin-list");
+const settingsMcpList = element("settings-mcp-list");
+const settingsSecurityList = element("settings-security-list");
+const settingsAdvancedConnections = element("settings-advanced-connections");
+const settingsPluginManagement = element("settings-plugin-management");
 const externalConnectionList = element("external-connection-list");
 const externalRunForm = requiredElement<HTMLFormElement>("external-run-form");
 const externalRunList = element("external-run-list");
@@ -88,6 +102,7 @@ const browserWorkflowList = createBrowserWorkflowReviewPanel();
 const browserProfileList = createBrowserProfilePanel();
 const agentBrowserWorkflowGrants = createAgentBrowserWorkflowGrants();
 installAgentBuilderToolsLayout(agentBrowserWorkflowGrants);
+installSettingsLayout();
 const modelPicker = installThemedSelect(model);
 const agentModelPicker = installThemedSelect(agentModel);
 const externalModelPicker = installThemedSelect(externalModel);
@@ -131,8 +146,11 @@ let agents: AgentSummary[] = [];
 let personas: PersonaSummary[] = [];
 let agentEvents: EventSource | undefined;
 let capabilitySearchTimer: number | undefined;
+let settingsReturnHash = "";
+let settingsReturnFocus: HTMLElement | undefined;
 let capabilityConnections: CapabilityConnectionSummary[] = [];
 let capabilitySnapshot: CapabilitySnapshot["broker"] | undefined;
+let capabilityCatalogSnapshot: CapabilitySnapshot | undefined;
 const attachmentsBySession = new Map<string, AttachmentSummary[]>();
 
 interface AttachmentSummary {
@@ -198,6 +216,26 @@ interface CapabilityProvider {
 	missingTools: string[];
 	permissions: string[];
 	connectionRequired?: boolean;
+	bindings: Array<{
+		capabilityId: string;
+		capabilityVersion: number;
+		toolName?: string;
+	}>;
+	authentication?: {
+		kind: "environment" | "oauth2";
+		configured: boolean;
+		fields: Array<{
+			env: string;
+			label: string;
+			required: boolean;
+			secret: boolean;
+			format?: "text" | "url";
+			operatorEditable?: boolean;
+			configured: boolean;
+		}>;
+		capabilityGroups?: Array<{ id: string; label: string; capabilityIds: string[] }>;
+		defaultCapabilityIds?: string[];
+	};
 }
 
 interface CapabilityConnectionSummary {
@@ -674,6 +712,22 @@ function installAgentBuilderToolsLayout(browserWorkflowGrants: HTMLElement): voi
 	const pluginSection = pluginForm.closest("details");
 	const browserWorkflowSection = browserWorkflowGrants.closest("details");
 	if (!pluginSection || !browserWorkflowSection) throw new Error("Agent Builder tool sections are incomplete");
+	const tabs = panel.parentElement?.querySelector<HTMLElement>(".builder-tabs");
+	const runtimeTab = tabs?.querySelector<HTMLButtonElement>('[data-builder-tab="builder-tools-panel"]');
+	const delegationTab = tabs?.querySelector<HTMLButtonElement>('[data-builder-tab="builder-connections-panel"]');
+	if (!tabs || !runtimeTab || !delegationTab) throw new Error("Agent Builder navigation is incomplete");
+	runtimeTab.textContent = "Runtime";
+	delegationTab.textContent = "Delegation";
+	const capabilityTab = document.createElement("button");
+	capabilityTab.type = "button";
+	capabilityTab.dataset.builderTab = "builder-capabilities-panel";
+	capabilityTab.textContent = "Capabilities";
+	tabs.insertBefore(capabilityTab, delegationTab);
+	const capabilityPanel = document.createElement("section");
+	capabilityPanel.id = "builder-capabilities-panel";
+	capabilityPanel.className = "builder-panel hidden";
+	capabilityPanel.dataset.builderPanel = "";
+	panel.after(capabilityPanel);
 	const stack = document.createElement("div");
 	stack.className = "builder-settings-stack";
 	stack.append(
@@ -697,20 +751,31 @@ function installAgentBuilderToolsLayout(browserWorkflowGrants: HTMLElement): voi
 				fieldLabel("agent-browser-runtime"),
 				fieldLabel("agent-browser-profile-kind"),
 				fieldLabel("agent-browser-profile-id"),
-				browserWorkflowSection,
 			],
 			false,
 		),
+	);
+	panel.prepend(stack);
+	const hiddenTools = element("agent-tools");
+	const hiddenCapabilities = element("agent-capabilities");
+	capabilityPanel.append(
+		hiddenTools,
+		hiddenCapabilities,
 		builderSettingsGroup(
 			"Capabilities",
-			"Grant only the tools this agent needs.",
+			"Grant only resources that are ready in Settings.",
 			[capabilityList],
 			true,
 			"agent-capability-summary",
 		),
-		builderSettingsGroup("Plugins", "Install and manage optional capability packages.", [pluginSection], false),
+		builderSettingsGroup(
+			"Browser workflows",
+			"Grant validated browser workflows to this agent.",
+			[browserWorkflowSection],
+			false,
+		),
 	);
-	panel.prepend(stack);
+	settingsPluginManagement.append(pluginSection);
 }
 
 function builderSettingsGroup(
@@ -750,6 +815,342 @@ function fieldLabel(id: string): HTMLLabelElement {
 	const label = requiredElement<HTMLElement>(id).closest("label");
 	if (!(label instanceof HTMLLabelElement)) throw new Error(`Agent Builder field ${id} is missing its label`);
 	return label;
+}
+
+type SettingsSection = "models" | "connections" | "capabilities" | "plugins" | "security";
+
+function installSettingsLayout(): void {
+	const connectionSection = capabilityConnectionForm.closest("details");
+	const approvalSection = capabilityApprovalList.closest("details");
+	const inboundSection = inboundRouteForm.closest("details");
+	const siteMonitorSection = siteMonitorForm.closest("details");
+	const financeWatchlistSection = financeWatchlistForm.closest("details");
+	if (!connectionSection || !approvalSection || !inboundSection || !siteMonitorSection || !financeWatchlistSection) {
+		throw new Error("Settings resources are incomplete");
+	}
+	settingsAdvancedConnections.append(connectionSection, siteMonitorSection, financeWatchlistSection);
+	settingsSecurityList.append(approvalSection, inboundSection);
+	for (const button of document.querySelectorAll<HTMLButtonElement>("[data-settings-section]")) {
+		button.addEventListener("click", () => {
+			const section = settingsSection(button.dataset.settingsSection);
+			showSettingsSection(section);
+			history.replaceState(null, "", `#settings/${section}`);
+		});
+	}
+	settingsCapabilitySearch.addEventListener("input", renderSettingsCapabilities);
+	window.addEventListener("hashchange", applySettingsHash);
+}
+
+function openSettings(section: SettingsSection = "models", resourceId?: string): void {
+	if (settingsWorkspace.classList.contains("hidden")) {
+		settingsReturnHash = location.hash.startsWith("#settings/") ? "" : location.hash;
+		settingsReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
+	}
+	const cwd = session?.snapshot?.cwd ?? requiredElement<HTMLInputElement>("agent-project-root").value;
+	const project = sessionFolderName(cwd) ?? "Pi deployment";
+	settingsProjectName.textContent = `Settings · ${project}`;
+	settingsProjectPath.textContent = cwd;
+	settingsProjectPath.title = cwd;
+	settingsWorkspace.classList.remove("hidden");
+	mobilePanelNone.checked = true;
+	showSettingsSection(section);
+	renderSettings();
+	const hash = `#settings/${section}${resourceId ? `/${encodeURIComponent(resourceId)}` : ""}`;
+	history.replaceState(null, "", hash);
+	window.setTimeout(() => {
+		const resource = resourceId
+			? settingsWorkspace.querySelector<HTMLElement>(`[data-settings-resource="${CSS.escape(resourceId)}"]`)
+			: undefined;
+		(resource ?? settingsClose).focus();
+		resource?.scrollIntoView({ block: "start" });
+	}, 0);
+}
+
+function closeSettings(): void {
+	settingsWorkspace.classList.add("hidden");
+	history.replaceState(null, "", `${location.pathname}${location.search}${settingsReturnHash}`);
+	settingsReturnFocus?.focus();
+}
+
+function applySettingsHash(): void {
+	if (!location.hash.startsWith("#settings/")) return;
+	const [, rawSection, rawResource] = location.hash.split("/");
+	openSettings(settingsSection(rawSection), rawResource ? decodeURIComponent(rawResource) : undefined);
+}
+
+function settingsSection(value: string | undefined): SettingsSection {
+	return value === "connections" ||
+		value === "capabilities" ||
+		value === "plugins" ||
+		value === "security" ||
+		value === "models"
+		? value
+		: "models";
+}
+
+function showSettingsSection(section: SettingsSection): void {
+	for (const button of document.querySelectorAll<HTMLButtonElement>("[data-settings-section]")) {
+		button.classList.toggle("active", button.dataset.settingsSection === section);
+		button.setAttribute("aria-current", button.dataset.settingsSection === section ? "page" : "false");
+	}
+	for (const panel of document.querySelectorAll<HTMLElement>("[data-settings-panel]")) {
+		panel.classList.toggle("hidden", panel.id !== `settings-${section}`);
+	}
+}
+
+function renderSettings(): void {
+	renderSettingsModels();
+	renderSettingsConnections();
+	renderSettingsCapabilities();
+	renderSettingsPlugins();
+}
+
+function renderSettingsModels(): void {
+	const byProvider = new Map<string, ModelMetadata[]>();
+	for (const entry of availableModels) {
+		const group = byProvider.get(entry.provider) ?? [];
+		group.push(entry);
+		byProvider.set(entry.provider, group);
+	}
+	settingsModelList.replaceChildren(
+		...[...byProvider.entries()].map(([provider, models]) =>
+			settingsCard(
+				provider,
+				`${models.length} usable model${models.length === 1 ? "" : "s"}`,
+				"Ready",
+				"Deployment",
+				provider,
+			),
+		),
+	);
+	if (byProvider.size === 0) appendText(settingsModelList, "No usable models reported", "settings-empty");
+}
+
+function renderSettingsConnections(): void {
+	const providers = capabilityCatalogSnapshot?.broker.providers.filter((provider) => provider.authentication) ?? [];
+	settingsConnectionList.replaceChildren(
+		...providers.map((provider) => {
+			const connection = capabilityConnections.find(
+				(entry) => entry.providerId === provider.id && entry.status !== "revoked",
+			);
+			const state = providerConnectionState(provider, connection);
+			const card = settingsCard(
+				provider.name,
+				connection?.accountLabel ?? provider.source,
+				state,
+				"Project",
+				provider.id,
+			);
+			if (provider.id === "google-workspace") {
+				const icon = document.createElement("span");
+				icon.className = "settings-provider-icon";
+				icon.textContent = "G";
+				icon.setAttribute("aria-hidden", "true");
+				card.querySelector(".settings-card-header")?.prepend(icon);
+			}
+			card.append(providerConfigurationForm(provider));
+			const actions = document.createElement("div");
+			actions.className = "settings-actions";
+			if (provider.trust === "quarantined" || provider.trust === "unreviewed") {
+				actions.append(capabilityProviderButton("Review", () => changeCapabilityProvider(provider.id, "review")));
+			} else if (provider.enabled) {
+				actions.append(capabilityProviderButton("Disable", () => changeCapabilityProvider(provider.id, "disable")));
+			} else {
+				const enable = capabilityProviderButton("Enable", () => changeCapabilityProvider(provider.id, "enable"));
+				enable.disabled = provider.health === "missing-tools";
+				actions.append(enable);
+			}
+			card.append(actions);
+			return card;
+		}),
+	);
+	if (providers.length === 0)
+		appendText(settingsConnectionList, "No configurable connections installed", "settings-empty");
+}
+
+function renderSettingsCapabilities(): void {
+	const query = settingsCapabilitySearch.value.trim().toLowerCase();
+	const broker = capabilityCatalogSnapshot?.broker;
+	if (!broker) {
+		settingsCapabilityList.replaceChildren();
+		appendText(settingsCapabilityList, "Capability catalogue has not loaded", "settings-empty");
+		return;
+	}
+	const cards = broker.capabilities
+		.filter((capability) =>
+			[capability.id, capability.name, capability.description, capability.category].some((value) =>
+				value.toLowerCase().includes(query),
+			),
+		)
+		.map((capability) => {
+			const provider = broker.providers.find((entry) => entry.id === capability.defaultProviderId);
+			const connectionReady =
+				!provider?.connectionRequired ||
+				capabilityConnections.some(
+					(connection) =>
+						connection.status === "active" &&
+						connection.providerId === provider.id &&
+						connection.capabilityIds.includes(capability.id),
+				);
+			const card = settingsCard(
+				capability.name,
+				`${capability.effect} · ${provider?.name ?? "No provider"}`,
+				canonicalCapabilityState(capability, provider, connectionReady),
+				"Deployment",
+				capability.id,
+			);
+			appendText(card, capability.description, "capability-meta");
+			if (provider && canonicalCapabilityState(capability, provider, connectionReady) !== "Ready") {
+				const actions = document.createElement("div");
+				actions.className = "settings-actions";
+				const configure = document.createElement("button");
+				configure.type = "button";
+				configure.textContent = settingsRemediationLabel(provider, connectionReady);
+				configure.addEventListener("click", () => openProviderSettings(provider));
+				actions.append(configure);
+				card.append(actions);
+			}
+			return card;
+		});
+	settingsCapabilityList.replaceChildren(...cards);
+	if (cards.length === 0) appendText(settingsCapabilityList, "No matching capabilities", "settings-empty");
+}
+
+function renderSettingsPlugins(): void {
+	const snapshot = capabilityCatalogSnapshot;
+	settingsPluginList.replaceChildren(
+		...(snapshot?.broker.providers ?? [])
+			.filter((provider) => !provider.authentication)
+			.map((provider) => {
+				const card = settingsCard(
+					provider.name,
+					`${provider.source}@${provider.version}`,
+					provider.health === "missing-tools" ? "Unavailable" : provider.enabled ? "Ready" : "Disabled",
+					"Deployment",
+					provider.id,
+				);
+				const actions = document.createElement("div");
+				actions.className = "settings-actions";
+				if (provider.trust === "quarantined" || provider.trust === "unreviewed") {
+					actions.append(
+						capabilityProviderButton("Review", () => changeCapabilityProvider(provider.id, "review")),
+					);
+				} else if (provider.enabled) {
+					actions.append(
+						capabilityProviderButton("Disable", () => changeCapabilityProvider(provider.id, "disable")),
+					);
+				} else {
+					const enable = capabilityProviderButton("Enable", () => changeCapabilityProvider(provider.id, "enable"));
+					enable.disabled = provider.health === "missing-tools";
+					actions.append(enable);
+				}
+				card.append(actions);
+				return card;
+			}),
+		...(snapshot?.plugins ?? []).map((entry) => {
+			const card = settingsCard(
+				entry.name,
+				entry.source ?? entry.description,
+				canonicalEntryState(entry),
+				"User",
+				entry.id,
+			);
+			if (entry.source) {
+				const actions = document.createElement("div");
+				actions.className = "settings-actions";
+				for (const action of ["update", "remove"] as const) {
+					const button = document.createElement("button");
+					button.type = "button";
+					button.textContent = action === "update" ? "Update" : "Remove";
+					if (action === "remove") button.className = "danger";
+					button.addEventListener("click", () => void changePlugin(action, entry.source ?? "", entry.scope));
+					actions.append(button);
+				}
+				card.append(actions);
+			}
+			return card;
+		}),
+	);
+	settingsMcpList.replaceChildren(
+		...(snapshot?.mcpServers ?? []).map((entry) =>
+			settingsCard(entry.name, entry.description, canonicalEntryState(entry), "Deployment", entry.id),
+		),
+	);
+}
+
+function settingsCard(
+	name: string,
+	description: string,
+	state: string,
+	scope: "Project" | "User" | "Deployment",
+	resourceId: string,
+): HTMLElement {
+	const card = document.createElement("article");
+	card.className = "settings-card";
+	card.dataset.settingsResource = resourceId;
+	card.tabIndex = -1;
+	const header = document.createElement("div");
+	header.className = "settings-card-header";
+	const title = document.createElement("strong");
+	title.textContent = name;
+	const badge = document.createElement("span");
+	badge.className = "settings-badge";
+	badge.textContent = scope;
+	header.append(title, badge);
+	card.append(header);
+	appendText(card, description, "capability-meta");
+	appendText(
+		card,
+		state,
+		state === "Needs attention" || state === "Unavailable" ? "settings-state error" : "settings-state",
+	);
+	return card;
+}
+
+function canonicalEntryState(entry: CapabilityEntry): string {
+	return entry.status === "active" ? "Ready" : entry.status === "available" ? "Setup required" : "Unavailable";
+}
+
+function providerConnectionState(
+	provider: CapabilityProvider,
+	connection: CapabilityConnectionSummary | undefined,
+): string {
+	if (!provider.authentication?.configured) return "Setup required";
+	if (provider.health === "missing-tools") return "Unavailable";
+	if (connection?.status === "unhealthy") return "Needs attention";
+	if (connection?.status === "active") return "Connected";
+	return "Ready to connect";
+}
+
+function canonicalCapabilityState(
+	capability: BrokeredCapability,
+	provider: CapabilityProvider | undefined,
+	connectionReady: boolean,
+): string {
+	if (!provider || provider.health === "missing-tools" || capability.status === "unavailable") return "Unavailable";
+	if (provider.authentication && !provider.authentication.configured) return "Setup required";
+	if (provider.trust === "unreviewed" || provider.trust === "quarantined") return "Setup required";
+	if (!provider.enabled) return "Disabled";
+	if (!connectionReady) {
+		return capabilityConnections.some(
+			(connection) => connection.providerId === provider.id && connection.status === "unhealthy",
+		)
+			? "Needs attention"
+			: "Setup required";
+	}
+	return capability.status === "active" ? "Ready" : "Setup required";
+}
+
+function settingsRemediationLabel(provider: CapabilityProvider, connectionReady: boolean): string {
+	if (provider.health === "missing-tools") return "Install";
+	if (provider.trust === "unreviewed" || provider.trust === "quarantined") return "Review";
+	if (!provider.authentication?.configured) return "Configure";
+	if (!connectionReady) return "Reconnect";
+	return provider.enabled ? "Configure" : "Enable";
+}
+
+function openProviderSettings(provider: CapabilityProvider): void {
+	openSettings(provider.authentication ? "connections" : "plugins", provider.id);
 }
 
 function createBrowserProfilePanel(): HTMLElement {
@@ -2934,16 +3335,13 @@ async function loadCapabilities(): Promise<void> {
 	if (!response.ok) throw new Error(`Could not load capabilities: HTTP ${response.status}`);
 	const payload: unknown = await response.json();
 	if (!isCapabilitySnapshot(payload)) throw new Error("Capability catalog returned an invalid response");
+	capabilityCatalogSnapshot = payload;
 	capabilitySnapshot = payload.broker;
 	const query = ensureCapabilitySearch().value.trim().toLowerCase();
 	const groups: Array<["local" | "remote", string, CapabilityEntry[], boolean]> = [
 		["local", "Tools", payload.tools, false],
 		["local", "Skills", payload.skills, false],
-		["local", "Plugins", payload.plugins, false],
 		["local", "Extensions", payload.extensions, false],
-		["remote", "MCP servers", payload.mcpServers, false],
-		["remote", "ACP connectors", payload.acpConnections, false],
-		["remote", "Model providers", payload.modelProviders, false],
 	];
 	element("capability-list").replaceChildren(
 		...renderBrokeredCapabilities(payload.broker, query),
@@ -3022,6 +3420,7 @@ async function loadCapabilities(): Promise<void> {
 		}),
 	);
 	updateBuilderCapabilitySummary();
+	renderSettings();
 }
 
 async function loadCapabilityConnections(): Promise<void> {
@@ -3060,6 +3459,7 @@ async function loadCapabilityConnections(): Promise<void> {
 		}),
 	);
 	refreshConnectionSelectors();
+	renderSettings();
 }
 
 function isCapabilityConnectionList(value: unknown): value is { connections: CapabilityConnectionSummary[] } {
@@ -3327,9 +3727,6 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 			value.toLowerCase().includes(query),
 		),
 	);
-	const providers = broker.providers.filter((provider) =>
-		[provider.name, provider.source, provider.id].some((value) => value.toLowerCase().includes(query)),
-	);
 	const capabilitySection = document.createElement("details");
 	capabilitySection.className = "capability-section";
 	capabilitySection.open = true;
@@ -3357,7 +3754,9 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 		checkbox.disabled = capability.status !== "active" || !connectionReady;
 		checkbox.title =
 			capability.status !== "active"
-				? "Review and enable a healthy provider first"
+				? defaultProvider?.authentication && !defaultProvider.authentication.configured
+					? "Configure the provider first"
+					: "Review and enable a healthy provider first"
 				: !connectionReady
 					? "Configure an active provider account with this grant"
 					: "Grant capability";
@@ -3368,7 +3767,7 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 		grant.append(checkbox, label);
 		const state = document.createElement("span");
 		state.className = "capability-status";
-		state.textContent = capability.status;
+		state.textContent = canonicalCapabilityState(capability, defaultProvider, connectionReady);
 		summary.append(grant, state);
 		const body = document.createElement("div");
 		body.className = "capability-body";
@@ -3378,6 +3777,13 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 			`${capability.category} · ${capability.effect} · ${capability.defaultProviderId ?? "no default provider"}`,
 			"capability-meta",
 		);
+		if (checkbox.disabled && defaultProvider) {
+			const configure = document.createElement("button");
+			configure.type = "button";
+			configure.textContent = settingsRemediationLabel(defaultProvider, connectionReady);
+			configure.addEventListener("click", () => openProviderSettings(defaultProvider));
+			body.append(configure);
+		}
 		const availableProviders = capability.providers
 			.map((id) => broker.providers.find((provider) => provider.id === id))
 			.filter((provider): provider is CapabilityProvider => provider?.enabled === true);
@@ -3403,38 +3809,210 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 		capabilitySection.append(card);
 	}
 
-	const providerSection = document.createElement("details");
-	providerSection.className = "capability-section";
-	const providerHeading = document.createElement("summary");
-	providerHeading.innerHTML = `<strong>Providers</strong><span class="capability-count">${providers.length}</span>`;
-	providerSection.append(providerHeading);
-	for (const provider of providers) {
-		const card = document.createElement("details");
-		card.className = "card capability-card";
-		const summary = document.createElement("summary");
-		summary.textContent = `${provider.name} · ${provider.trust}`;
-		const body = document.createElement("div");
-		body.className = "capability-body";
-		appendText(body, `${provider.source}@${provider.version}`, "muted");
-		appendText(body, `Health: ${provider.health}`, "capability-meta");
-		appendText(body, `Permissions: ${provider.permissions.join(", ")}`, "capability-meta");
-		if (provider.missingTools.length > 0) appendText(body, `Missing: ${provider.missingTools.join(", ")}`, "muted");
-		const actions = document.createElement("div");
-		actions.className = "routine-actions";
-		if (provider.trust === "quarantined" || provider.trust === "unreviewed") {
-			actions.append(capabilityProviderButton("Review", () => changeCapabilityProvider(provider.id, "review")));
-		} else if (provider.enabled) {
-			actions.append(capabilityProviderButton("Disable", () => changeCapabilityProvider(provider.id, "disable")));
-		} else {
-			const enable = capabilityProviderButton("Enable", () => changeCapabilityProvider(provider.id, "enable"));
-			enable.disabled = provider.health === "missing-tools";
-			actions.append(enable);
-		}
-		body.append(actions);
-		card.append(summary, body);
-		providerSection.append(card);
+	return [capabilitySection];
+}
+
+function providerConfigurationForm(provider: CapabilityProvider): HTMLFormElement {
+	const form = document.createElement("form");
+	form.className = "configuration-form provider-configuration-form";
+	const connection = capabilityConnections.find(
+		(entry) => entry.providerId === provider.id && entry.status === "active",
+	);
+	if (connection) appendText(form, `Connected account: ${connection.accountLabel}`, "provider-account");
+	if (provider.id === "google-workspace" && !isLoopbackHostname(location.hostname)) {
+		appendText(
+			form,
+			"If the registered callback uses 127.0.0.1, complete authorization in a browser on this Pi host.",
+			"muted",
+		);
 	}
-	return [capabilitySection, providerSection];
+	for (const field of provider.authentication?.fields ?? []) {
+		if (field.operatorEditable === false) continue;
+		const label = document.createElement("label");
+		label.textContent = `${field.label}${field.required ? " *" : ""}`;
+		const input = document.createElement("input");
+		input.name = field.env;
+		input.type = field.secret ? "password" : field.format === "url" ? "url" : "text";
+		input.autocomplete = "off";
+		input.placeholder = field.configured ? "Configured; leave blank to keep" : "Not configured";
+		label.append(input);
+		if (field.configured) {
+			const clearLabel = document.createElement("label");
+			clearLabel.className = "capability-grant";
+			const clear = document.createElement("input");
+			clear.type = "checkbox";
+			clear.dataset.clearEnvironment = field.env;
+			clearLabel.append(clear, " Clear saved value");
+			label.append(clearLabel);
+		}
+		form.append(label);
+	}
+	const save = document.createElement("button");
+	save.type = "submit";
+	save.textContent = provider.authentication?.kind === "oauth2" ? "Save OAuth configuration" : "Save configuration";
+	form.append(save);
+	if (provider.authentication?.kind === "oauth2") {
+		if (provider.authentication.capabilityGroups?.length) {
+			form.append(providerCapabilityPermissions(provider, connection));
+		}
+		const connected = connection !== undefined;
+		const authorize = document.createElement("button");
+		authorize.type = "button";
+		authorize.textContent = connected ? "Update Google access" : "Connect Google account";
+		authorize.disabled = !provider.authentication.configured;
+		authorize.title = authorize.disabled ? "Save the required OAuth configuration first" : "";
+		authorize.addEventListener("click", () => {
+			authorize.disabled = true;
+			authorize.textContent = "Connecting…";
+			void startProviderAuthorization(provider.id, form).catch((error: unknown) => {
+				setStatus(error instanceof Error ? error.message : String(error), true);
+				authorize.disabled = false;
+				authorize.textContent = connected ? "Update Google access" : "Connect Google account";
+			});
+		});
+		form.append(authorize);
+		if (connected) {
+			const revoke = document.createElement("button");
+			revoke.type = "button";
+			revoke.className = "danger";
+			revoke.textContent = "Revoke";
+			revoke.addEventListener("click", () => void revokeProviderAuthorization(provider.id));
+			form.append(revoke);
+		}
+	}
+	form.addEventListener("submit", (event) => {
+		event.preventDefault();
+		void configureCapabilityProvider(provider.id, form).catch((error: unknown) =>
+			setStatus(error instanceof Error ? error.message : String(error), true),
+		);
+	});
+	return form;
+}
+
+function providerCapabilityPermissions(
+	provider: CapabilityProvider,
+	connection: CapabilityConnectionSummary | undefined,
+): HTMLElement {
+	const section = document.createElement("div");
+	section.className = "provider-permissions";
+	appendText(section, "Google services", "provider-permissions-title");
+	const selected = new Set(connection?.capabilityIds ?? provider.authentication?.defaultCapabilityIds ?? []);
+	for (const group of provider.authentication?.capabilityGroups ?? []) {
+		const service = document.createElement("fieldset");
+		service.className = "provider-service";
+		const available = group.capabilityIds.filter((capabilityId) =>
+			providerCapabilityAvailable(provider, capabilityId),
+		);
+		const legend = document.createElement("legend");
+		legend.textContent = group.label;
+		const state = document.createElement("span");
+		state.className = available.length > 0 ? "provider-service-state available" : "provider-service-state";
+		state.textContent = available.length > 0 ? `${available.length} available` : "Adapter required";
+		legend.append(state);
+		service.append(legend);
+		for (const capabilityId of group.capabilityIds) {
+			const capability = capabilitySnapshot?.capabilities.find((entry) => entry.id === capabilityId);
+			const label = document.createElement("label");
+			label.className = "provider-capability";
+			const checkbox = document.createElement("input");
+			checkbox.type = "checkbox";
+			checkbox.dataset.authorizationCapability = capabilityId;
+			checkbox.checked = selected.has(capabilityId);
+			checkbox.disabled = !providerCapabilityAvailable(provider, capabilityId);
+			label.append(checkbox, capability?.name ?? capabilityId);
+			service.append(label);
+		}
+		section.append(service);
+	}
+	return section;
+}
+
+function providerCapabilityAvailable(provider: CapabilityProvider, capabilityId: string): boolean {
+	const binding = provider.bindings.find((entry) => entry.capabilityId === capabilityId);
+	return Boolean(binding && (!binding.toolName || !provider.missingTools.includes(binding.toolName)));
+}
+
+async function startProviderAuthorization(providerId: string, form: HTMLFormElement): Promise<void> {
+	if (!capabilityToken) return;
+	const capabilityIds = [...form.querySelectorAll<HTMLInputElement>("input[data-authorization-capability]:checked")]
+		.filter((input) => !input.disabled)
+		.map((input) => input.dataset.authorizationCapability ?? "")
+		.filter(Boolean);
+	if (capabilityIds.length === 0) throw new Error("Select at least one available Google capability");
+	const popup = window.open("", "pi-provider-authorization", "popup,width=620,height=760");
+	if (!popup) throw new Error("Allow popups to authorize this provider");
+	const response = await fetch(
+		`/capability-providers/${encodeURIComponent(providerId)}/authorize?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ capabilityIds }),
+		},
+	);
+	if (!response.ok) {
+		popup.close();
+		throw new Error(await responseError(response, "Could not start provider authorization"));
+	}
+	const payload: unknown = await response.json();
+	if (
+		typeof payload !== "object" ||
+		payload === null ||
+		!("authorizationUrl" in payload) ||
+		typeof payload.authorizationUrl !== "string"
+	)
+		throw new Error("Provider authorization returned an invalid URL");
+	popup.location.href = payload.authorizationUrl;
+	for (let attempt = 0; attempt < 60; attempt += 1) {
+		await new Promise((resolve) => window.setTimeout(resolve, 2_000));
+		await loadCapabilityConnections();
+		if (
+			capabilityConnections.some(
+				(connection) => connection.providerId === providerId && connection.status === "active",
+			)
+		) {
+			await loadCapabilities();
+			setStatus("Provider connected");
+			return;
+		}
+	}
+	throw new Error("Provider authorization did not complete within two minutes");
+}
+
+async function revokeProviderAuthorization(providerId: string): Promise<void> {
+	if (!capabilityToken || !window.confirm(`Revoke ${providerId} authorization?`)) return;
+	const response = await fetch(
+		`/capability-providers/${encodeURIComponent(providerId)}/revoke?token=${encodeURIComponent(capabilityToken)}`,
+		{ method: "POST", headers: { "content-type": "application/json" }, body: "{}" },
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not revoke provider authorization"));
+	await Promise.all([loadCapabilityConnections(), loadCapabilities(), loadRoutines()]);
+	setStatus("Provider authorization revoked");
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+	return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" || hostname === "[::1]";
+}
+
+async function configureCapabilityProvider(providerId: string, form: HTMLFormElement): Promise<void> {
+	if (!capabilityToken) return;
+	const values: Record<string, string> = {};
+	for (const input of form.querySelectorAll<HTMLInputElement>("input[name]")) {
+		if (input.value !== "") values[input.name] = input.value;
+	}
+	const clear = [...form.querySelectorAll<HTMLInputElement>("input[data-clear-environment]:checked")].map(
+		(input) => input.dataset.clearEnvironment ?? "",
+	);
+	const response = await fetch(
+		`/capability-providers/${encodeURIComponent(providerId)}/configuration?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ values, clear }),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not configure provider"));
+	await loadCapabilities();
+	setStatus("Provider configuration saved");
 }
 
 function capabilityProviderButton(label: string, action: () => void): HTMLButtonElement {
@@ -5567,6 +6145,12 @@ showConnectionForm.addEventListener("click", () => {
 	if (!connectionForm.classList.contains("hidden")) connectionUrl.focus();
 });
 
+openSettingsButton.addEventListener("click", () => openSettings("models"));
+settingsClose.addEventListener("click", closeSettings);
+window.addEventListener("keydown", (event) => {
+	if (event.key === "Escape" && !settingsWorkspace.classList.contains("hidden")) closeSettings();
+});
+
 connectionForm.addEventListener("submit", (event) => {
 	event.preventDefault();
 	const controlUrl = connectionUrl.value.trim();
@@ -6105,4 +6689,5 @@ installPanelResizer("right-resizer", "--details-width", "pi-serve-details-width"
 resizeComposer();
 clearRoutineEditor();
 clearWorkflowEditor();
+if (location.hash.startsWith("#settings/")) applySettingsHash();
 void connect().catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));

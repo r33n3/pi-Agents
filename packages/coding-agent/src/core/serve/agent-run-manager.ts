@@ -46,6 +46,7 @@ export class AgentRunManager implements AsyncDisposable {
 	readonly #activeByResource = new Map<string, ActiveRun>();
 	readonly #maxConcurrentRuns: number;
 	#disposed = false;
+	#disposePromise: Promise<void> | undefined;
 
 	constructor(registry: AgentRegistry, executor: AgentExecutor, artifactsRoot: string, maxConcurrentRuns = 4) {
 		if (!Number.isSafeInteger(maxConcurrentRuns) || maxConcurrentRuns < 1) {
@@ -189,8 +190,11 @@ export class AgentRunManager implements AsyncDisposable {
 			return { ...record };
 		}
 		active.abortRequested = true;
-		await active.execution.abort();
-		await active.completion;
+		try {
+			await active.execution.abort();
+		} finally {
+			await active.completion;
+		}
 		return { ...active.record };
 	}
 
@@ -202,13 +206,9 @@ export class AgentRunManager implements AsyncDisposable {
 		return { ...record };
 	}
 
-	async dispose(): Promise<void> {
-		if (this.#disposed) return;
-		this.#disposed = true;
-		await Promise.all([...this.#activeByRun.values()].map((active) => active.execution.abort()));
-		await Promise.all([...this.#activeByRun.values()].map((active) => active.completion));
-		await this.#executor.dispose();
-		await this.#queue.close();
+	dispose(): Promise<void> {
+		this.#disposePromise ??= this.#dispose();
+		return this.#disposePromise;
 	}
 
 	[Symbol.asyncDispose](): Promise<void> {
@@ -233,14 +233,42 @@ export class AgentRunManager implements AsyncDisposable {
 			record.status = active.abortRequested ? "aborted" : "failed";
 			record.error = error instanceof Error ? error.message : String(error);
 		} finally {
+			try {
+				await execution.dispose();
+			} catch (error) {
+				record.status = active.abortRequested ? "aborted" : "failed";
+				record.error = error instanceof Error ? error.message : String(error);
+			}
 			record.finishedAt = Date.now();
-			await this.#persistRecord(record);
-			this.#activeByAgent.delete(record.agentId);
-			this.#activeByWorkspace.delete(active.workspaceKey);
-			this.#activeByRun.delete(record.id);
-			for (const key of active.resourceKeys) this.#activeByResource.delete(key);
-			await execution.dispose();
+			try {
+				await this.#persistRecord(record);
+			} catch (error) {
+				record.status = "failed";
+				record.error = `Run record persistence failed: ${error instanceof Error ? error.message : String(error)}`;
+			}
+			if (this.#activeByAgent.get(record.agentId) === active) this.#activeByAgent.delete(record.agentId);
+			if (this.#activeByWorkspace.get(active.workspaceKey) === active) {
+				this.#activeByWorkspace.delete(active.workspaceKey);
+			}
+			if (this.#activeByRun.get(record.id) === active) this.#activeByRun.delete(record.id);
+			for (const key of active.resourceKeys) {
+				if (this.#activeByResource.get(key) === active) this.#activeByResource.delete(key);
+			}
 		}
+	}
+
+	async #dispose(): Promise<void> {
+		this.#disposed = true;
+		await this.#queue.close();
+		const activeRuns = [...this.#activeByRun.values()];
+		for (const active of activeRuns) active.abortRequested = true;
+		await Promise.allSettled(activeRuns.map((active) => active.execution.abort()));
+		await Promise.allSettled(
+			activeRuns
+				.map((active) => active.completion)
+				.filter((completion): completion is Promise<void> => completion !== undefined),
+		);
+		await this.#executor.dispose();
 	}
 
 	async #persistRecord(record: AgentRunRecord): Promise<void> {

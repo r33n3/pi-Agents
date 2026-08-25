@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -6,6 +7,9 @@ import { createAgentSessionFromServices, createAgentSessionServices } from "../a
 import type { ToolDefinition } from "../extensions/types.ts";
 import { SessionManager } from "../session-manager.ts";
 import type {
+	AgentWorkerHostAction,
+	AgentWorkerHostActionResponseMessage,
+	AgentWorkerHostActionResult,
 	AgentWorkerRequest,
 	AgentWorkerResponse,
 	AgentWorkerResultArtifact,
@@ -24,18 +28,27 @@ import { createBrowserWorkflowTools } from "./browser-workflow-tools.ts";
 import { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
 import { createEverydayDataTools } from "./everyday-data-tools.ts";
 import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
-import { createScopedAgentTools } from "./scoped-agent-tools.ts";
+import { createScopedAgentTools, type ScopedAgentFileOperations } from "./scoped-agent-tools.ts";
 import { createSearxngTools } from "./searxng-tools.ts";
 import { WorkspacePreviewServer } from "./workspace-preview-server.ts";
 
 let activeSession: AgentSession | undefined;
 let abortRequested = false;
 let started = false;
+const pendingHostActions = new Map<
+	string,
+	{ resolve: (result: AgentWorkerHostActionResult) => void; reject: (error: Error) => void }
+>();
 
 process.on("message", (value: unknown) => {
 	if (!isRequest(value)) return;
+	if (value.type === "host-action-response") {
+		handleHostActionResponse(value);
+		return;
+	}
 	if (value.type === "abort") {
 		abortRequested = true;
+		rejectPendingHostActions(new Error("Agent worker was aborted"));
 		void activeSession?.abort();
 		return;
 	}
@@ -49,6 +62,7 @@ process.once("SIGINT", requestAbort);
 
 function requestAbort(): void {
 	abortRequested = true;
+	rejectPendingHostActions(new Error("Agent worker was aborted"));
 	void activeSession?.abort();
 }
 
@@ -85,7 +99,9 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 			);
 		}
 		const isolated = definition.executor === "harness";
-		const customTools = (isolated ? [...createScopedAgentTools(definition, workspace)] : []) as ToolDefinition[];
+		const customTools = (
+			isolated ? [...createScopedAgentTools(definition, workspace, hostScopedFileOperations)] : []
+		) as ToolDefinition[];
 		const everydayConfigurations = new EverydayConfigurationRegistry(
 			join(request.serveRoot, "capabilities", "everyday-data"),
 		);
@@ -194,6 +210,7 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 	} catch (error) {
 		response = { type: "error", error: error instanceof Error ? error.message : String(error) };
 	} finally {
+		rejectPendingHostActions(new Error("Agent worker stopped"));
 		for (const cleanup of cleanups) await cleanup().catch(() => undefined);
 		if (response) await send(response).catch(() => undefined);
 		process.disconnect?.();
@@ -217,7 +234,57 @@ async function writeResultArtifact(path: string, artifact: AgentWorkerResultArti
 function isRequest(value: unknown): value is AgentWorkerRequest {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const type = (value as { type?: unknown }).type;
-	return type === "start" || type === "abort";
+	return type === "start" || type === "abort" || type === "host-action-response";
+}
+
+const hostScopedFileOperations: ScopedAgentFileOperations = {
+	async read(path) {
+		const result = await requestHostAction({ family: "filesystem.read", path });
+		if (result.family !== "filesystem.read") throw new Error("Host returned the wrong filesystem result");
+		return result.content;
+	},
+	async list(path) {
+		const result = await requestHostAction({ family: "filesystem.list", path });
+		if (result.family !== "filesystem.list") throw new Error("Host returned the wrong filesystem result");
+		return result.entries;
+	},
+	async write(path, content) {
+		const result = await requestHostAction({ family: "filesystem.write", path, content });
+		if (result.family !== "filesystem.write") throw new Error("Host returned the wrong filesystem result");
+		return result.bytesWritten;
+	},
+};
+
+function requestHostAction(action: AgentWorkerHostAction): Promise<AgentWorkerHostActionResult> {
+	if (abortRequested) return Promise.reject(new Error("Agent worker was aborted"));
+	const requestId = randomUUID();
+	return new Promise((resolve, reject) => {
+		pendingHostActions.set(requestId, { resolve, reject });
+		void send({ type: "host-action-request", requestId, action }).catch((error) => {
+			pendingHostActions.delete(requestId);
+			reject(error instanceof Error ? error : new Error(String(error)));
+		});
+	});
+}
+
+function handleHostActionResponse(message: AgentWorkerHostActionResponseMessage): void {
+	const pending = pendingHostActions.get(message.requestId);
+	if (!pending) return;
+	pendingHostActions.delete(message.requestId);
+	if (message.error) {
+		pending.reject(Object.assign(new Error(message.error.message), { code: message.error.code }));
+		return;
+	}
+	if (!message.result) {
+		pending.reject(new Error("Host action response has no result"));
+		return;
+	}
+	pending.resolve(message.result);
+}
+
+function rejectPendingHostActions(error: Error): void {
+	for (const pending of pendingHostActions.values()) pending.reject(error);
+	pendingHostActions.clear();
 }
 
 function lastAssistantText(messages: readonly AgentMessage[]): string {

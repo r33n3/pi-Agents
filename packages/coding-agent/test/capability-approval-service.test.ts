@@ -39,8 +39,7 @@ describe("CapabilityApprovalService", () => {
 	test("preserves one idempotency key and outcome across restart and retries", async () => {
 		const receipt = await approvals.issue(request, true);
 		const first = await approvals.begin(receipt.id, request);
-		const retry = await approvals.begin(receipt.id, request);
-		expect(retry.idempotencyKey).toBe(first.idempotencyKey);
+		await expect(approvals.begin(receipt.id, request)).rejects.toThrow("already in progress");
 		await approvals.complete(receipt.id, { providerMessageId: "message-1" });
 
 		const restored = new CapabilityApprovalService(root);

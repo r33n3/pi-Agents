@@ -147,6 +147,7 @@ describe("CapabilityBroker", () => {
 			activeToolNames: () => activeTools,
 			definitions,
 			manifests: connectedManifest,
+			providerConnectionAvailable: () => true,
 			connectionResolver: (id) =>
 				id === "fixture-account"
 					? { providerId: "fixture-search", capabilityIds: ["web.search"], status }
@@ -171,6 +172,41 @@ describe("CapabilityBroker", () => {
 				"session",
 			),
 		).toThrow("is revoked");
+	});
+
+	test("requires an active account before enabling a connection-backed provider", async () => {
+		activeTools = ["fixture_search"];
+		let connected = false;
+		const provider = new CapabilityBroker(root, {
+			activeToolNames: () => activeTools,
+			definitions,
+			manifests: [{ ...manifests[0]!, connectionRequired: true }],
+			providerConnectionAvailable: () => connected,
+		});
+		await provider.initialize();
+		await provider.reviewProvider("fixture-search", true);
+		await expect(provider.enableProvider("fixture-search", true)).rejects.toThrow("requires an active connection");
+		connected = true;
+		await provider.enableProvider("fixture-search", true);
+		expect(provider.snapshot().providers[0]).toMatchObject({ enabled: true });
+	});
+
+	test("rejects provider manifests that declare process-control environment fields", () => {
+		const dangerous: CapabilityProviderManifest = {
+			...manifests[0]!,
+			authentication: {
+				kind: "environment",
+				fields: [{ env: "NODE_OPTIONS", label: "Unsafe", required: true, secret: false }],
+			},
+		};
+		expect(
+			() =>
+				new CapabilityBroker(root, {
+					activeToolNames: () => activeTools,
+					definitions,
+					manifests: [dangerous],
+				}),
+		).toThrow("prohibited environment field");
 	});
 
 	test("rejects non-read capability grants for unattended execution", async () => {
@@ -217,7 +253,10 @@ describe("CapabilityBroker", () => {
 	});
 
 	test("advertises the built-in SearXNG provider when its tool is loaded", async () => {
-		const defaults = new CapabilityBroker(root, { activeToolNames: () => ["searxng_search"] });
+		const defaults = new CapabilityBroker(root, {
+			activeToolNames: () => ["searxng_search"],
+			environmentValue: (name) => (name === "SEARXNG_BASE_URL" ? "http://127.0.0.1:8080" : undefined),
+		});
 		await defaults.initialize();
 		const snapshot = defaults.snapshot();
 		expect(snapshot.capabilities.find((entry) => entry.id === "web.search")).toMatchObject({
@@ -228,5 +267,35 @@ describe("CapabilityBroker", () => {
 			id: "pi-searxng",
 			health: "ready",
 		});
+		expect(snapshot.providers.find((entry) => entry.id === "google-workspace")?.authentication).toMatchObject({
+			kind: "oauth2",
+			defaultCapabilityIds: ["email.search", "email.read", "email.draft"],
+			capabilityGroups: [
+				{ id: "gmail", label: "Gmail" },
+				{ id: "calendar", label: "Calendar" },
+				{ id: "drive", label: "Drive" },
+				{ id: "contacts", label: "Contacts" },
+				{ id: "chat", label: "Google Chat" },
+			],
+		});
+	});
+
+	test("rejects authentication groups that expose unbound capabilities", async () => {
+		const invalid: CapabilityProviderManifest = {
+			...manifests[0]!,
+			authentication: {
+				kind: "oauth2",
+				fields: [],
+				capabilityGroups: [{ id: "search", label: "Search", capabilityIds: ["web.fetch"] }],
+			},
+		};
+		expect(
+			() =>
+				new CapabilityBroker(root, {
+					activeToolNames: () => activeTools,
+					definitions,
+					manifests: [invalid],
+				}),
+		).toThrow("groups an unbound capability");
 	});
 });

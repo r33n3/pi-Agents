@@ -34,14 +34,19 @@ import { CurrentSessionService } from "./current-session-service.ts";
 import { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
 import { createEverydayDataTools } from "./everyday-data-tools.ts";
 import { type ExternalConnectionDefinition, ExternalConnectionManager } from "./external-connection-manager.ts";
+import { GoogleWorkspaceOAuth } from "./google-workspace-oauth.ts";
+import { createGoogleWorkspaceTools } from "./google-workspace-tools.ts";
+import { GovernedActionService } from "./governed-action-service.ts";
 import { InboundRoutingService } from "./inbound-routing-service.ts";
 import { PersonaCatalog, resolvePersonaProject } from "./persona-catalog.ts";
 import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
 import { PluginManagementService } from "./plugin-management-service.ts";
+import { ProviderEnvironmentStore } from "./provider-environment-store.ts";
 import { RoutineRegistry } from "./routine-registry.ts";
 import { createScopedAgentTools } from "./scoped-agent-tools.ts";
 import { createSearxngTools } from "./searxng-tools.ts";
 import { ServeAttachmentStore } from "./serve-attachment-store.ts";
+import { ServeAuditStore } from "./serve-audit-store.ts";
 import { createServePage } from "./serve-page.ts";
 import { WebSocketListener } from "./websocket-listener.ts";
 import { WorkflowService } from "./workflow-service.ts";
@@ -115,6 +120,9 @@ export class ServeHost implements AsyncDisposable {
 		const requestedPort = this.#options.port ?? 4173;
 		const token = randomBytes(32).toString("base64url");
 		const serveRoot = join(agentDir, "serve");
+		const auditStore = new ServeAuditStore(join(serveRoot, "audit"));
+		await auditStore.initialize();
+		const governedActions = new GovernedActionService(auditStore);
 		const browserDriver = new PlaywrightBrowserDriver();
 		const browserCaptureStore = new BrowserWorkflowCaptureStore(join(serveRoot, "browser", "captures"));
 		await browserCaptureStore.initialize();
@@ -130,6 +138,7 @@ export class ServeHost implements AsyncDisposable {
 			4,
 			browserArtifactStore,
 			browserCaptureStore,
+			governedActions,
 		);
 		const browserWorkflowRunner = new BrowserWorkflowRunner(
 			browserWorkflowRegistry,
@@ -210,9 +219,41 @@ export class ServeHost implements AsyncDisposable {
 						extension.resolvedPath,
 						extension.sourceInfo?.source ?? "",
 					]),
+			providerConnectionAvailable: (providerId) =>
+				capabilityConnections
+					.snapshot()
+					.some((connection) => connection.providerId === providerId && connection.status === "active"),
 			connectionResolver: (connectionId) => capabilityConnections.find(connectionId),
 		});
 		await capabilityBroker.initialize();
+		const providerEnvironment = new ProviderEnvironmentStore(session.sessionManager.getCwd(), (providerId) =>
+			capabilityBroker.authenticationManifest(providerId),
+		);
+		const googleWorkspaceOAuth = new GoogleWorkspaceOAuth(providerEnvironment, capabilityConnections);
+		const googleWorkspaceTools = createGoogleWorkspaceTools({
+			approvals: capabilityApprovals,
+			credentials: providerEnvironment,
+			governedActions,
+			identities: { actorId: "pi-session", sessionId: session.sessionId },
+			authorizeCapability: async (capabilityId) => {
+				try {
+					await capabilityConnections.assertGrant("google-workspace-primary", "google-workspace", capabilityId);
+					return { decision: "allow", reason: "Active provider account grant", grant: capabilityId };
+				} catch (error) {
+					return {
+						decision: "deny",
+						reason: error instanceof Error ? error.message : "Provider account grant is unavailable",
+					};
+				}
+			},
+			markConnectionUnhealthy: async () => {
+				const connection = await capabilityConnections.get("google-workspace-primary");
+				if (!connection || connection.status === "revoked") return;
+				await capabilityConnections.save({ ...connection, status: "unhealthy" });
+			},
+		});
+		brokeredTools.push(...googleWorkspaceTools);
+		session.registerCustomTools(googleWorkspaceTools);
 		const agentRegistry = new AgentRegistry(serveRoot, {
 			catalogDirectory: join(agentDir, "agents"),
 			personaDirectory: join(agentDir, "personas"),
@@ -339,6 +380,7 @@ export class ServeHost implements AsyncDisposable {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir,
 			serveRoot,
+			governedActions,
 			defaultModel: session.model ? { provider: session.model.provider, id: session.model.id } : undefined,
 			capabilityToolNames: (context) =>
 				capabilityBroker.resolveToolNames(context.definition.capabilities, context.definition.executor),
@@ -667,6 +709,8 @@ export class ServeHost implements AsyncDisposable {
 				capabilityApprovals,
 				inboundRouting,
 				everydayConfigurations,
+				providerEnvironment,
+				googleWorkspaceOAuth,
 			),
 			auxiliary: {
 				path: "/browser-stream",

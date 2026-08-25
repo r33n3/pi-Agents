@@ -140,7 +140,7 @@ describe("PlaywrightBrowserDriver", () => {
 		});
 		await manager.navigate(session.id, origin);
 		await manager.startCapture(session.id);
-		manager.setControl(session.id, "user");
+		await manager.setControl(session.id, "user");
 		await manager.pointerClick(session.id, 100, 40);
 		await manager.typeText(session.id, "pi browser recording");
 		const capture = await manager.stopCapture(session.id);

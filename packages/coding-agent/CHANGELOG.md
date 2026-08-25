@@ -16,10 +16,14 @@
 - Added a dependency-aware `pi-coordinator` workflow and live, inspectable subagent activity tabs in the web console.
 - Added model-facing managed-browser recording tools and isolated local/public review sessions so Pi and deployed agents can capture, validate, and replay exact workflow versions.
 - Added supervised child-process execution for deployed agents with bounded cross-project concurrency, durable same-project queues, revision-pinned runs, named browser-profile leases, and deterministic process-tree termination.
+- Added a dedicated Settings workspace for model, provider, capability, plugin, MCP, and security configuration, with a simplified Agent Builder focused on per-agent grants.
+- Added managed Google Workspace OAuth and Gmail tools with encrypted credential storage, scoped grants, revocation, token refresh, and approval-gated email mutations.
+- Added durable redacted audit records and a governed action boundary for browser, provider, and isolated agent filesystem effects.
 
 ### Changed
 
 - Moved Agent Builder conversations into temporary main-chat tabs while retaining synchronized configuration in the Agent Builder workspace.
+- Isolated deployed-agent runtime environments from host secrets and routed permitted filesystem actions through typed, auditable host RPC.
 
 ### Fixed
 
