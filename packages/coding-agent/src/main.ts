@@ -930,6 +930,7 @@ export async function main(args: string[], options?: MainOptions) {
 			session,
 			host,
 			port: requestedPort,
+			token: process.env.PI_SERVE_TOKEN,
 			autoIncrementPort: parsed.servePort === undefined,
 			onError: (error) => console.error(chalk.red(`Serve error: ${error.message}`)),
 		});

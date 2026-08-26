@@ -49,4 +49,15 @@ describe("ServeHost", () => {
 
 		await expect(host.start()).rejects.toThrow("Serve host has already been started");
 	});
+
+	test("uses and validates a caller-supplied serve token", async () => {
+		const token = "stable_background_serve_token_1234567890";
+		host = new ServeHost({ agentDir: harness.tempDir, session: harness.session, port: 0, token });
+		const result = await host.start();
+		expect(new URL(result.url).searchParams.get("token")).toBe(token);
+		await host.close();
+
+		host = new ServeHost({ agentDir: harness.tempDir, session: harness.session, port: 0, token: "short" });
+		await expect(host.start()).rejects.toThrow("PI_SERVE_TOKEN must be 32-128 URL-safe characters");
+	});
 });
