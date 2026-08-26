@@ -5,8 +5,17 @@ let timer;
 let activePrompt;
 let requestCounter = 0;
 const pendingHostActions = new Map();
+const pendingCapabilityTools = new Map();
 
 process.on("message", (message) => {
+	if (message?.type === "capability-tool-response") {
+		const pending = pendingCapabilityTools.get(message.requestId);
+		if (!pending) return;
+		pendingCapabilityTools.delete(message.requestId);
+		if (message.error) pending.reject(Object.assign(new Error(message.error.message), { code: message.error.code }));
+		else pending.resolve(message.result);
+		return;
+	}
 	if (message?.type === "host-action-response") {
 		const pending = pendingHostActions.get(message.requestId);
 		if (!pending) return;
@@ -31,6 +40,10 @@ process.on("message", (message) => {
 		void runHostActionScenario(message);
 		return;
 	}
+	if (activePrompt === "capability") {
+		void runCapabilityScenario(message);
+		return;
+	}
 	timer = setTimeout(async () => {
 		const output =
 			message.context.prompt === "inspect"
@@ -42,6 +55,7 @@ process.on("message", (message) => {
 						firecrawlKey: process.env.FIRECRAWL_API_KEY,
 						firecrawlUrl: process.env.FIRECRAWL_BASE_URL,
 						searxngUrl: process.env.SEARXNG_BASE_URL,
+						modelCredentialReceived: typeof message.modelApiKey === "string" && message.modelApiKey.length > 0,
 						secret: process.env.PI_TEST_UNRELATED_SECRET,
 						pid: process.pid,
 					})
@@ -89,6 +103,27 @@ async function runHostActionScenario(message) {
 	await writeFile(message.resultPath, JSON.stringify({ output: JSON.stringify(output), transcript: [] }));
 	process.send?.({ type: "result" });
 	process.disconnect?.();
+}
+
+async function runCapabilityScenario(message) {
+	const tool = message.capabilityTools.find((entry) => entry.name === "test_capability");
+	const result = await requestCapabilityTool(tool.name, { value: "worker input" });
+	await mkdir(dirname(message.resultPath), { recursive: true });
+	await writeFile(message.resultPath, JSON.stringify({ output: JSON.stringify(result), transcript: [] }));
+	process.send?.({ type: "result" });
+	process.disconnect?.();
+}
+
+function requestCapabilityTool(toolName, input) {
+	const requestId = `capability-${++requestCounter}`;
+	return new Promise((resolve, reject) => {
+		pendingCapabilityTools.set(requestId, { resolve, reject });
+		process.send?.({ type: "capability-tool-request", requestId, toolName, input }, (error) => {
+			if (!error) return;
+			pendingCapabilityTools.delete(requestId);
+			reject(error);
+		});
+	});
 }
 
 function requestHostAction(action) {

@@ -2,7 +2,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import Type from "typebox";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import type { ToolDefinition } from "../src/core/extensions/types.ts";
 import type { AgentExecutionContext } from "../src/core/serve/agent-executor.ts";
 import { type AgentHostFileSystem, ChildProcessAgentExecutor } from "../src/core/serve/child-process-agent-executor.ts";
 import { GovernedActionService } from "../src/core/serve/governed-action-service.ts";
@@ -80,12 +82,14 @@ describe("ChildProcessAgentExecutor", () => {
 		await executor.dispose();
 	});
 
-	test("passes runtime configuration without provider or unrelated secrets", async () => {
+	test("passes only the selected model credential over private IPC", async () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
 			capabilityToolNames: () => ["email_search", "firecrawl_search", "searxng_search"],
 			workerPath,
+			resolveModelApiKey: async (model) =>
+				model.provider === "openai" && model.id === "test" ? "ephemeral-provider-value" : undefined,
 			environment: {
 				PATH: process.env.PATH,
 				PATHEXT: process.env.PATHEXT,
@@ -101,6 +105,7 @@ describe("ChildProcessAgentExecutor", () => {
 		const result = await (await executor.start(context("inspect"))).result;
 		const inspected = JSON.parse(result.output) as Record<string, unknown>;
 		expect(inspected.provider).toBeUndefined();
+		expect(inspected.modelCredentialReceived).toBe(true);
 		expect(inspected.googleAccess).toBeUndefined();
 		expect(inspected.firecrawlKey).toBeUndefined();
 		expect(inspected).toMatchObject({
@@ -136,6 +141,33 @@ describe("ChildProcessAgentExecutor", () => {
 				rm(secondWorkspace, { recursive: true, force: true }),
 			]);
 		}
+	});
+
+	test("brokers granted capability tools through the parent process", async () => {
+		const calls: unknown[] = [];
+		const tool: ToolDefinition = {
+			name: "test_capability",
+			label: "Test capability",
+			description: "Runs in the parent process",
+			parameters: Type.Object({ value: Type.String() }),
+			async execute(_id, input) {
+				calls.push(input);
+				return { content: [{ type: "text", text: "host result" }], details: undefined };
+			},
+		};
+		const executor = new ChildProcessAgentExecutor({
+			agentDir: process.cwd(),
+			serveRoot,
+			capabilityToolNames: () => [tool.name],
+			capabilityTools: () => [tool],
+			workerPath,
+		});
+		const result = JSON.parse((await (await executor.start(context("capability"))).result).output) as {
+			content: Array<{ text: string }>;
+		};
+		expect(calls).toEqual([{ value: "worker input" }]);
+		expect(result.content[0]?.text).toBe("host result");
+		await executor.dispose();
 	});
 
 	test("stopping one worker does not interrupt another worker", async () => {

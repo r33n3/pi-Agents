@@ -388,8 +388,22 @@ export class ServeHost implements AsyncDisposable {
 			serveRoot,
 			governedActions,
 			defaultModel: session.model ? { provider: session.model.provider, id: session.model.id } : undefined,
+			resolveModelApiKey: async (modelRef) => {
+				const workerModel = modelRuntime.getModel(modelRef.provider, modelRef.id);
+				if (!workerModel) return undefined;
+				return (await modelRuntime.getAuth(workerModel))?.auth.apiKey;
+			},
 			capabilityToolNames: (context) =>
 				capabilityBroker.resolveToolNames(context.definition.capabilities, context.definition.executor),
+			capabilityTools: (context) => {
+				const names = new Set(
+					capabilityBroker.resolveToolNames(context.definition.capabilities, context.definition.executor),
+				);
+				if (context.definition.source === "pi-agent") {
+					for (const name of context.definition.tools) names.add(name);
+				}
+				return brokeredTools.filter((tool) => names.has(tool.name));
+			},
 		});
 		this.#agentRunManager = new AgentRunManager(agentRegistry, executor, join(serveRoot, "runs"));
 		await this.#agentRunManager.initialize();
