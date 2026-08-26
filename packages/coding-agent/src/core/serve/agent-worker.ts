@@ -7,6 +7,7 @@ import type { AgentSession } from "../agent-session.ts";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../agent-session-services.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import { SessionManager } from "../session-manager.ts";
+import type { AgentExecutionPhase } from "./agent-executor.ts";
 import type {
 	AgentWorkerCapabilityToolResponseMessage,
 	AgentWorkerHostAction,
@@ -37,6 +38,7 @@ import { WorkspacePreviewServer } from "./workspace-preview-server.ts";
 let activeSession: AgentSession | undefined;
 let abortRequested = false;
 let started = false;
+let phase: AgentExecutionPhase = "initializing";
 const pendingHostActions = new Map<
 	string,
 	{ resolve: (result: AgentWorkerHostActionResult) => void; reject: (error: Error) => void }
@@ -81,7 +83,12 @@ function requestAbort(): void {
 async function run(request: AgentWorkerStartMessage): Promise<void> {
 	const cleanups: Array<() => Promise<void>> = [];
 	let response: AgentWorkerResponse | undefined;
+	const heartbeat = setInterval(() => {
+		void send({ type: "heartbeat", phase, timestamp: Date.now() }).catch(() => undefined);
+	}, 5_000);
+	heartbeat.unref();
 	try {
+		await emitProgress("initializing", "Initializing isolated agent session");
 		const definition = request.context.definition;
 		const workspace = request.context.workspace;
 		const services = await createAgentSessionServices({
@@ -217,7 +224,7 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 		});
 		activeSession = created.session;
 		const unsubscribe = activeSession.subscribe((event) => {
-			void send({ type: "event", message: event.type }).catch(() => {});
+			void emitProgress(sessionEventPhase(event.type), event.type).catch(() => undefined);
 		});
 		cleanups.unshift(async () => {
 			unsubscribe();
@@ -232,21 +239,47 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 			"Operate only through the provided tools. All tool paths are confined to your assigned workspace.",
 			`Task: ${request.context.prompt}`,
 		].join("\n\n");
+		await emitProgress("waiting-for-model", "Waiting for model response");
 		await activeSession.prompt(instructions, { source: "rpc" });
+		await emitProgress("writing-results", "Writing durable run results");
 		await writeResultArtifact(request.resultPath, {
+			status: "succeeded",
 			output: lastAssistantText(activeSession.messages),
 			transcript: [...activeSession.messages],
 		});
 		response = { type: "result" };
 	} catch (error) {
-		response = { type: "error", error: error instanceof Error ? error.message : String(error) };
+		const message = error instanceof Error ? error.message : String(error);
+		try {
+			await writeResultArtifact(request.resultPath, { status: "failed", error: message });
+			response = { type: "result" };
+		} catch (artifactError) {
+			response = {
+				type: "error",
+				error: `Agent failed: ${message}; completion persistence failed: ${artifactError instanceof Error ? artifactError.message : String(artifactError)}`,
+			};
+		}
 	} finally {
+		clearInterval(heartbeat);
 		rejectPendingHostActions(new Error("Agent worker stopped"));
 		rejectPendingCapabilityTools(new Error("Agent worker stopped"));
 		for (const cleanup of cleanups) await cleanup().catch(() => undefined);
 		if (response) await send(response).catch(() => undefined);
 		process.disconnect?.();
 	}
+}
+
+async function emitProgress(nextPhase: AgentExecutionPhase, message: string): Promise<void> {
+	phase = nextPhase;
+	await send({ type: "event", phase, message, timestamp: Date.now() });
+}
+
+function sessionEventPhase(type: string): AgentExecutionPhase {
+	if (type.startsWith("tool_execution_")) return "running-tool";
+	if (type.includes("message_update") || type.includes("text_delta") || type.includes("thinking_delta")) {
+		return "generating";
+	}
+	return "waiting-for-model";
 }
 
 function send(message: AgentWorkerResponse): Promise<void> {

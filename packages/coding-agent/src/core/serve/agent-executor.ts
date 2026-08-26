@@ -14,7 +14,21 @@ export interface AgentExecutionResult {
 	transcript: readonly AgentMessage[];
 }
 
-export type AgentExecutionListener = (message: string) => void;
+export type AgentExecutionPhase =
+	| "initializing"
+	| "waiting-for-model"
+	| "generating"
+	| "running-tool"
+	| "writing-results";
+
+export interface AgentExecutionEvent {
+	kind: "progress" | "heartbeat";
+	phase: AgentExecutionPhase;
+	message: string;
+	timestamp: number;
+}
+
+export type AgentExecutionListener = (event: AgentExecutionEvent) => void;
 
 export interface AgentExecution extends AsyncDisposable {
 	readonly result: Promise<AgentExecutionResult>;
@@ -71,7 +85,14 @@ class SessionExecution implements AgentExecution {
 	constructor(session: AgentSession, context: AgentExecutionContext, onDispose: () => void) {
 		this.#session = session;
 		this.#onDispose = onDispose;
-		this.#unsubscribe = session.subscribe((event) => this.#emit(event.type));
+		this.#unsubscribe = session.subscribe((event) =>
+			this.#emit({
+				kind: "progress",
+				phase: sessionEventPhase(event.type),
+				message: event.type,
+				timestamp: Date.now(),
+			}),
+		);
 		this.result = this.#run(context);
 	}
 
@@ -110,13 +131,21 @@ class SessionExecution implements AgentExecution {
 			await this.#session.prompt(instructions, { source: "rpc" });
 			return { output: lastAssistantText(this.#session.messages), transcript: [...this.#session.messages] };
 		} finally {
-			this.#emit("settled");
+			this.#emit({ kind: "progress", phase: "writing-results", message: "settled", timestamp: Date.now() });
 		}
 	}
 
-	#emit(message: string): void {
-		for (const listener of this.#listeners) listener(message);
+	#emit(event: AgentExecutionEvent): void {
+		for (const listener of this.#listeners) listener(event);
 	}
+}
+
+function sessionEventPhase(type: string): AgentExecutionPhase {
+	if (type.startsWith("tool_execution_")) return "running-tool";
+	if (type.includes("message_update") || type.includes("text_delta") || type.includes("thinking_delta")) {
+		return "generating";
+	}
+	return "waiting-for-model";
 }
 
 function lastAssistantText(messages: readonly AgentMessage[]): string {

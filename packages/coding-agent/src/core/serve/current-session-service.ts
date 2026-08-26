@@ -8,7 +8,7 @@ import {
 	type PiSessionRuntime,
 } from "@earendil-works/pi-server";
 import type { AgentSession } from "../agent-session.ts";
-import { AgentSessionServeDelegate } from "./agent-session-serve-delegate.ts";
+import { AgentSessionServeDelegate, runSupervisedSessionPrompt } from "./agent-session-serve-delegate.ts";
 import { LiveSessionRuntime } from "./live-session-runtime.ts";
 import type { ServeAttachment } from "./serve-attachment-store.ts";
 
@@ -117,7 +117,7 @@ export class CurrentSessionService implements PiServerService {
 			context.push(`Attached file: ${attachment.name}\nLocal path: ${attachment.path}`);
 		}
 		const prompt = context.length > 0 ? `${text}\n\n${context.join("\n\n")}` : text;
-		await session.prompt(prompt, { images });
+		await runSupervisedSessionPrompt(session, () => session.prompt(prompt, { images }));
 	}
 
 	#findSession(sessionId: string): AgentSession {

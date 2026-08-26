@@ -1,5 +1,5 @@
 import type { AgentMessage, AgentToolResult, ToolExecutionMode } from "@earendil-works/pi-agent-core";
-import type { AgentExecutionContext } from "./agent-executor.ts";
+import type { AgentExecutionContext, AgentExecutionPhase } from "./agent-executor.ts";
 
 export interface AgentWorkerCapabilityTool {
 	name: string;
@@ -59,17 +59,24 @@ export type AgentWorkerRequest =
 
 export interface AgentWorkerEventMessage {
 	type: "event";
+	phase: AgentExecutionPhase;
 	message: string;
+	timestamp: number;
+}
+
+export interface AgentWorkerHeartbeatMessage {
+	type: "heartbeat";
+	phase: AgentExecutionPhase;
+	timestamp: number;
 }
 
 export interface AgentWorkerResultMessage {
 	type: "result";
 }
 
-export interface AgentWorkerResultArtifact {
-	output: string;
-	transcript: AgentMessage[];
-}
+export type AgentWorkerResultArtifact =
+	| { status: "succeeded"; output: string; transcript: AgentMessage[] }
+	| { status: "failed"; error: string };
 
 export interface AgentWorkerErrorMessage {
 	type: "error";
@@ -91,6 +98,7 @@ export interface AgentWorkerCapabilityToolRequestMessage {
 
 export type AgentWorkerResponse =
 	| AgentWorkerEventMessage
+	| AgentWorkerHeartbeatMessage
 	| AgentWorkerResultMessage
 	| AgentWorkerErrorMessage
 	| AgentWorkerHostActionRequestMessage

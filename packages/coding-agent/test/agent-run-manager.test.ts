@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import type {
 	AgentExecution,
 	AgentExecutionContext,
+	AgentExecutionEvent,
 	AgentExecutionResult,
 	AgentExecutor,
 } from "../src/core/serve/agent-executor.ts";
@@ -22,6 +23,7 @@ class DeferredExecution implements AgentExecution {
 	resolve: (result: AgentExecutionResult) => void = () => {};
 	reject: (error: Error) => void = () => {};
 	aborted = false;
+	listener: ((event: AgentExecutionEvent) => void) | undefined;
 
 	constructor() {
 		this.result = new Promise((resolve, reject) => {
@@ -30,8 +32,15 @@ class DeferredExecution implements AgentExecution {
 		});
 	}
 
-	subscribe(): () => void {
-		return () => {};
+	subscribe(listener: (event: AgentExecutionEvent) => void): () => void {
+		this.listener = listener;
+		return () => {
+			if (this.listener === listener) this.listener = undefined;
+		};
+	}
+
+	emit(event: AgentExecutionEvent): void {
+		this.listener?.(event);
 	}
 
 	abort(): Promise<void> {
@@ -121,7 +130,29 @@ describe("AgentRunManager", () => {
 		await expect.poll(() => runs.get(run.id)?.finishedAt).toBeTypeOf("number");
 	});
 
-	test("prevents different agents from mutating the same project concurrently", async () => {
+	test("persists worker phase and activity while a run is active", async () => {
+		const { root, executor, runs } = await setup();
+		const run = await runs.start("research", "Long task");
+		executor.executions[0].emit({
+			kind: "progress",
+			phase: "waiting-for-model",
+			message: "Waiting for model response",
+			timestamp: 1234,
+		});
+		await expect.poll(() => runs.get(run.id)?.phase).toBe("waiting-for-model");
+		expect(runs.get(run.id)).toMatchObject({
+			progressMessage: "Waiting for model response",
+			lastActivityAt: 1234,
+		});
+		executor.executions[0].resolve({ output: "Done", transcript: [] });
+		await runs.waitForCompletion(run.id);
+		const persisted = JSON.parse(
+			await readFile(join(root, "artifacts", "research", run.id, "run.json"), "utf8"),
+		) as Record<string, unknown>;
+		expect(persisted).toMatchObject({ phase: "waiting-for-model", lastActivityAt: 1234 });
+	});
+
+	test("allows read-only agents to inspect the same project concurrently", async () => {
 		const { registry, executor, runs } = await setup();
 		await registry.save({
 			id: "review",
@@ -135,13 +166,34 @@ describe("AgentRunManager", () => {
 			schedules: [],
 		});
 		const active = await runs.start("research", "Research");
-		await expect(runs.start("review", "Review")).rejects.toThrow("already has an active run");
+		const review = await runs.start("review", "Review concurrently");
+		expect(review).toMatchObject({ agentId: "review", status: "running" });
+		executor.executions[0]!.resolve({ output: "Done", transcript: [] });
+		executor.executions[1]!.resolve({ output: "Reviewed", transcript: [] });
+		await runs.waitForCompletion(active.id);
+		await runs.waitForCompletion(review.id);
+	});
+
+	test("serializes a workspace writer against other agents in the same project", async () => {
+		const { registry, executor, runs } = await setup();
+		await registry.save({
+			id: "writer",
+			name: "Writer",
+			description: "Writes",
+			tools: ["read", "write"],
+			memory: "none",
+			persona: "Careful",
+			executor: "harness",
+			permissionPolicy: "workspace-write",
+			schedules: [],
+		});
+		const active = await runs.start("research", "Research");
+		await expect(runs.start("writer", "Write")).rejects.toThrow("already has an active run");
 		executor.executions[0]!.resolve({ output: "Done", transcript: [] });
 		await runs.waitForCompletion(active.id);
-		const review = await runs.start("review", "Review after release");
-		expect(review).toMatchObject({ agentId: "review" });
-		executor.executions[1]!.resolve({ output: "Done", transcript: [] });
-		await runs.waitForCompletion(review.id);
+		const write = await runs.start("writer", "Write after release");
+		executor.executions[1]!.resolve({ output: "Written", transcript: [] });
+		await runs.waitForCompletion(write.id);
 	});
 
 	test("runs agents in separate projects concurrently and stopping one does not affect the other", async () => {

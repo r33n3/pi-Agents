@@ -38,6 +38,9 @@ export interface AgentTask {
 	createdAt: number;
 	startedAt?: number;
 	finishedAt?: number;
+	phase?: AgentRunRecord["phase"];
+	progressMessage?: string;
+	lastActivityAt?: number;
 	attemptIds: string[];
 	result?: string;
 	error?: string;
@@ -262,7 +265,7 @@ export class AgentTaskService implements AsyncDisposable {
 
 	getTask(taskId: string): AgentTask | undefined {
 		const task = this.#tasks.get(taskId);
-		return task ? cloneTask(task) : undefined;
+		return task ? this.#taskView(task) : undefined;
 	}
 
 	listTasks(filter: AgentTaskFilter = {}): AgentTask[] {
@@ -275,7 +278,7 @@ export class AgentTaskService implements AsyncDisposable {
 					(filter.status === undefined || task.status === filter.status),
 			)
 			.sort((left, right) => right.createdAt - left.createdAt)
-			.map(cloneTask);
+			.map((task) => this.#taskView(task));
 	}
 
 	subscribe(listener: AgentTaskListener): () => void {
@@ -376,6 +379,17 @@ export class AgentTaskService implements AsyncDisposable {
 		await appendFile(this.#messagesPath(conversation.id), `${JSON.stringify(message)}\n`, "utf8");
 		conversation.updatedAt = message.createdAt;
 		await this.#persistConversation(conversation);
+	}
+
+	#taskView(task: AgentTask): AgentTask {
+		const runId = task.attemptIds.at(-1);
+		const run = runId ? this.#runs.get(runId) : undefined;
+		return cloneTask({
+			...task,
+			phase: run?.phase,
+			progressMessage: run?.progressMessage,
+			lastActivityAt: run?.lastActivityAt,
+		});
 	}
 
 	async #emit(task: AgentTask, type: AgentTaskEvent["type"], summary?: string): Promise<void> {

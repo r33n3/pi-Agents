@@ -1,9 +1,26 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { describe, expect, test } from "vitest";
 import type { AgentSession, AgentSessionEvent } from "../src/core/agent-session.ts";
-import { AgentSessionServeDelegate } from "../src/core/serve/agent-session-serve-delegate.ts";
+import {
+	AgentSessionServeDelegate,
+	runSupervisedSessionPrompt,
+} from "../src/core/serve/agent-session-serve-delegate.ts";
 
 describe("AgentSessionServeDelegate", () => {
+	test("aborts a session turn that stops producing events", async () => {
+		let aborted = false;
+		const session = {
+			subscribe: () => () => {},
+			abort: async () => {
+				aborted = true;
+			},
+		} as unknown as AgentSession;
+		await expect(runSupervisedSessionPrompt(session, () => new Promise<void>(() => {}), 20)).rejects.toThrow(
+			"made no progress",
+		);
+		expect(aborted).toBe(true);
+	});
+
 	test("projects live subagent progress into protocol snapshots", () => {
 		let eventListener: ((event: AgentSessionEvent) => void) | undefined;
 		const session = {

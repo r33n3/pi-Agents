@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ModelRef } from "@earendil-works/pi-protocol";
-import type { AgentExecution, AgentExecutor } from "./agent-executor.ts";
+import type { AgentExecution, AgentExecutionEvent, AgentExecutionPhase, AgentExecutor } from "./agent-executor.ts";
 import type { AgentDefinition, AgentRegistry } from "./agent-registry.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
@@ -18,6 +18,10 @@ export interface AgentRunRecord {
 	createdAt: number;
 	startedAt?: number;
 	finishedAt?: number;
+	phase?: AgentExecutionPhase;
+	progressMessage?: string;
+	lastActivityAt?: number;
+	lastHeartbeatAt?: number;
 	artifactDirectory: string;
 	error?: string;
 	model?: ModelRef;
@@ -28,8 +32,12 @@ interface ActiveRun {
 	record: AgentRunRecord;
 	execution: AgentExecution;
 	workspaceKey: string;
+	workspaceWritable: boolean;
 	abortRequested: boolean;
 	resourceKeys: string[];
+	unsubscribe: () => void;
+	progressPersistence: Promise<void>;
+	lastProgressPersistedAt: number;
 	completion?: Promise<void>;
 }
 
@@ -41,7 +49,7 @@ export class AgentRunManager implements AsyncDisposable {
 	readonly #queue = new SerialOperationQueue();
 	readonly #records = new Map<string, AgentRunRecord>();
 	readonly #activeByAgent = new Map<string, ActiveRun>();
-	readonly #activeByWorkspace = new Map<string, ActiveRun>();
+	readonly #activeByWorkspace = new Map<string, Set<ActiveRun>>();
 	readonly #activeByRun = new Map<string, ActiveRun>();
 	readonly #activeByResource = new Map<string, ActiveRun>();
 	readonly #maxConcurrentRuns: number;
@@ -98,7 +106,7 @@ export class AgentRunManager implements AsyncDisposable {
 		if (!definition) throw new Error(`Agent ${agentId} was not found`);
 		const workspace = this.#registry.workspacePath(definition);
 		const workspaceKey = process.platform === "win32" ? resolve(workspace).toLowerCase() : resolve(workspace);
-		if (this.#activeByWorkspace.has(workspaceKey)) return "workspace-busy";
+		if (hasWorkspaceConflict(definition, this.#activeByWorkspace.get(workspaceKey))) return "workspace-busy";
 		return resourceKeys(definition).some((key) => this.#activeByResource.has(key)) ? "workspace-busy" : "available";
 	}
 
@@ -128,7 +136,7 @@ export class AgentRunManager implements AsyncDisposable {
 			if (this.#activeByAgent.has(agentId)) throw new Error(`Agent ${agentId} already has an active run`);
 			const workspace = this.#registry.workspacePath(definition);
 			const workspaceKey = process.platform === "win32" ? resolve(workspace).toLowerCase() : resolve(workspace);
-			if (this.#activeByWorkspace.has(workspaceKey)) {
+			if (hasWorkspaceConflict(definition, this.#activeByWorkspace.get(workspaceKey))) {
 				throw new Error(`Agent project ${workspace} already has an active run`);
 			}
 			const requiredResources = resourceKeys(definition);
@@ -158,15 +166,26 @@ export class AgentRunManager implements AsyncDisposable {
 				});
 				record.status = "running";
 				record.startedAt = Date.now();
+				record.phase = "initializing";
+				record.progressMessage = "Starting isolated agent worker";
+				record.lastActivityAt = record.startedAt;
+				record.lastHeartbeatAt = record.startedAt;
 				const active: ActiveRun = {
 					record,
 					execution,
 					workspaceKey,
+					workspaceWritable: definition.permissionPolicy === "workspace-write",
 					abortRequested: false,
 					resourceKeys: requiredResources,
+					unsubscribe: () => {},
+					progressPersistence: Promise.resolve(),
+					lastProgressPersistedAt: record.startedAt,
 				};
+				active.unsubscribe = execution.subscribe((event) => this.#recordProgress(active, event));
 				this.#activeByAgent.set(agentId, active);
-				this.#activeByWorkspace.set(workspaceKey, active);
+				const workspaceRuns = this.#activeByWorkspace.get(workspaceKey) ?? new Set<ActiveRun>();
+				workspaceRuns.add(active);
+				this.#activeByWorkspace.set(workspaceKey, workspaceRuns);
 				this.#activeByRun.set(runId, active);
 				for (const key of requiredResources) this.#activeByResource.set(key, active);
 				await this.#persistRecord(record);
@@ -233,6 +252,8 @@ export class AgentRunManager implements AsyncDisposable {
 			record.status = active.abortRequested ? "aborted" : "failed";
 			record.error = error instanceof Error ? error.message : String(error);
 		} finally {
+			active.unsubscribe();
+			await active.progressPersistence;
 			try {
 				await execution.dispose();
 			} catch (error) {
@@ -247,14 +268,32 @@ export class AgentRunManager implements AsyncDisposable {
 				record.error = `Run record persistence failed: ${error instanceof Error ? error.message : String(error)}`;
 			}
 			if (this.#activeByAgent.get(record.agentId) === active) this.#activeByAgent.delete(record.agentId);
-			if (this.#activeByWorkspace.get(active.workspaceKey) === active) {
-				this.#activeByWorkspace.delete(active.workspaceKey);
-			}
+			const workspaceRuns = this.#activeByWorkspace.get(active.workspaceKey);
+			workspaceRuns?.delete(active);
+			if (workspaceRuns?.size === 0) this.#activeByWorkspace.delete(active.workspaceKey);
 			if (this.#activeByRun.get(record.id) === active) this.#activeByRun.delete(record.id);
 			for (const key of active.resourceKeys) {
 				if (this.#activeByResource.get(key) === active) this.#activeByResource.delete(key);
 			}
 		}
+	}
+
+	#recordProgress(active: ActiveRun, event: AgentExecutionEvent): void {
+		if (this.#activeByRun.get(active.record.id) !== active) return;
+		const phaseChanged = active.record.phase !== event.phase;
+		active.record.phase = event.phase;
+		active.record.lastHeartbeatAt = event.timestamp;
+		if (event.kind === "progress") {
+			active.record.progressMessage = event.message;
+			active.record.lastActivityAt = event.timestamp;
+		}
+		if (!phaseChanged && event.timestamp - active.lastProgressPersistedAt < 5_000) return;
+		active.lastProgressPersistedAt = event.timestamp;
+		active.progressPersistence = active.progressPersistence
+			.then(() => this.#persistRecord(active.record))
+			.catch((error: unknown) => {
+				active.record.error = `Run progress persistence failed: ${error instanceof Error ? error.message : String(error)}`;
+			});
 	}
 
 	async #dispose(): Promise<void> {
@@ -281,6 +320,16 @@ function resourceKeys(definition: AgentDefinition): string[] {
 	return definition.browser?.profile.kind === "named" ? [`browser-profile:${definition.browser.profile.id}`] : [];
 }
 
+function hasWorkspaceConflict(definition: AgentDefinition, activeRuns: ReadonlySet<ActiveRun> | undefined): boolean {
+	if (!activeRuns || activeRuns.size === 0) return false;
+	if (definition.permissionPolicy === "workspace-write") return true;
+	return [...activeRuns].some((active) => active.record.agentId !== definition.id && isWorkspaceWriter(active));
+}
+
+function isWorkspaceWriter(active: ActiveRun): boolean {
+	return active.workspaceWritable;
+}
+
 function parseRunRecord(value: unknown, artifactDirectory: string): AgentRunRecord {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Invalid run record");
 	const record = value as Record<string, unknown>;
@@ -300,6 +349,10 @@ function parseRunRecord(value: unknown, artifactDirectory: string): AgentRunReco
 		createdAt: record.createdAt,
 		startedAt: typeof record.startedAt === "number" ? record.startedAt : undefined,
 		finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : undefined,
+		phase: isExecutionPhase(record.phase) ? record.phase : undefined,
+		progressMessage: typeof record.progressMessage === "string" ? record.progressMessage : undefined,
+		lastActivityAt: typeof record.lastActivityAt === "number" ? record.lastActivityAt : undefined,
+		lastHeartbeatAt: typeof record.lastHeartbeatAt === "number" ? record.lastHeartbeatAt : undefined,
 		artifactDirectory,
 		error: typeof record.error === "string" ? record.error : undefined,
 		model: record.model === undefined ? undefined : modelRef(record.model),
@@ -310,6 +363,16 @@ function parseRunRecord(value: unknown, artifactDirectory: string): AgentRunReco
 				? record.agentRevision
 				: 1,
 	};
+}
+
+function isExecutionPhase(value: unknown): value is AgentExecutionPhase {
+	return (
+		value === "initializing" ||
+		value === "waiting-for-model" ||
+		value === "generating" ||
+		value === "running-tool" ||
+		value === "writing-results"
+	);
 }
 
 function modelRef(value: unknown): ModelRef {
