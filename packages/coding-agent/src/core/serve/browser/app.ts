@@ -103,6 +103,17 @@ const browserProfileList = createBrowserProfilePanel();
 const agentBrowserWorkflowGrants = createAgentBrowserWorkflowGrants();
 installAgentBuilderToolsLayout(agentBrowserWorkflowGrants);
 installSettingsLayout();
+const agentSubmit = (() => {
+	const value = agentForm.querySelector<HTMLButtonElement>('button[type="submit"]');
+	if (!value) throw new Error("Agent Builder submit control is missing");
+	return value;
+})();
+const agentValidation = document.createElement("p");
+agentValidation.className = "muted";
+agentValidation.setAttribute("role", "status");
+agentValidation.setAttribute("aria-live", "polite");
+agentForm.before(agentValidation);
+installAgentBuilderStepControls();
 const modelPicker = installThemedSelect(model);
 const agentModelPicker = installThemedSelect(agentModel);
 const externalModelPicker = installThemedSelect(externalModel);
@@ -119,8 +130,11 @@ let activeSidebarAgent: AgentSummary | undefined;
 let activeTargetKey: string | undefined;
 let activeAgentId: string | undefined;
 let activeSubagentKey: string | undefined;
+let activeExternalRunId = localStorage.getItem("pi-serve-active-external-run") ?? undefined;
 const openAgentIds: string[] = [];
 const openSubagentKeys: string[] = [];
+const openExternalRunIds = readStoredStringArray("pi-serve-external-run-tabs");
+const externalResultByRunId = new Map<string, string>();
 const subagentActivityByKey = new Map<string, SubagentActivity>();
 const agentConversationIds = new Map<string, string>();
 const agentTasksByAgent = new Map<string, AgentTaskSummary[]>();
@@ -135,11 +149,16 @@ let previewRefreshRequested = false;
 let cachedBrowserStatus: BrowserConsoleStatus | undefined;
 let periodicRefreshPromise: Promise<void> | undefined;
 let previewCapture: BrowserCaptureSummary | undefined;
+const previewSessionsWithoutCapture = new Set<string>();
 let recordedBrowserWorkflows: BrowserWorkflowSummary[] = [];
 let browserWorkflowRuns: BrowserWorkflowRunSummary[] = [];
 let lastBrowserWorkflowLoadAt = 0;
 const browserWorkflowReviews = new Map<string, BrowserWorkflowReview>();
 let selectedExternalConnectionId: string | undefined;
+let externalRuns: ExternalRunSummary[] = [];
+let renderedExternalRunSignature = "";
+let renderedExternalRunListSignature = "";
+let lastAppliedBuilderDraft = "";
 let availableModels: ModelMetadata[] = [];
 let agentModelsInitialized = false;
 let agents: AgentSummary[] = [];
@@ -232,6 +251,7 @@ interface CapabilityProvider {
 			format?: "text" | "url";
 			operatorEditable?: boolean;
 			configured: boolean;
+			value?: string;
 		}>;
 		capabilityGroups?: Array<{ id: string; label: string; capabilityIds: string[] }>;
 		defaultCapabilityIds?: string[];
@@ -247,6 +267,8 @@ interface CapabilityConnectionSummary {
 	capabilityIds: string[];
 	status: "active" | "unhealthy" | "revoked";
 }
+
+type CapabilityConnectionState = "not-required" | "missing" | "unhealthy" | "not-granted" | "ready";
 
 interface CapabilityApprovalSummary {
 	id: string;
@@ -928,19 +950,40 @@ function renderSettingsModels(): void {
 
 function renderSettingsConnections(): void {
 	const providers = capabilityCatalogSnapshot?.broker.providers.filter((provider) => provider.authentication) ?? [];
-	settingsConnectionList.replaceChildren(
-		...providers.map((provider) => {
+	const groupedProviders = [
+		{
+			title: "Web services",
+			description: "Search and extraction endpoints available to Pi and deployed agents.",
+			providers: providers.filter((provider) => provider.authentication?.kind === "environment"),
+		},
+		{
+			title: "Connected accounts",
+			description: "OAuth and other authenticated service accounts.",
+			providers: providers.filter((provider) => provider.authentication?.kind !== "environment"),
+		},
+	];
+	const children: HTMLElement[] = [];
+	for (const group of groupedProviders) {
+		if (group.providers.length === 0) continue;
+		const heading = document.createElement("header");
+		heading.className = "settings-group-heading";
+		const title = document.createElement("strong");
+		title.textContent = group.title;
+		heading.append(title);
+		appendText(heading, group.description, "muted");
+		children.push(heading);
+		for (const provider of group.providers) {
 			const connection = capabilityConnections.find(
 				(entry) => entry.providerId === provider.id && entry.status !== "revoked",
 			);
 			const state = providerConnectionState(provider, connection);
-			const card = settingsCard(
-				provider.name,
-				connection?.accountLabel ?? provider.source,
-				state,
-				"Project",
-				provider.id,
-			);
+			const description =
+				provider.id === "pi-searxng"
+					? "Private web search"
+					: provider.id === "pi-firecrawl"
+						? "Web search, scrape, and crawl"
+						: (connection?.accountLabel ?? provider.source);
+			const card = settingsCard(provider.name, description, state, "Project", provider.id);
 			if (provider.id === "google-workspace") {
 				const icon = document.createElement("span");
 				icon.className = "settings-provider-icon";
@@ -957,13 +1000,21 @@ function renderSettingsConnections(): void {
 				actions.append(capabilityProviderButton("Disable", () => changeCapabilityProvider(provider.id, "disable")));
 			} else {
 				const enable = capabilityProviderButton("Enable", () => changeCapabilityProvider(provider.id, "enable"));
-				enable.disabled = provider.health === "missing-tools";
+				enable.disabled =
+					provider.health === "missing-tools" ||
+					(provider.connectionRequired === true && connection?.status !== "active");
+				enable.title = enable.disabled
+					? provider.health === "missing-tools"
+						? "Install the required adapter first"
+						: "Connect an account first"
+					: "";
 				actions.append(enable);
 			}
 			card.append(actions);
-			return card;
-		}),
-	);
+			children.push(card);
+		}
+	}
+	settingsConnectionList.replaceChildren(...children);
 	if (providers.length === 0)
 		appendText(settingsConnectionList, "No configurable connections installed", "settings-empty");
 }
@@ -983,29 +1034,23 @@ function renderSettingsCapabilities(): void {
 			),
 		)
 		.map((capability) => {
-			const provider = broker.providers.find((entry) => entry.id === capability.defaultProviderId);
-			const connectionReady =
-				!provider?.connectionRequired ||
-				capabilityConnections.some(
-					(connection) =>
-						connection.status === "active" &&
-						connection.providerId === provider.id &&
-						connection.capabilityIds.includes(capability.id),
-				);
+			const provider = resolveCapabilityProvider(broker, capability);
+			const connectionState = provider ? providerCapabilityConnectionState(provider, capability.id) : "missing";
+			const state = canonicalCapabilityState(capability, provider, connectionState);
 			const card = settingsCard(
 				capability.name,
 				`${capability.effect} · ${provider?.name ?? "No provider"}`,
-				canonicalCapabilityState(capability, provider, connectionReady),
+				state,
 				"Deployment",
 				capability.id,
 			);
 			appendText(card, capability.description, "capability-meta");
-			if (provider && canonicalCapabilityState(capability, provider, connectionReady) !== "Ready") {
+			if (provider && state !== "Ready") {
 				const actions = document.createElement("div");
 				actions.className = "settings-actions";
 				const configure = document.createElement("button");
 				configure.type = "button";
-				configure.textContent = settingsRemediationLabel(provider, connectionReady);
+				configure.textContent = settingsRemediationLabel(provider, connectionState);
 				configure.addEventListener("click", () => openProviderSettings(provider));
 				actions.append(configure);
 				card.append(actions);
@@ -1117,36 +1162,73 @@ function providerConnectionState(
 ): string {
 	if (!provider.authentication?.configured) return "Setup required";
 	if (provider.health === "missing-tools") return "Unavailable";
+	if (provider.authentication.kind === "environment") {
+		if (provider.trust === "unreviewed" || provider.trust === "quarantined") return "Configured · review required";
+		if (!provider.enabled) return "Configured · disabled";
+		if (provider.health === "degraded") return "Degraded";
+		return "Ready";
+	}
+	if (!connection) return "OAuth configured · account not connected";
 	if (connection?.status === "unhealthy") return "Needs attention";
-	if (connection?.status === "active") return "Connected";
-	return "Ready to connect";
+	if (provider.trust === "unreviewed" || provider.trust === "quarantined") return "Connected · review required";
+	if (!provider.enabled) return "Connected · disabled";
+	if (provider.health === "degraded") return "Connected · limited services";
+	return "Ready";
+}
+
+function resolveCapabilityProvider(
+	broker: CapabilitySnapshot["broker"],
+	capability: BrokeredCapability,
+): CapabilityProvider | undefined {
+	const configuredDefault = broker.providers.find((provider) => provider.id === capability.defaultProviderId);
+	if (configuredDefault) return configuredDefault;
+	const candidates = capability.providers.flatMap((providerId) => {
+		const provider = broker.providers.find((entry) => entry.id === providerId);
+		return provider ? [provider] : [];
+	});
+	return candidates.find((provider) => provider.authentication?.configured) ?? candidates[0];
 }
 
 function canonicalCapabilityState(
 	capability: BrokeredCapability,
 	provider: CapabilityProvider | undefined,
-	connectionReady: boolean,
+	connectionState: CapabilityConnectionState,
 ): string {
 	if (!provider || provider.health === "missing-tools" || capability.status === "unavailable") return "Unavailable";
-	if (provider.authentication && !provider.authentication.configured) return "Setup required";
-	if (provider.trust === "unreviewed" || provider.trust === "quarantined") return "Setup required";
+	if (provider.authentication && !provider.authentication.configured) return "Configuration required";
+	if (connectionState === "missing") return "Account not connected";
+	if (connectionState === "unhealthy") return "Needs attention";
+	if (connectionState === "not-granted") return "Access not granted";
+	if (provider.trust === "unreviewed" || provider.trust === "quarantined") return "Review required";
 	if (!provider.enabled) return "Disabled";
-	if (!connectionReady) {
-		return capabilityConnections.some(
-			(connection) => connection.providerId === provider.id && connection.status === "unhealthy",
-		)
-			? "Needs attention"
-			: "Setup required";
-	}
 	return capability.status === "active" ? "Ready" : "Setup required";
 }
 
-function settingsRemediationLabel(provider: CapabilityProvider, connectionReady: boolean): string {
+function settingsRemediationLabel(provider: CapabilityProvider, connectionState: CapabilityConnectionState): string {
 	if (provider.health === "missing-tools") return "Install";
-	if (provider.trust === "unreviewed" || provider.trust === "quarantined") return "Review";
 	if (!provider.authentication?.configured) return "Configure";
-	if (!connectionReady) return "Reconnect";
+	if (connectionState === "missing") return "Connect";
+	if (connectionState === "unhealthy") return "Reconnect";
+	if (connectionState === "not-granted") return "Update access";
+	if (provider.trust === "unreviewed" || provider.trust === "quarantined") return "Review";
 	return provider.enabled ? "Configure" : "Enable";
+}
+
+function providerCapabilityConnectionState(
+	provider: CapabilityProvider,
+	capabilityId: string,
+): CapabilityConnectionState {
+	if (!provider.connectionRequired) return "not-required";
+	const connections = capabilityConnections.filter(
+		(connection) => connection.providerId === provider.id && connection.status !== "revoked",
+	);
+	if (connections.length === 0) return "missing";
+	if (connections.some((connection) => connection.status === "unhealthy")) return "unhealthy";
+	return connections.some(
+		(connection) => connection.status === "active" && connection.capabilityIds.includes(capabilityId),
+	)
+		? "ready"
+		: "not-granted";
 }
 
 function openProviderSettings(provider: CapabilityProvider): void {
@@ -1593,6 +1675,7 @@ function render(snapshot: SessionSnapshot): void {
 		else closeSubagentTab(activeSubagentKey);
 		return;
 	}
+	if (activeExternalRunId) return;
 	if (builderActive) return;
 	if (activeAgentId) return;
 	const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
@@ -1639,6 +1722,104 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 	renderSessionStats(snapshot);
 	setStatus(projectRoot || "Configure and deploy a local agent");
 	if (nearBottom) transcript.scrollTop = transcript.scrollHeight;
+	applyAgentBuilderDraftFromTranscript();
+}
+
+function renderExternalRun(run: ExternalRunSummary): void {
+	if (activeExternalRunId !== run.id) return;
+	const renderSignature = `${run.id}:${run.status}:${run.error ?? ""}:${externalResultByRunId.get(run.id) ?? ""}`;
+	if (renderSignature === renderedExternalRunSignature) return;
+	renderedExternalRunSignature = renderSignature;
+	const connection = externalConnections.find((entry) => entry.id === run.connectionId);
+	const heading = document.createElement("section");
+	heading.className = "subagent-inspector-heading";
+	const title = document.createElement("strong");
+	title.textContent = connection?.name ?? run.connectionId;
+	const state = document.createElement("span");
+	state.textContent = externalRunStatusLabel(run.status);
+	const task = document.createElement("p");
+	task.textContent = run.prompt;
+	heading.append(title, state, task);
+
+	const body = document.createElement("section");
+	body.className = "subagent-timeline";
+	const result = externalResultByRunId.get(run.id);
+	if (result) {
+		const message = document.createElement("div");
+		message.className = "agent-message-content";
+		appendAgentMarkdown(message, result);
+		body.append(message);
+	} else if (run.error) {
+		appendText(body, run.error, "run-error");
+	} else {
+		const progress = document.createElement("div");
+		progress.className = "agent-running";
+		progress.append(document.createElement("i"), document.createTextNode(`${externalRunStatusLabel(run.status)}…`));
+		body.append(progress);
+	}
+
+	const actions = document.createElement("div");
+	actions.className = "result-actions";
+	if (run.status === "starting" || run.status === "running") {
+		const stop = document.createElement("button");
+		stop.type = "button";
+		stop.className = "abort";
+		stop.textContent = "Stop";
+		stop.addEventListener("click", () => void abortExternalRun(run.id));
+		actions.append(stop);
+	}
+	if (run.status === "failed" || run.status === "aborted") {
+		const retry = document.createElement("button");
+		retry.type = "button";
+		retry.textContent = "Retry";
+		retry.addEventListener("click", () => void retryExternalRun(run));
+		actions.append(retry);
+	}
+	if (run.status === "succeeded") {
+		const use = document.createElement("button");
+		use.type = "button";
+		use.textContent = "Send result to Pi";
+		use.addEventListener("click", () => void sendExternalResultToPi(run));
+		actions.append(use);
+	}
+	if (actions.childElementCount > 0) body.append(actions);
+
+	transcript.replaceChildren(heading, body);
+	transcript.scrollTop = transcript.scrollHeight;
+	phase.textContent = run.status;
+	input.disabled = true;
+	input.value = "";
+	input.placeholder = "Delegated run output";
+	send.disabled = true;
+	model.disabled = true;
+	modelPicker.refresh();
+	thinking.disabled = true;
+	attachmentButton.disabled = true;
+	attachmentInput.disabled = true;
+	attachmentList.replaceChildren();
+	sessionPath.textContent = formatWorkingDirectory(run.cwd);
+	sessionPath.title = run.cwd;
+	sessionStats.textContent = `${run.model.provider}/${run.model.id}`;
+	sessionStats.title = "Delegated model";
+	setStatus(`${connection?.name ?? run.connectionId} · ${externalRunStatusLabel(run.status)}`);
+	if (run.status === "succeeded" && !result) void loadExternalResultIntoTab(run);
+}
+
+function externalRunStatusLabel(value: string): string {
+	if (value === "succeeded") return "Completed";
+	if (value === "failed") return "Failed";
+	if (value === "aborted") return "Stopped";
+	if (value === "starting") return "Starting";
+	return "Running";
+}
+
+async function loadExternalResultIntoTab(run: ExternalRunSummary): Promise<void> {
+	try {
+		externalResultByRunId.set(run.id, await externalResult(run.id));
+		if (activeExternalRunId === run.id) renderExternalRun(run);
+	} catch (error) {
+		setStatus(error instanceof Error ? error.message : String(error), true);
+	}
 }
 
 function renderEarlierMessages(
@@ -2124,14 +2305,22 @@ function renderSessionNavigation(): void {
 			wrapper.className = "session-tab-wrap";
 			wrapper.classList.toggle(
 				"active",
-				!builderActive && !activeAgentId && !activeSubagentKey && target.key === activeTargetKey,
+				!builderActive &&
+					!activeAgentId &&
+					!activeSubagentKey &&
+					!activeExternalRunId &&
+					target.key === activeTargetKey,
 			);
 			const button = document.createElement("button");
 			button.type = "button";
 			button.className = "session-tab";
 			button.classList.toggle(
 				"active",
-				!builderActive && !activeAgentId && !activeSubagentKey && target.key === activeTargetKey,
+				!builderActive &&
+					!activeAgentId &&
+					!activeSubagentKey &&
+					!activeExternalRunId &&
+					target.key === activeTargetKey,
 			);
 			const sessionName = sessionDisplayName(target);
 			const connection = connections.get(target.connectionId);
@@ -2187,6 +2376,29 @@ function renderSessionNavigation(): void {
 			wrapper.append(button, close);
 			return [wrapper];
 		}),
+		...openExternalRunIds.flatMap((runId) => {
+			const run = externalRuns.find((entry) => entry.id === runId);
+			if (!run) return [];
+			const connection = externalConnections.find((entry) => entry.id === run.connectionId);
+			const wrapper = document.createElement("div");
+			wrapper.className = "session-tab-wrap";
+			wrapper.classList.toggle("active", run.id === activeExternalRunId);
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "session-tab agent-session-tab";
+			button.textContent = connection?.name ?? run.connectionId;
+			button.title = `${externalRunStatusLabel(run.status)} · ${run.prompt}`;
+			button.addEventListener("click", () => openExternalRun(run));
+			const close = document.createElement("button");
+			close.type = "button";
+			close.className = "session-tab-close";
+			close.textContent = "×";
+			close.title = `Close ${connection?.name ?? run.connectionId} result`;
+			close.setAttribute("aria-label", close.title);
+			close.addEventListener("click", () => closeExternalRunTab(run.id));
+			wrapper.append(button, close);
+			return [wrapper];
+		}),
 	);
 	connectionList.replaceChildren(
 		...[...connections.values()].map((entry) => {
@@ -2214,7 +2426,14 @@ function renderSessionNavigation(): void {
 				const button = document.createElement("button");
 				button.type = "button";
 				button.className = "session-select";
-				button.classList.toggle("active", !builderActive && target.key === activeTargetKey);
+				button.classList.toggle(
+					"active",
+					!builderActive &&
+						!activeAgentId &&
+						!activeSubagentKey &&
+						!activeExternalRunId &&
+						target.key === activeTargetKey,
+				);
 				const name = document.createElement("strong");
 				name.textContent = sessionDisplayName(target);
 				const cwd = document.createElement("span");
@@ -2261,6 +2480,8 @@ async function switchSession(target: SessionTarget): Promise<void> {
 		builderActive = false;
 		activeAgentId = undefined;
 		activeSubagentKey = undefined;
+		activeExternalRunId = undefined;
+		persistExternalRunTabs();
 		if (session.snapshot) render(session.snapshot);
 		renderSessionNavigation();
 		renderAttachments();
@@ -2279,6 +2500,8 @@ async function switchSession(target: SessionTarget): Promise<void> {
 	builderActive = false;
 	activeAgentId = undefined;
 	activeSubagentKey = undefined;
+	activeExternalRunId = undefined;
+	persistExternalRunTabs();
 	populateModels(entry.client.snapshot?.models ?? []);
 	unsubscribeSession = session.subscribe(render);
 	if (session.snapshot) render(session.snapshot);
@@ -2353,6 +2576,7 @@ async function togglePreviewRecording(): Promise<void> {
 			: undefined;
 	if (!capture) throw new Error("Browser recording response is invalid");
 	previewCapture = capture;
+	previewSessionsWithoutCapture.delete(activePreviewSessionId);
 	if (isBrowserCaptureStopResult(value) && value.workflow) {
 		setPreviewMessage(
 			value.workflow.status === "compiled"
@@ -2365,21 +2589,42 @@ async function togglePreviewRecording(): Promise<void> {
 	await loadBrowserWorkflows(true);
 }
 
-async function loadPreviewCapture(): Promise<void> {
-	if (!capabilityToken || !activePreviewSessionId) return;
+async function loadPreviewCapture(): Promise<boolean> {
+	if (!capabilityToken || !activePreviewSessionId) return false;
+	const sessionId = activePreviewSessionId;
+	if (previewSessionsWithoutCapture.has(sessionId)) return true;
 	const response = await fetch(
-		`/browser/sessions/${encodeURIComponent(activePreviewSessionId)}/capture?token=${encodeURIComponent(capabilityToken)}`,
+		`/browser/sessions/${encodeURIComponent(sessionId)}/capture?token=${encodeURIComponent(capabilityToken)}`,
 	);
 	if (response.status === 404) {
-		if (previewCapture?.status === "recording") previewCapture = undefined;
+		const sessionResponse = await fetch(
+			`/browser/sessions/${encodeURIComponent(sessionId)}/diagnostics?token=${encodeURIComponent(capabilityToken)}`,
+		);
+		if (sessionResponse.status !== 404) {
+			previewCapture = undefined;
+			previewSessionsWithoutCapture.add(sessionId);
+			renderPreviewRecording();
+			return true;
+		}
+		previewCapture = undefined;
+		selectedPreviewSessionId = undefined;
+		activePreviewSessionId = undefined;
+		activePreviewSession = undefined;
+		previewImage.removeAttribute("src");
+		previewStream?.close();
+		previewStream = undefined;
+		previewStreamSessionId = undefined;
+		setPreviewControls(undefined);
 		renderPreviewRecording();
-		return;
+		setPreviewMessage("Browser session ended. Start or select another managed browser.");
+		return false;
 	}
 	if (!response.ok) throw new Error(await responseError(response, "Could not load browser recording"));
 	const value: unknown = await response.json();
 	if (!isBrowserCaptureSummary(value)) throw new Error("Browser recording response is invalid");
 	previewCapture = value;
 	renderPreviewRecording();
+	return true;
 }
 
 function recordedStepText(step: BrowserCaptureSummary["steps"][number], index: number): string {
@@ -2798,7 +3043,7 @@ async function loadPreviewOnce(): Promise<void> {
 	}
 	previewSession.textContent = `${browserOwnerLabel(browserSession)} · ${browserSession.controlOwner === "user" ? "User control" : "Agent control"}`;
 	setPreviewControls(browserSession);
-	await loadPreviewCapture();
+	if (!(await loadPreviewCapture())) return;
 	if (browserSession.status === "failed") {
 		previewImage.removeAttribute("src");
 		setPreviewMessage(browserSession.lastError ?? "Browser session failed", true);
@@ -3308,9 +3553,9 @@ async function connect(): Promise<void> {
 			loadCapabilityConnections()
 				.then(() => Promise.all([loadCapabilities(), loadWaveTwoControls()]))
 				.catch(() => {}),
-			loadExternalConnections().catch((error: unknown) =>
-				setStatus(error instanceof Error ? error.message : String(error), true),
-			),
+			loadExternalConnections()
+				.then(loadExternalRuns)
+				.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true)),
 		]);
 	}, 0);
 }
@@ -3742,15 +3987,11 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 		const checkbox = document.createElement("input");
 		checkbox.type = "checkbox";
 		checkbox.checked = grants.some((entry) => entry.capabilityId === capability.id);
-		const defaultProvider = broker.providers.find((provider) => provider.id === capability.defaultProviderId);
-		const connectionReady =
-			!defaultProvider?.connectionRequired ||
-			capabilityConnections.some(
-				(connection) =>
-					connection.status === "active" &&
-					connection.providerId === defaultProvider.id &&
-					connection.capabilityIds.includes(capability.id),
-			);
+		const defaultProvider = resolveCapabilityProvider(broker, capability);
+		const connectionState = defaultProvider
+			? providerCapabilityConnectionState(defaultProvider, capability.id)
+			: "missing";
+		const connectionReady = connectionState === "not-required" || connectionState === "ready";
 		checkbox.disabled = capability.status !== "active" || !connectionReady;
 		checkbox.title =
 			capability.status !== "active"
@@ -3767,7 +4008,7 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 		grant.append(checkbox, label);
 		const state = document.createElement("span");
 		state.className = "capability-status";
-		state.textContent = canonicalCapabilityState(capability, defaultProvider, connectionReady);
+		state.textContent = canonicalCapabilityState(capability, defaultProvider, connectionState);
 		summary.append(grant, state);
 		const body = document.createElement("div");
 		body.className = "capability-body";
@@ -3780,7 +4021,7 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 		if (checkbox.disabled && defaultProvider) {
 			const configure = document.createElement("button");
 			configure.type = "button";
-			configure.textContent = settingsRemediationLabel(defaultProvider, connectionReady);
+			configure.textContent = settingsRemediationLabel(defaultProvider, connectionState);
 			configure.addEventListener("click", () => openProviderSettings(defaultProvider));
 			body.append(configure);
 		}
@@ -3834,6 +4075,7 @@ function providerConfigurationForm(provider: CapabilityProvider): HTMLFormElemen
 		input.name = field.env;
 		input.type = field.secret ? "password" : field.format === "url" ? "url" : "text";
 		input.autocomplete = "off";
+		if (!field.secret && field.value) input.value = field.value;
 		input.placeholder = field.configured ? "Configured; leave blank to keep" : "Not configured";
 		label.append(input);
 		if (field.configured) {
@@ -3895,19 +4137,29 @@ function providerCapabilityPermissions(
 ): HTMLElement {
 	const section = document.createElement("div");
 	section.className = "provider-permissions";
-	appendText(section, "Google services", "provider-permissions-title");
+	appendText(
+		section,
+		connection ? "Connected Google access" : "Google access to request",
+		"provider-permissions-title",
+	);
 	const selected = new Set(connection?.capabilityIds ?? provider.authentication?.defaultCapabilityIds ?? []);
 	for (const group of provider.authentication?.capabilityGroups ?? []) {
 		const service = document.createElement("fieldset");
 		service.className = "provider-service";
-		const available = group.capabilityIds.filter((capabilityId) =>
-			providerCapabilityAvailable(provider, capabilityId),
+		const supported = group.capabilityIds.filter((capabilityId) =>
+			providerCapabilitySupported(provider, capabilityId),
 		);
+		const connected = supported.filter((capabilityId) => connection?.capabilityIds.includes(capabilityId));
 		const legend = document.createElement("legend");
 		legend.textContent = group.label;
 		const state = document.createElement("span");
-		state.className = available.length > 0 ? "provider-service-state available" : "provider-service-state";
-		state.textContent = available.length > 0 ? `${available.length} available` : "Adapter required";
+		state.className = connected.length > 0 ? "provider-service-state available" : "provider-service-state";
+		state.textContent =
+			supported.length === 0
+				? "Adapter required"
+				: connection
+					? `${connected.length} connected`
+					: `${supported.length} supported`;
 		legend.append(state);
 		service.append(legend);
 		for (const capabilityId of group.capabilityIds) {
@@ -3918,7 +4170,7 @@ function providerCapabilityPermissions(
 			checkbox.type = "checkbox";
 			checkbox.dataset.authorizationCapability = capabilityId;
 			checkbox.checked = selected.has(capabilityId);
-			checkbox.disabled = !providerCapabilityAvailable(provider, capabilityId);
+			checkbox.disabled = !providerCapabilitySupported(provider, capabilityId);
 			label.append(checkbox, capability?.name ?? capabilityId);
 			service.append(label);
 		}
@@ -3927,7 +4179,7 @@ function providerCapabilityPermissions(
 	return section;
 }
 
-function providerCapabilityAvailable(provider: CapabilityProvider, capabilityId: string): boolean {
+function providerCapabilitySupported(provider: CapabilityProvider, capabilityId: string): boolean {
 	const binding = provider.bindings.find((entry) => entry.capabilityId === capabilityId);
 	return Boolean(binding && (!binding.toolName || !provider.missingTools.includes(binding.toolName)));
 }
@@ -4467,6 +4719,156 @@ function activateBuilderTab(id: string): void {
 	});
 }
 
+interface BuilderRequirement {
+	fieldId: string;
+	label: string;
+	panelId: string;
+}
+
+const builderRequirements: BuilderRequirement[] = [
+	{ fieldId: "agent-name", label: "Name", panelId: "builder-profile-panel" },
+	{ fieldId: "agent-description", label: "Description", panelId: "builder-profile-panel" },
+	{ fieldId: "agent-project-root", label: "Project folder", panelId: "builder-profile-panel" },
+	{ fieldId: "agent-persona", label: "Persona instructions", panelId: "builder-profile-panel" },
+];
+
+function installAgentBuilderStepControls(): void {
+	const panelIds = [
+		"builder-profile-panel",
+		"builder-tools-panel",
+		"builder-capabilities-panel",
+		"builder-connections-panel",
+		"builder-automation-panel",
+	];
+	panelIds.forEach((panelId, index) => {
+		const panel = element(panelId);
+		const controls = document.createElement("div");
+		controls.className = "routine-actions";
+		if (index > 0) {
+			const back = document.createElement("button");
+			back.type = "button";
+			back.className = "secondary-action";
+			back.textContent = "Back";
+			back.addEventListener("click", () => activateBuilderTab(panelIds[index - 1] ?? panelId));
+			controls.append(back);
+		}
+		if (index < panelIds.length - 1) {
+			const next = document.createElement("button");
+			next.type = "button";
+			next.className = "secondary-action";
+			next.textContent = "Next";
+			next.addEventListener("click", () => {
+				const missing = missingBuilderRequirements().find((entry) => entry.panelId === panelId);
+				if (missing) {
+					const field = requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(
+						missing.fieldId,
+					);
+					field.focus();
+					field.reportValidity();
+					setStatus(`${missing.label} is required before continuing`, true);
+					return;
+				}
+				activateBuilderTab(panelIds[index + 1] ?? panelId);
+			});
+			controls.append(next);
+		}
+		panel.append(controls);
+	});
+}
+
+function missingBuilderRequirements(): BuilderRequirement[] {
+	const missing = builderRequirements.filter((requirement) => {
+		const field = requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(requirement.fieldId);
+		return !field.value.trim() || !field.checkValidity();
+	});
+	const profileKind = requiredElement<HTMLSelectElement>("agent-browser-profile-kind").value;
+	const profile = requiredElement<HTMLInputElement>("agent-browser-profile-id");
+	if (profileKind === "named" && (!profile.value.trim() || !profile.checkValidity()))
+		missing.push({
+			fieldId: "agent-browser-profile-id",
+			label: "Browser profile name",
+			panelId: "builder-tools-panel",
+		});
+	return missing;
+}
+
+function updateAgentBuilderReadiness(): void {
+	const missing = missingBuilderRequirements();
+	const ready = missing.length === 0;
+	agentSubmit.setAttribute("aria-disabled", String(!ready));
+	agentSubmit.title = ready
+		? "Save and deploy this agent"
+		: `Required: ${missing.map((entry) => entry.label).join(", ")}`;
+	agentSubmit.style.opacity = ready ? "" : ".55";
+	agentValidation.className = ready ? "muted" : "run-error";
+	agentValidation.textContent = ready
+		? "Ready to deploy. Optional capabilities, delegation, and automation can be added now or later."
+		: `Complete ${missing.map((entry) => entry.label).join(", ")} before deployment.`;
+	const incompletePanels = new Set(missing.map((entry) => entry.panelId));
+	for (const tab of document.querySelectorAll<HTMLButtonElement>("[data-builder-tab]")) {
+		const base = tab.dataset.baseLabel ?? tab.textContent?.replace(/[ ✓•]+$/, "") ?? "Step";
+		tab.dataset.baseLabel = base;
+		tab.textContent = `${base} ${incompletePanels.has(tab.dataset.builderTab ?? "") ? "•" : "✓"}`;
+	}
+}
+
+function validateAgentBuilder(): boolean {
+	updateAgentBuilderReadiness();
+	const first = missingBuilderRequirements()[0];
+	if (!first) return true;
+	activateBuilderTab(first.panelId);
+	const field = requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(first.fieldId);
+	field.focus();
+	field.reportValidity();
+	setStatus(`${first.label} is required before the agent can be deployed`, true);
+	return false;
+}
+
+function applyAgentBuilderDraftFromTranscript(): void {
+	const content = transcript.textContent ?? "";
+	const matches = [...content.matchAll(/\[AGENT_DRAFT\]([\s\S]*?)\[\/AGENT_DRAFT\]/g)];
+	const encoded = matches.at(-1)?.[1]?.trim();
+	if (!encoded || encoded === lastAppliedBuilderDraft) return;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(encoded);
+	} catch {
+		return;
+	}
+	const draft = objectRecord(parsed);
+	if (!draft) return;
+	lastAppliedBuilderDraft = encoded;
+	setBuilderDraftText("agent-name", draft.name);
+	setBuilderDraftText("agent-description", draft.description);
+	setBuilderDraftText("agent-project-root", draft.projectRoot);
+	setBuilderDraftText("agent-persona", draft.persona);
+	setBuilderDraftSelect("agent-model", draft.model);
+	setBuilderDraftSelect("agent-thinking", draft.thinking);
+	setBuilderDraftSelect("agent-executor", draft.executor);
+	setBuilderDraftSelect("agent-permissions", draft.permissionPolicy);
+	setBuilderDraftSelect("agent-browser-access", draft.browserAccess);
+	if (Array.isArray(draft.tools) && draft.tools.every((entry) => typeof entry === "string"))
+		requiredElement<HTMLInputElement>("agent-tools").value = draft.tools.join(",");
+	if (Array.isArray(draft.delegateAgentIds) && draft.delegateAgentIds.every((entry) => typeof entry === "string"))
+		requiredElement<HTMLInputElement>("agent-delegates").value = draft.delegateAgentIds.join(", ");
+	updateAgentBrowserProfileFields();
+	updateAgentBuilderReadiness();
+	element("builder-title").textContent = requiredElement<HTMLInputElement>("agent-name").value || "Build a new agent";
+	void loadCapabilities().catch(() => {});
+	setStatus("Agent Builder applied a draft. Review each step, then save and deploy.");
+}
+
+function setBuilderDraftText(fieldId: string, value: unknown): void {
+	if (typeof value !== "string" || !value.trim()) return;
+	requiredElement<HTMLInputElement | HTMLTextAreaElement>(fieldId).value = value.trim();
+}
+
+function setBuilderDraftSelect(fieldId: string, value: unknown): void {
+	if (typeof value !== "string") return;
+	const select = requiredElement<HTMLSelectElement>(fieldId);
+	if ([...select.options].some((option) => option.value === value)) select.value = value;
+}
+
 function resizeComposer(): void {
 	input.style.height = "0";
 	input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
@@ -4577,6 +4979,8 @@ async function openAgent(agent?: AgentSummary): Promise<void> {
 	builderActive = false;
 	activeAgentId = agent.id;
 	activeSubagentKey = undefined;
+	activeExternalRunId = undefined;
+	persistExternalRunTabs();
 	if (!openAgentIds.includes(agent.id)) openAgentIds.push(agent.id);
 	selectedAgentTitle.textContent = agent.name;
 	selectedAgentMeta.textContent = `${agent.model ? `${agent.model.provider}/${agent.model.id}` : "Current Pi model"} · ${formatWorkingDirectory(agent.projectRoot)}`;
@@ -4604,6 +5008,8 @@ function openSubagentInspector(key: string): void {
 	builderActive = false;
 	activeAgentId = undefined;
 	activeSubagentKey = key;
+	activeExternalRunId = undefined;
+	persistExternalRunTabs();
 	mobilePanelNone.checked = true;
 	renderSubagentInspector(activity);
 	renderSessionNavigation();
@@ -4620,6 +5026,55 @@ function closeSubagentTab(key: string): void {
 	if (session?.snapshot) render(session.snapshot);
 	renderSessionNavigation();
 	renderAttachments();
+}
+
+function openExternalRun(run: ExternalRunSummary): void {
+	builderActive = false;
+	activeAgentId = undefined;
+	activeSubagentKey = undefined;
+	activeExternalRunId = run.id;
+	if (!openExternalRunIds.includes(run.id)) openExternalRunIds.push(run.id);
+	persistExternalRunTabs();
+	mobilePanelNone.checked = true;
+	renderedExternalRunSignature = "";
+	renderExternalRun(run);
+	renderSessionNavigation();
+}
+
+function closeExternalRunTab(runId: string): void {
+	const index = openExternalRunIds.indexOf(runId);
+	if (index >= 0) openExternalRunIds.splice(index, 1);
+	persistExternalRunTabs();
+	if (activeExternalRunId !== runId) {
+		renderSessionNavigation();
+		return;
+	}
+	activeExternalRunId = undefined;
+	persistExternalRunTabs();
+	const fallbackId = openExternalRunIds.at(-1);
+	const fallback = fallbackId ? externalRuns.find((entry) => entry.id === fallbackId) : undefined;
+	if (fallback) {
+		openExternalRun(fallback);
+		return;
+	}
+	if (session?.snapshot) render(session.snapshot);
+	renderSessionNavigation();
+	renderAttachments();
+}
+
+function persistExternalRunTabs(): void {
+	localStorage.setItem("pi-serve-external-run-tabs", JSON.stringify(openExternalRunIds));
+	if (activeExternalRunId) localStorage.setItem("pi-serve-active-external-run", activeExternalRunId);
+	else localStorage.removeItem("pi-serve-active-external-run");
+}
+
+function readStoredStringArray(key: string): string[] {
+	try {
+		const value: unknown = JSON.parse(localStorage.getItem(key) ?? "[]");
+		return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+	} catch {
+		return [];
+	}
 }
 
 function renderSubagentInspector(activity: SubagentActivity): void {
@@ -4785,6 +5240,7 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 			: "";
 	agentModelPicker.refresh();
 	updatePersonaPreview();
+	updateAgentBuilderReadiness();
 	element("builder-title").textContent = agent
 		? catalogAgent
 			? `${agent.name} · Pi agent catalog`
@@ -4800,6 +5256,8 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 	if (showConversation) {
 		activeAgentId = undefined;
 		activeSubagentKey = undefined;
+		activeExternalRunId = undefined;
+		persistExternalRunTabs();
 	}
 	unsubscribeBuilder = builderSession.subscribe((snapshot) => {
 		if (builderActive) renderBuilderConversation(snapshot);
@@ -4815,6 +5273,8 @@ function openBuilderChat(): void {
 	builderActive = true;
 	activeAgentId = undefined;
 	activeSubagentKey = undefined;
+	activeExternalRunId = undefined;
+	persistExternalRunTabs();
 	activateTab("agent-builder");
 	mobilePanelNone.checked = true;
 	renderBuilderConversation(builderSession.snapshot);
@@ -5140,44 +5600,86 @@ async function continueAgentTask(taskId: string, message: string): Promise<void>
 }
 
 async function loadExternalRuns(): Promise<void> {
-	if (!capabilityToken || !selectedExternalConnectionId) return;
+	if (!capabilityToken) return;
+	const previousTabSignature = externalTabSignature();
 	const response = await fetch(`/external-runs.json?token=${encodeURIComponent(capabilityToken)}`);
 	if (!response.ok) throw new Error(`Could not load external runs: HTTP ${response.status}`);
 	const payload: unknown = await response.json();
 	if (!isExternalRunList(payload)) throw new Error("External run manager returned an invalid response");
-	const runs = payload.runs.filter((run) => run.connectionId === selectedExternalConnectionId);
-	externalRunList.replaceChildren(
-		...runs.map((run) => {
-			const card = document.createElement("div");
-			card.className = "card run-card";
-			appendText(card, `${run.status} · ${run.model.provider}/${run.model.id}`);
-			appendText(card, run.prompt, "muted");
-			if (run.error) appendText(card, run.error, "run-error");
-			const actions = document.createElement("div");
-			actions.className = "result-actions";
-			if (run.status === "starting" || run.status === "running") {
-				const abort = document.createElement("button");
-				abort.type = "button";
-				abort.className = "abort";
-				abort.textContent = "Stop";
-				abort.addEventListener("click", () => void abortExternalRun(run.id));
-				actions.append(abort);
-			}
-			if (run.status === "succeeded") {
-				const open = document.createElement("button");
-				open.type = "button";
-				open.textContent = "View result";
-				open.addEventListener("click", () => void showExternalResult(run, card));
-				const use = document.createElement("button");
-				use.type = "button";
-				use.textContent = "Send to Pi";
-				use.addEventListener("click", () => void sendExternalResultToPi(run));
-				actions.append(open, use);
-			}
-			if (actions.childElementCount > 0) card.append(actions);
-			return card;
-		}),
+	externalRuns = payload.runs;
+	for (const run of externalRuns) {
+		if ((run.status === "starting" || run.status === "running") && !openExternalRunIds.includes(run.id))
+			openExternalRunIds.push(run.id);
+	}
+	for (let index = openExternalRunIds.length - 1; index >= 0; index--) {
+		if (!externalRuns.some((run) => run.id === openExternalRunIds[index])) openExternalRunIds.splice(index, 1);
+	}
+	if (activeExternalRunId && !openExternalRunIds.includes(activeExternalRunId)) activeExternalRunId = undefined;
+	persistExternalRunTabs();
+	const runs = selectedExternalConnectionId
+		? externalRuns.filter((run) => run.connectionId === selectedExternalConnectionId)
+		: [];
+	const listSignature = JSON.stringify(
+		runs.map((run) => [run.id, run.status, run.error, run.prompt, run.model.provider, run.model.id]),
 	);
+	if (listSignature !== renderedExternalRunListSignature) {
+		renderedExternalRunListSignature = listSignature;
+		externalRunList.replaceChildren(
+			...runs.map((run) => {
+				const card = document.createElement("div");
+				card.className = "card run-card";
+				appendText(card, `${run.status} · ${run.model.provider}/${run.model.id}`);
+				appendText(card, run.prompt, "muted");
+				if (run.error) appendText(card, run.error, "run-error");
+				const actions = document.createElement("div");
+				actions.className = "result-actions";
+				if (run.status === "starting" || run.status === "running") {
+					const abort = document.createElement("button");
+					abort.type = "button";
+					abort.className = "abort";
+					abort.textContent = "Stop";
+					abort.addEventListener("click", () => void abortExternalRun(run.id));
+					actions.append(abort);
+				}
+				if (run.status === "succeeded") {
+					const open = document.createElement("button");
+					open.type = "button";
+					open.textContent = "View result";
+					open.addEventListener("click", () => void showExternalResult(run, card));
+					const use = document.createElement("button");
+					use.type = "button";
+					use.textContent = "Send to Pi";
+					use.addEventListener("click", () => void sendExternalResultToPi(run));
+					actions.append(open, use);
+				}
+				if (run.status === "failed" || run.status === "aborted") {
+					const retry = document.createElement("button");
+					retry.type = "button";
+					retry.textContent = "Retry";
+					retry.addEventListener("click", () => void retryExternalRun(run));
+					const inspect = document.createElement("button");
+					inspect.type = "button";
+					inspect.textContent = "Open tab";
+					inspect.addEventListener("click", () => openExternalRun(run));
+					actions.append(inspect, retry);
+				}
+				if (actions.childElementCount > 0) card.append(actions);
+				return card;
+			}),
+		);
+	}
+	const activeRun = activeExternalRunId ? externalRuns.find((entry) => entry.id === activeExternalRunId) : undefined;
+	if (activeRun) renderExternalRun(activeRun);
+	if (previousTabSignature !== externalTabSignature()) renderSessionNavigation();
+}
+
+function externalTabSignature(): string {
+	return openExternalRunIds
+		.map((id) => {
+			const run = externalRuns.find((entry) => entry.id === id);
+			return `${id}:${run?.status ?? "missing"}`;
+		})
+		.join("|");
 }
 
 function isExternalRunList(value: unknown): value is { runs: ExternalRunSummary[] } {
@@ -5258,6 +5760,35 @@ async function abortExternalRun(runId: string): Promise<void> {
 	);
 	if (!response.ok) throw new Error(`Could not stop delegated run: HTTP ${response.status}`);
 	await loadExternalRuns();
+}
+
+async function retryExternalRun(run: ExternalRunSummary): Promise<void> {
+	await startExternalRun(run.connectionId, run.prompt, run.cwd, run.model);
+}
+
+async function startExternalRun(
+	connectionId: string,
+	prompt: string,
+	cwd: string,
+	selectedModel: { provider: string; id: string },
+): Promise<void> {
+	if (!capabilityToken) throw new Error("The capability token is missing");
+	const response = await fetch(`/external-runs?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ connectionId, prompt, cwd, model: selectedModel }),
+	});
+	if (!response.ok) throw new Error(await responseError(response, "Could not start delegated run"));
+	const value: unknown = await response.json();
+	if (!isExternalRunSummary(value)) throw new Error("External run manager returned an invalid run");
+	externalRuns = [value, ...externalRuns.filter((entry) => entry.id !== value.id)];
+	openExternalRun(value);
+	await loadExternalRuns();
+	setStatus(`Delegated to ${connectionId}`);
+}
+
+function isExternalRunSummary(value: unknown): value is ExternalRunSummary {
+	return isExternalRunList({ runs: [value] });
 }
 
 interface RoutineSummary {
@@ -5814,7 +6345,7 @@ form.addEventListener("submit", (event) => {
 });
 
 async function submitComposer(): Promise<void> {
-	if (activeSubagentKey) return;
+	if (activeSubagentKey || activeExternalRunId) return;
 	if (builderActive) {
 		await submitBuilderComposer();
 		return;
@@ -5863,8 +6394,10 @@ async function submitBuilderComposer(): Promise<void> {
 	resizeComposer();
 	const message = [
 		"You are Agent Builder, a temporary specialist helping configure and deploy one local Pi agent.",
-		"Ask concise questions, recommend concrete settings, and keep the visible configuration form as the source of truth.",
-		"Do not claim that you changed a field. State the exact field values the user should save when the design is ready.",
+		"Ask concise questions and recommend concrete settings. The visible configuration form remains the source of truth.",
+		"When you have enough information for a useful draft, end with exactly one machine-readable marker. Use one-line valid JSON and omit unknown optional fields:",
+		'[AGENT_DRAFT]{"name":"...","description":"...","projectRoot":"...","persona":"...","model":"provider/model","thinking":"high","executor":"harness","permissionPolicy":"read-only","browserAccess":"disabled","tools":["read"],"delegateAgentIds":[]}[/AGENT_DRAFT]',
+		"The console applies that marker to the form. Tell the user to review the populated steps before deployment.",
 		`Current name: ${requiredElement<HTMLInputElement>("agent-name").value || "not set"}`,
 		`Current description: ${requiredElement<HTMLTextAreaElement>("agent-description").value || "not set"}`,
 		`Current project folder: ${requiredElement<HTMLInputElement>("agent-project-root").value || "not set"}`,
@@ -6084,7 +6617,7 @@ model.addEventListener("change", () => {
 	const separator = model.value.indexOf("/");
 	if (separator < 1) return;
 	const targetSession = builderActive ? builderSession : session;
-	if (!targetSession || activeAgentId) return;
+	if (!targetSession || activeAgentId || activeSubagentKey || activeExternalRunId) return;
 	void targetSession
 		.setModel({ provider: model.value.slice(0, separator), id: model.value.slice(separator + 1) })
 		.catch((error: unknown) => setStatus(String(error), true));
@@ -6092,7 +6625,7 @@ model.addEventListener("change", () => {
 
 thinking.addEventListener("change", () => {
 	const targetSession = builderActive ? builderSession : session;
-	if (targetSession && !activeAgentId)
+	if (targetSession && !activeAgentId && !activeSubagentKey && !activeExternalRunId)
 		void targetSession
 			.setThinking(thinking.value as ThinkingLevel)
 			.catch((error: unknown) => setStatus(String(error), true));
@@ -6145,7 +6678,10 @@ showConnectionForm.addEventListener("click", () => {
 	if (!connectionForm.classList.contains("hidden")) connectionUrl.focus();
 });
 
-openSettingsButton.addEventListener("click", () => openSettings("models"));
+openSettingsButton.addEventListener("click", () => {
+	mobilePanelNone.checked = true;
+	openSettings("models");
+});
 settingsClose.addEventListener("click", closeSettings);
 window.addEventListener("keydown", (event) => {
 	if (event.key === "Escape" && !settingsWorkspace.classList.contains("hidden")) closeSettings();
@@ -6168,6 +6704,7 @@ connectionForm.addEventListener("submit", (event) => {
 agentForm.addEventListener("submit", (event) => {
 	event.preventDefault();
 	if (!capabilityToken) return;
+	if (!validateAgentBuilder()) return;
 	const id = requiredElement<HTMLInputElement>("agent-id").value;
 	const value = (field: string) =>
 		requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(field).value;
@@ -6270,16 +6807,25 @@ agentForm.addEventListener("submit", (event) => {
 		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
 });
 
-personaSelect.addEventListener("change", () => updatePersonaPreview(true));
+personaSelect.addEventListener("change", () => {
+	updatePersonaPreview(true);
+	updateAgentBuilderReadiness();
+});
 requiredElement<HTMLSelectElement>("agent-executor").addEventListener("change", () => {
 	void loadCapabilities().catch((error: unknown) =>
 		setStatus(error instanceof Error ? error.message : String(error), true),
 	);
 });
-requiredElement<HTMLSelectElement>("agent-browser-profile-kind").addEventListener(
-	"change",
-	updateAgentBrowserProfileFields,
-);
+requiredElement<HTMLSelectElement>("agent-browser-profile-kind").addEventListener("change", () => {
+	updateAgentBrowserProfileFields();
+	updateAgentBuilderReadiness();
+});
+agentForm.addEventListener("input", updateAgentBuilderReadiness);
+agentForm.addEventListener("change", updateAgentBuilderReadiness);
+for (const field of document.querySelectorAll<HTMLElement>('[form="agent-form"]')) {
+	field.addEventListener("input", updateAgentBuilderReadiness);
+	field.addEventListener("change", updateAgentBuilderReadiness);
+}
 
 pluginForm.addEventListener("submit", (event) => {
 	event.preventDefault();
@@ -6417,36 +6963,24 @@ async function saveEverydayConfiguration(
 externalRunForm.addEventListener("submit", (event) => {
 	event.preventDefault();
 	if (!capabilityToken) return;
+	if (!externalRunForm.reportValidity()) {
+		setStatus("Complete the delegation task, working directory, and model", true);
+		return;
+	}
 	const connectionId = requiredElement<HTMLInputElement>("external-id").value;
 	const prompt = requiredElement<HTMLTextAreaElement>("external-prompt").value.trim();
 	const cwd = requiredElement<HTMLInputElement>("external-cwd").value.trim();
 	const separator = externalModel.value.indexOf("/");
-	if (!connectionId || !prompt || !cwd || separator < 1) return;
-	void fetch(`/external-runs?token=${encodeURIComponent(capabilityToken)}`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({
-			connectionId,
-			prompt,
-			cwd,
-			model: { provider: externalModel.value.slice(0, separator), id: externalModel.value.slice(separator + 1) },
-		}),
+	if (!connectionId || !prompt || !cwd || separator < 1) {
+		setStatus("Select a valid delegation connection and model", true);
+		return;
+	}
+	void startExternalRun(connectionId, prompt, cwd, {
+		provider: externalModel.value.slice(0, separator),
+		id: externalModel.value.slice(separator + 1),
 	})
-		.then(async (response) => {
-			if (!response.ok) {
-				const payload: unknown = await response.json();
-				throw new Error(
-					typeof payload === "object" &&
-						payload !== null &&
-						"error" in payload &&
-						typeof payload.error === "string"
-						? payload.error
-						: `Could not start delegated run: HTTP ${response.status}`,
-				);
-			}
+		.then(() => {
 			requiredElement<HTMLTextAreaElement>("external-prompt").value = "";
-			await loadExternalRuns();
-			setStatus(`Delegated to ${connectionId}`);
 		})
 		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
 });
@@ -6674,8 +7208,8 @@ window.setInterval(() => {
 		if (activeTab === "browser") await loadPreview();
 		if (activeTab === "agents-workspace") {
 			if (activeSidebarAgent) await loadSelectedAgent();
-			await loadExternalRuns();
 		}
+		if (activeTab === "agents-workspace" || openExternalRunIds.length > 0) await loadExternalRuns();
 		if (activeTab === "agent-builder") await Promise.all([loadRoutines(), loadWorkflows()]);
 	})()
 		.catch(() => {})
@@ -6689,5 +7223,6 @@ installPanelResizer("right-resizer", "--details-width", "pi-serve-details-width"
 resizeComposer();
 clearRoutineEditor();
 clearWorkflowEditor();
+updateAgentBuilderReadiness();
 if (location.hash.startsWith("#settings/")) applySettingsHash();
 void connect().catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));

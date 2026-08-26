@@ -207,6 +207,8 @@ export class ExternalConnectionManager implements AsyncDisposable {
 		const { record, execution } = active;
 		try {
 			const result = await execution.result;
+			const protocolError = externalProtocolError(result.output);
+			if (protocolError) throw new Error(protocolError);
 			await mkdir(record.artifactDirectory, { recursive: true });
 			await Promise.all([
 				writeFile(resolve(record.artifactDirectory, "result.md"), `${result.output}\n`, "utf8"),
@@ -278,4 +280,10 @@ function isRunStatus(value: unknown): value is ExternalConnectionRunStatus {
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 	return error instanceof Error && "code" in error;
+}
+
+function externalProtocolError(output: string): string | undefined {
+	const message = output.trim();
+	if (/^HTTP\s+(?:401|403|407|429|5\d\d)(?:\s|:|$)/i.test(message)) return message;
+	return undefined;
 }

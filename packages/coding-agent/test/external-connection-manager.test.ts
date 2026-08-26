@@ -111,4 +111,14 @@ describe("ExternalConnectionManager", () => {
 		await expect(manager.abort(run.id)).resolves.toMatchObject({ status: "aborted" });
 		expect(executions[0].aborted).toBe(true);
 	});
+
+	test("records authentication protocol responses as failed delegations", async () => {
+		const { manager, executions } = await setup();
+		const run = await manager.start({ connectionId: "openai", prompt: "Delegate" });
+
+		executions[0].resolve({ output: "HTTP 401: Missing Authentication header", transcript: [] });
+		await expect.poll(() => manager.getRun(run.id)?.status).toBe("failed");
+		expect(manager.getRun(run.id)?.error).toBe("HTTP 401: Missing Authentication header");
+		await expect(manager.readResult(run.id)).resolves.toBeUndefined();
+	});
 });

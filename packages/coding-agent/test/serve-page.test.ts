@@ -266,6 +266,9 @@ describe("createServePage", () => {
 		expect(html).toContain('for="mobile-panel-right"');
 		expect(html).toContain("#mobile-panel-left:checked~.rail");
 		expect(html).toContain("#mobile-panel-right:checked~.details");
+		expect(html).toContain(".rail #open-settings{position:absolute");
+		expect(html).toContain(".rail .rail-heading{position:static;z-index:3}");
+		expect(html).toContain("bottom:calc(14px + env(safe-area-inset-bottom))");
 		expect(html).toContain("@media(max-width:1024px),(max-width:1366px) and (hover:none) and (pointer:coarse)");
 		expect(html).toContain(".thinking-activity");
 		expect(html).toContain('id="attachment-button"');
@@ -293,6 +296,8 @@ describe("createServePage", () => {
 		const bundleText = await bundle.text();
 		expect(bundleText.length).toBeGreaterThan(1000);
 		expect(bundleText).toContain("tool-activity-summary");
+		expect(bundleText).toContain("Web services");
+		expect(bundleText).toContain("Configured \\xB7 review required");
 		expect(bundleText).toContain("tool-activity-state");
 		expect(bundleText).toContain("tokens remaining");
 		expect(bundleText).toContain("Estimated session cost in US dollars");
@@ -314,7 +319,11 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("Capabilities");
 		expect(bundleText).toContain("#settings/");
 		expect(bundleText).toContain("Setup required");
-		expect(bundleText).toContain("Ready to connect");
+		expect(bundleText).toContain("OAuth configured \\xB7 account not connected");
+		expect(bundleText).toContain("Account not connected");
+		expect(bundleText).toContain("Access not granted");
+		expect(bundleText).toContain("Google access to request");
+		expect(bundleText).toContain("supported");
 		expect(bundleText).toContain("Needs attention");
 		expect(bundleText).toContain("agent-capability-summary");
 		expect(bundleText).toContain("capability-grant");
@@ -322,6 +331,12 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("subagent-session-tab");
 		expect(bundleText).toContain("Inspect agent run");
 		expect(bundleText).toContain("Subagent inspector is read-only");
+		expect(bundleText).toContain("Agent Builder applied a draft");
+		expect(bundleText).toContain("[AGENT_DRAFT]");
+		expect(bundleText).toContain("Complete the delegation task, working directory, and model");
+		expect(bundleText).toContain("Delegated run output");
+		expect(bundleText).toContain("Send result to Pi");
+		expect(bundleText).toContain("Browser session ended. Start or select another managed browser.");
 		expect(bundleText).not.toContain("No active browser");
 		expect(bundleText).not.toContain("Record a walkthrough, then send it to Pi for review.");
 		expect(bundleText).not.toContain("Ask Pi or an agent to open a permitted URL.");
