@@ -412,14 +412,11 @@ export class ServeHost implements AsyncDisposable {
 		if (!claudeModels.some((model) => model.id === sonnet.id)) {
 			claudeModels.unshift({ ...sonnet, name: "Claude Sonnet 5" });
 		}
-		const hermesModels = [...availableModels];
-		if (!hermesModels.some((model) => model.provider === "ollama" && model.id === "qwen3.6:latest")) {
-			hermesModels.push({
-				provider: "ollama",
-				id: "qwen3.6:latest",
-				name: "Qwen 3.6 (Hermes local)",
-			});
-		}
+		const hermesConfiguredModel = {
+			provider: "hermes",
+			id: "configured",
+			name: "Hermes configured model",
+		};
 		const externalConnections: ExternalConnectionDefinition[] = [
 			{
 				id: "claude-code",
@@ -450,9 +447,9 @@ export class ServeHost implements AsyncDisposable {
 					session.getToolDefinition("hermes_agent") !== undefined &&
 					openAiModels.some((model) => model.id === luna.id),
 				warning:
-					"GPT-5.6 Luna dispatches the request. Hermes uses the selected target model and bypasses interactive approvals.",
-				defaultModel: luna,
-				models: hermesModels,
+					"GPT-5.6 Luna dispatches the request. Hermes uses the provider and model configured in Hermes and bypasses interactive approvals.",
+				defaultModel: hermesConfiguredModel,
+				models: [hermesConfiguredModel],
 			},
 		];
 		this.#externalSessionExecutor = new AgentSessionExecutor(createExecutionSession);
@@ -467,7 +464,7 @@ export class ServeHost implements AsyncDisposable {
 					prompt: isClaude
 						? `Call claude_code immediately with this exact task, working directory, and model. Return its result without replacing it with your own work.\n\nTask: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}`
 						: isHermes
-							? `Call hermes_agent immediately with this exact goal, working directory, and model. Return its result without replacing it with your own work.\n\nGoal: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}`
+							? `Call hermes_agent immediately with this exact goal and working directory. Use Hermes's configured model and return its result without replacing it with your own work.\n\nGoal: ${request.prompt}\n\nWorking directory: ${request.cwd}`
 							: request.prompt,
 					definition: {
 						id: `external-${request.connection.id}`,

@@ -79,7 +79,7 @@ export interface CapabilityProviderManifest {
 export interface ProviderAuthenticationView {
 	kind: "environment" | "oauth2";
 	configured: boolean;
-	fields: Array<ProviderConfigurationField & { configured: boolean }>;
+	fields: Array<ProviderConfigurationField & { configured: boolean; value?: string }>;
 	capabilityGroups?: ProviderCapabilityGroup[];
 	defaultCapabilityIds?: string[];
 }
@@ -725,10 +725,14 @@ export class CapabilityBroker {
 						configured: manifest.authentication.fields
 							.filter((field) => field.required)
 							.every((field) => Boolean(this.#environmentValue(field.env)?.trim())),
-						fields: manifest.authentication.fields.map((field) => ({
-							...field,
-							configured: Boolean(this.#environmentValue(field.env)?.trim()),
-						})),
+						fields: manifest.authentication.fields.map((field) => {
+							const value = this.#environmentValue(field.env)?.trim();
+							return {
+								...field,
+								configured: Boolean(value),
+								...(field.secret || !value ? {} : { value }),
+							};
+						}),
 					}
 				: undefined,
 		};

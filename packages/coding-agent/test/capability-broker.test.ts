@@ -255,7 +255,12 @@ describe("CapabilityBroker", () => {
 	test("advertises the built-in SearXNG provider when its tool is loaded", async () => {
 		const defaults = new CapabilityBroker(root, {
 			activeToolNames: () => ["searxng_search"],
-			environmentValue: (name) => (name === "SEARXNG_BASE_URL" ? "http://127.0.0.1:8080" : undefined),
+			environmentValue: (name) =>
+				name === "SEARXNG_BASE_URL"
+					? "http://127.0.0.1:8080"
+					: name === "GOOGLE_CLIENT_SECRET"
+						? "not-exposed-secret"
+						: undefined,
 		});
 		await defaults.initialize();
 		const snapshot = defaults.snapshot();
@@ -266,7 +271,11 @@ describe("CapabilityBroker", () => {
 		expect(snapshot.providers.find((entry) => entry.id === "pi-searxng")).toMatchObject({
 			id: "pi-searxng",
 			health: "ready",
+			authentication: {
+				fields: [{ env: "SEARXNG_BASE_URL", configured: true, value: "http://127.0.0.1:8080" }],
+			},
 		});
+		expect(JSON.stringify(snapshot)).not.toContain("not-exposed-secret");
 		expect(snapshot.providers.find((entry) => entry.id === "google-workspace")?.authentication).toMatchObject({
 			kind: "oauth2",
 			defaultCapabilityIds: ["email.search", "email.read", "email.draft"],

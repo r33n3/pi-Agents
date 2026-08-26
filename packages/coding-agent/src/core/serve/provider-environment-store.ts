@@ -15,7 +15,7 @@ export interface ProviderEnvironmentStatus {
 	providerId: string;
 	kind: "environment" | "oauth2";
 	configured: boolean;
-	fields: Array<ProviderConfigurationField & { configured: boolean }>;
+	fields: Array<ProviderConfigurationField & { configured: boolean; value?: string }>;
 }
 
 /** Owns write-only provider configuration in one project-local environment file. */
@@ -40,10 +40,14 @@ export class ProviderEnvironmentStore implements CredentialStore {
 
 	async status(providerId: string): Promise<ProviderEnvironmentStatus> {
 		const manifest = this.#requiredManifest(providerId);
-		const fields = manifest.fields.map((field) => ({
-			...field,
-			configured: Boolean(this.#environment[field.env]?.trim()),
-		}));
+		const fields = manifest.fields.map((field) => {
+			const value = this.#environment[field.env]?.trim();
+			return {
+				...field,
+				configured: Boolean(value),
+				...(field.secret || !value ? {} : { value }),
+			};
+		});
 		return {
 			providerId,
 			kind: manifest.kind,

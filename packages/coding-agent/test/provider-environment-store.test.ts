@@ -41,10 +41,11 @@ describe("ProviderEnvironmentStore", () => {
 			kind: "environment",
 			configured: true,
 			fields: [
-				{ ...manifest.fields[0], configured: true },
+				{ ...manifest.fields[0], configured: true, value: "https://example.test" },
 				{ ...manifest.fields[1], configured: true },
 			],
 		});
+		expect(JSON.stringify(result)).toContain("https://example.test");
 		expect(JSON.stringify(result)).not.toContain("new-secret");
 		expect(await readFile(join(root, ".env.local"), "utf8")).toBe(
 			'# retained\nUNRELATED=keep\nFIXTURE_TOKEN="new-secret"\nFIXTURE_URL="https://example.test"\n',
