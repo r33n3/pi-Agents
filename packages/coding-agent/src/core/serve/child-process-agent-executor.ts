@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ModelRef } from "@earendil-works/pi-protocol";
 import { killProcessTree } from "../../utils/shell.ts";
+import type { ToolDefinition } from "../extensions/types.ts";
 import type {
 	AgentExecution,
 	AgentExecutionContext,
@@ -13,6 +14,7 @@ import type {
 	AgentExecutor,
 } from "./agent-executor.ts";
 import type {
+	AgentWorkerCapabilityToolRequestMessage,
 	AgentWorkerHostAction,
 	AgentWorkerHostActionRequestMessage,
 	AgentWorkerHostActionResult,
@@ -33,9 +35,11 @@ export interface ChildProcessAgentExecutorOptions {
 	agentDir: string;
 	serveRoot: string;
 	capabilityToolNames: (context: AgentExecutionContext) => string[];
+	capabilityTools?: (context: AgentExecutionContext) => ToolDefinition[];
 	timeoutMs?: number;
 	workerPath?: string;
 	defaultModel?: ModelRef;
+	resolveModelApiKey?: (model: ModelRef) => Promise<string | undefined>;
 	environment?: NodeJS.ProcessEnv;
 	governedActions?: GovernedActionService;
 	hostFileSystem?: AgentHostFileSystem;
@@ -63,6 +67,10 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 				: { ...context, definition: { ...context.definition, model: this.#options.defaultModel } };
 		const effectiveContext = { ...modeledContext, workspace: resolve(modeledContext.workspace) };
 		const capabilityToolNames = this.#options.capabilityToolNames(effectiveContext);
+		const capabilityTools = this.#options.capabilityTools?.(effectiveContext) ?? [];
+		const modelApiKey = effectiveContext.definition.model
+			? await this.#options.resolveModelApiKey?.(effectiveContext.definition.model)
+			: undefined;
 		const resultPath = resolve(
 			this.#options.serveRoot,
 			"runs",
@@ -79,11 +87,22 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 				serveRoot: this.#options.serveRoot,
 				resultPath,
 				capabilityToolNames,
+				capabilityTools: capabilityTools.map((tool) => ({
+					name: tool.name,
+					label: tool.label,
+					description: tool.description,
+					parameters: tool.parameters,
+					promptSnippet: tool.promptSnippet,
+					promptGuidelines: tool.promptGuidelines,
+					executionMode: tool.executionMode,
+				})),
+				modelApiKey,
 			},
 			resultPath,
 			this.#options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
 			workerEnvironment(this.#options.environment ?? process.env, capabilityToolNames),
 			effectiveContext,
+			new Map(capabilityTools.map((tool) => [tool.name, tool])),
 			this.#options.governedActions,
 			this.#options.hostFileSystem ?? localHostFileSystem,
 			() => this.#executions.delete(execution),
@@ -113,9 +132,11 @@ class ChildProcessExecution implements AgentExecution {
 	readonly #timeout: NodeJS.Timeout;
 	readonly #exit: Promise<void>;
 	readonly #context: AgentExecutionContext;
+	readonly #capabilityTools: ReadonlyMap<string, ToolDefinition>;
 	readonly #governedActions: GovernedActionService | undefined;
 	readonly #hostFileSystem: AgentHostFileSystem;
 	readonly #pendingHostActions = new Map<string, AbortController>();
+	readonly #pendingCapabilityTools = new Map<string, AbortController>();
 	#resolveExit: () => void = () => {};
 	#resolve: (result: AgentExecutionResult) => void = () => {};
 	#reject: (error: Error) => void = () => {};
@@ -132,6 +153,7 @@ class ChildProcessExecution implements AgentExecution {
 		timeoutMs: number,
 		environment: NodeJS.ProcessEnv,
 		context: AgentExecutionContext,
+		capabilityTools: ReadonlyMap<string, ToolDefinition>,
 		governedActions: GovernedActionService | undefined,
 		hostFileSystem: AgentHostFileSystem,
 		onDispose: () => void,
@@ -139,6 +161,7 @@ class ChildProcessExecution implements AgentExecution {
 		this.#onDispose = onDispose;
 		this.#resultPath = resultPath;
 		this.#context = context;
+		this.#capabilityTools = capabilityTools;
 		this.#governedActions = governedActions;
 		this.#hostFileSystem = hostFileSystem;
 		this.result = new Promise((resolve, reject) => {
@@ -213,6 +236,18 @@ class ChildProcessExecution implements AgentExecution {
 
 	#handleMessage(value: unknown): void {
 		if (!isWorkerResponse(value)) return;
+		if (value.type === "capability-tool-request") {
+			let request: AgentWorkerCapabilityToolRequestMessage;
+			try {
+				request = parseCapabilityToolRequest(value);
+			} catch (error) {
+				this.#fail(error instanceof Error ? error : new Error(String(error)));
+				this.#terminate();
+				return;
+			}
+			void this.#handleCapabilityTool(request);
+			return;
+		}
 		if (value.type === "host-action-request") {
 			let request: AgentWorkerHostActionRequestMessage;
 			try {
@@ -300,6 +335,54 @@ class ChildProcessExecution implements AgentExecution {
 		}
 	}
 
+	async #handleCapabilityTool(request: AgentWorkerCapabilityToolRequestMessage): Promise<void> {
+		if (this.#settled || this.#exited) return;
+		if (this.#pendingCapabilityTools.has(request.requestId)) {
+			this.#sendToChild({
+				type: "capability-tool-response",
+				requestId: request.requestId,
+				error: { code: "ERR_DUPLICATE_REQUEST", message: "Capability tool request id is already active" },
+			});
+			return;
+		}
+		const tool = this.#capabilityTools.get(request.toolName);
+		if (!tool) {
+			this.#sendToChild({
+				type: "capability-tool-response",
+				requestId: request.requestId,
+				error: { code: "ERR_TOOL_UNAVAILABLE", message: "Capability tool is unavailable" },
+			});
+			return;
+		}
+		const controller = new AbortController();
+		this.#pendingCapabilityTools.set(request.requestId, controller);
+		try {
+			const result = await tool.execute(
+				request.requestId,
+				request.input as never,
+				controller.signal,
+				undefined,
+				undefined as never,
+			);
+			if (!controller.signal.aborted && !this.#settled && !this.#exited) {
+				this.#sendToChild({ type: "capability-tool-response", requestId: request.requestId, result });
+			}
+		} catch (error) {
+			if (!controller.signal.aborted && !this.#settled && !this.#exited) {
+				this.#sendToChild({
+					type: "capability-tool-response",
+					requestId: request.requestId,
+					error: {
+						code: "ERR_CAPABILITY_TOOL_FAILED",
+						message: error instanceof Error ? error.message : "Capability tool failed",
+					},
+				});
+			}
+		} finally {
+			this.#pendingCapabilityTools.delete(request.requestId);
+		}
+	}
+
 	async #executeHostAction(action: AgentWorkerHostAction, signal: AbortSignal): Promise<AgentWorkerHostActionResult> {
 		if (!this.#governedActions)
 			throw hostActionError("ERR_HOST_ACTION_UNAVAILABLE", "Host action gateway is unavailable");
@@ -382,6 +465,8 @@ class ChildProcessExecution implements AgentExecution {
 
 	#abortPendingHostActions(): void {
 		for (const controller of this.#pendingHostActions.values()) controller.abort();
+		for (const controller of this.#pendingCapabilityTools.values()) controller.abort();
+		this.#pendingCapabilityTools.clear();
 	}
 
 	#sendHostActionError(requestId: string, code: string, message: string): void {
@@ -511,7 +596,27 @@ function defaultWorkerPath(): string {
 function isWorkerResponse(value: unknown): value is AgentWorkerResponse {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const type = (value as { type?: unknown }).type;
-	return type === "event" || type === "result" || type === "error" || type === "host-action-request";
+	return (
+		type === "event" ||
+		type === "result" ||
+		type === "error" ||
+		type === "host-action-request" ||
+		type === "capability-tool-request"
+	);
+}
+
+function parseCapabilityToolRequest(value: AgentWorkerResponse): AgentWorkerCapabilityToolRequestMessage {
+	if (value.type !== "capability-tool-request") throw new Error("Worker message is not a capability tool request");
+	if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value.requestId)) {
+		throw new Error("Agent worker capability tool request id is invalid");
+	}
+	if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value.toolName)) {
+		throw new Error("Agent worker capability tool name is invalid");
+	}
+	if (Buffer.byteLength(JSON.stringify(value.input), "utf8") > MAX_SCOPED_AGENT_FILE_BYTES) {
+		throw new Error("Agent worker capability tool input exceeds the 1 MiB limit");
+	}
+	return value;
 }
 
 function parseHostActionRequest(value: AgentWorkerResponse): AgentWorkerHostActionRequestMessage {

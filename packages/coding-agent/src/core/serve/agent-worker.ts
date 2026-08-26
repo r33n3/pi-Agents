@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { TSchema } from "typebox";
 import type { AgentSession } from "../agent-session.ts";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../agent-session-services.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import { SessionManager } from "../session-manager.ts";
 import type {
+	AgentWorkerCapabilityToolResponseMessage,
 	AgentWorkerHostAction,
 	AgentWorkerHostActionResponseMessage,
 	AgentWorkerHostActionResult,
@@ -39,9 +41,17 @@ const pendingHostActions = new Map<
 	string,
 	{ resolve: (result: AgentWorkerHostActionResult) => void; reject: (error: Error) => void }
 >();
+const pendingCapabilityTools = new Map<
+	string,
+	{ resolve: (result: AgentToolResult<unknown>) => void; reject: (error: Error) => void; cleanup: () => void }
+>();
 
 process.on("message", (value: unknown) => {
 	if (!isRequest(value)) return;
+	if (value.type === "capability-tool-response") {
+		handleCapabilityToolResponse(value);
+		return;
+	}
 	if (value.type === "host-action-response") {
 		handleHostActionResponse(value);
 		return;
@@ -49,6 +59,7 @@ process.on("message", (value: unknown) => {
 	if (value.type === "abort") {
 		abortRequested = true;
 		rejectPendingHostActions(new Error("Agent worker was aborted"));
+		rejectPendingCapabilityTools(new Error("Agent worker was aborted"));
 		void activeSession?.abort();
 		return;
 	}
@@ -63,6 +74,7 @@ process.once("SIGINT", requestAbort);
 function requestAbort(): void {
 	abortRequested = true;
 	rejectPendingHostActions(new Error("Agent worker was aborted"));
+	rejectPendingCapabilityTools(new Error("Agent worker was aborted"));
 	void activeSession?.abort();
 }
 
@@ -88,6 +100,9 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 						.join("\n\n"),
 			},
 		});
+		if (request.modelApiKey && definition.model) {
+			await services.modelRuntime.setRuntimeApiKey(definition.model.provider, request.modelApiKey);
+		}
 		const model = definition.model
 			? services.modelRuntime.getModel(definition.model.provider, definition.model.id)
 			: services.modelRuntime.getAvailableSnapshot()[0];
@@ -102,6 +117,22 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 		const customTools = (
 			isolated ? [...createScopedAgentTools(definition, workspace, hostScopedFileOperations)] : []
 		) as ToolDefinition[];
+		customTools.push(
+			...request.capabilityTools.map(
+				(tool): ToolDefinition => ({
+					name: tool.name,
+					label: tool.label,
+					description: tool.description,
+					parameters: tool.parameters as TSchema,
+					promptSnippet: tool.promptSnippet,
+					promptGuidelines: tool.promptGuidelines,
+					executionMode: tool.executionMode,
+					execute(_toolCallId, input, signal) {
+						return requestCapabilityTool(tool.name, input, signal);
+					},
+				}),
+			),
+		);
 		const everydayConfigurations = new EverydayConfigurationRegistry(
 			join(request.serveRoot, "capabilities", "everyday-data"),
 		);
@@ -211,6 +242,7 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 		response = { type: "error", error: error instanceof Error ? error.message : String(error) };
 	} finally {
 		rejectPendingHostActions(new Error("Agent worker stopped"));
+		rejectPendingCapabilityTools(new Error("Agent worker stopped"));
 		for (const cleanup of cleanups) await cleanup().catch(() => undefined);
 		if (response) await send(response).catch(() => undefined);
 		process.disconnect?.();
@@ -234,7 +266,59 @@ async function writeResultArtifact(path: string, artifact: AgentWorkerResultArti
 function isRequest(value: unknown): value is AgentWorkerRequest {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const type = (value as { type?: unknown }).type;
-	return type === "start" || type === "abort" || type === "host-action-response";
+	return (
+		type === "start" || type === "abort" || type === "host-action-response" || type === "capability-tool-response"
+	);
+}
+
+function requestCapabilityTool(
+	toolName: string,
+	input: unknown,
+	signal: AbortSignal | undefined,
+): Promise<AgentToolResult<unknown>> {
+	if (abortRequested || signal?.aborted) return Promise.reject(new Error("Agent worker was aborted"));
+	const requestId = randomUUID();
+	return new Promise((resolve, reject) => {
+		const abort = () => {
+			pendingCapabilityTools.delete(requestId);
+			reject(new Error("Capability tool call was aborted"));
+		};
+		pendingCapabilityTools.set(requestId, {
+			resolve,
+			reject,
+			cleanup: () => signal?.removeEventListener("abort", abort),
+		});
+		signal?.addEventListener("abort", abort, { once: true });
+		void send({ type: "capability-tool-request", requestId, toolName, input }).catch((error) => {
+			pendingCapabilityTools.delete(requestId);
+			signal?.removeEventListener("abort", abort);
+			reject(error instanceof Error ? error : new Error(String(error)));
+		});
+	});
+}
+
+function handleCapabilityToolResponse(message: AgentWorkerCapabilityToolResponseMessage): void {
+	const pending = pendingCapabilityTools.get(message.requestId);
+	if (!pending) return;
+	pendingCapabilityTools.delete(message.requestId);
+	pending.cleanup();
+	if (message.error) {
+		pending.reject(Object.assign(new Error(message.error.message), { code: message.error.code }));
+		return;
+	}
+	if (!message.result) {
+		pending.reject(new Error("Capability tool response has no result"));
+		return;
+	}
+	pending.resolve(message.result);
+}
+
+function rejectPendingCapabilityTools(error: Error): void {
+	for (const pending of pendingCapabilityTools.values()) {
+		pending.cleanup();
+		pending.reject(error);
+	}
+	pendingCapabilityTools.clear();
 }
 
 const hostScopedFileOperations: ScopedAgentFileOperations = {

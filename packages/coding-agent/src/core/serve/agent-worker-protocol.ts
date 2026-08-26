@@ -1,5 +1,15 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentToolResult, ToolExecutionMode } from "@earendil-works/pi-agent-core";
 import type { AgentExecutionContext } from "./agent-executor.ts";
+
+export interface AgentWorkerCapabilityTool {
+	name: string;
+	label: string;
+	description: string;
+	parameters: unknown;
+	promptSnippet?: string;
+	promptGuidelines?: string[];
+	executionMode?: ToolExecutionMode;
+}
 
 export interface AgentWorkerStartMessage {
 	type: "start";
@@ -8,6 +18,9 @@ export interface AgentWorkerStartMessage {
 	serveRoot: string;
 	resultPath: string;
 	capabilityToolNames: string[];
+	capabilityTools: AgentWorkerCapabilityTool[];
+	/** Ephemeral provider credential resolved by the parent runtime; never persisted by the worker. */
+	modelApiKey?: string;
 }
 
 export interface AgentWorkerAbortMessage {
@@ -31,10 +44,18 @@ export interface AgentWorkerHostActionResponseMessage {
 	error?: { code: string; message: string };
 }
 
+export interface AgentWorkerCapabilityToolResponseMessage {
+	type: "capability-tool-response";
+	requestId: string;
+	result?: AgentToolResult<unknown>;
+	error?: { code: string; message: string };
+}
+
 export type AgentWorkerRequest =
 	| AgentWorkerStartMessage
 	| AgentWorkerAbortMessage
-	| AgentWorkerHostActionResponseMessage;
+	| AgentWorkerHostActionResponseMessage
+	| AgentWorkerCapabilityToolResponseMessage;
 
 export interface AgentWorkerEventMessage {
 	type: "event";
@@ -61,8 +82,16 @@ export interface AgentWorkerHostActionRequestMessage {
 	action: AgentWorkerHostAction;
 }
 
+export interface AgentWorkerCapabilityToolRequestMessage {
+	type: "capability-tool-request";
+	requestId: string;
+	toolName: string;
+	input: unknown;
+}
+
 export type AgentWorkerResponse =
 	| AgentWorkerEventMessage
 	| AgentWorkerResultMessage
 	| AgentWorkerErrorMessage
-	| AgentWorkerHostActionRequestMessage;
+	| AgentWorkerHostActionRequestMessage
+	| AgentWorkerCapabilityToolRequestMessage;
