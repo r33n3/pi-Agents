@@ -57,6 +57,8 @@ export interface ServeHostOptions {
 	session: AgentSession;
 	host?: string;
 	port?: number;
+	/** Optional caller-supplied bearer token for persistent background serve processes. */
+	token?: string;
 	autoIncrementPort?: boolean;
 	onError?: (error: Error) => void;
 }
@@ -118,7 +120,11 @@ export class ServeHost implements AsyncDisposable {
 		const modelRuntime = session.modelRuntime;
 		const host = this.#options.host ?? "127.0.0.1";
 		const requestedPort = this.#options.port ?? 4173;
-		const token = randomBytes(32).toString("base64url");
+		const configuredToken = this.#options.token?.trim();
+		if (configuredToken !== undefined && !/^[A-Za-z0-9_-]{32,128}$/.test(configuredToken)) {
+			throw new Error("PI_SERVE_TOKEN must be 32-128 URL-safe characters");
+		}
+		const token = configuredToken ?? randomBytes(32).toString("base64url");
 		const serveRoot = join(agentDir, "serve");
 		const auditStore = new ServeAuditStore(join(serveRoot, "audit"));
 		await auditStore.initialize();
