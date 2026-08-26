@@ -164,6 +164,8 @@ let agentModelsInitialized = false;
 let agents: AgentSummary[] = [];
 let personas: PersonaSummary[] = [];
 let agentEvents: EventSource | undefined;
+let agentsLoadPromise: Promise<void> | undefined;
+const selectedAgentLoadPromises = new Map<string, Promise<void>>();
 let capabilitySearchTimer: number | undefined;
 let settingsReturnHash = "";
 let settingsReturnFocus: HTMLElement | undefined;
@@ -322,6 +324,9 @@ interface AgentTaskSummary {
 	status: "queued" | "running" | "completed" | "failed" | "cancelled";
 	prompt: string;
 	createdAt: number;
+	phase?: "initializing" | "waiting-for-model" | "generating" | "running-tool" | "writing-results";
+	progressMessage?: string;
+	lastActivityAt?: number;
 	result?: string;
 	error?: string;
 }
@@ -4387,7 +4392,14 @@ interface AgentSummary {
 	schedules: Array<{ id: string; prompt: string; intervalMinutes: number; enabled: boolean }>;
 }
 
-async function loadAgents(): Promise<void> {
+function loadAgents(): Promise<void> {
+	agentsLoadPromise ??= loadAgentsNow().finally(() => {
+		agentsLoadPromise = undefined;
+	});
+	return agentsLoadPromise;
+}
+
+async function loadAgentsNow(): Promise<void> {
 	if (!capabilityToken) return;
 	const response = await fetch(`/agents.json?token=${encodeURIComponent(capabilityToken)}`);
 	if (!response.ok) throw new Error(`Could not load agents: HTTP ${response.status}`);
@@ -5300,11 +5312,22 @@ async function closeBuilderChat(restoreMainChat = true): Promise<void> {
 	renderAttachments();
 }
 
-async function loadSelectedAgent(): Promise<void> {
-	if (!capabilityToken || !activeSidebarAgent) return;
+function loadSelectedAgent(): Promise<void> {
+	if (!capabilityToken || !activeSidebarAgent) return Promise.resolve();
 	const agent = activeSidebarAgent;
+	const token = capabilityToken;
+	const active = selectedAgentLoadPromises.get(agent.id);
+	if (active) return active;
+	const load = loadSelectedAgentNow(agent, token).finally(() => {
+		selectedAgentLoadPromises.delete(agent.id);
+	});
+	selectedAgentLoadPromises.set(agent.id, load);
+	return load;
+}
+
+async function loadSelectedAgentNow(agent: AgentSummary, token: string): Promise<void> {
 	const conversationsResponse = await fetch(
-		`/agent-conversations.json?agentId=${encodeURIComponent(agent.id)}&token=${encodeURIComponent(capabilityToken)}`,
+		`/agent-conversations.json?agentId=${encodeURIComponent(agent.id)}&token=${encodeURIComponent(token)}`,
 	);
 	if (!conversationsResponse.ok)
 		throw new Error(await responseError(conversationsResponse, "Could not load agent conversation"));
@@ -5313,7 +5336,7 @@ async function loadSelectedAgent(): Promise<void> {
 	let messages: AgentMessageSummary[] = [];
 	if (conversationId) {
 		const messagesResponse = await fetch(
-			`/agent-conversations/${encodeURIComponent(conversationId)}/messages?token=${encodeURIComponent(capabilityToken)}`,
+			`/agent-conversations/${encodeURIComponent(conversationId)}/messages?token=${encodeURIComponent(token)}`,
 		);
 		if (!messagesResponse.ok) throw new Error(await responseError(messagesResponse, "Could not load agent messages"));
 		const payload: unknown = await messagesResponse.json();
@@ -5337,13 +5360,18 @@ function renderAgentConversation(
 		running.className = "message assistant agent-running";
 		const dot = document.createElement("i");
 		const label = document.createElement("span");
-		label.textContent = `${agent.name} is working`;
+		label.textContent = `${agent.name} · ${agentTaskPhase(activeTask)}`;
 		running.append(dot, label);
+		if (activeTask.progressMessage) {
+			const detail = document.createElement("small");
+			detail.textContent = activeTask.progressMessage;
+			running.append(detail);
+		}
 		items.push(running);
 	}
 	transcript.replaceChildren(...items);
 	transcript.scrollTop = transcript.scrollHeight;
-	phase.textContent = activeTask?.status ?? "idle";
+	phase.textContent = activeTask ? agentTaskPhase(activeTask) : "idle";
 	send.classList.toggle("is-stopping", Boolean(activeTask));
 	send.setAttribute("aria-label", activeTask ? `Stop ${agent.name}` : `Message ${agent.name}`);
 	input.placeholder = `Message ${agent.name}…`;
@@ -5364,9 +5392,20 @@ function renderAgentConversation(
 	thinking.value = agent.thinking ?? session?.snapshot?.thinkingLevel ?? "off";
 	sessionPath.textContent = formatWorkingDirectory(agent.projectRoot);
 	sessionPath.title = agent.projectRoot;
-	sessionStats.textContent = activeTask ? `${agent.name} · ${activeTask.status}` : agent.name;
+	sessionStats.textContent = activeTask
+		? `${agent.name} · ${agentTaskPhase(activeTask)}${activeTask.lastActivityAt ? ` · ${activityAge(activeTask.lastActivityAt)}` : ""}`
+		: agent.name;
 	sessionStats.title = "Active agent conversation";
 	setStatus(activeTask ? `${agent.name} is running a task` : agent.projectRoot);
+}
+
+function agentTaskPhase(task: AgentTaskSummary): string {
+	return (task.phase ?? task.status).replaceAll("-", " ");
+}
+
+function activityAge(timestamp: number): string {
+	const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1_000));
+	return seconds < 60 ? `${seconds}s ago` : `${Math.floor(seconds / 60)}m ago`;
 }
 
 function renderAgentMessage(agent: AgentSummary, message: AgentMessageSummary): HTMLElement {

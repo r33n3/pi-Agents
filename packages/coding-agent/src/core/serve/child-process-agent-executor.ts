@@ -10,6 +10,7 @@ import type {
 	AgentExecution,
 	AgentExecutionContext,
 	AgentExecutionListener,
+	AgentExecutionPhase,
 	AgentExecutionResult,
 	AgentExecutor,
 } from "./agent-executor.ts";
@@ -37,6 +38,8 @@ export interface ChildProcessAgentExecutorOptions {
 	capabilityToolNames: (context: AgentExecutionContext) => string[];
 	capabilityTools?: (context: AgentExecutionContext) => ToolDefinition[];
 	timeoutMs?: number;
+	idleTimeoutMs?: number;
+	heartbeatTimeoutMs?: number;
 	workerPath?: string;
 	defaultModel?: ModelRef;
 	resolveModelApiKey?: (model: ModelRef) => Promise<string | undefined>;
@@ -46,6 +49,9 @@ export interface ChildProcessAgentExecutorOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 20_000;
+const WATCHDOG_INTERVAL_MS = 1_000;
 const ABORT_GRACE_MS = 2_000;
 
 /** Runs every invocation in an OS process so model or tool work cannot block the serve control plane. */
@@ -100,6 +106,8 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 			},
 			resultPath,
 			this.#options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+			this.#options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
+			this.#options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS,
 			workerEnvironment(this.#options.environment ?? process.env, capabilityToolNames),
 			effectiveContext,
 			new Map(capabilityTools.map((tool) => [tool.name, tool])),
@@ -130,6 +138,7 @@ class ChildProcessExecution implements AgentExecution {
 	readonly #onDispose: () => void;
 	readonly #resultPath: string;
 	readonly #timeout: NodeJS.Timeout;
+	#watchdog: NodeJS.Timeout | undefined;
 	readonly #exit: Promise<void>;
 	readonly #context: AgentExecutionContext;
 	readonly #capabilityTools: ReadonlyMap<string, ToolDefinition>;
@@ -145,12 +154,17 @@ class ChildProcessExecution implements AgentExecution {
 	#disposed = false;
 	#abortPromise: Promise<void> | undefined;
 	#stderr = "";
+	#phase: AgentExecutionPhase = "initializing";
+	#lastActivityAt = Date.now();
+	#lastHeartbeatAt = Date.now();
 
 	constructor(
 		workerPath: string,
 		start: AgentWorkerRequest,
 		resultPath: string,
 		timeoutMs: number,
+		idleTimeoutMs: number,
+		heartbeatTimeoutMs: number,
 		environment: NodeJS.ProcessEnv,
 		context: AgentExecutionContext,
 		capabilityTools: ReadonlyMap<string, ToolDefinition>,
@@ -191,9 +205,9 @@ class ChildProcessExecution implements AgentExecution {
 			this.#resolveExit();
 			if (this.#settled) return;
 			const detail = this.#stderr.trim();
-			this.#fail(
+			this.#completeFromArtifact(
 				new Error(
-					`Agent worker exited before returning a result (${signal ?? `code ${code ?? "unknown"}`})${detail ? `: ${detail}` : ""}`,
+					`Agent worker exited before returning a result notification (${signal ?? `code ${code ?? "unknown"}`})${detail ? `: ${detail}` : ""}`,
 				),
 			);
 		});
@@ -201,6 +215,22 @@ class ChildProcessExecution implements AgentExecution {
 			this.#fail(new Error(`Agent worker timed out after ${timeoutMs}ms`));
 			this.#terminate();
 		}, timeoutMs);
+		this.#watchdog = setInterval(
+			() => {
+				const now = Date.now();
+				if (now - this.#lastHeartbeatAt > heartbeatTimeoutMs) {
+					this.#fail(new Error(`Agent worker heartbeat stopped during ${this.#phase}`));
+					this.#terminate();
+					return;
+				}
+				if (now - this.#lastActivityAt > idleTimeoutMs) {
+					this.#fail(new Error(`Agent worker made no progress for ${idleTimeoutMs}ms during ${this.#phase}`));
+					this.#terminate();
+				}
+			},
+			Math.min(WATCHDOG_INTERVAL_MS, idleTimeoutMs, heartbeatTimeoutMs),
+		);
+		this.#watchdog.unref();
 		this.#child.send(start, (error) => {
 			if (error) {
 				this.#fail(error);
@@ -223,6 +253,7 @@ class ChildProcessExecution implements AgentExecution {
 		if (this.#disposed) return;
 		this.#disposed = true;
 		clearTimeout(this.#timeout);
+		clearInterval(this.#watchdog);
 		if (!this.#exited) await (this.#settled ? this.#stop(false) : this.abort());
 		if (!this.#settled) this.#fail(new Error("Agent worker was disposed"));
 		this.#abortPendingHostActions();
@@ -236,7 +267,21 @@ class ChildProcessExecution implements AgentExecution {
 
 	#handleMessage(value: unknown): void {
 		if (!isWorkerResponse(value)) return;
+		this.#lastHeartbeatAt = Date.now();
+		if (value.type === "heartbeat") {
+			this.#phase = value.phase;
+			for (const listener of this.#listeners) {
+				listener({
+					kind: "heartbeat",
+					phase: value.phase,
+					message: "worker heartbeat",
+					timestamp: Date.now(),
+				});
+			}
+			return;
+		}
 		if (value.type === "capability-tool-request") {
+			this.#markActivity("running-tool", `Using ${value.toolName}`);
 			let request: AgentWorkerCapabilityToolRequestMessage;
 			try {
 				request = parseCapabilityToolRequest(value);
@@ -249,6 +294,7 @@ class ChildProcessExecution implements AgentExecution {
 			return;
 		}
 		if (value.type === "host-action-request") {
+			this.#markActivity("running-tool", `Using ${value.action.family}`);
 			let request: AgentWorkerHostActionRequestMessage;
 			try {
 				request = parseHostActionRequest(value);
@@ -261,18 +307,29 @@ class ChildProcessExecution implements AgentExecution {
 			return;
 		}
 		if (value.type === "event") {
-			for (const listener of this.#listeners) listener(value.message);
+			this.#markActivity(value.phase, value.message);
 			return;
 		}
 		if (value.type === "error") {
 			this.#fail(new Error(value.error));
 			return;
 		}
+		this.#completeFromArtifact();
+	}
+
+	#completeFromArtifact(missingArtifactError?: Error): void {
 		if (this.#settled) return;
 		this.#settled = true;
 		this.#abortPendingHostActions();
 		clearTimeout(this.#timeout);
-		void readWorkerResult(this.#resultPath).then(this.#resolve, this.#reject);
+		clearInterval(this.#watchdog);
+		void readWorkerResult(this.#resultPath).then(this.#resolve, (error: unknown) => {
+			if (missingArtifactError && isFileNotFound(error)) {
+				this.#reject(missingArtifactError);
+				return;
+			}
+			this.#reject(error instanceof Error ? error : new Error(String(error)));
+		});
 	}
 
 	#fail(error: Error): void {
@@ -280,6 +337,7 @@ class ChildProcessExecution implements AgentExecution {
 		this.#settled = true;
 		this.#abortPendingHostActions();
 		clearTimeout(this.#timeout);
+		clearInterval(this.#watchdog);
 		void unlink(this.#resultPath).catch(() => {});
 		this.#reject(error);
 	}
@@ -287,6 +345,14 @@ class ChildProcessExecution implements AgentExecution {
 	#terminate(): void {
 		const pid = this.#child.pid;
 		if (pid !== undefined) killProcessTree(pid);
+	}
+
+	#markActivity(phase: AgentExecutionPhase, message: string): void {
+		this.#phase = phase;
+		this.#lastActivityAt = Date.now();
+		for (const listener of this.#listeners) {
+			listener({ kind: "progress", phase, message, timestamp: this.#lastActivityAt });
+		}
 	}
 
 	async #stop(requestAbort: boolean): Promise<void> {
@@ -579,13 +645,27 @@ async function readWorkerResult(path: string): Promise<AgentExecutionResult> {
 			throw new Error("Agent worker result artifact is invalid");
 		}
 		const artifact = value as Partial<AgentWorkerResultArtifact>;
-		if (typeof artifact.output !== "string" || !Array.isArray(artifact.transcript)) {
+		if (artifact.status === "failed") {
+			if (typeof artifact.error !== "string" || artifact.error.length === 0) {
+				throw new Error("Agent worker failure artifact is invalid");
+			}
+			throw new Error(artifact.error);
+		}
+		if (
+			artifact.status !== "succeeded" ||
+			typeof artifact.output !== "string" ||
+			!Array.isArray(artifact.transcript)
+		) {
 			throw new Error("Agent worker result artifact is invalid");
 		}
 		return { output: artifact.output, transcript: artifact.transcript as AgentMessage[] };
 	} finally {
 		await unlink(path).catch(() => {});
 	}
+}
+
+function isFileNotFound(error: unknown): boolean {
+	return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 function defaultWorkerPath(): string {
@@ -598,6 +678,7 @@ function isWorkerResponse(value: unknown): value is AgentWorkerResponse {
 	const type = (value as { type?: unknown }).type;
 	return (
 		type === "event" ||
+		type === "heartbeat" ||
 		type === "result" ||
 		type === "error" ||
 		type === "host-action-request" ||

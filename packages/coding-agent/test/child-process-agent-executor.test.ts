@@ -59,10 +59,10 @@ describe("ChildProcessAgentExecutor", () => {
 			workerPath,
 		});
 		const execution = await executor.start(context("done"));
-		const events: string[] = [];
+		const events: Array<{ kind: string; message: string }> = [];
 		execution.subscribe((event) => events.push(event));
 		await expect(execution.result).resolves.toMatchObject({ output: "done", transcript: [] });
-		expect(events).toContain("started");
+		expect(events).toContainEqual(expect.objectContaining({ kind: "progress", message: "started" }));
 		await execution.dispose();
 		await executor.dispose();
 	});
@@ -78,6 +78,32 @@ describe("ChildProcessAgentExecutor", () => {
 		const result = await execution.result;
 		expect(result.output).toBe("large");
 		expect(JSON.stringify(result.transcript).length).toBeGreaterThan(2_000_000);
+		await execution.dispose();
+		await executor.dispose();
+	});
+
+	test("recovers a durable result when the worker exits before notifying the parent", async () => {
+		const executor = new ChildProcessAgentExecutor({
+			agentDir: process.cwd(),
+			serveRoot,
+			capabilityToolNames: () => [],
+			workerPath,
+		});
+		const execution = await executor.start(context("result-without-ipc"));
+		await expect(execution.result).resolves.toMatchObject({ output: "recovered", transcript: [] });
+		await execution.dispose();
+		await executor.dispose();
+	});
+
+	test("recovers a durable agent error when the worker exits before notifying the parent", async () => {
+		const executor = new ChildProcessAgentExecutor({
+			agentDir: process.cwd(),
+			serveRoot,
+			capabilityToolNames: () => [],
+			workerPath,
+		});
+		const execution = await executor.start(context("error-without-ipc"));
+		await expect(execution.result).rejects.toThrow("durable worker failure");
 		await execution.dispose();
 		await executor.dispose();
 	});
@@ -389,6 +415,36 @@ describe("ChildProcessAgentExecutor", () => {
 		const result = expect(execution.result).rejects.toThrow("aborted");
 		await execution.abort();
 		await result;
+		await execution.dispose();
+		await executor.dispose();
+	});
+
+	test("times out a worker that heartbeats without making progress", async () => {
+		const executor = new ChildProcessAgentExecutor({
+			agentDir: process.cwd(),
+			serveRoot,
+			capabilityToolNames: () => [],
+			workerPath,
+			idleTimeoutMs: 30,
+			heartbeatTimeoutMs: 200,
+		});
+		const execution = await executor.start(context("stalled-heartbeat"));
+		await expect(execution.result).rejects.toThrow("made no progress");
+		await execution.dispose();
+		await executor.dispose();
+	});
+
+	test("times out a worker whose heartbeat stops", async () => {
+		const executor = new ChildProcessAgentExecutor({
+			agentDir: process.cwd(),
+			serveRoot,
+			capabilityToolNames: () => [],
+			workerPath,
+			idleTimeoutMs: 1_000,
+			heartbeatTimeoutMs: 30,
+		});
+		const execution = await executor.start(context("silent"));
+		await expect(execution.result).rejects.toThrow("heartbeat stopped");
 		await execution.dispose();
 		await executor.dispose();
 	});

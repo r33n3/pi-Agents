@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 let timer;
+let heartbeat;
 let activePrompt;
 let requestCounter = 0;
 const pendingHostActions = new Map();
@@ -27,6 +28,7 @@ process.on("message", (message) => {
 	if (message?.type === "abort") {
 		if (activePrompt === "ignore-abort") return;
 		clearTimeout(timer);
+		clearInterval(heartbeat);
 		for (const pending of pendingHostActions.values()) pending.reject(new Error("aborted"));
 		pendingHostActions.clear();
 		process.send?.({ type: "error", error: "aborted" });
@@ -35,9 +37,25 @@ process.on("message", (message) => {
 	}
 	if (message?.type !== "start") return;
 	activePrompt = message.context.prompt;
-	process.send?.({ type: "event", message: "started" });
+	process.send?.({ type: "event", phase: "initializing", message: "started", timestamp: Date.now() });
+	if (activePrompt === "stalled-heartbeat") {
+		heartbeat = setInterval(
+			() => process.send?.({ type: "heartbeat", phase: "waiting-for-model", timestamp: Date.now() }),
+			10,
+		);
+		return;
+	}
+	if (activePrompt === "silent") return;
 	if (["filesystem", "escape", "host-action-slow", "host-action-crash"].includes(activePrompt)) {
 		void runHostActionScenario(message);
+		return;
+	}
+	if (activePrompt === "result-without-ipc") {
+		void writeCompletionWithoutIpc(message, { status: "succeeded", output: "recovered", transcript: [] });
+		return;
+	}
+	if (activePrompt === "error-without-ipc") {
+		void writeCompletionWithoutIpc(message, { status: "failed", error: "durable worker failure" });
 		return;
 	}
 	if (activePrompt === "capability") {
@@ -65,7 +83,7 @@ process.on("message", (message) => {
 				? [{ role: "assistant", content: [{ type: "text", text: "x".repeat(2_000_000) }] }]
 				: [];
 		await mkdir(dirname(message.resultPath), { recursive: true });
-		await writeFile(message.resultPath, JSON.stringify({ output, transcript }));
+		await writeFile(message.resultPath, JSON.stringify({ status: "succeeded", output, transcript }));
 		process.send?.({ type: "result" });
 		process.disconnect?.();
 	}, ["slow", "ignore-abort"].includes(message.context.prompt) ? 5_000 : message.context.prompt === "medium" ? 500 : 10);
@@ -73,14 +91,12 @@ process.on("message", (message) => {
 
 async function runHostActionScenario(message) {
 	if (activePrompt === "host-action-crash") {
-		process.send?.(
-			{
-				type: "host-action-request",
-				requestId: `request-${++requestCounter}`,
-				action: { family: "filesystem.read", path: "slow.txt" },
-			},
-			() => process.exit(7),
-		);
+		process.send?.({
+			type: "host-action-request",
+			requestId: `request-${++requestCounter}`,
+			action: { family: "filesystem.read", path: "slow.txt" },
+		});
+		setTimeout(() => process.exit(7), 10);
 		return;
 	}
 	let output;
@@ -100,7 +116,10 @@ async function runHostActionScenario(message) {
 		output = { error: error instanceof Error ? error.message : String(error), code: error?.code };
 	}
 	await mkdir(dirname(message.resultPath), { recursive: true });
-	await writeFile(message.resultPath, JSON.stringify({ output: JSON.stringify(output), transcript: [] }));
+	await writeFile(
+		message.resultPath,
+		JSON.stringify({ status: "succeeded", output: JSON.stringify(output), transcript: [] }),
+	);
 	process.send?.({ type: "result" });
 	process.disconnect?.();
 }
@@ -109,8 +128,17 @@ async function runCapabilityScenario(message) {
 	const tool = message.capabilityTools.find((entry) => entry.name === "test_capability");
 	const result = await requestCapabilityTool(tool.name, { value: "worker input" });
 	await mkdir(dirname(message.resultPath), { recursive: true });
-	await writeFile(message.resultPath, JSON.stringify({ output: JSON.stringify(result), transcript: [] }));
+	await writeFile(
+		message.resultPath,
+		JSON.stringify({ status: "succeeded", output: JSON.stringify(result), transcript: [] }),
+	);
 	process.send?.({ type: "result" });
+	process.disconnect?.();
+}
+
+async function writeCompletionWithoutIpc(message, artifact) {
+	await mkdir(dirname(message.resultPath), { recursive: true });
+	await writeFile(message.resultPath, JSON.stringify(artifact));
 	process.disconnect?.();
 }
 

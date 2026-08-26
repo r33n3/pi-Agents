@@ -71,7 +71,7 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 	}
 
 	prompt(input: PromptInput): Promise<void> {
-		return this.session.prompt(input.text);
+		return runSupervisedSessionPrompt(this.session, () => this.session.prompt(input.text));
 	}
 
 	steer(input: SteerInput): Promise<void> {
@@ -281,5 +281,35 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 			this.itemIds.set(message, id);
 		}
 		return id;
+	}
+}
+
+const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
+
+export async function runSupervisedSessionPrompt(
+	session: AgentSession,
+	prompt: () => Promise<void>,
+	idleTimeoutMs = DEFAULT_SESSION_IDLE_TIMEOUT_MS,
+): Promise<void> {
+	let timer: NodeJS.Timeout | undefined;
+	let rejectStalled: (error: Error) => void = () => {};
+	const stalled = new Promise<never>((_resolve, reject) => {
+		rejectStalled = reject;
+	});
+	const resetWatchdog = () => {
+		clearTimeout(timer);
+		timer = setTimeout(() => {
+			void session.abort().catch(() => undefined);
+			rejectStalled(new Error(`Pi session made no progress for ${idleTimeoutMs}ms`));
+		}, idleTimeoutMs);
+		timer.unref();
+	};
+	const unsubscribe = session.subscribe(resetWatchdog);
+	resetWatchdog();
+	try {
+		await Promise.race([prompt(), stalled]);
+	} finally {
+		clearTimeout(timer);
+		unsubscribe();
 	}
 }
