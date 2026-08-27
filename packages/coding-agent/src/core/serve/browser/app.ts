@@ -79,6 +79,7 @@ const settingsSecurityList = element("settings-security-list");
 const settingsAdvancedConnections = element("settings-advanced-connections");
 const settingsPluginManagement = element("settings-plugin-management");
 const externalConnectionList = element("external-connection-list");
+const claudeAuthFlow = createClaudeAuthFlow();
 const externalRunForm = requiredElement<HTMLFormElement>("external-run-form");
 const externalRunList = element("external-run-list");
 const externalModel = requiredElement<HTMLSelectElement>("external-model");
@@ -131,9 +132,11 @@ let activeTargetKey: string | undefined;
 let activeAgentId: string | undefined;
 let activeSubagentKey: string | undefined;
 let activeExternalRunId = localStorage.getItem("pi-serve-active-external-run") ?? undefined;
+let activeExternalConnectionId = localStorage.getItem("pi-serve-active-external-connection") ?? undefined;
 const openAgentIds: string[] = [];
 const openSubagentKeys: string[] = [];
 const openExternalRunIds = readStoredStringArray("pi-serve-external-run-tabs");
+const openExternalConnectionIds = readStoredStringArray("pi-serve-external-connection-tabs");
 const externalResultByRunId = new Map<string, string>();
 const subagentActivityByKey = new Map<string, SubagentActivity>();
 const agentConversationIds = new Map<string, string>();
@@ -243,7 +246,7 @@ interface CapabilityProvider {
 		toolName?: string;
 	}>;
 	authentication?: {
-		kind: "environment" | "oauth2";
+		kind: "environment" | "oauth2" | "plaid-link";
 		configured: boolean;
 		fields: Array<{
 			env: string;
@@ -251,6 +254,7 @@ interface CapabilityProvider {
 			required: boolean;
 			secret: boolean;
 			format?: "text" | "url";
+			options?: Array<{ value: string; label: string }>;
 			operatorEditable?: boolean;
 			configured: boolean;
 			value?: string;
@@ -359,10 +363,20 @@ interface ExternalConnectionSummary {
 	name: string;
 	description: string;
 	inputLabel: "Task" | "Goal";
+	provider: "anthropic" | "openai" | "hermes";
+	authentication: "subscription" | "api-key" | "configured";
+	billing: "subscription" | "usage-based" | "configured";
 	available: boolean;
 	warning?: string;
 	defaultModel: { provider: string; id: string };
 	models: Array<{ provider: string; id: string; name: string }>;
+}
+
+interface ClaudeSubscriptionLoginStatus {
+	status: "idle" | "running" | "succeeded" | "failed";
+	authenticated: boolean;
+	authorizationUrl?: string;
+	error?: string;
 }
 
 interface ExternalRunSummary {
@@ -1352,6 +1366,7 @@ function updateAgentBrowserProfileFields(): void {
 
 function createRoutineEditor(): {
 	form: HTMLFormElement;
+	scope: HTMLParagraphElement;
 	id: HTMLInputElement;
 	name: HTMLInputElement;
 	targetKind: HTMLSelectElement;
@@ -1381,13 +1396,16 @@ function createRoutineEditor(): {
 	deleteButton: HTMLButtonElement;
 	runButton: HTMLButtonElement;
 	clearButton: HTMLButtonElement;
+	saveButton: HTMLButtonElement;
 } {
 	const panel = element("routines");
 	const card = document.createElement("div");
 	card.className = "card";
 	const title = document.createElement("strong");
 	title.id = "routine-editor-title";
-	title.textContent = "New routine";
+	title.textContent = "New schedule";
+	const scope = document.createElement("p");
+	scope.className = "muted";
 	const form = document.createElement("form");
 	form.id = "routine-editor";
 	const id = document.createElement("input");
@@ -1466,10 +1484,10 @@ function createRoutineEditor(): {
 	const enabledLabel = label("Active", enabled);
 	const actions = document.createElement("div");
 	actions.className = "routine-actions";
-	const save = document.createElement("button");
-	save.type = "submit";
-	save.className = "primary";
-	save.textContent = "Save";
+	const saveButton = document.createElement("button");
+	saveButton.type = "submit";
+	saveButton.className = "primary";
+	saveButton.textContent = "Save schedule";
 	const runButton = document.createElement("button");
 	runButton.type = "button";
 	runButton.textContent = "Run now";
@@ -1480,7 +1498,7 @@ function createRoutineEditor(): {
 	deleteButton.type = "button";
 	deleteButton.className = "danger";
 	deleteButton.textContent = "Delete";
-	actions.append(save, runButton, clearButton, deleteButton);
+	actions.append(saveButton, runButton, clearButton, deleteButton);
 	form.append(
 		id,
 		label("Name", name),
@@ -1503,10 +1521,11 @@ function createRoutineEditor(): {
 		preview,
 		actions,
 	);
-	card.append(title, form);
+	card.append(title, scope, form);
 	panel.insertBefore(card, routineList);
 	return {
 		form,
+		scope,
 		id,
 		name,
 		targetKind,
@@ -1536,6 +1555,7 @@ function createRoutineEditor(): {
 		deleteButton,
 		runButton,
 		clearButton,
+		saveButton,
 	};
 }
 
@@ -1681,6 +1701,7 @@ function render(snapshot: SessionSnapshot): void {
 		return;
 	}
 	if (activeExternalRunId) return;
+	if (activeExternalConnectionId) return;
 	if (builderActive) return;
 	if (activeAgentId) return;
 	const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
@@ -1810,6 +1831,85 @@ function renderExternalRun(run: ExternalRunSummary): void {
 	if (run.status === "succeeded" && !result) void loadExternalResultIntoTab(run);
 }
 
+function renderExternalConversation(connection: ExternalConnectionSummary): void {
+	if (activeExternalConnectionId !== connection.id) return;
+	const runs = externalRuns
+		.filter((run) => run.connectionId === connection.id)
+		.sort((left, right) => left.createdAt - right.createdAt);
+	const heading = document.createElement("section");
+	heading.className = "external-chat-heading";
+	const title = document.createElement("strong");
+	title.textContent = connection.name;
+	const profile = document.createElement("span");
+	profile.className = "muted";
+	profile.textContent = `${connection.authentication === "subscription" ? "Subscription" : connection.authentication === "api-key" ? "API" : "Configured"} · ${connection.defaultModel.id}`;
+	heading.append(title, profile);
+	const timeline = document.createElement("section");
+	timeline.className = "subagent-timeline";
+	if (runs.length === 0) appendText(timeline, `Message ${connection.name} below to start.`, "muted");
+	for (const run of runs) {
+		const turn = document.createElement("article");
+		turn.className = "external-chat-turn";
+		const user = document.createElement("div");
+		user.className = "external-chat-user";
+		user.textContent = run.prompt;
+		const agent = document.createElement("div");
+		agent.className = "external-chat-agent agent-message-content";
+		const result = externalResultByRunId.get(run.id);
+		if (result) appendAgentMarkdown(agent, result);
+		else if (run.error) appendText(agent, run.error, "run-error");
+		else {
+			const progress = document.createElement("div");
+			progress.className = "agent-running";
+			progress.append(
+				document.createElement("i"),
+				document.createTextNode(`${externalRunStatusLabel(run.status)}…`),
+			);
+			agent.append(progress);
+		}
+		const actions = document.createElement("div");
+		actions.className = "result-actions";
+		if (run.status === "succeeded") {
+			const sendToPi = document.createElement("button");
+			sendToPi.type = "button";
+			sendToPi.textContent = "↗ Pi";
+			sendToPi.title = "Send this response to Pi";
+			sendToPi.addEventListener("click", () => void sendExternalResultToPi(run));
+			actions.append(sendToPi);
+		}
+		turn.append(user, agent);
+		if (actions.childElementCount > 0) turn.append(actions);
+		timeline.append(turn);
+		if (run.status === "succeeded" && !result) void loadExternalResultIntoTab(run);
+	}
+	transcript.replaceChildren(heading, timeline);
+	transcript.scrollTop = transcript.scrollHeight;
+	const activeRun = runs.findLast((run) => run.status === "starting" || run.status === "running");
+	phase.textContent = activeRun ? externalRunStatusLabel(activeRun.status) : "ready";
+	input.disabled = false;
+	input.placeholder = `Message ${connection.name}…`;
+	input.setAttribute("aria-label", `Message ${connection.name}`);
+	send.disabled = false;
+	send.classList.toggle("is-stopping", activeRun !== undefined);
+	send.setAttribute("aria-label", activeRun ? "Stop delegated response" : "Send message");
+	const delegatedModel = `${connection.defaultModel.provider}/${connection.defaultModel.id}`;
+	if (Array.from(model.options).some((option) => option.value === delegatedModel)) {
+		model.value = delegatedModel;
+		modelPicker.refresh();
+	}
+	model.disabled = true;
+	thinking.disabled = true;
+	attachmentButton.disabled = true;
+	attachmentInput.disabled = true;
+	attachmentList.replaceChildren();
+	const cwd = runs.at(-1)?.cwd ?? requiredElement<HTMLInputElement>("external-cwd").value;
+	sessionPath.textContent = cwd ? formatWorkingDirectory(cwd) : "Delegated session";
+	sessionPath.title = cwd;
+	sessionStats.textContent = `${connection.defaultModel.provider}/${connection.defaultModel.id}`;
+	sessionStats.title = "Delegated model";
+	setStatus(`${connection.name} · ${activeRun ? externalRunStatusLabel(activeRun.status) : "Ready"}`);
+}
+
 function externalRunStatusLabel(value: string): string {
 	if (value === "succeeded") return "Completed";
 	if (value === "failed") return "Failed";
@@ -1822,6 +1922,10 @@ async function loadExternalResultIntoTab(run: ExternalRunSummary): Promise<void>
 	try {
 		externalResultByRunId.set(run.id, await externalResult(run.id));
 		if (activeExternalRunId === run.id) renderExternalRun(run);
+		if (activeExternalConnectionId === run.connectionId) {
+			const connection = externalConnections.find((entry) => entry.id === run.connectionId);
+			if (connection) renderExternalConversation(connection);
+		}
 	} catch (error) {
 		setStatus(error instanceof Error ? error.message : String(error), true);
 	}
@@ -2313,6 +2417,7 @@ function renderSessionNavigation(): void {
 				!builderActive &&
 					!activeAgentId &&
 					!activeSubagentKey &&
+					!activeExternalConnectionId &&
 					!activeExternalRunId &&
 					target.key === activeTargetKey,
 			);
@@ -2324,6 +2429,7 @@ function renderSessionNavigation(): void {
 				!builderActive &&
 					!activeAgentId &&
 					!activeSubagentKey &&
+					!activeExternalConnectionId &&
 					!activeExternalRunId &&
 					target.key === activeTargetKey,
 			);
@@ -2378,6 +2484,28 @@ function renderSessionNavigation(): void {
 			close.title = `Close ${subagentName(activity.item.input)} inspector`;
 			close.setAttribute("aria-label", close.title);
 			close.addEventListener("click", () => closeSubagentTab(key));
+			wrapper.append(button, close);
+			return [wrapper];
+		}),
+		...openExternalConnectionIds.flatMap((connectionId) => {
+			const connection = externalConnections.find((entry) => entry.id === connectionId);
+			if (!connection) return [];
+			const wrapper = document.createElement("div");
+			wrapper.className = "session-tab-wrap";
+			wrapper.classList.toggle("active", connection.id === activeExternalConnectionId);
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "session-tab agent-session-tab";
+			button.textContent = connection.name;
+			button.title = `Open ${connection.name} chat`;
+			button.addEventListener("click", () => openExternalConnection(connection));
+			const close = document.createElement("button");
+			close.type = "button";
+			close.className = "session-tab-close";
+			close.textContent = "×";
+			close.title = `Close ${connection.name} chat`;
+			close.setAttribute("aria-label", close.title);
+			close.addEventListener("click", () => closeExternalConnectionTab(connection.id));
 			wrapper.append(button, close);
 			return [wrapper];
 		}),
@@ -2486,7 +2614,9 @@ async function switchSession(target: SessionTarget): Promise<void> {
 		activeAgentId = undefined;
 		activeSubagentKey = undefined;
 		activeExternalRunId = undefined;
+		activeExternalConnectionId = undefined;
 		persistExternalRunTabs();
+		persistExternalConnectionTabs();
 		if (session.snapshot) render(session.snapshot);
 		renderSessionNavigation();
 		renderAttachments();
@@ -2506,7 +2636,9 @@ async function switchSession(target: SessionTarget): Promise<void> {
 	activeAgentId = undefined;
 	activeSubagentKey = undefined;
 	activeExternalRunId = undefined;
+	activeExternalConnectionId = undefined;
 	persistExternalRunTabs();
+	persistExternalConnectionTabs();
 	populateModels(entry.client.snapshot?.models ?? []);
 	unsubscribeSession = session.subscribe(render);
 	if (session.snapshot) render(session.snapshot);
@@ -4061,10 +4193,19 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 function providerConfigurationForm(provider: CapabilityProvider): HTMLFormElement {
 	const form = document.createElement("form");
 	form.className = "configuration-form provider-configuration-form";
-	const connection = capabilityConnections.find(
-		(entry) => entry.providerId === provider.id && entry.status === "active",
+	const connections = capabilityConnections.filter(
+		(entry) => entry.providerId === provider.id && entry.status === "active" && entry.id !== "plaid-all",
 	);
-	if (connection) appendText(form, `Connected account: ${connection.accountLabel}`, "provider-account");
+	const connection = connections[0];
+	if (connections.length > 0) {
+		appendText(
+			form,
+			connections.length === 1
+				? `Connected account: ${connection!.accountLabel}`
+				: `${connections.length} connected accounts: ${connections.map((entry) => entry.accountLabel).join(", ")}`,
+			"provider-account",
+		);
+	}
 	if (provider.id === "google-workspace" && !isLoopbackHostname(location.hostname)) {
 		appendText(
 			form,
@@ -4076,12 +4217,23 @@ function providerConfigurationForm(provider: CapabilityProvider): HTMLFormElemen
 		if (field.operatorEditable === false) continue;
 		const label = document.createElement("label");
 		label.textContent = `${field.label}${field.required ? " *" : ""}`;
-		const input = document.createElement("input");
+		const input = field.options ? document.createElement("select") : document.createElement("input");
 		input.name = field.env;
-		input.type = field.secret ? "password" : field.format === "url" ? "url" : "text";
-		input.autocomplete = "off";
+		if (input instanceof HTMLInputElement) {
+			input.type = field.secret ? "password" : field.format === "url" ? "url" : "text";
+			input.autocomplete = "off";
+		} else {
+			for (const optionValue of field.options ?? []) {
+				const option = document.createElement("option");
+				option.value = optionValue.value;
+				option.textContent = optionValue.label;
+				input.append(option);
+			}
+		}
 		if (!field.secret && field.value) input.value = field.value;
-		input.placeholder = field.configured ? "Configured; leave blank to keep" : "Not configured";
+		if (input instanceof HTMLInputElement) {
+			input.placeholder = field.configured ? "Configured; leave blank to keep" : "Not configured";
+		}
 		label.append(input);
 		if (field.configured) {
 			const clearLabel = document.createElement("label");
@@ -4096,16 +4248,28 @@ function providerConfigurationForm(provider: CapabilityProvider): HTMLFormElemen
 	}
 	const save = document.createElement("button");
 	save.type = "submit";
-	save.textContent = provider.authentication?.kind === "oauth2" ? "Save OAuth configuration" : "Save configuration";
+	save.textContent =
+		provider.authentication?.kind === "oauth2"
+			? "Save OAuth configuration"
+			: provider.authentication?.kind === "plaid-link"
+				? "Save Plaid configuration"
+				: "Save configuration";
 	form.append(save);
-	if (provider.authentication?.kind === "oauth2") {
+	if (provider.authentication?.kind === "oauth2" || provider.authentication?.kind === "plaid-link") {
 		if (provider.authentication.capabilityGroups?.length) {
 			form.append(providerCapabilityPermissions(provider, connection));
 		}
-		const connected = connection !== undefined;
+		const connected = connections.length > 0;
+		const plaid = provider.authentication.kind === "plaid-link";
 		const authorize = document.createElement("button");
 		authorize.type = "button";
-		authorize.textContent = connected ? "Update Google access" : "Connect Google account";
+		authorize.textContent = plaid
+			? connected
+				? "Connect another account"
+				: "Connect financial account"
+			: connected
+				? "Update Google access"
+				: "Connect Google account";
 		authorize.disabled = !provider.authentication.configured;
 		authorize.title = authorize.disabled ? "Save the required OAuth configuration first" : "";
 		authorize.addEventListener("click", () => {
@@ -4114,7 +4278,13 @@ function providerConfigurationForm(provider: CapabilityProvider): HTMLFormElemen
 			void startProviderAuthorization(provider.id, form).catch((error: unknown) => {
 				setStatus(error instanceof Error ? error.message : String(error), true);
 				authorize.disabled = false;
-				authorize.textContent = connected ? "Update Google access" : "Connect Google account";
+				authorize.textContent = plaid
+					? connected
+						? "Connect another account"
+						: "Connect financial account"
+					: connected
+						? "Update Google access"
+						: "Connect Google account";
 			});
 		});
 		form.append(authorize);
@@ -4144,7 +4314,9 @@ function providerCapabilityPermissions(
 	section.className = "provider-permissions";
 	appendText(
 		section,
-		connection ? "Connected Google access" : "Google access to request",
+		connection
+			? `Connected ${provider.authentication?.kind === "plaid-link" ? "financial data" : "Google access"}`
+			: `${provider.authentication?.kind === "plaid-link" ? "Financial data" : "Google access"} to request`,
 		"provider-permissions-title",
 	);
 	const selected = new Set(connection?.capabilityIds ?? provider.authentication?.defaultCapabilityIds ?? []);
@@ -4195,7 +4367,12 @@ async function startProviderAuthorization(providerId: string, form: HTMLFormElem
 		.filter((input) => !input.disabled)
 		.map((input) => input.dataset.authorizationCapability ?? "")
 		.filter(Boolean);
-	if (capabilityIds.length === 0) throw new Error("Select at least one available Google capability");
+	if (capabilityIds.length === 0) throw new Error("Select at least one available provider capability");
+	const existingConnectionIds = new Set(
+		capabilityConnections
+			.filter((connection) => connection.providerId === providerId && connection.status === "active")
+			.map((connection) => connection.id),
+	);
 	const popup = window.open("", "pi-provider-authorization", "popup,width=620,height=760");
 	if (!popup) throw new Error("Allow popups to authorize this provider");
 	const response = await fetch(
@@ -4222,10 +4399,12 @@ async function startProviderAuthorization(providerId: string, form: HTMLFormElem
 	for (let attempt = 0; attempt < 60; attempt += 1) {
 		await new Promise((resolve) => window.setTimeout(resolve, 2_000));
 		await loadCapabilityConnections();
+		const activeConnections = capabilityConnections.filter(
+			(connection) => connection.providerId === providerId && connection.status === "active",
+		);
 		if (
-			capabilityConnections.some(
-				(connection) => connection.providerId === providerId && connection.status === "active",
-			)
+			activeConnections.some((connection) => !existingConnectionIds.has(connection.id)) ||
+			(providerId !== "plaid" && activeConnections.length > 0)
 		) {
 			await loadCapabilities();
 			setStatus("Provider connected");
@@ -4253,7 +4432,7 @@ function isLoopbackHostname(hostname: string): boolean {
 async function configureCapabilityProvider(providerId: string, form: HTMLFormElement): Promise<void> {
 	if (!capabilityToken) return;
 	const values: Record<string, string> = {};
-	for (const input of form.querySelectorAll<HTMLInputElement>("input[name]")) {
+	for (const input of form.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[name]")) {
 		if (input.value !== "") values[input.name] = input.value;
 	}
 	const clear = [...form.querySelectorAll<HTMLInputElement>("input[data-clear-environment]:checked")].map(
@@ -4323,12 +4502,13 @@ function selectedAgentCapabilities(): AgentCapabilityGrant[] {
 function updateAgentCapabilityGrant(capability: BrokeredCapability, enabled: boolean): void {
 	const grants = selectedAgentCapabilities().filter((entry) => entry.capabilityId !== capability.id);
 	if (enabled) {
-		const connection = capabilityConnections.find(
+		const matchingConnections = capabilityConnections.filter(
 			(entry) =>
 				entry.status === "active" &&
 				entry.providerId === capability.defaultProviderId &&
 				entry.capabilityIds.includes(capability.id),
 		);
+		const connection = matchingConnections.find((entry) => entry.id === "plaid-all") ?? matchingConnections[0];
 		grants.push({
 			capabilityId: capability.id,
 			capabilityVersion: capability.version,
@@ -4614,6 +4794,123 @@ function isPersonaList(value: unknown): value is { personas: PersonaSummary[] } 
 	);
 }
 
+function createClaudeAuthFlow(): {
+	panel: HTMLElement;
+	message: HTMLElement;
+	link: HTMLAnchorElement;
+	cancel: HTMLButtonElement;
+} {
+	const panel = document.createElement("div");
+	panel.className = "card external-auth-flow hidden";
+	panel.setAttribute("role", "status");
+	panel.setAttribute("aria-live", "polite");
+	const title = document.createElement("strong");
+	title.textContent = "Connect Claude subscription";
+	const message = document.createElement("p");
+	message.className = "muted";
+	const actions = document.createElement("div");
+	actions.className = "external-auth-actions";
+	const link = document.createElement("a");
+	link.className = "hidden";
+	link.target = "_blank";
+	link.rel = "noopener noreferrer";
+	link.textContent = "Continue sign-in";
+	const cancel = document.createElement("button");
+	cancel.type = "button";
+	cancel.className = "hidden";
+	cancel.textContent = "Cancel";
+	actions.append(link, cancel);
+	panel.append(title, message, actions);
+	externalConnectionList.after(panel);
+	cancel.addEventListener("click", () => void cancelClaudeSubscriptionLogin());
+	return { panel, message, link, cancel };
+}
+
+let claudeAuthPoll: number | undefined;
+
+async function startClaudeSubscriptionLogin(): Promise<void> {
+	if (!capabilityToken) return;
+	claudeAuthFlow.panel.classList.remove("hidden");
+	claudeAuthFlow.message.textContent = "Starting Claude Code sign-in…";
+	const response = await fetch(`/auth/claude-subscription?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+	});
+	if (!response.ok) throw new Error(await responseError(response, "Could not start Claude subscription login"));
+	const status: unknown = await response.json();
+	if (!isClaudeSubscriptionLoginStatus(status)) throw new Error("Claude login returned an invalid response");
+	renderClaudeSubscriptionLogin(status);
+}
+
+async function pollClaudeSubscriptionLogin(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/auth/claude-subscription?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) throw new Error(await responseError(response, "Could not read Claude subscription login"));
+	const status: unknown = await response.json();
+	if (!isClaudeSubscriptionLoginStatus(status)) throw new Error("Claude login returned an invalid response");
+	renderClaudeSubscriptionLogin(status);
+}
+
+async function cancelClaudeSubscriptionLogin(): Promise<void> {
+	if (!capabilityToken) return;
+	if (claudeAuthPoll !== undefined) window.clearTimeout(claudeAuthPoll);
+	const response = await fetch(`/auth/claude-subscription?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "DELETE",
+	});
+	if (!response.ok) throw new Error(await responseError(response, "Could not cancel Claude subscription login"));
+	const status: unknown = await response.json();
+	if (!isClaudeSubscriptionLoginStatus(status)) throw new Error("Claude login returned an invalid response");
+	renderClaudeSubscriptionLogin(status);
+}
+
+function renderClaudeSubscriptionLogin(status: ClaudeSubscriptionLoginStatus): void {
+	claudeAuthFlow.panel.classList.toggle("hidden", status.status === "succeeded");
+	claudeAuthFlow.link.classList.toggle("hidden", status.status !== "running" || status.authorizationUrl === undefined);
+	if (status.authorizationUrl) claudeAuthFlow.link.href = status.authorizationUrl;
+	claudeAuthFlow.cancel.classList.toggle("hidden", status.status !== "running");
+	claudeAuthFlow.message.textContent =
+		status.status === "running"
+			? status.authorizationUrl
+				? "Finish authorization in the Claude sign-in page."
+				: "Waiting for Claude authorization. A sign-in page may open on the Pi host."
+			: status.status === "succeeded"
+				? "Claude subscription is connected and ready."
+				: status.status === "failed"
+					? (status.error ?? "Claude subscription login failed")
+					: "Claude subscription is not connected.";
+	if (status.status === "running") {
+		if (claudeAuthPoll !== undefined) window.clearTimeout(claudeAuthPoll);
+		claudeAuthPoll = window.setTimeout(() => {
+			void pollClaudeSubscriptionLogin().catch((error: unknown) =>
+				setStatus(error instanceof Error ? error.message : String(error), true),
+			);
+		}, 1_000);
+	} else {
+		claudeAuthPoll = undefined;
+		if (status.authenticated) {
+			setStatus("Claude subscription connected");
+			void loadExternalConnections();
+		}
+	}
+}
+
+function isClaudeSubscriptionLoginStatus(value: unknown): value is ClaudeSubscriptionLoginStatus {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"status" in value &&
+		(value.status === "idle" ||
+			value.status === "running" ||
+			value.status === "succeeded" ||
+			value.status === "failed") &&
+		"authenticated" in value &&
+		typeof value.authenticated === "boolean" &&
+		(!("authorizationUrl" in value) ||
+			value.authorizationUrl === undefined ||
+			typeof value.authorizationUrl === "string") &&
+		(!("error" in value) || value.error === undefined || typeof value.error === "string")
+	);
+}
+
 async function loadExternalConnections(): Promise<void> {
 	if (!capabilityToken) return;
 	const response = await fetch(`/external-connections.json?token=${encodeURIComponent(capabilityToken)}`);
@@ -4625,21 +4922,22 @@ async function loadExternalConnections(): Promise<void> {
 	externalConnectionList.replaceChildren(
 		...externalConnections.map((connection) => {
 			const button = document.createElement("button");
+			const canConnectSubscription = connection.id === "claude-code-subscription" && !connection.available;
 			button.type = "button";
 			button.className = "nav-item external-connection-entry";
 			button.classList.toggle("active", connection.id === selectedExternalConnectionId);
-			button.disabled = !connection.available;
+			button.disabled = !connection.available && !canConnectSubscription;
 			const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
 			icon.classList.add("external-connection-icon");
-			icon.dataset.provider = connection.id;
+			icon.dataset.provider = connection.provider;
 			icon.setAttribute("viewBox", "0 0 24 24");
 			icon.setAttribute("aria-hidden", "true");
 			const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
 			use.setAttribute(
 				"href",
-				connection.id === "claude-code"
+				connection.provider === "anthropic"
 					? "#external-icon-anthropic"
-					: connection.id === "openai"
+					: connection.provider === "openai"
 						? "#external-icon-openai"
 						: connection.id === "hermes"
 							? "#external-icon-hermes"
@@ -4653,12 +4951,22 @@ async function loadExternalConnections(): Promise<void> {
 			const state = document.createElement("span");
 			state.className = "muted";
 			state.textContent = connection.available
-				? `${connection.defaultModel.provider}/${connection.defaultModel.id}`
-				: "Unavailable";
+				? `${connection.authentication === "subscription" ? "Subscription" : connection.authentication === "api-key" ? "API" : "Configured"} · ${connection.defaultModel.id}`
+				: canConnectSubscription
+					? "Connect"
+					: "Unavailable";
 			copy.append(name, state);
 			button.append(icon, copy);
 			button.title = connection.description;
-			button.addEventListener("click", () => openExternalConnection(connection));
+			button.addEventListener("click", () => {
+				if (canConnectSubscription) {
+					void startClaudeSubscriptionLogin().catch((error: unknown) =>
+						setStatus(error instanceof Error ? error.message : String(error), true),
+					);
+					return;
+				}
+				openExternalConnection(connection);
+			});
 			return button;
 		}),
 	);
@@ -4680,6 +4988,18 @@ function isExternalConnectionList(value: unknown): value is { connections: Exter
 			typeof connection.description === "string" &&
 			"inputLabel" in connection &&
 			(connection.inputLabel === "Task" || connection.inputLabel === "Goal") &&
+			"provider" in connection &&
+			(connection.provider === "anthropic" ||
+				connection.provider === "openai" ||
+				connection.provider === "hermes") &&
+			"authentication" in connection &&
+			(connection.authentication === "subscription" ||
+				connection.authentication === "api-key" ||
+				connection.authentication === "configured") &&
+			"billing" in connection &&
+			(connection.billing === "subscription" ||
+				connection.billing === "usage-based" ||
+				connection.billing === "configured") &&
 			"available" in connection &&
 			typeof connection.available === "boolean" &&
 			"models" in connection &&
@@ -4689,6 +5009,12 @@ function isExternalConnectionList(value: unknown): value is { connections: Exter
 
 function openExternalConnection(connection: ExternalConnectionSummary): void {
 	selectedExternalConnectionId = connection.id;
+	builderActive = false;
+	activeAgentId = undefined;
+	activeSubagentKey = undefined;
+	activeExternalRunId = undefined;
+	activeExternalConnectionId = connection.id;
+	if (!openExternalConnectionIds.includes(connection.id)) openExternalConnectionIds.push(connection.id);
 	requiredElement<HTMLInputElement>("external-id").value = connection.id;
 	element("external-title").textContent = connection.name;
 	element("external-description").textContent = connection.description;
@@ -4707,8 +5033,12 @@ function openExternalConnection(connection: ExternalConnectionSummary): void {
 	);
 	externalModel.value = `${connection.defaultModel.provider}/${connection.defaultModel.id}`;
 	externalModelPicker.refresh();
-	element("external-delegate").classList.remove("hidden");
+	element("external-delegate").classList.add("hidden");
 	activateTab("agents-workspace");
+	mobilePanelNone.checked = true;
+	persistExternalConnectionTabs();
+	renderExternalConversation(connection);
+	renderSessionNavigation();
 	void loadExternalConnections().catch(() => {});
 	void loadExternalRuns().catch(() => {});
 }
@@ -4805,17 +5135,23 @@ function missingBuilderRequirements(): BuilderRequirement[] {
 }
 
 function updateAgentBuilderReadiness(): void {
+	const catalogManaged = activeSidebarAgent?.source === "pi-agent";
 	const missing = missingBuilderRequirements();
-	const ready = missing.length === 0;
+	const ready = missing.length === 0 && !catalogManaged;
+	agentSubmit.disabled = catalogManaged;
 	agentSubmit.setAttribute("aria-disabled", String(!ready));
 	agentSubmit.title = ready
 		? "Save and deploy this agent"
-		: `Required: ${missing.map((entry) => entry.label).join(", ")}`;
+		: catalogManaged
+			? "This definition is managed by the Pi Markdown agent catalog"
+			: `Required: ${missing.map((entry) => entry.label).join(", ")}`;
 	agentSubmit.style.opacity = ready ? "" : ".55";
-	agentValidation.className = ready ? "muted" : "run-error";
-	agentValidation.textContent = ready
-		? "Ready to deploy. Optional capabilities, delegation, and automation can be added now or later."
-		: `Complete ${missing.map((entry) => entry.label).join(", ")} before deployment.`;
+	agentValidation.className = ready || catalogManaged ? "muted" : "run-error";
+	agentValidation.textContent = catalogManaged
+		? "Managed by the Pi Markdown agent catalog. Edit its schedule here; edit the Markdown definition to change the agent."
+		: ready
+			? "Ready to deploy. Optional capabilities, delegation, and automation can be added now or later."
+			: `Complete ${missing.map((entry) => entry.label).join(", ")} before deployment.`;
 	const incompletePanels = new Set(missing.map((entry) => entry.panelId));
 	for (const tab of document.querySelectorAll<HTMLButtonElement>("[data-builder-tab]")) {
 		const base = tab.dataset.baseLabel ?? tab.textContent?.replace(/[ ✓•]+$/, "") ?? "Step";
@@ -4887,7 +5223,13 @@ function resizeComposer(): void {
 }
 
 function activePromptHistory(): PromptHistory | undefined {
-	const key = builderActive ? builderSession?.id : activeAgentId ? `agent:${activeAgentId}` : session?.id;
+	const key = builderActive
+		? builderSession?.id
+		: activeAgentId
+			? `agent:${activeAgentId}`
+			: activeExternalConnectionId
+				? `external:${activeExternalConnectionId}`
+				: session?.id;
 	if (!key) return undefined;
 	let history = promptHistoryBySession.get(key);
 	if (!history) {
@@ -4992,7 +5334,9 @@ async function openAgent(agent?: AgentSummary): Promise<void> {
 	activeAgentId = agent.id;
 	activeSubagentKey = undefined;
 	activeExternalRunId = undefined;
+	activeExternalConnectionId = undefined;
 	persistExternalRunTabs();
+	persistExternalConnectionTabs();
 	if (!openAgentIds.includes(agent.id)) openAgentIds.push(agent.id);
 	selectedAgentTitle.textContent = agent.name;
 	selectedAgentMeta.textContent = `${agent.model ? `${agent.model.provider}/${agent.model.id}` : "Current Pi model"} · ${formatWorkingDirectory(agent.projectRoot)}`;
@@ -5021,7 +5365,9 @@ function openSubagentInspector(key: string): void {
 	activeAgentId = undefined;
 	activeSubagentKey = key;
 	activeExternalRunId = undefined;
+	activeExternalConnectionId = undefined;
 	persistExternalRunTabs();
+	persistExternalConnectionTabs();
 	mobilePanelNone.checked = true;
 	renderSubagentInspector(activity);
 	renderSessionNavigation();
@@ -5044,9 +5390,11 @@ function openExternalRun(run: ExternalRunSummary): void {
 	builderActive = false;
 	activeAgentId = undefined;
 	activeSubagentKey = undefined;
+	activeExternalConnectionId = undefined;
 	activeExternalRunId = run.id;
 	if (!openExternalRunIds.includes(run.id)) openExternalRunIds.push(run.id);
 	persistExternalRunTabs();
+	persistExternalConnectionTabs();
 	mobilePanelNone.checked = true;
 	renderedExternalRunSignature = "";
 	renderExternalRun(run);
@@ -5072,6 +5420,34 @@ function closeExternalRunTab(runId: string): void {
 	if (session?.snapshot) render(session.snapshot);
 	renderSessionNavigation();
 	renderAttachments();
+}
+
+function closeExternalConnectionTab(connectionId: string): void {
+	const index = openExternalConnectionIds.indexOf(connectionId);
+	if (index >= 0) openExternalConnectionIds.splice(index, 1);
+	if (activeExternalConnectionId !== connectionId) {
+		persistExternalConnectionTabs();
+		renderSessionNavigation();
+		return;
+	}
+	activeExternalConnectionId = undefined;
+	persistExternalConnectionTabs();
+	const fallbackId = openExternalConnectionIds.at(-1);
+	const fallback = fallbackId ? externalConnections.find((entry) => entry.id === fallbackId) : undefined;
+	if (fallback) {
+		openExternalConnection(fallback);
+		return;
+	}
+	if (session?.snapshot) render(session.snapshot);
+	renderSessionNavigation();
+	renderAttachments();
+}
+
+function persistExternalConnectionTabs(): void {
+	localStorage.setItem("pi-serve-external-connection-tabs", JSON.stringify(openExternalConnectionIds));
+	if (activeExternalConnectionId)
+		localStorage.setItem("pi-serve-active-external-connection", activeExternalConnectionId);
+	else localStorage.removeItem("pi-serve-active-external-connection");
 }
 
 function persistExternalRunTabs(): void {
@@ -5269,7 +5645,9 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 		activeAgentId = undefined;
 		activeSubagentKey = undefined;
 		activeExternalRunId = undefined;
+		activeExternalConnectionId = undefined;
 		persistExternalRunTabs();
+		persistExternalConnectionTabs();
 	}
 	unsubscribeBuilder = builderSession.subscribe((snapshot) => {
 		if (builderActive) renderBuilderConversation(snapshot);
@@ -5277,7 +5655,9 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 	if (showConversation && builderSession.snapshot) renderBuilderConversation(builderSession.snapshot);
 	if (showConversation) mobilePanelNone.checked = true;
 	renderSessionNavigation();
-	await loadCapabilities().catch(() => {});
+	refreshRoutineEditorOptions();
+	clearRoutineEditor();
+	await Promise.all([loadCapabilities(), loadRoutines()]).catch(() => {});
 }
 
 function openBuilderChat(): void {
@@ -5286,7 +5666,9 @@ function openBuilderChat(): void {
 	activeAgentId = undefined;
 	activeSubagentKey = undefined;
 	activeExternalRunId = undefined;
+	activeExternalConnectionId = undefined;
 	persistExternalRunTabs();
+	persistExternalConnectionTabs();
 	activateTab("agent-builder");
 	mobilePanelNone.checked = true;
 	renderBuilderConversation(builderSession.snapshot);
@@ -5709,6 +6091,10 @@ async function loadExternalRuns(): Promise<void> {
 	}
 	const activeRun = activeExternalRunId ? externalRuns.find((entry) => entry.id === activeExternalRunId) : undefined;
 	if (activeRun) renderExternalRun(activeRun);
+	const activeConnection = activeExternalConnectionId
+		? externalConnections.find((entry) => entry.id === activeExternalConnectionId)
+		: undefined;
+	if (activeConnection) renderExternalConversation(activeConnection);
 	if (previousTabSignature !== externalTabSignature()) renderSessionNavigation();
 }
 
@@ -5821,7 +6207,14 @@ async function startExternalRun(
 	const value: unknown = await response.json();
 	if (!isExternalRunSummary(value)) throw new Error("External run manager returned an invalid run");
 	externalRuns = [value, ...externalRuns.filter((entry) => entry.id !== value.id)];
-	openExternalRun(value);
+	if (activeExternalConnectionId === connectionId) {
+		if (!openExternalConnectionIds.includes(connectionId)) openExternalConnectionIds.push(connectionId);
+		persistExternalConnectionTabs();
+		const connection = externalConnections.find((entry) => entry.id === connectionId);
+		if (connection) renderExternalConversation(connection);
+	} else {
+		openExternalRun(value);
+	}
 	await loadExternalRuns();
 	setStatus(`Delegated to ${connectionId}`);
 }
@@ -5934,7 +6327,21 @@ function refreshRoutineEditorOptions(): void {
 		}),
 	);
 	if (externalConnections.some((entry) => entry.id === selectedAcp)) routineEditor.acp.value = selectedAcp;
+	if (activeSidebarAgent) routineEditor.agent.value = activeSidebarAgent.id;
 	refreshRoutineModels();
+}
+
+function applyRoutineAgentScope(): void {
+	const agent = activeSidebarAgent;
+	routineEditor.targetKind.value = "agent";
+	routineEditor.targetKind.disabled = true;
+	routineEditor.agent.disabled = true;
+	routineEditor.saveButton.disabled = !agent;
+	routineEditor.scope.textContent = agent
+		? `Schedules run ${agent.name} in its configured project folder.`
+		: "Save and deploy this agent before adding a schedule.";
+	if (agent) routineEditor.agent.value = agent.id;
+	updateRoutineTargetFields();
 }
 
 function refreshRoutineModels(selected = routineEditor.model.value): void {
@@ -6026,13 +6433,14 @@ function clearRoutineEditor(): void {
 	routineEditor.timezone.value = Intl.DateTimeFormat().resolvedOptions().timeZone;
 	routineEditor.maxDuration.value = "60";
 	routineEditor.browserParameters.value = "{}";
+	routineEditor.enabled.checked = true;
 	routineEditor.deleteButton.disabled = true;
 	routineEditor.runButton.disabled = true;
-	element("routine-editor-title").textContent = "New routine";
+	element("routine-editor-title").textContent = "New schedule";
 	routineList.querySelectorAll(".routine-card").forEach((card) => {
 		card.classList.remove("active");
 	});
-	updateRoutineTargetFields();
+	applyRoutineAgentScope();
 	updateRoutineCronFromPreset();
 }
 
@@ -6073,8 +6481,26 @@ async function loadRoutines(): Promise<void> {
 	const payload: unknown = await response.json();
 	if (!isRoutineList(payload)) throw new Error("Routine service returned an invalid response");
 	routines = payload.routines;
+	const agent = activeSidebarAgent;
+	const agentRoutines = agent
+		? payload.routines.filter((routine) => routine.target.kind === "agent" && routine.target.agentId === agent.id)
+		: [];
+	if (!agent) {
+		const empty = document.createElement("div");
+		empty.className = "settings-empty";
+		empty.textContent = "Save and deploy this agent before adding schedules.";
+		routineList.replaceChildren(empty);
+		return;
+	}
+	if (agentRoutines.length === 0) {
+		const empty = document.createElement("div");
+		empty.className = "settings-empty";
+		empty.textContent = `No schedules for ${agent.name}. Add one above when this agent should run automatically.`;
+		routineList.replaceChildren(empty);
+		return;
+	}
 	routineList.replaceChildren(
-		...payload.routines.map((routine) => {
+		...agentRoutines.map((routine) => {
 			const card = document.createElement("div");
 			card.className = "card routine-card";
 			card.dataset.routineId = routine.id;
@@ -6140,6 +6566,9 @@ async function loadRoutines(): Promise<void> {
 					: `${routine.cron} · ${routine.timezone}`,
 				"muted",
 			);
+			if (routine.lastRunAt) {
+				appendText(card, `Last run ${new Date(routine.lastRunAt).toLocaleString()}`, "muted");
+			}
 			appendText(card, routine.prompt, "muted");
 			if (routine.lastError) appendText(card, routine.lastError, "run-error");
 			if (routine.availabilityError) appendText(card, routine.availabilityError, "run-error");
@@ -6147,7 +6576,7 @@ async function loadRoutines(): Promise<void> {
 			return card;
 		}),
 	);
-	const selected = routines.find((routine) => routine.id === routineEditor.id.value);
+	const selected = agentRoutines.find((routine) => routine.id === routineEditor.id.value);
 	if (selected) editRoutine(selected);
 }
 
@@ -6385,6 +6814,10 @@ form.addEventListener("submit", (event) => {
 
 async function submitComposer(): Promise<void> {
 	if (activeSubagentKey || activeExternalRunId) return;
+	if (activeExternalConnectionId) {
+		await submitExternalComposer(activeExternalConnectionId);
+		return;
+	}
 	if (builderActive) {
 		await submitBuilderComposer();
 		return;
@@ -6417,6 +6850,27 @@ async function submitComposer(): Promise<void> {
 	} else {
 		await session.prompt(text);
 	}
+}
+
+async function submitExternalComposer(connectionId: string): Promise<void> {
+	const connection = externalConnections.find((entry) => entry.id === connectionId);
+	if (!connection) throw new Error("The selected delegation connection is unavailable");
+	const activeRun = externalRuns.find(
+		(run) => run.connectionId === connectionId && (run.status === "starting" || run.status === "running"),
+	);
+	if (activeRun) {
+		await abortExternalRun(activeRun.id);
+		return;
+	}
+	const prompt = input.value.trim();
+	if (!prompt) return;
+	recordPromptHistory(prompt);
+	input.value = "";
+	resizeComposer();
+	const latest = externalRuns.find((run) => run.connectionId === connectionId);
+	const cwd = latest?.cwd ?? (requiredElement<HTMLInputElement>("external-cwd").value || session?.snapshot?.cwd);
+	if (!cwd) throw new Error("A working directory is required for the delegated chat");
+	await startExternalRun(connectionId, prompt, cwd, latest?.model ?? connection.defaultModel);
 }
 
 async function submitBuilderComposer(): Promise<void> {
@@ -6656,7 +7110,8 @@ model.addEventListener("change", () => {
 	const separator = model.value.indexOf("/");
 	if (separator < 1) return;
 	const targetSession = builderActive ? builderSession : session;
-	if (!targetSession || activeAgentId || activeSubagentKey || activeExternalRunId) return;
+	if (!targetSession || activeAgentId || activeSubagentKey || activeExternalRunId || activeExternalConnectionId)
+		return;
 	void targetSession
 		.setModel({ provider: model.value.slice(0, separator), id: model.value.slice(separator + 1) })
 		.catch((error: unknown) => setStatus(String(error), true));
@@ -6664,7 +7119,7 @@ model.addEventListener("change", () => {
 
 thinking.addEventListener("change", () => {
 	const targetSession = builderActive ? builderSession : session;
-	if (targetSession && !activeAgentId && !activeSubagentKey && !activeExternalRunId)
+	if (targetSession && !activeAgentId && !activeSubagentKey && !activeExternalRunId && !activeExternalConnectionId)
 		void targetSession
 			.setThinking(thinking.value as ThinkingLevel)
 			.catch((error: unknown) => setStatus(String(error), true));
@@ -6700,7 +7155,7 @@ for (const button of document.querySelectorAll<HTMLButtonElement>("[data-builder
 				.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
 		}
 		if (panel === "builder-automation-panel")
-			void loadEverydayConfigurations().catch((error: unknown) =>
+			void Promise.all([loadEverydayConfigurations(), loadRoutines()]).catch((error: unknown) =>
 				setStatus(error instanceof Error ? error.message : String(error), true),
 			);
 	});
@@ -7035,6 +7490,10 @@ routineEditor.clearButton.addEventListener("click", clearRoutineEditor);
 routineEditor.form.addEventListener("submit", (event) => {
 	event.preventDefault();
 	if (!capabilityToken) return;
+	if (!activeSidebarAgent) {
+		setStatus("Save and deploy this agent before adding a schedule", true);
+		return;
+	}
 	const kind = routineEditor.targetKind.value;
 	let browserParameters: Record<string, string | number | boolean> = {};
 	if (kind === "browser-workflow") {

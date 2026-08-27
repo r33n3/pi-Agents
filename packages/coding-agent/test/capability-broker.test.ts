@@ -287,6 +287,14 @@ describe("CapabilityBroker", () => {
 				{ id: "chat", label: "Google Chat" },
 			],
 		});
+		expect(snapshot.providers.find((entry) => entry.id === "plaid")).toMatchObject({
+			id: "plaid",
+			connectionRequired: true,
+			authentication: {
+				kind: "plaid-link",
+				defaultCapabilityIds: ["finance.accounts", "finance.transactions", "finance.spending"],
+			},
+		});
 	});
 
 	test("rejects authentication groups that expose unbound capabilities", async () => {

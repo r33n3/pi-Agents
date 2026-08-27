@@ -59,10 +59,14 @@ async function setup(): Promise<{
 	const manager = new ExternalConnectionManager(
 		[
 			{
-				id: "openai",
+				id: "openai-api",
+				aliases: ["openai"],
 				name: "OpenAI Agent",
 				description: "External agent",
 				inputLabel: "Task",
+				provider: "openai",
+				authentication: "api-key",
+				billing: "usage-based",
 				available: true,
 				defaultModel: { provider: "openai", id: "gpt-5.6-luna" },
 				models: [{ provider: "openai", id: "gpt-5.6-luna", name: "GPT-5.6 Luna" }],
@@ -86,7 +90,7 @@ describe("ExternalConnectionManager", () => {
 		const { root, manager, executions, requests } = await setup();
 		const run = await manager.start({ connectionId: "openai", prompt: "Investigate", cwd: root });
 		expect(requests[0]).toMatchObject({
-			connection: { id: "openai" },
+			connection: { id: "openai-api" },
 			model: { provider: "openai", id: "gpt-5.6-luna" },
 			prompt: "Investigate",
 		});

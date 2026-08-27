@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
+import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { PiServer } from "@earendil-works/pi-server";
 import type { AgentSession } from "../agent-session.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
+import { ModelRuntime } from "../model-runtime.ts";
 import { DefaultResourceLoader } from "../resource-loader.ts";
 import { createAgentSession } from "../sdk.ts";
 import { SessionManager } from "../session-manager.ts";
@@ -30,6 +32,8 @@ import { CapabilityBroker } from "./capability-broker.ts";
 import { CapabilityCatalog } from "./capability-catalog.ts";
 import { CapabilityConnectionRegistry } from "./capability-connection-registry.ts";
 import { ChildProcessAgentExecutor } from "./child-process-agent-executor.ts";
+import { ClaudeSubscriptionLogin } from "./claude-subscription-login.ts";
+import { CodexCliExecution, isCodexSubscriptionAvailable } from "./codex-cli-execution.ts";
 import { CurrentSessionService } from "./current-session-service.ts";
 import { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
 import { createEverydayDataTools } from "./everyday-data-tools.ts";
@@ -39,6 +43,8 @@ import { createGoogleWorkspaceTools } from "./google-workspace-tools.ts";
 import { GovernedActionService } from "./governed-action-service.ts";
 import { InboundRoutingService } from "./inbound-routing-service.ts";
 import { PersonaCatalog, resolvePersonaProject } from "./persona-catalog.ts";
+import { PlaidConnectionService } from "./plaid-connection.ts";
+import { createPlaidTools, PLAID_TOOL_NAMES } from "./plaid-tools.ts";
 import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
 import { PluginManagementService } from "./plugin-management-service.ts";
 import { ProviderEnvironmentStore } from "./provider-environment-store.ts";
@@ -84,6 +90,7 @@ export class ServeHost implements AsyncDisposable {
 	#agentRoutineScheduler: AgentRoutineScheduler | undefined;
 	#externalConnectionManager: ExternalConnectionManager | undefined;
 	#externalSessionExecutor: AgentSessionExecutor | undefined;
+	#claudeSubscriptionLogin: ClaudeSubscriptionLogin | undefined;
 	#attachmentStore: ServeAttachmentStore | undefined;
 	#browserSessionManager: BrowserSessionManager | undefined;
 	#workspacePreviewServer: WorkspacePreviewServer | undefined;
@@ -236,6 +243,18 @@ export class ServeHost implements AsyncDisposable {
 			capabilityBroker.authenticationManifest(providerId),
 		);
 		const googleWorkspaceOAuth = new GoogleWorkspaceOAuth(providerEnvironment, capabilityConnections);
+		const plaidConnections = new PlaidConnectionService(providerEnvironment, capabilityConnections, {
+			clientUserId: `pi-session-${session.sessionId}`,
+		});
+		const plaidToolNames = new Set<string>(PLAID_TOOL_NAMES);
+		const sessionPlaidTools = createPlaidTools(plaidConnections, () =>
+			capabilityConnections
+				.snapshot()
+				.filter((connection) => connection.providerId === "plaid" && connection.status === "active")
+				.map((connection) => connection.id),
+		);
+		brokeredTools.push(...sessionPlaidTools);
+		session.registerCustomTools(sessionPlaidTools);
 		const googleWorkspaceTools = createGoogleWorkspaceTools({
 			approvals: capabilityApprovals,
 			credentials: providerEnvironment,
@@ -291,10 +310,11 @@ export class ServeHost implements AsyncDisposable {
 			workspace: string,
 			agentSessionManager = SessionManager.inMemory(workspace),
 			browserOwner?: BrowserOwner,
+			executionModelRuntime = modelRuntime,
 		) => {
 			const requestedModel = definition.model;
 			const agentModel = requestedModel
-				? modelRuntime.getModel(requestedModel.provider, requestedModel.id)
+				? executionModelRuntime.getModel(requestedModel.provider, requestedModel.id)
 				: session.model;
 			if (!agentModel) {
 				throw new Error(
@@ -333,7 +353,14 @@ export class ServeHost implements AsyncDisposable {
 						})
 					: [];
 			const capabilityTools = capabilityBroker.resolveToolNames(definition.capabilities, definition.executor);
-			const brokerTools = brokeredTools.filter((tool) => capabilityTools.includes(tool.name));
+			const allowedPlaidConnectionIds = definition.capabilities
+				.filter((grant) => grant.providerId === "plaid" && grant.connectionId)
+				.map((grant) => grant.connectionId!);
+			const agentPlaidTools = createPlaidTools(plaidConnections, () => allowedPlaidConnectionIds);
+			const brokerTools = [
+				...brokeredTools.filter((tool) => !plaidToolNames.has(tool.name)),
+				...agentPlaidTools,
+			].filter((tool) => capabilityTools.includes(tool.name));
 			const customTools = [
 				...scopedTools,
 				...browserTools,
@@ -368,7 +395,7 @@ export class ServeHost implements AsyncDisposable {
 			const created = await createAgentSession({
 				cwd: workspace,
 				agentDir,
-				modelRuntime,
+				modelRuntime: executionModelRuntime,
 				model: agentModel,
 				thinkingLevel: definition.thinking,
 				tools: toolNames,
@@ -383,6 +410,23 @@ export class ServeHost implements AsyncDisposable {
 				kind: "agent-run",
 				id: context.runId,
 			});
+		const createOpenAiApiExecutionSession = async (context: Parameters<AgentSessionExecutor["start"]>[0]) => {
+			const apiKey = process.env.OPENAI_API_KEY?.trim();
+			if (!apiKey) throw new Error("OpenAI API requires OPENAI_API_KEY in project Settings");
+			const apiRuntime = await ModelRuntime.create({
+				credentials: new InMemoryCredentialStore(),
+				modelsPath: join(agentDir, "models.json"),
+				refreshOnCreate: false,
+			});
+			await apiRuntime.setRuntimeApiKey("openai", apiKey);
+			return createConfiguredAgentSession(
+				context.definition,
+				context.workspace,
+				undefined,
+				{ kind: "agent-run", id: context.runId },
+				apiRuntime,
+			);
+		};
 		const executor = new ChildProcessAgentExecutor({
 			agentDir,
 			serveRoot,
@@ -402,7 +446,13 @@ export class ServeHost implements AsyncDisposable {
 				if (context.definition.source === "pi-agent") {
 					for (const name of context.definition.tools) names.add(name);
 				}
-				return brokeredTools.filter((tool) => names.has(tool.name));
+				const allowedPlaidConnectionIds = context.definition.capabilities
+					.filter((grant) => grant.providerId === "plaid" && grant.connectionId)
+					.map((grant) => grant.connectionId!);
+				return [
+					...brokeredTools.filter((tool) => !plaidToolNames.has(tool.name)),
+					...createPlaidTools(plaidConnections, () => allowedPlaidConnectionIds),
+				].filter((tool) => names.has(tool.name));
 			},
 		});
 		this.#agentRunManager = new AgentRunManager(agentRegistry, executor, join(serveRoot, "runs"));
@@ -427,6 +477,19 @@ export class ServeHost implements AsyncDisposable {
 		}));
 		const openAiModels = availableModels.filter((model) => model.provider === "openai");
 		const luna = { provider: "openai", id: "gpt-5.6-luna" };
+		if (!openAiModels.some((model) => model.id === luna.id)) {
+			openAiModels.unshift({ ...luna, name: "GPT-5.6 Luna" });
+		}
+		const codexSubscriptionModelIds = new Set([
+			"gpt-5.6-sol",
+			"gpt-5.6-terra",
+			"gpt-5.6-luna",
+			"gpt-5.5",
+			"gpt-5.4",
+			"gpt-5.4-mini",
+			"gpt-5.3-codex-spark",
+		]);
+		const codexSubscriptionModels = openAiModels.filter((model) => codexSubscriptionModelIds.has(model.id));
 		const sonnet = { provider: "anthropic", id: "claude-sonnet-5" };
 		const claudeModels = availableModels.filter((model) => model.provider === "anthropic");
 		if (!claudeModels.some((model) => model.id === sonnet.id)) {
@@ -437,24 +500,74 @@ export class ServeHost implements AsyncDisposable {
 			id: "configured",
 			name: "Hermes configured model",
 		};
+		const claudeSubscriptionLogin = new ClaudeSubscriptionLogin();
+		this.#claudeSubscriptionLogin = claudeSubscriptionLogin;
 		const externalConnections: ExternalConnectionDefinition[] = [
 			{
-				id: "claude-code",
-				name: "Claude Code ACP",
-				description: "Delegate a task to Claude Code through the loaded ACP extension.",
+				id: "claude-code-subscription",
+				name: "Claude Code — Subscription",
+				description: "Delegate through Claude Code ACP using the Claude subscription login stored by Claude Code.",
 				inputLabel: "Task",
-				available: session.getToolDefinition("claude_code") !== undefined,
-				warning: "Claude Code actions are auto-approved. The selected Claude model is used by the ACP session.",
+				provider: "anthropic",
+				authentication: "subscription",
+				billing: "subscription",
+				get available() {
+					return (
+						session.getToolDefinition("claude_code") !== undefined &&
+						claudeSubscriptionLogin.getStatus().authenticated
+					);
+				},
+				warning:
+					"Requires `claude auth login`. ANTHROPIC_API_KEY is removed from this worker so API billing cannot be selected accidentally.",
 				defaultModel: sonnet,
 				models: claudeModels,
 			},
 			{
-				id: "openai",
-				name: "OpenAI Agent",
-				description: "Run a separate Pi SDK agent while the main Pi session remains available.",
+				id: "anthropic-api",
+				aliases: ["claude-code"],
+				name: "Anthropic — API",
+				description: "Delegate through Claude Code ACP using the configured Anthropic API key.",
 				inputLabel: "Task",
-				available: openAiModels.some((model) => model.id === luna.id),
-				warning: "This agent can use file and shell tools in the selected working directory.",
+				provider: "anthropic",
+				authentication: "api-key",
+				billing: "usage-based",
+				get available() {
+					return (
+						session.getToolDefinition("claude_code") !== undefined &&
+						Boolean(process.env.ANTHROPIC_API_KEY?.trim())
+					);
+				},
+				warning: "Usage is billed to the Anthropic API account configured by ANTHROPIC_API_KEY.",
+				defaultModel: sonnet,
+				models: claudeModels,
+			},
+			{
+				id: "codex-subscription",
+				name: "Codex — ChatGPT Subscription",
+				description: "Run an independent Codex CLI task using the local ChatGPT login.",
+				inputLabel: "Task",
+				provider: "openai",
+				authentication: "subscription",
+				billing: "subscription",
+				available: isCodexSubscriptionAvailable(),
+				warning:
+					"Requires `codex login`. OPENAI_API_KEY is removed from this worker so API billing cannot be selected accidentally.",
+				defaultModel: luna,
+				models: codexSubscriptionModels,
+			},
+			{
+				id: "openai-api",
+				aliases: ["openai"],
+				name: "OpenAI — API",
+				description: "Run a separate Pi SDK agent using the configured OpenAI API account.",
+				inputLabel: "Task",
+				provider: "openai",
+				authentication: "api-key",
+				billing: "usage-based",
+				get available() {
+					return Boolean(process.env.OPENAI_API_KEY?.trim()) && openAiModels.some((model) => model.id === luna.id);
+				},
+				warning: "Usage is billed to the OpenAI API account configured by OPENAI_API_KEY.",
 				defaultModel: luna,
 				models: openAiModels,
 			},
@@ -463,6 +576,9 @@ export class ServeHost implements AsyncDisposable {
 				name: "Hermes Agent",
 				description: "Delegate a goal to Hermes one-shot mode with its memory, skills, and tools.",
 				inputLabel: "Goal",
+				provider: "hermes",
+				authentication: "configured",
+				billing: "configured",
 				available:
 					session.getToolDefinition("hermes_agent") !== undefined &&
 					openAiModels.some((model) => model.id === luna.id),
@@ -473,16 +589,24 @@ export class ServeHost implements AsyncDisposable {
 			},
 		];
 		this.#externalSessionExecutor = new AgentSessionExecutor(createExecutionSession);
+		const externalOpenAiApiExecutor = new AgentSessionExecutor(createOpenAiApiExecutionSession);
 		this.#externalConnectionManager = new ExternalConnectionManager(
 			externalConnections,
 			async (request) => {
-				const isClaude = request.connection.id === "claude-code";
+				const isClaude = request.connection.provider === "anthropic";
+				const isClaudeSubscription = request.connection.id === "claude-code-subscription";
+				const isCodexSubscription = request.connection.id === "codex-subscription";
 				const isHermes = request.connection.id === "hermes";
-				return this.#externalSessionExecutor!.start({
+				if (isCodexSubscription) {
+					return new CodexCliExecution({ cwd: request.cwd, prompt: request.prompt, model: request.model.id });
+				}
+				const executionExecutor =
+					request.connection.id === "openai-api" ? externalOpenAiApiExecutor : this.#externalSessionExecutor!;
+				return executionExecutor.start({
 					runId: request.runId,
 					workspace: request.cwd,
 					prompt: isClaude
-						? `Call claude_code immediately with this exact task, working directory, and model. Return its result without replacing it with your own work.\n\nTask: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}`
+						? `Call claude_code immediately with this exact task, working directory, model, and authentication profile. Return its result without replacing it with your own work.\n\nTask: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}\n\nAuthentication: ${isClaudeSubscription ? "subscription" : "api-key"}`
 						: isHermes
 							? `Call hermes_agent immediately with this exact goal and working directory. Use Hermes's configured model and return its result without replacing it with your own work.\n\nGoal: ${request.prompt}\n\nWorking directory: ${request.cwd}`
 							: request.prompt,
@@ -728,6 +852,8 @@ export class ServeHost implements AsyncDisposable {
 				everydayConfigurations,
 				providerEnvironment,
 				googleWorkspaceOAuth,
+				plaidConnections,
+				claudeSubscriptionLogin,
 			),
 			auxiliary: {
 				path: "/browser-stream",
@@ -769,6 +895,7 @@ export class ServeHost implements AsyncDisposable {
 			() => this.#agentRunManager?.dispose() ?? Promise.resolve(),
 			() => this.#externalConnectionManager?.dispose() ?? Promise.resolve(),
 			() => this.#externalSessionExecutor?.dispose() ?? Promise.resolve(),
+			() => this.#claudeSubscriptionLogin?.dispose() ?? Promise.resolve(),
 			() => this.#attachmentStore?.dispose() ?? Promise.resolve(),
 			() => this.#browserSessionManager?.dispose() ?? Promise.resolve(),
 			() => this.#workspacePreviewServer?.close() ?? Promise.resolve(),

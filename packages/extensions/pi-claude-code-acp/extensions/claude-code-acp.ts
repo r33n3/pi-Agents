@@ -32,6 +32,8 @@ interface SessionHandle {
 	stderrTail: string;
 }
 
+type ClaudeAuthenticationMode = "subscription" | "api-key";
+
 const sessions = new Map<string, Promise<SessionHandle>>();
 
 function resolveAgentEntry(): string {
@@ -74,7 +76,7 @@ class AutoApproveClient implements acp.Client {
 	}
 }
 
-async function createSession(cwd: string, model: string): Promise<SessionHandle> {
+async function createSession(cwd: string, model: string, authentication: ClaudeAuthenticationMode): Promise<SessionHandle> {
 	if (!existsSync(cwd)) {
 		throw new Error(`claude_code: cwd does not exist: ${cwd}`);
 	}
@@ -85,6 +87,16 @@ async function createSession(cwd: string, model: string): Promise<SessionHandle>
 	// not a Claude Code runtime, so the SDK's nested-session guard must not see that var.
 	const env = { ...process.env };
 	delete env.CLAUDECODE;
+	if (authentication === "subscription") {
+		// Claude Code supports subscription and API-key authentication. Keep the
+		// subscription profile deterministic even when the parent Pi shell has an API key.
+		delete env.ANTHROPIC_API_KEY;
+		delete env.ANTHROPIC_AUTH_TOKEN;
+		delete env.ANTHROPIC_BASE_URL;
+		delete env.ANTHROPIC_CUSTOM_HEADERS;
+		delete env.CLAUDE_CODE_USE_BEDROCK;
+		delete env.CLAUDE_CODE_USE_VERTEX;
+	}
 	// Default delegated sessions to Sonnet 5 (bare id, no "[1m]" — the 1M context window
 	// isn't needed for typical delegated tasks) at medium thinking. 8192 is the "medium"
 	// token budget pi itself uses across providers (see packages/ai/src/api/*.ts). Only
@@ -128,7 +140,7 @@ async function createSession(cwd: string, model: string): Promise<SessionHandle>
 	const connection = new acp.ClientSideConnection(() => client, stream);
 	handle.connection = connection;
 
-	const sessionKey = `${cwd}\0${model}`;
+	const sessionKey = `${cwd}\0${model}\0${authentication}`;
 	proc.on("exit", () => {
 		sessions.delete(sessionKey);
 	});
@@ -157,11 +169,11 @@ async function createSession(cwd: string, model: string): Promise<SessionHandle>
 	return handle;
 }
 
-function getSession(cwd: string, model: string): Promise<SessionHandle> {
-	const sessionKey = `${cwd}\0${model}`;
+function getSession(cwd: string, model: string, authentication: ClaudeAuthenticationMode): Promise<SessionHandle> {
+	const sessionKey = `${cwd}\0${model}\0${authentication}`;
 	let pending = sessions.get(sessionKey);
 	if (!pending) {
-		pending = createSession(cwd, model).catch((err) => {
+		pending = createSession(cwd, model, authentication).catch((err) => {
 			sessions.delete(sessionKey);
 			throw err;
 		});
@@ -188,12 +200,19 @@ const claudeCodeTool = defineTool({
 		model: Type.Optional(
 			Type.String({ description: "Claude model id for this ACP session (defaults to claude-sonnet-5)" }),
 		),
+		authentication: Type.Optional(
+			Type.Union([Type.Literal("subscription"), Type.Literal("api-key")], {
+				description:
+					"Authentication profile. Subscription removes ANTHROPIC_API_KEY before launching Claude Code; api-key inherits it.",
+			}),
+		),
 	}),
 
 	async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 		const cwd = params.cwd ? resolvePath(ctx.cwd, params.cwd) : ctx.cwd;
 		const model = (params.model ?? "claude-sonnet-5").replace(/^anthropic\//, "");
-		const handle = await getSession(cwd, model);
+		const authentication = params.authentication ?? "subscription";
+		const handle = await getSession(cwd, model, authentication);
 
 		let buffer = "";
 		handle.onChunk = (text) => {
@@ -209,7 +228,7 @@ const claudeCodeTool = defineTool({
 
 			return {
 				content: [{ type: "text", text: buffer || "(Claude Code produced no text output)" }],
-				details: { stopReason: result.stopReason, cwd, model },
+				details: { stopReason: result.stopReason, cwd, model, authentication },
 			};
 		} catch (err) {
 			const stderrNote = handle.stderrTail.trim() ? `\n\nclaude-agent-acp stderr (tail):\n${handle.stderrTail}` : "";
@@ -222,7 +241,7 @@ const claudeCodeTool = defineTool({
 			// kept-alive child process (open stdio pipes) would otherwise block pi's own
 			// process from exiting once the prompt is done.
 			if (ctx.mode !== "tui" && ctx.mode !== "rpc") {
-				sessions.delete(`${cwd}\0${model}`);
+				sessions.delete(`${cwd}\0${model}\0${authentication}`);
 				handle.proc.kill();
 			}
 		}

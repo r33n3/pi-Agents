@@ -11,6 +11,7 @@ import type { CapabilityBroker } from "./capability-broker.ts";
 import type { CapabilityCatalog } from "./capability-catalog.ts";
 import type { CapabilityConnectionInput, CapabilityConnectionRegistry } from "./capability-connection-registry.ts";
 import { matchesCapabilityToken } from "./capability-token.ts";
+import type { ClaudeSubscriptionLogin } from "./claude-subscription-login.ts";
 import { nextCronRun } from "./cron-schedule.ts";
 import type { CurrentSessionService } from "./current-session-service.ts";
 import type { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
@@ -18,6 +19,7 @@ import type { ExternalConnectionManager } from "./external-connection-manager.ts
 import type { GoogleWorkspaceOAuth } from "./google-workspace-oauth.ts";
 import type { InboundRoute, InboundRoutingService } from "./inbound-routing-service.ts";
 import type { PersonaCatalog } from "./persona-catalog.ts";
+import type { PlaidConnectionService } from "./plaid-connection.ts";
 import type { PluginManagementService } from "./plugin-management-service.ts";
 import type { ProviderEnvironmentStore } from "./provider-environment-store.ts";
 import type { RoutineDefinitionInput, RoutineRegistry } from "./routine-registry.ts";
@@ -56,6 +58,8 @@ export function createServePage(
 	everydayConfigurations?: EverydayConfigurationRegistry,
 	providerEnvironment?: ProviderEnvironmentStore,
 	googleWorkspaceOAuth?: GoogleWorkspaceOAuth,
+	plaidConnections?: PlaidConnectionService,
+	claudeSubscriptionLogin?: ClaudeSubscriptionLogin,
 ): (request: IncomingMessage, response: ServerResponse) => void {
 	return (request, response) => {
 		void serveRequest(
@@ -83,6 +87,8 @@ export function createServePage(
 			everydayConfigurations,
 			providerEnvironment,
 			googleWorkspaceOAuth,
+			plaidConnections,
+			claudeSubscriptionLogin,
 		).catch((error: unknown) => {
 			if (response.headersSent) {
 				response.end();
@@ -120,6 +126,8 @@ async function serveRequest(
 	everydayConfigurations: EverydayConfigurationRegistry | undefined,
 	providerEnvironment: ProviderEnvironmentStore | undefined,
 	googleWorkspaceOAuth: GoogleWorkspaceOAuth | undefined,
+	plaidConnections: PlaidConnectionService | undefined,
+	claudeSubscriptionLogin: ClaudeSubscriptionLogin | undefined,
 ): Promise<void> {
 	const url = new URL(request.url ?? "/", "http://localhost");
 	if (url.pathname === "/capability-oauth/google-workspace/callback") {
@@ -146,6 +154,10 @@ async function serveRequest(
 		await serveA2a(request, response, url, a2aAdapter);
 		return;
 	}
+	if (url.pathname === "/auth/claude-subscription") {
+		serveClaudeSubscriptionLogin(request, response, claudeSubscriptionLogin);
+		return;
+	}
 	if (url.pathname === "/plugins.json" || url.pathname.startsWith("/plugins/")) {
 		await servePlugins(request, response, url, pluginManagement);
 		return;
@@ -159,8 +171,22 @@ async function serveRequest(
 			pluginManagement,
 			providerEnvironment,
 			googleWorkspaceOAuth,
+			plaidConnections,
 			token,
 		);
+		return;
+	}
+	if (url.pathname === "/capability-plaid/link") {
+		servePlaidLink(response, url);
+		return;
+	}
+	if (url.pathname === "/plaid-link-client.js") {
+		response
+			.writeHead(200, {
+				...SECURITY_HEADERS,
+				"content-type": "text/javascript; charset=utf-8",
+			})
+			.end(PLAID_LINK_CLIENT);
 		return;
 	}
 	if (url.pathname === "/capability-connections.json" || url.pathname.startsWith("/capability-connections/")) {
@@ -308,6 +334,30 @@ function serveAgentEvents(
 	});
 }
 
+function serveClaudeSubscriptionLogin(
+	request: IncomingMessage,
+	response: ServerResponse,
+	login: ClaudeSubscriptionLogin | undefined,
+): void {
+	if (!login) {
+		json(response, 503, { error: "Claude subscription login is unavailable" });
+		return;
+	}
+	if (request.method === "GET") {
+		json(response, 200, login.getStatus());
+		return;
+	}
+	if (request.method === "POST") {
+		json(response, 202, login.start());
+		return;
+	}
+	if (request.method === "DELETE") {
+		json(response, 200, login.abort());
+		return;
+	}
+	response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST, DELETE" }).end();
+}
+
 async function serveCapabilityProviders(
 	request: IncomingMessage,
 	response: ServerResponse,
@@ -316,6 +366,7 @@ async function serveCapabilityProviders(
 	plugins: PluginManagementService | undefined,
 	environment: ProviderEnvironmentStore | undefined,
 	googleOAuth: GoogleWorkspaceOAuth | undefined,
+	plaid: PlaidConnectionService | undefined,
 	capabilityToken: string,
 ): Promise<void> {
 	if (!broker) {
@@ -347,29 +398,66 @@ async function serveCapabilityProviders(
 			return;
 		}
 		if (operation === "authorize") {
-			if (!googleOAuth) throw new Error("Google Workspace authorization is unavailable");
-			if (providerId !== "google-workspace") throw new Error(`Provider ${providerId} does not support OAuth`);
 			if (request.method !== "POST") {
 				response.writeHead(405, { ...SECURITY_HEADERS, allow: "POST" }).end();
 				return;
 			}
-			const body = object(await readJsonBody(request), "Google authorization request");
+			const body = object(await readJsonBody(request), "provider authorization request");
 			const capabilities = body.capabilityIds === undefined ? [] : stringArray(body.capabilityIds, "capabilityIds");
 			const host = request.headers.host;
-			if (!host) throw new Error("Google authorization requires an HTTP host");
-			json(response, 200, googleOAuth.start(`http://${host}`, capabilities, capabilityToken));
+			if (!host) throw new Error("Provider authorization requires an HTTP host");
+			if (providerId === "google-workspace") {
+				if (!googleOAuth) throw new Error("Google Workspace authorization is unavailable");
+				json(response, 200, googleOAuth.start(`http://${host}`, capabilities, capabilityToken));
+				return;
+			}
+			if (providerId === "plaid") {
+				if (!plaid) throw new Error("Plaid authorization is unavailable");
+				const started = await plaid.startLink();
+				const authorizationUrl = new URL("/capability-plaid/link", `http://${host}`);
+				authorizationUrl.searchParams.set("token", capabilityToken);
+				authorizationUrl.searchParams.set("linkToken", started.linkToken);
+				json(response, 200, { authorizationUrl: authorizationUrl.href, expiration: started.expiration });
+				return;
+			}
+			throw new Error(`Provider ${providerId} does not support authorization`);
+		}
+		if (operation === "complete") {
+			if (providerId !== "plaid" || !plaid)
+				throw new Error(`Provider ${providerId} does not support Link completion`);
+			if (request.method !== "POST") {
+				response.writeHead(405, { ...SECURITY_HEADERS, allow: "POST" }).end();
+				return;
+			}
+			const body = object(await readJsonBody(request), "Plaid Link completion");
+			const institution = body.institution === undefined ? {} : object(body.institution, "Plaid institution");
+			json(
+				response,
+				200,
+				await plaid.completeLink(requiredString(body.publicToken, "publicToken"), {
+					id: optionalString(institution.id, "Plaid institution ID"),
+					name: optionalString(institution.name, "Plaid institution name"),
+				}),
+			);
 			return;
 		}
 		if (operation === "revoke") {
-			if (!googleOAuth) throw new Error("Google Workspace authorization is unavailable");
-			if (providerId !== "google-workspace") throw new Error(`Provider ${providerId} does not support OAuth`);
 			if (request.method !== "POST") {
 				response.writeHead(405, { ...SECURITY_HEADERS, allow: "POST" }).end();
 				return;
 			}
-			await googleOAuth.revoke();
-			json(response, 200, { revoked: true });
-			return;
+			if (providerId === "google-workspace") {
+				if (!googleOAuth) throw new Error("Google Workspace authorization is unavailable");
+				await googleOAuth.revoke();
+				json(response, 200, { revoked: true });
+				return;
+			}
+			if (providerId === "plaid") {
+				if (!plaid) throw new Error("Plaid authorization is unavailable");
+				json(response, 200, { revoked: await plaid.revokeAll() });
+				return;
+			}
+			throw new Error(`Provider ${providerId} does not support authorization revocation`);
 		}
 		if (request.method !== "POST") {
 			response.writeHead(405, { ...SECURITY_HEADERS, allow: "POST" }).end();
@@ -1788,6 +1876,50 @@ async function readJsonBody(request: IncomingMessage, maximumBytes = 64 * 1024):
 	return JSON.parse((await readBody(request, maximumBytes)).toString("utf8"));
 }
 
+function servePlaidLink(response: ServerResponse, url: URL): void {
+	const linkToken = requiredString(url.searchParams.get("linkToken"), "Plaid Link token");
+	const capabilityToken = requiredString(url.searchParams.get("token"), "Pi capability token");
+	response
+		.writeHead(200, {
+			...SECURITY_HEADERS,
+			"content-security-policy":
+				"default-src 'self'; connect-src 'self' https://*.plaid.com; img-src 'self' data: https://*.plaid.com; script-src 'self' https://cdn.plaid.com; style-src 'unsafe-inline'; frame-src https://*.plaid.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+			"content-type": "text/html; charset=utf-8",
+		})
+		.end(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect financial account</title><style>body{margin:0;display:grid;min-height:100vh;place-items:center;background:#0b0b0d;color:#f2f2f4;font:16px system-ui}.card{max-width:28rem;padding:2rem;border:1px solid #303038;border-radius:1rem;background:#18181c;text-align:center}.muted{color:#a5a5ae}</style></head>
+<body data-link-token="${escapeHtml(linkToken)}" data-capability-token="${escapeHtml(capabilityToken)}"><main class="card"><h1>Connect financial account</h1><p id="plaid-status" class="muted">Opening Plaid Link…</p></main><script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script><script src="/plaid-link-client.js?token=${escapeHtml(capabilityToken)}"></script></body></html>`);
+}
+
+const PLAID_LINK_CLIENT = `"use strict";
+(() => {
+  const status = document.getElementById("plaid-status");
+  const linkToken = document.body.dataset.linkToken;
+  const capabilityToken = document.body.dataset.capabilityToken;
+  const fail = (message) => { if (status) status.textContent = message; };
+  if (!linkToken || !capabilityToken || !window.Plaid) { fail("Plaid Link could not start."); return; }
+  const handler = window.Plaid.create({
+    token: linkToken,
+    onSuccess: async (publicToken, metadata) => {
+      fail("Securing account connection…");
+      try {
+        const response = await fetch("/capability-providers/plaid/complete?token=" + encodeURIComponent(capabilityToken), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ publicToken, institution: metadata.institution ?? {} })
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload && payload.error ? payload.error : "Connection failed");
+        fail("Financial account connected. This window will close.");
+        if (window.opener) window.opener.postMessage({ type: "pi-provider-connected", providerId: "plaid" }, location.origin);
+        window.setTimeout(() => window.close(), 600);
+      } catch (error) { fail(error instanceof Error ? error.message : "Connection failed"); }
+    },
+    onExit: (error) => { if (error) fail(error.display_message || error.error_message || "Plaid Link closed with an error"); }
+  });
+  handler.open();
+})();`;
+
 async function readBody(request: IncomingMessage, maximumBytes: number): Promise<Buffer> {
 	let length = 0;
 	const chunks: Buffer[] = [];
@@ -1896,7 +2028,7 @@ function renderPage(token: string): string {
 .thinking-activity{margin:0 0 12px;color:var(--muted)}.thinking-activity summary{display:flex;width:fit-content;align-items:center;gap:5px;cursor:pointer;font-size:12px;font-style:italic;list-style:none}.thinking-activity summary::-webkit-details-marker{display:none}.thinking-activity summary:before{content:"›";font-style:normal;transition:transform .15s}.thinking-activity[open] summary:before{transform:rotate(90deg)}.thinking-body{margin:8px 0 0 8px;padding-left:11px;border-left:2px solid var(--line);white-space:pre-wrap;font-style:italic}.thinking-dots{display:none;align-items:center;gap:3px}.thinking-activity.is-streaming .thinking-dots{display:inline-flex}.thinking-dots i{width:3px;height:3px;border-radius:50%;background:currentColor;animation:thinking-pulse 1.1s infinite ease-in-out}.thinking-dots i:nth-child(2){animation-delay:.16s}.thinking-dots i:nth-child(3){animation-delay:.32s}@keyframes thinking-pulse{0%,60%,100%{opacity:.25;transform:translateY(0)}30%{opacity:1;transform:translateY(-2px)}}
 :root{color-scheme:dark;--bg:#09090a;--panel:#101012;--surface:#1a1a1e;--surface2:#24242a;--line:#2d2d33;--text:#f2f2f3;--muted:#92929b;--pi:#7eb5f5;--danger:#ef4444;--rail-width:256px;--details-width:360px}*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{margin:0;background:var(--bg);color:var(--text);font:14px Inter,ui-sans-serif,system-ui,sans-serif;display:grid;grid-template-columns:var(--rail-width) 5px minmax(420px,1fr) 5px var(--details-width)}button,textarea,select,input{font:inherit}button{cursor:pointer}.hidden{display:none!important}.muted{color:var(--muted)}.rail,.details{position:relative;min-width:0;min-height:0;background:var(--panel);overflow:hidden}.rail{display:flex;flex-direction:column;padding:14px}.details{display:flex;flex-direction:column;padding:14px}.pi-watermark{position:absolute;z-index:0;left:-24px;bottom:-58px;color:var(--pi);font:italic 900 260px/1 "Yu Mincho","Hiragino Mincho ProN","Noto Serif JP",serif;letter-spacing:-.18em;opacity:.045;transform:rotate(-11deg) scaleX(.86);user-select:none;pointer-events:none;filter:blur(.2px)}.rail-tabs,.tabs,.builder-tabs{position:relative;z-index:1;display:flex;gap:4px;border-bottom:1px solid var(--line)}.rail-tabs{margin-bottom:12px}.rail-tabs button,.tabs button,.builder-tabs button{flex:1;background:transparent;border:0;color:var(--muted);padding:10px 7px}.rail-tabs button.active,.tabs button.active,.builder-tabs button.active{color:var(--text);border-bottom:2px solid var(--pi)}.rail-panel,.details [data-panel],.builder-panel{position:relative;z-index:1;min-height:0;overflow:auto;scrollbar-gutter:stable}.rail-panel{flex:1}.section-title{margin:18px 8px 8px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.12em}.nav-item,.card{background:color-mix(in srgb,var(--surface) 92%,transparent);border:1px solid transparent;border-radius:11px;padding:12px;margin-top:8px}.nav-item{display:block;width:100%;color:var(--text);text-align:left}.nav-item:hover{background:var(--surface2)}.nav-item.active{background:var(--surface2);border-color:#3b3b44}.nav-item:disabled{opacity:.45;cursor:not-allowed}.session-entry strong,.session-entry span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session-entry span{margin-top:4px;font-size:11px}.connection-group{margin:14px 0}.connection-heading{display:flex;align-items:center;gap:7px;padding:0 7px;color:var(--muted);font-size:11px}.connection-heading i{width:7px;height:7px;border-radius:50%;background:#43c58a}.connection-heading button{margin-left:auto;background:transparent;border:0;color:var(--muted);font-size:17px}.new-agent{color:var(--pi)}#connection-form{display:grid;gap:8px;margin:12px 0;padding:12px;border:1px solid var(--line);border-radius:11px;background:rgba(15,15,17,.75)}#connection-form label{font-size:11px;color:var(--muted)}#connection-url{width:100%;margin-top:5px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}#connection-form button,.secondary-action{border:1px solid var(--line);border-radius:8px;background:var(--surface2);color:var(--text);padding:9px}.resizer{position:relative;z-index:20;background:var(--line);cursor:col-resize;touch-action:none}.resizer:hover,.resizer.dragging{background:var(--pi)}main{display:flex;flex-direction:column;min-width:0;min-height:0;background:radial-gradient(circle at 50% 18%,rgba(126,181,245,.035),transparent 38%)}.header{min-height:59px;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid var(--line)}.session-tabs{display:flex;gap:5px;min-width:0;overflow-x:auto;scrollbar-width:none}.session-tabs::-webkit-scrollbar{display:none}.session-tab{max-width:190px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:transparent;color:var(--muted);border:1px solid transparent;border-radius:8px;padding:8px 11px}.session-tab.active{background:var(--surface);border-color:var(--line);color:var(--text)}#session-path{margin-left:auto;max-width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font:11px ui-monospace,SFMono-Regular,Consolas,monospace}#transcript{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:30px max(28px,calc((100% - 860px)/2));scrollbar-gutter:stable}.message{white-space:pre-wrap;line-height:1.65;margin:0 0 20px;padding:0;max-width:820px}.message.assistant{margin-right:auto}.message.user{width:fit-content;max-width:min(76%,720px);margin-left:auto;background:#202d3d;border:1px solid #2e4057;border-radius:18px 18px 5px 18px;padding:12px 16px}.message.tool{border:1px solid var(--line);border-radius:10px;background:rgba(20,20,23,.7);color:var(--muted);font-size:12px;padding:11px 13px}.message-label{text-transform:uppercase;letter-spacing:.1em;color:var(--pi);font-size:9px;font-weight:700;margin-bottom:7px}.message.user .message-label{display:none}.thinking{color:var(--muted);font-style:italic;border-left:2px solid var(--line);padding-left:11px}.tool-call{color:#c4a7e7}.chat-dock{padding:8px max(18px,calc((100% - 900px)/2)) 18px;background:linear-gradient(transparent,var(--bg) 18%)}.controls{display:flex;align-items:center;gap:9px;padding:4px 8px 8px;color:var(--muted);font-size:11px}.controls label{display:flex;align-items:center;gap:5px}.controls select{max-width:210px;background:transparent;color:var(--muted);border:0;padding:4px}.controls #phase{margin-left:auto;text-transform:capitalize}#composer{display:flex;align-items:flex-end;gap:8px;padding:8px;background:var(--surface);border:1px solid #3a3a42;border-radius:19px;box-shadow:0 14px 40px rgba(0,0,0,.32)}#prompt{flex:1;resize:none;min-height:44px;max-height:180px;background:transparent;color:var(--text);border:0;outline:0;padding:11px 9px;line-height:1.5;overflow-y:auto}#composer-action{flex:0 0 42px;width:42px;height:42px;display:grid;place-items:center;border:0;border-radius:50%;background:var(--text);color:var(--bg);transition:background .16s,transform .16s}#composer-action:hover{transform:scale(1.04)}#composer-action svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2.3;stroke-linecap:round;stroke-linejoin:round}#composer-action .stop-icon{display:none;width:13px;height:13px;border-radius:2px;background:white}#composer-action.is-stopping{background:var(--danger);color:white}#composer-action.is-stopping .send-icon{display:none}#composer-action.is-stopping .stop-icon{display:block}#composer-action:disabled{opacity:.35;cursor:default;transform:none}.composer-meta{display:flex;align-items:center;gap:12px;min-height:20px;padding:6px 8px 0;color:var(--muted);font:10px ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap}.composer-meta #status{min-width:0;overflow:hidden;text-overflow:ellipsis}.composer-meta #status.error{color:var(--danger)}#session-stats{margin-left:auto;overflow:hidden;text-overflow:ellipsis}.tabs{flex:0 0 auto;margin-bottom:14px}.details [data-panel]{flex:1}.card strong{display:block;margin-bottom:6px}.builder-tabs{margin:4px 0 12px}.builder-panel{max-height:calc(100vh - 120px)}#agent-form,#run-form,#external-run-form{display:grid;gap:10px}#agent-form label,#run-form label,#external-run-form label{display:grid;gap:5px;color:var(--muted);font-size:11px}#agent-form input,#agent-form textarea,#agent-form select,#run-form textarea,#run-form select,#builder-prompt,#external-run-form input,#external-run-form textarea,#external-run-form select{width:100%;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}#agent-form button,#run-form button,#builder-chat-form button,#external-run-form button{background:var(--pi);color:#07101b;border:0;border-radius:8px;padding:10px;font-weight:700}.external-warning{color:#e4ba68;font-size:11px;line-height:1.45}.external-result{white-space:pre-wrap;max-height:260px;overflow:auto;margin-top:10px;padding:10px;border:1px solid var(--line);border-radius:8px;background:#131316}.result-actions{display:flex;gap:7px}.result-actions button{flex:1;border:1px solid var(--line);border-radius:7px;background:var(--surface2);color:var(--text);padding:7px}.result-actions button.abort{color:var(--danger);border-color:var(--danger)}#builder-chat{height:calc(100vh - 310px);min-height:220px;overflow:auto;overscroll-behavior:contain;padding:4px;scrollbar-gutter:stable}#builder-chat .message{max-width:100%;margin-bottom:13px;font-size:12px}#builder-chat .message.user{padding:9px 11px}#builder-chat-form{display:grid;gap:8px;margin-top:10px}.run-card button{margin-top:8px;background:transparent;color:var(--danger);border:1px solid var(--danger);border-radius:6px;padding:5px}.run-error{color:var(--danger)}@media(max-width:1050px){:root{--rail-width:210px;--details-width:310px}}@media(max-width:820px){body{grid-template-columns:190px 4px minmax(0,1fr)}.details,.right-resizer{display:none}.left-resizer{display:block}}@media(max-width:620px){body{display:block}.rail,.resizer{display:none}main{height:100dvh}#transcript{padding:20px 16px}.header{padding:0 9px}.chat-dock{padding:6px 10px 12px}.controls,.composer-meta{overflow-x:auto}}
 #agent-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.agent-entry{display:flex;min-width:0;flex-direction:column;align-items:center;gap:7px;margin-top:0;padding:7px;text-align:center}.agent-icon{display:grid;width:100%;aspect-ratio:1;place-items:center;object-fit:cover;border-radius:8px;background:var(--surface2);color:var(--pi);font:700 34px/1 Georgia,serif}.agent-name{display:block;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}.session-row{display:flex;align-items:center;gap:6px;padding:4px}.session-row:hover{background:var(--surface2)}.session-select{min-width:0;flex:1;background:transparent;border:0;color:var(--text);text-align:left;padding:8px}.session-select.active{color:var(--pi)}.session-rename{background:transparent;border:0;color:var(--muted);font-size:10px;padding:7px 4px}.session-rename:hover{color:var(--text)}
-.external-connection-entry{display:flex;align-items:center;gap:10px;padding:9px}.external-connection-icon{width:38px;height:38px;flex:0 0 38px;padding:7px;border-radius:9px;color:#fff}.external-connection-icon[data-provider="claude-code"]{background:#d97757}.external-connection-icon[data-provider="openai"]{background:#171c1b}.external-connection-icon[data-provider="hermes"]{background:#49347a;color:#f2d58b}.external-connection-copy{min-width:0}.external-connection-entry strong,.external-connection-entry span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.external-connection-entry span{margin-top:4px;font-size:11px}
+.external-connection-entry{display:flex;align-items:center;gap:10px;padding:9px}.external-connection-icon{width:38px;height:38px;flex:0 0 38px;padding:7px;border-radius:9px;color:#fff}.external-connection-icon[data-provider="anthropic"]{background:#d97757}.external-connection-icon[data-provider="openai"]{background:#171c1b}.external-connection-icon[data-provider="hermes"]{background:#49347a;color:#f2d58b}.external-connection-copy{min-width:0}.external-connection-entry strong,.external-connection-entry span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.external-connection-entry span{margin-top:4px;font-size:11px}.external-auth-flow{margin-top:10px}.external-auth-flow p{margin:7px 0}.external-auth-actions{display:flex;gap:8px;align-items:center}.external-auth-actions a{display:inline-flex;align-items:center;min-height:34px;padding:0 12px;border:1px solid var(--accent);border-radius:8px;color:var(--accent);text-decoration:none}.external-chat-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0 16px}.external-chat-turn{margin:0 0 18px}.external-chat-user{width:fit-content;max-width:min(760px,86%);margin-left:auto;padding:12px 16px;border-radius:16px 16px 4px 16px;background:#203044}.external-chat-agent{padding:14px 0}.external-chat-state{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
 .agent-chat-composer{display:flex!important;align-items:flex-end;gap:7px;padding:7px;border:1px solid #3a3a42;border-radius:15px;background:var(--surface)}.agent-chat-composer #builder-prompt{min-height:42px;max-height:120px;resize:none;border:0;background:transparent;outline:0}.agent-chat-composer button{width:38px;height:38px;flex:0 0 38px;padding:0!important;border-radius:50%!important;font-size:22px}.agent-chat-composer button.is-stopping{background:var(--danger)!important;color:#fff!important;font-size:12px}
 .themed-select{display:inline-block;min-width:0;width:100%}.themed-select-trigger{position:relative;width:100%;min-width:0;padding:8px 28px 8px 10px;border:1px solid var(--line);border-radius:8px;background:#131316;color:var(--text);overflow:hidden;text-align:left;text-overflow:ellipsis;white-space:nowrap}.themed-select-trigger:after{position:absolute;right:10px;top:50%;width:6px;height:6px;border-right:1px solid var(--muted);border-bottom:1px solid var(--muted);content:"";transform:translateY(-70%) rotate(45deg)}.themed-select-trigger:focus-visible{outline:2px solid var(--pi);outline-offset:1px}.themed-select-list{position:fixed;z-index:1000;overflow:auto;padding:6px;border:1px solid #3a3a42;border-radius:10px;background:#111114;box-shadow:0 18px 50px rgba(0,0,0,.65);scrollbar-color:#44444d #111114}.themed-select-option{display:block;width:100%;padding:9px 10px;border:0;border-radius:6px;background:transparent;color:var(--text);overflow:hidden;text-align:left;text-overflow:ellipsis;white-space:nowrap}.themed-select-option:hover,.themed-select-option:focus-visible{background:var(--surface2);outline:0}.themed-select-option[aria-selected="true"]{background:#20344b;color:#cfe5ff}.themed-select-option:disabled{opacity:.4}.controls .themed-select{width:210px}.controls label{min-width:0}
 .pi-watermark{font-size:650px}
