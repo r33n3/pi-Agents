@@ -114,6 +114,9 @@ describe("createServePage", () => {
 					name: "OpenAI Agent",
 					description: "Separate SDK agent",
 					inputLabel: "Task",
+					provider: "openai",
+					authentication: "api-key",
+					billing: "usage-based",
 					available: true,
 					defaultModel: { provider: "openai", id: "gpt-5.6-luna" },
 					models: [{ provider: "openai", id: "gpt-5.6-luna", name: "GPT-5.6 Luna" }],
@@ -322,7 +325,9 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("OAuth configured \\xB7 account not connected");
 		expect(bundleText).toContain("Account not connected");
 		expect(bundleText).toContain("Access not granted");
-		expect(bundleText).toContain("Google access to request");
+		expect(bundleText).toContain("Financial data");
+		expect(bundleText).toContain("Google access");
+		expect(bundleText).toContain("to request");
 		expect(bundleText).toContain("supported");
 		expect(bundleText).toContain("Needs attention");
 		expect(bundleText).toContain("agent-capability-summary");
@@ -342,6 +347,19 @@ describe("createServePage", () => {
 		expect(bundleText).not.toContain("Ask Pi or an agent to open a permitted URL.");
 		expect(bundleText).not.toContain("Could not load browser diagnostics");
 		expect(bundleText).toContain("Send to Pi");
+	});
+
+	test("serves the authenticated Plaid Link host without exposing it anonymously", async () => {
+		expect((await fetch(`${origin}/capability-plaid/link?linkToken=link-sandbox`)).status).toBe(403);
+		const page = await fetch(
+			`${origin}/capability-plaid/link?token=secret-token&linkToken=${encodeURIComponent("link-sandbox")}`,
+		);
+		expect(page.status).toBe(200);
+		expect(page.headers.get("content-security-policy")).toContain("https://cdn.plaid.com");
+		const html = await page.text();
+		expect(html).toContain('data-link-token="link-sandbox"');
+		expect(html).toContain("/plaid-link-client.js?token=secret-token");
+		expect((await fetch(`${origin}/plaid-link-client.js?token=secret-token`)).status).toBe(200);
 	});
 
 	test("creates and removes everyday configurations through authenticated controls", async () => {

@@ -13,7 +13,7 @@ export interface ProviderEnvironmentUpdate {
 
 export interface ProviderEnvironmentStatus {
 	providerId: string;
-	kind: "environment" | "oauth2";
+	kind: "environment" | "oauth2" | "plaid-link";
 	configured: boolean;
 	fields: Array<ProviderConfigurationField & { configured: boolean; value?: string }>;
 }
@@ -257,6 +257,9 @@ function validateValue(field: ProviderConfigurationField, value: string): string
 		if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
 			throw new Error(`${field.env} must be an HTTP(S) URL without embedded credentials`);
 		}
+	}
+	if (field.options && normalized !== "" && !field.options.some((option) => option.value === normalized)) {
+		throw new Error(`${field.env} must be one of: ${field.options.map((option) => option.value).join(", ")}`);
 	}
 	return normalized;
 }

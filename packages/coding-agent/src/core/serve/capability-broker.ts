@@ -49,11 +49,12 @@ export interface ProviderConfigurationField {
 	required: boolean;
 	secret: boolean;
 	format?: "text" | "url";
+	options?: Array<{ value: string; label: string }>;
 	operatorEditable?: boolean;
 }
 
 export interface ProviderAuthenticationManifest {
-	kind: "environment" | "oauth2";
+	kind: "environment" | "oauth2" | "plaid-link";
 	fields: ProviderConfigurationField[];
 	capabilityGroups?: ProviderCapabilityGroup[];
 	defaultCapabilityIds?: string[];
@@ -72,12 +73,14 @@ export interface CapabilityProviderManifest {
 	version: string;
 	permissions: string[];
 	connectionRequired?: boolean;
+	/** Authentication/configuration used by a connector that does not project agent tools. */
+	configurationOnly?: boolean;
 	authentication?: ProviderAuthenticationManifest;
 	bindings: CapabilityProviderBinding[];
 }
 
 export interface ProviderAuthenticationView {
-	kind: "environment" | "oauth2";
+	kind: "environment" | "oauth2" | "plaid-link";
 	configured: boolean;
 	fields: Array<ProviderConfigurationField & { configured: boolean; value?: string }>;
 	capabilityGroups?: ProviderCapabilityGroup[];
@@ -221,6 +224,32 @@ const WAVE_ONE_DEFINITIONS: readonly CapabilityDefinition[] = [
 ];
 
 const WAVE_ONE_MANIFESTS: readonly CapabilityProviderManifest[] = [
+	{
+		id: "anthropic-api",
+		name: "Anthropic API",
+		source: "builtin:anthropic-api",
+		version: "1",
+		permissions: ["usage-based Anthropic model access"],
+		configurationOnly: true,
+		authentication: {
+			kind: "environment",
+			fields: [{ env: "ANTHROPIC_API_KEY", label: "Anthropic API key", required: true, secret: true }],
+		},
+		bindings: [],
+	},
+	{
+		id: "openai-api",
+		name: "OpenAI API",
+		source: "builtin:openai-api",
+		version: "1",
+		permissions: ["usage-based OpenAI model access"],
+		configurationOnly: true,
+		authentication: {
+			kind: "environment",
+			fields: [{ env: "OPENAI_API_KEY", label: "OpenAI API key", required: true, secret: true }],
+		},
+		bindings: [],
+	},
 	{
 		id: "pi-searxng",
 		name: "SearXNG",
@@ -392,7 +421,7 @@ const WAVE_TWO_DEFINITIONS: readonly CapabilityDefinition[] = [
 	...readDefinitions("feeds", ["read"]),
 	...readDefinitions("sites", ["monitor"]),
 	...readDefinitions("events", ["search"]),
-	...readDefinitions("finance", ["quotes", "filings", "watchlist"]),
+	...readDefinitions("finance", ["quotes", "filings", "watchlist", "accounts", "transactions", "spending"]),
 ];
 
 const WAVE_TWO_MANIFESTS: readonly CapabilityProviderManifest[] = [
@@ -432,6 +461,66 @@ const WAVE_TWO_MANIFESTS: readonly CapabilityProviderManifest[] = [
 	productivityManifest("slack", "Slack", "slack", ["messaging"]),
 	productivityManifest("microsoft-teams", "Microsoft Teams", "microsoft_teams", ["messaging"]),
 	productivityManifest("telegram", "Telegram", "telegram", ["messaging"]),
+	{
+		id: "plaid",
+		name: "Plaid Financial Accounts",
+		source: "connector:plaid",
+		version: "1",
+		permissions: ["read financial account metadata", "read balances", "read transactions"],
+		connectionRequired: true,
+		authentication: {
+			kind: "plaid-link",
+			defaultCapabilityIds: ["finance.accounts", "finance.transactions", "finance.spending"],
+			capabilityGroups: [
+				{
+					id: "financial-data",
+					label: "Financial data",
+					capabilityIds: ["finance.accounts", "finance.transactions", "finance.spending"],
+				},
+			],
+			fields: [
+				{ env: "PLAID_CLIENT_ID", label: "Plaid client ID", required: true, secret: false },
+				{ env: "PLAID_SECRET", label: "Plaid secret", required: true, secret: true },
+				{
+					env: "PLAID_ENV",
+					label: "Plaid environment",
+					required: true,
+					secret: false,
+					options: [
+						{ value: "sandbox", label: "Sandbox (test data)" },
+						{ value: "production", label: "Production (live accounts)" },
+					],
+				},
+				{
+					env: "PLAID_ITEMS_JSON",
+					label: "Plaid Item credentials",
+					required: false,
+					secret: true,
+					operatorEditable: false,
+				},
+			],
+		},
+		bindings: [
+			{
+				capabilityId: "finance.accounts",
+				capabilityVersion: 1,
+				toolName: "plaid_finance_accounts_list",
+				executors: ["session", "harness"],
+			},
+			{
+				capabilityId: "finance.transactions",
+				capabilityVersion: 1,
+				toolName: "plaid_finance_transactions_search",
+				executors: ["session", "harness"],
+			},
+			{
+				capabilityId: "finance.spending",
+				capabilityVersion: 1,
+				toolName: "plaid_finance_spending_summary",
+				executors: ["session", "harness"],
+			},
+		],
+	},
 ];
 
 /** Owns canonical capability grants, provider trust, defaults, and execution projection. */
@@ -698,18 +787,24 @@ export class CapabilityBroker {
 		);
 		const missingTools = [
 			...new Set(
-				requiredTools.length === 0 && !passiveLoaded
+				requiredTools.length === 0 && !passiveLoaded && manifest.configurationOnly !== true
 					? [`provider:${manifest.source}`]
 					: requiredTools.filter((toolName) => !activeTools.has(toolName)),
 			),
 		];
+		const configurationReady =
+			manifest.configurationOnly === true &&
+			(manifest.authentication?.fields ?? [])
+				.filter((field) => field.required)
+				.every((field) => Boolean(this.#environmentValue(field.env)?.trim()));
 		return {
 			...manifest,
 			digest: manifestDigest(manifest),
 			trust: state.trust,
 			enabled: state.enabled,
-			health:
-				requiredTools.length === 0
+			health: configurationReady
+				? "ready"
+				: requiredTools.length === 0
 					? passiveLoaded
 						? "passive"
 						: "missing-tools"

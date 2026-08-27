@@ -13,9 +13,13 @@ export interface ExternalConnectionModel extends ModelRef {
 
 export interface ExternalConnectionDefinition {
 	id: string;
+	aliases?: string[];
 	name: string;
 	description: string;
 	inputLabel: "Task" | "Goal";
+	provider: "anthropic" | "openai" | "hermes";
+	authentication: "subscription" | "api-key" | "configured";
+	billing: "subscription" | "usage-based" | "configured";
 	available: boolean;
 	warning?: string;
 	defaultModel: ModelRef;
@@ -58,6 +62,7 @@ interface ActiveRun {
 /** Owns asynchronous external delegations and their durable result artifacts. */
 export class ExternalConnectionManager implements AsyncDisposable {
 	readonly #connections: ReadonlyMap<string, ExternalConnectionDefinition>;
+	readonly #connectionAliases: ReadonlyMap<string, string>;
 	readonly #executionFactory: ExternalConnectionExecutionFactory;
 	readonly #artifactsRoot: string;
 	readonly #defaultCwd: string;
@@ -73,6 +78,11 @@ export class ExternalConnectionManager implements AsyncDisposable {
 		defaultCwd: string,
 	) {
 		this.#connections = new Map(connections.map((connection) => [connection.id, connection]));
+		this.#connectionAliases = new Map(
+			connections.flatMap((connection) =>
+				(connection.aliases ?? []).map((alias) => [alias, connection.id] as const),
+			),
+		);
 		this.#executionFactory = executionFactory;
 		this.#artifactsRoot = resolve(artifactsRoot);
 		this.#defaultCwd = resolve(defaultCwd);
@@ -130,7 +140,8 @@ export class ExternalConnectionManager implements AsyncDisposable {
 	}): Promise<ExternalConnectionRunRecord> {
 		return this.#queue.run(async () => {
 			if (this.#disposed) throw new Error("External connection manager is disposed");
-			const connection = this.#connections.get(input.connectionId);
+			const connectionId = this.#connectionAliases.get(input.connectionId) ?? input.connectionId;
+			const connection = this.#connections.get(connectionId);
 			if (!connection) throw new Error(`External connection ${input.connectionId} was not found`);
 			if (!connection.available) throw new Error(`${connection.name} is unavailable in this Pi process`);
 			const prompt = input.prompt.trim();
