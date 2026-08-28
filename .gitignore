@@ -46,4 +46,22 @@ todo.md
 plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
+
+# Local Pi agents and runtime state. Keep shared extensions, prompts, and skills tracked.
+.pi/agents/
+.pi/agents-runs/
+.pi/agents-schedules/
+.pi/memory/
+.pi/personas/
+.pi/serve/
+.pi/sessions/
+.pi/auth.json
+.pi/models.json
+.pi/models-store.json
+.pi/settings.json
+.pi/trust.json
+.pi/mantle-token.py
+
+# Local task scratch files
+.tmp_*
 collect.sh

@@ -203,4 +203,20 @@ describe("BrowserWorkflowRegistry", () => {
 		await restored.initialize();
 		expect(restored.get(saved.id)).toBeUndefined();
 	});
+
+	test("deletes every persisted version and remains deleted after restart", async () => {
+		const root = await registryRoot();
+		const registry = new BrowserWorkflowRegistry(root);
+		await registry.initialize();
+		const first = await registry.saveDraft(workflow());
+		await registry.saveDraft({ ...workflow(), description: "Second version" });
+
+		await expect(registry.delete(first.id)).resolves.toBe(true);
+		expect(registry.get(first.id)).toBeUndefined();
+		await expect(registry.delete(first.id)).resolves.toBe(false);
+
+		const restored = new BrowserWorkflowRegistry(root);
+		await restored.initialize();
+		expect(restored.get(first.id)).toBeUndefined();
+	});
 });

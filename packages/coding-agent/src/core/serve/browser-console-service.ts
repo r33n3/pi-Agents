@@ -174,6 +174,11 @@ export class BrowserConsoleService {
 		return this.#workflowRegistry.activate(id, version);
 	}
 
+	deleteWorkflow(id: string): Promise<boolean> {
+		if (!this.#workflowRegistry) throw new Error("Browser workflow registry is unavailable");
+		return this.#workflowRegistry.delete(id);
+	}
+
 	executeWorkflow(
 		id: string,
 		version: number,

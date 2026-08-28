@@ -7,6 +7,8 @@ import type {
 	TranscriptItem,
 } from "@earendil-works/pi-protocol";
 import { createBrowserId } from "./browser-id.ts";
+import { getSessionCostPresentation } from "./model-pricing.ts";
+import { filterPresentedModels } from "./model-visibility.ts";
 import { installThemedSelect } from "./themed-select.ts";
 import { selectTranscriptWindow } from "./transcript-window.ts";
 import { createBrowserWebSocketTransport } from "./websocket-transport.ts";
@@ -20,13 +22,17 @@ document.body.classList.toggle("browser-popout", browserPopoutMode);
 if (browserPopoutMode) document.title = "Pi Browser";
 
 const status = element("status");
-const sessionPath = element("session-path");
+const sessionPath = requiredElement<HTMLButtonElement>("session-path");
+const sessionPathForm = requiredElement<HTMLFormElement>("session-path-form");
+const sessionPathInput = requiredElement<HTMLInputElement>("session-path-input");
+const sessionPathCancel = requiredElement<HTMLButtonElement>("session-path-cancel");
 const sessionStats = element("session-stats");
 const transcript = element("transcript");
 const form = requiredElement<HTMLFormElement>("composer");
 const input = requiredElement<HTMLTextAreaElement>("prompt");
 const send = requiredElement<HTMLButtonElement>("composer-action");
 const mobilePanelNone = requiredElement<HTMLInputElement>("mobile-panel-none");
+const mobilePanelRight = requiredElement<HTMLInputElement>("mobile-panel-right");
 const attachmentInput = requiredElement<HTMLInputElement>("attachment-input");
 const attachmentButton = requiredElement<HTMLButtonElement>("attachment-button");
 const attachmentList = element("attachment-list");
@@ -42,7 +48,8 @@ const agentForm = requiredElement<HTMLFormElement>("agent-form");
 const selectedAgentPanel = element("selected-agent");
 const selectedAgentTitle = element("selected-agent-title");
 const selectedAgentMeta = element("selected-agent-meta");
-const agentTaskList = element("agent-task-list");
+const agentActivityList = element("agent-activity-list");
+selectedAgentPanel.querySelector(".agent-run-history")?.remove();
 const routineList = element("routine-list");
 const routineEditor = createRoutineEditor();
 const workflowList = element("workflow-list");
@@ -79,6 +86,9 @@ const settingsSecurityList = element("settings-security-list");
 const settingsAdvancedConnections = element("settings-advanced-connections");
 const settingsPluginManagement = element("settings-plugin-management");
 const externalConnectionList = element("external-connection-list");
+const delegationPanelHost = element("delegation-panel-host");
+const delegationPanel = externalConnectionList.closest("details");
+if (delegationPanel) delegationPanelHost.append(delegationPanel);
 const claudeAuthFlow = createClaudeAuthFlow();
 const externalRunForm = requiredElement<HTMLFormElement>("external-run-form");
 const externalRunList = element("external-run-list");
@@ -131,11 +141,11 @@ let activeSidebarAgent: AgentSummary | undefined;
 let activeTargetKey: string | undefined;
 let activeAgentId: string | undefined;
 let activeSubagentKey: string | undefined;
-let activeExternalRunId = localStorage.getItem("pi-serve-active-external-run") ?? undefined;
+let activeExternalRunId = localStorage.getItem("pi-serve-active-external-run-v2") ?? undefined;
 let activeExternalConnectionId = localStorage.getItem("pi-serve-active-external-connection") ?? undefined;
 const openAgentIds: string[] = [];
 const openSubagentKeys: string[] = [];
-const openExternalRunIds = readStoredStringArray("pi-serve-external-run-tabs");
+const openExternalRunIds = readStoredStringArray("pi-serve-external-run-tabs-v2");
 const openExternalConnectionIds = readStoredStringArray("pi-serve-external-connection-tabs");
 const externalResultByRunId = new Map<string, string>();
 const subagentActivityByKey = new Map<string, SubagentActivity>();
@@ -157,6 +167,7 @@ let recordedBrowserWorkflows: BrowserWorkflowSummary[] = [];
 let browserWorkflowRuns: BrowserWorkflowRunSummary[] = [];
 let lastBrowserWorkflowLoadAt = 0;
 const browserWorkflowReviews = new Map<string, BrowserWorkflowReview>();
+const browserWorkflowActionStates = new Map<string, { status: "running" | "completed" | "failed"; message: string }>();
 let selectedExternalConnectionId: string | undefined;
 let externalRuns: ExternalRunSummary[] = [];
 let renderedExternalRunSignature = "";
@@ -387,6 +398,10 @@ interface ExternalRunSummary {
 	model: { provider: string; id: string };
 	status: string;
 	createdAt: number;
+	startedAt?: number;
+	phase?: string;
+	progress?: string;
+	lastActivityAt?: number;
 	error?: string;
 }
 
@@ -1259,10 +1274,13 @@ function createBrowserProfilePanel(): HTMLElement {
 	const details = document.createElement("details");
 	details.className = "card browser-profiles";
 	const summary = document.createElement("summary");
-	summary.textContent = "Named browser profiles";
-	summary.title = "Dedicated Pi sign-in profiles; one live session may use each profile";
+	summary.textContent = "Signed-in profiles";
+	summary.title = "Optional saved login state for browser workflows that access authenticated sites";
+	const description = document.createElement("p");
+	description.className = "muted browser-profile-description";
+	description.textContent = "Optional. Use a named profile only when a workflow must stay signed in to a site.";
 	const list = document.createElement("div");
-	details.append(summary, list);
+	details.append(summary, description, list);
 	browserPanel.append(details);
 	details.addEventListener("toggle", () => {
 		if (details.open) void loadBrowserProfiles().catch((error: unknown) => setPreviewMessage(String(error), true));
@@ -1679,6 +1697,89 @@ function setStatus(message: string, error = false): void {
 	status.classList.toggle("error", error);
 }
 
+function setSessionPath(path: string, editable: boolean): void {
+	sessionPath.textContent = path ? formatWorkingDirectory(path) : "No workspace";
+	sessionPath.title = editable ? `Change target folder · ${path}` : path;
+	sessionPath.dataset.path = path;
+	sessionPath.disabled = !editable;
+	sessionPath.setAttribute("aria-label", editable ? `Change target folder from ${path}` : `Workspace ${path}`);
+	if (!editable) closeSessionPathEditor();
+}
+
+function closeSessionPathEditor(): void {
+	sessionPathForm.classList.add("hidden");
+	sessionPath.classList.remove("hidden");
+}
+
+function openSessionPathEditor(): void {
+	if (sessionPath.disabled) return;
+	sessionPathInput.value = sessionPath.dataset.path ?? "";
+	sessionPath.classList.add("hidden");
+	sessionPathForm.classList.remove("hidden");
+	sessionPathInput.focus();
+	sessionPathInput.select();
+}
+
+async function saveTargetPath(path: string): Promise<void> {
+	const projectRoot = path.trim();
+	if (!projectRoot) throw new Error("Enter a target directory");
+	if (activeExternalConnectionId) {
+		if (
+			externalRuns.some(
+				(run) =>
+					run.connectionId === activeExternalConnectionId &&
+					(run.status === "starting" || run.status === "running"),
+			)
+		)
+			throw new Error("Wait for the delegated response to finish");
+		requiredElement<HTMLInputElement>("external-cwd").value = projectRoot;
+		localStorage.setItem(`pi-serve-external-cwd:${activeExternalConnectionId}`, projectRoot);
+		const connection = externalConnections.find((entry) => entry.id === activeExternalConnectionId);
+		if (connection) renderExternalConversation(connection);
+		closeSessionPathEditor();
+		setStatus(`Next delegated request: ${formatWorkingDirectory(projectRoot)}`);
+		return;
+	}
+	const agent = agents.find((entry) => entry.id === activeAgentId);
+	if (!agent) throw new Error("The selected agent is unavailable");
+	if (agent.source !== "managed") throw new Error("Markdown catalog agents must be edited in their source file");
+	if (agentTasksByAgent.get(agent.id)?.some((task) => task.status === "queued" || task.status === "running"))
+		throw new Error("Wait for the agent task to finish");
+	if (!capabilityToken) throw new Error("The capability token is missing");
+	const response = await fetch(
+		`/agents/${encodeURIComponent(agent.id)}?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				personaId: agent.personaId,
+				name: agent.name,
+				description: agent.description,
+				projectRoot,
+				tools: agent.tools,
+				capabilities: agent.capabilities,
+				memory: agent.memory,
+				persona: agent.persona,
+				executor: agent.executor,
+				permissionPolicy: agent.permissionPolicy,
+				model: agent.model,
+				thinking: agent.thinking,
+				delegateAgentIds: agent.delegateAgentIds,
+				a2a: agent.a2a,
+				browser: agent.browser,
+				browserWorkflows: agent.browserWorkflows,
+				schedules: agent.schedules,
+			}),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not update agent target directory"));
+	closeSessionPathEditor();
+	await loadAgents();
+	const updated = agents.find((entry) => entry.id === agent.id);
+	if (updated && activeAgentId === updated.id) await openAgent(updated);
+	setStatus(`Agent target: ${formatWorkingDirectory(projectRoot)}`);
+}
+
 function setBusy(snapshot: SessionSnapshot): void {
 	const busy = snapshot.phase !== "idle";
 	send.disabled = false;
@@ -1715,14 +1816,14 @@ function render(snapshot: SessionSnapshot): void {
 		window.hiddenCount > 0 ? renderEarlierMessages(snapshot, window.hiddenCount, window.visibleCount) : [];
 	transcript.replaceChildren(...earlier, ...window.items.map(renderItem));
 	setBusy(snapshot);
+	replacePrimaryModelOptions(availableModels);
 	model.value = `${snapshot.model.provider}/${snapshot.model.id}`;
 	modelPicker.refresh();
 	thinking.value = snapshot.thinkingLevel;
 	input.disabled = false;
 	input.placeholder = "Message Pi…";
 	input.setAttribute("aria-label", "Message Pi");
-	sessionPath.textContent = formatWorkingDirectory(snapshot.cwd);
-	sessionPath.title = snapshot.cwd;
+	setSessionPath(snapshot.cwd, false);
 	renderSessionStats(snapshot);
 	transcript.scrollTop = nearBottom ? transcript.scrollHeight : previousScrollTop;
 }
@@ -1730,8 +1831,32 @@ function render(snapshot: SessionSnapshot): void {
 function renderBuilderConversation(snapshot: SessionSnapshot): void {
 	if (!builderActive) return;
 	const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
-	transcript.replaceChildren(...snapshot.transcript.map(renderItem));
+	const guide = document.createElement("section");
+	guide.className = "builder-guide";
+	const heading = document.createElement("div");
+	heading.className = "builder-guide-heading";
+	const title = document.createElement("strong");
+	title.textContent = activeSidebarAgent ? `Refine ${activeSidebarAgent.name}` : "Build an agent";
+	const advanced = document.createElement("button");
+	advanced.type = "button";
+	advanced.className = "secondary-action";
+	advanced.textContent = "Advanced configuration";
+	advanced.title = "Review and edit the generated agent configuration";
+	advanced.addEventListener("click", () => {
+		activateTab("agent-builder");
+		mobilePanelRight.checked = true;
+	});
+	heading.append(title, advanced);
+	const guidance = document.createElement("p");
+	guidance.className = "muted";
+	guidance.textContent =
+		snapshot.transcript.length === 0
+			? "Describe the outcome, working folder, and access the agent needs. Agent Builder will ask for anything missing."
+			: "Continue refining the agent here, or review the generated settings.";
+	guide.append(heading, guidance);
+	transcript.replaceChildren(guide, ...snapshot.transcript.map(renderItem));
 	setBusy(snapshot);
+	replacePrimaryModelOptions(availableModels);
 	model.value = `${snapshot.model.provider}/${snapshot.model.id}`;
 	modelPicker.refresh();
 	thinking.value = snapshot.thinkingLevel;
@@ -1743,8 +1868,7 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 	attachmentButton.title = "Agent Builder attachments are not available yet";
 	attachmentList.replaceChildren();
 	const projectRoot = requiredElement<HTMLInputElement>("agent-project-root").value;
-	sessionPath.textContent = projectRoot ? formatWorkingDirectory(projectRoot) : "Agent Builder";
-	sessionPath.title = projectRoot;
+	setSessionPath(projectRoot || "Agent Builder", false);
 	renderSessionStats(snapshot);
 	setStatus(projectRoot || "Configure and deploy a local agent");
 	if (nearBottom) transcript.scrollTop = transcript.scrollHeight;
@@ -1753,7 +1877,8 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 
 function renderExternalRun(run: ExternalRunSummary): void {
 	if (activeExternalRunId !== run.id) return;
-	const renderSignature = `${run.id}:${run.status}:${run.error ?? ""}:${externalResultByRunId.get(run.id) ?? ""}`;
+	const elapsedBucket = run.status === "starting" || run.status === "running" ? Math.floor(Date.now() / 5_000) : 0;
+	const renderSignature = `${run.id}:${run.status}:${run.progress ?? ""}:${run.lastActivityAt ?? 0}:${elapsedBucket}:${run.error ?? ""}:${externalResultByRunId.get(run.id) ?? ""}`;
 	if (renderSignature === renderedExternalRunSignature) return;
 	renderedExternalRunSignature = renderSignature;
 	const connection = externalConnections.find((entry) => entry.id === run.connectionId);
@@ -1780,7 +1905,7 @@ function renderExternalRun(run: ExternalRunSummary): void {
 	} else {
 		const progress = document.createElement("div");
 		progress.className = "agent-running";
-		progress.append(document.createElement("i"), document.createTextNode(`${externalRunStatusLabel(run.status)}…`));
+		progress.append(document.createElement("i"), document.createTextNode(externalRunProgressLabel(run)));
 		body.append(progress);
 	}
 
@@ -1817,14 +1942,15 @@ function renderExternalRun(run: ExternalRunSummary): void {
 	input.value = "";
 	input.placeholder = "Delegated run output";
 	send.disabled = true;
+	replacePrimaryModelOptions(connection?.models ?? availableModels);
+	model.value = `${run.model.provider}/${run.model.id}`;
 	model.disabled = true;
 	modelPicker.refresh();
 	thinking.disabled = true;
 	attachmentButton.disabled = true;
 	attachmentInput.disabled = true;
 	attachmentList.replaceChildren();
-	sessionPath.textContent = formatWorkingDirectory(run.cwd);
-	sessionPath.title = run.cwd;
+	setSessionPath(run.cwd, false);
 	sessionStats.textContent = `${run.model.provider}/${run.model.id}`;
 	sessionStats.title = "Delegated model";
 	setStatus(`${connection?.name ?? run.connectionId} · ${externalRunStatusLabel(run.status)}`);
@@ -1836,6 +1962,14 @@ function renderExternalConversation(connection: ExternalConnectionSummary): void
 	const runs = externalRuns
 		.filter((run) => run.connectionId === connection.id)
 		.sort((left, right) => left.createdAt - right.createdAt);
+	const configuredCwd = requiredElement<HTMLInputElement>("external-cwd");
+	if (!configuredCwd.value) {
+		configuredCwd.value =
+			localStorage.getItem(`pi-serve-external-cwd:${connection.id}`) ??
+			runs.at(-1)?.cwd ??
+			session?.snapshot?.cwd ??
+			"";
+	}
 	const heading = document.createElement("section");
 	heading.className = "external-chat-heading";
 	const title = document.createElement("strong");
@@ -1861,10 +1995,7 @@ function renderExternalConversation(connection: ExternalConnectionSummary): void
 		else {
 			const progress = document.createElement("div");
 			progress.className = "agent-running";
-			progress.append(
-				document.createElement("i"),
-				document.createTextNode(`${externalRunStatusLabel(run.status)}…`),
-			);
+			progress.append(document.createElement("i"), document.createTextNode(externalRunProgressLabel(run)));
 			agent.append(progress);
 		}
 		const actions = document.createElement("div");
@@ -1889,22 +2020,28 @@ function renderExternalConversation(connection: ExternalConnectionSummary): void
 	input.disabled = false;
 	input.placeholder = `Message ${connection.name}…`;
 	input.setAttribute("aria-label", `Message ${connection.name}`);
+	resizeComposer();
 	send.disabled = false;
 	send.classList.toggle("is-stopping", activeRun !== undefined);
 	send.setAttribute("aria-label", activeRun ? "Stop delegated response" : "Send message");
-	const delegatedModel = `${connection.defaultModel.provider}/${connection.defaultModel.id}`;
-	if (Array.from(model.options).some((option) => option.value === delegatedModel)) {
-		model.value = delegatedModel;
-		modelPicker.refresh();
-	}
-	model.disabled = true;
+	const storedModel = localStorage.getItem(`pi-serve-external-model:${connection.id}`);
+	const currentModel = storedModel ?? model.value;
+	const currentModelIsSupported = connection.models.some((entry) => `${entry.provider}/${entry.id}` === currentModel);
+	const delegatedModel =
+		activeRun?.model ??
+		(currentModelIsSupported ? modelRefFromValue(currentModel) : undefined) ??
+		runs.at(-1)?.model ??
+		connection.defaultModel;
+	replacePrimaryModelOptions(connection.models);
+	model.value = `${delegatedModel.provider}/${delegatedModel.id}`;
+	model.disabled = activeRun !== undefined || connection.models.length < 2;
+	modelPicker.refresh();
 	thinking.disabled = true;
 	attachmentButton.disabled = true;
 	attachmentInput.disabled = true;
 	attachmentList.replaceChildren();
-	const cwd = runs.at(-1)?.cwd ?? requiredElement<HTMLInputElement>("external-cwd").value;
-	sessionPath.textContent = cwd ? formatWorkingDirectory(cwd) : "Delegated session";
-	sessionPath.title = cwd;
+	const cwd = configuredCwd.value || runs.at(-1)?.cwd;
+	setSessionPath(cwd || "Delegated session", activeRun === undefined);
 	sessionStats.textContent = `${connection.defaultModel.provider}/${connection.defaultModel.id}`;
 	sessionStats.title = "Delegated model";
 	setStatus(`${connection.name} · ${activeRun ? externalRunStatusLabel(activeRun.status) : "Ready"}`);
@@ -1916,6 +2053,20 @@ function externalRunStatusLabel(value: string): string {
 	if (value === "aborted") return "Stopped";
 	if (value === "starting") return "Starting";
 	return "Running";
+}
+
+function externalRunProgressLabel(run: ExternalRunSummary): string {
+	if (run.status !== "starting" && run.status !== "running") return externalRunStatusLabel(run.status);
+	const elapsed = Math.max(0, Math.floor((Date.now() - (run.startedAt ?? run.createdAt)) / 1000));
+	const activity = run.progress ? run.progress.replaceAll("_", " ") : externalRunStatusLabel(run.status);
+	return `${activity} · ${formatElapsed(elapsed)}`;
+}
+
+function formatElapsed(totalSeconds: number): string {
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
 }
 
 async function loadExternalResultIntoTab(run: ExternalRunSummary): Promise<void> {
@@ -1989,13 +2140,20 @@ function renderSessionStats(snapshot: SessionSnapshot): void {
 			);
 		}
 	}
-	if (totals.cost)
-		appendStat("$", totals.cost.toFixed(3), "Estimated session cost in US dollars", "session-stat-cost");
-	const children: HTMLElement[] = [];
-	if (totalsLabel.childElementCount > 0) children.push(totalsLabel);
 	const currentModel = availableModels.find(
 		(entry) => entry.provider === snapshot.model.provider && entry.id === snapshot.model.id,
 	);
+	const costPresentation = getSessionCostPresentation(
+		snapshot.model.provider,
+		currentModel?.cost,
+		totals.cost,
+		totals.input + totals.output + totals.cacheRead + totals.cacheWrite > 0,
+	);
+	if (costPresentation) {
+		appendStat("$", costPresentation.value, costPresentation.title, "session-stat-cost");
+	}
+	const children: HTMLElement[] = [];
+	if (totalsLabel.childElementCount > 0) children.push(totalsLabel);
 	if (currentModel) {
 		const contextTokens = latestAssistantUsage
 			? latestAssistantUsage.totalTokens ||
@@ -2059,7 +2217,17 @@ function renderItem(item: TranscriptItem): HTMLElement {
 			appendText(article, `Using ${content.toolName}`, "tool-call");
 		} else if (content.type === "image") appendText(article, `[image: ${content.mimeType}]`);
 	}
+	if (item.role === "assistant" && (item.status === "error" || item.status === "aborted") && item.errorMessage) {
+		appendText(article, friendlyAssistantError(item.errorMessage), "run-error");
+	}
 	return article;
+}
+
+function friendlyAssistantError(message: string): string {
+	if (/no credits remaining/i.test(message)) {
+		return "OpenAI API credits are exhausted. Add API credits, choose another configured API model, or use the Codex ChatGPT subscription connection under Agents.";
+	}
+	return message;
 }
 
 function renderThinkingActivity(
@@ -2302,22 +2470,16 @@ function appendText(parent: HTMLElement, text: string, className?: string): void
 }
 
 function populateModels(models: readonly ModelMetadata[], includeAgentModels = false): void {
-	availableModels = [...models];
-	const options = models.map((entry) => {
-		const option = document.createElement("option");
-		option.value = `${entry.provider}/${entry.id}`;
-		option.textContent = `${entry.provider} / ${entry.name}`;
-		return option;
-	});
-	model.replaceChildren(...options);
-	modelPicker.refresh();
+	const presentedModels = filterPresentedModels(models);
+	availableModels = presentedModels;
+	replacePrimaryModelOptions(presentedModels);
 	if (!includeAgentModels) return;
 	const inherit = document.createElement("option");
 	inherit.value = "";
 	inherit.textContent = "Inherit current session";
 	agentModel.replaceChildren(
 		inherit,
-		...models.map((entry) => {
+		...presentedModels.map((entry) => {
 			const option = document.createElement("option");
 			option.value = `${entry.provider}/${entry.id}`;
 			const recommended = entry.provider === recommendedAgentModel.provider && entry.id === recommendedAgentModel.id;
@@ -2327,7 +2489,7 @@ function populateModels(models: readonly ModelMetadata[], includeAgentModels = f
 	);
 	if (!agentModelsInitialized) {
 		const recommendedModelValue = `${recommendedAgentModel.provider}/${recommendedAgentModel.id}`;
-		agentModel.value = models.some(
+		agentModel.value = presentedModels.some(
 			(entry) => entry.provider === recommendedAgentModel.provider && entry.id === recommendedAgentModel.id,
 		)
 			? recommendedModelValue
@@ -2336,6 +2498,22 @@ function populateModels(models: readonly ModelMetadata[], includeAgentModels = f
 	}
 	agentModelPicker.refresh();
 	refreshRoutineEditorOptions();
+}
+
+function replacePrimaryModelOptions(models: readonly { provider: string; id: string; name: string }[]): void {
+	const options = models.map((entry) => {
+		const option = document.createElement("option");
+		option.value = `${entry.provider}/${entry.id}`;
+		option.textContent = `${entry.provider} / ${entry.name}`;
+		return option;
+	});
+	model.replaceChildren(...options);
+	modelPicker.refresh();
+}
+
+function modelRefFromValue(value: string): { provider: string; id: string } | undefined {
+	const separator = value.indexOf("/");
+	return separator > 0 ? { provider: value.slice(0, separator), id: value.slice(separator + 1) } : undefined;
 }
 
 function socketUrl(controlUrl: string): { label: string; url: string } {
@@ -2901,34 +3079,51 @@ async function renderBrowserWorkflows(): Promise<void> {
 		body.append(values);
 		const actions = document.createElement("div");
 		actions.className = "browser-workflow-actions";
+		const actionStateKey = `${workflow.id}@${workflow.version}`;
 		if (workflow.status === "compiled") {
 			actions.append(
-				browserWorkflowAction("✓", "Validate workflow in a fresh browser", () =>
-					browserWorkflowRequest(workflow, "validate", workflowParameterValues(body)),
+				browserWorkflowAction(
+					"✓",
+					"Validate workflow in a fresh browser",
+					() => browserWorkflowRequest(workflow, "validate", workflowParameterValues(body)),
+					actionStateKey,
 				),
 			);
 		}
 		if (workflow.status === "validated") {
 			actions.append(
-				browserWorkflowAction("●", "Activate validated workflow", () =>
-					browserWorkflowRequest(workflow, "activate", {}),
+				browserWorkflowAction(
+					"●",
+					"Activate validated workflow",
+					() => browserWorkflowRequest(workflow, "activate", {}),
+					actionStateKey,
 				),
 			);
 		}
 		if (workflow.status === "active") {
 			actions.append(
-				browserWorkflowAction("▶", "Run active workflow", () =>
-					browserWorkflowRequest(workflow, "run", workflowParameterValues(body)),
+				browserWorkflowAction(
+					"▶",
+					"Run active workflow",
+					() => browserWorkflowRequest(workflow, "run", workflowParameterValues(body)),
+					actionStateKey,
 				),
-				browserWorkflowAction("◇", "Create a reusable Pi skill reference", () =>
-					browserWorkflowReferenceRequest(workflow, "create-skill"),
+				browserWorkflowAction(
+					"◇",
+					"Create a reusable Pi skill reference",
+					() => browserWorkflowReferenceRequest(workflow, "create-skill"),
+					actionStateKey,
 				),
-				browserWorkflowAction("⊞", "Use as a frontend test for this project", () =>
-					browserWorkflowReferenceRequest(workflow, "frontend-test"),
+				browserWorkflowAction(
+					"⊞",
+					"Use as a frontend test for this project",
+					() => browserWorkflowReferenceRequest(workflow, "frontend-test"),
+					actionStateKey,
 				),
 			);
 		}
-		body.append(actions);
+		actions.append(browserWorkflowDeleteAction(workflow, actionStateKey));
+		body.append(actions, renderBrowserWorkflowActionState(actionStateKey));
 		card.append(summary, body);
 		cards.push(card);
 	}
@@ -2963,22 +3158,100 @@ function renderBrowserWorkflowIssue(
 	return row;
 }
 
-function browserWorkflowAction(label: string, title: string, action: () => Promise<void>): HTMLButtonElement {
+function browserWorkflowAction(
+	label: string,
+	title: string,
+	action: () => Promise<void>,
+	stateKey?: string,
+): HTMLButtonElement {
 	const button = document.createElement("button");
 	button.type = "button";
 	button.textContent = label;
 	button.title = title;
 	button.setAttribute("aria-label", title);
+	if (stateKey && browserWorkflowActionStates.get(stateKey)?.status === "running") {
+		button.disabled = true;
+		button.setAttribute("aria-busy", "true");
+	}
 	button.addEventListener("click", () => {
 		button.disabled = true;
+		button.setAttribute("aria-busy", "true");
+		if (stateKey) {
+			browserWorkflowActionStates.set(stateKey, { status: "running", message: `${title}…` });
+			void renderBrowserWorkflows();
+		}
 		void action()
-			.then(() => loadBrowserWorkflows(true))
-			.catch((error: unknown) => setPreviewMessage(error instanceof Error ? error.message : String(error), true))
+			.then(() => {
+				if (stateKey) {
+					browserWorkflowActionStates.set(stateKey, { status: "completed", message: `${title} completed` });
+				}
+				return loadBrowserWorkflows(true);
+			})
+			.catch((error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				if (stateKey) browserWorkflowActionStates.set(stateKey, { status: "failed", message });
+				setPreviewMessage(message, true);
+				return renderBrowserWorkflows();
+			})
 			.finally(() => {
 				button.disabled = false;
+				button.removeAttribute("aria-busy");
 			});
 	});
 	return button;
+}
+
+function renderBrowserWorkflowActionState(stateKey: string): HTMLElement {
+	const output = document.createElement("span");
+	output.className = "browser-workflow-action-state";
+	const state = browserWorkflowActionStates.get(stateKey);
+	if (!state) return output;
+	output.dataset.status = state.status;
+	output.setAttribute("role", "status");
+	output.textContent = state.message;
+	return output;
+}
+
+function browserWorkflowDeleteAction(workflow: BrowserWorkflowSummary, stateKey: string): HTMLButtonElement {
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "danger";
+	button.textContent = "×";
+	button.title = "Delete recorded workflow";
+	button.setAttribute("aria-label", `Delete recorded workflow ${workflow.name}`);
+	button.addEventListener("click", () => {
+		if (
+			!window.confirm(
+				`Delete browser workflow "${workflow.name}" and all of its versions? Agents and routines that reference it will no longer run.`,
+			)
+		) {
+			return;
+		}
+		browserWorkflowActionStates.set(stateKey, { status: "running", message: "Deleting workflow…" });
+		void renderBrowserWorkflows();
+		void deleteBrowserWorkflow(workflow)
+			.then(() => {
+				browserWorkflowActionStates.delete(stateKey);
+				setPreviewMessage(`${workflow.name}: deleted`);
+				return loadBrowserWorkflows(true);
+			})
+			.catch((error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				browserWorkflowActionStates.set(stateKey, { status: "failed", message });
+				setPreviewMessage(message, true);
+				return renderBrowserWorkflows();
+			});
+	});
+	return button;
+}
+
+async function deleteBrowserWorkflow(workflow: BrowserWorkflowSummary): Promise<void> {
+	if (!capabilityToken) throw new Error("Browser workflow access is unavailable");
+	const response = await fetch(
+		`/browser/workflows/${encodeURIComponent(workflow.id)}?token=${encodeURIComponent(capabilityToken)}`,
+		{ method: "DELETE" },
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not delete browser workflow"));
 }
 
 function workflowParameterValues(container: HTMLElement): Record<string, string | number | boolean> {
@@ -3674,12 +3947,17 @@ async function removeConnection(id: string): Promise<void> {
 async function connect(): Promise<void> {
 	if (!capabilityToken) throw new Error("The capability token is missing");
 	setStatus("Connecting to Pi…");
+	const restoredExternalConnectionId = activeExternalConnectionId;
 	const primary = await addConnection(location.href, true);
 	client = primary.client;
 	populateModels(primary.client.snapshot?.models ?? [], true);
 	const initial = sessionTargets().find((target) => target.connectionId === primary.id);
 	if (!initial) throw new Error("The active Pi session is unavailable");
 	await switchSession(initial);
+	if (restoredExternalConnectionId && openExternalConnectionIds.includes(restoredExternalConnectionId)) {
+		activeExternalConnectionId = restoredExternalConnectionId;
+		persistExternalConnectionTabs();
+	}
 	installAgentEvents();
 	window.setTimeout(() => {
 		void Promise.all([
@@ -4618,10 +4896,16 @@ async function loadAgentsNow(): Promise<void> {
 			button.addEventListener("click", () => void openAgent(agent));
 			const menu = document.createElement("details");
 			menu.className = "agent-menu";
+			menu.addEventListener("toggle", () => {
+				if (menu.open) closeAgentMenus(menu);
+			});
 			const menuButton = document.createElement("summary");
 			menuButton.textContent = "⋯";
 			menuButton.title = "Agent actions";
 			const actions = document.createElement("div");
+			actions.addEventListener("click", () => {
+				menu.open = false;
+			});
 			const edit = document.createElement("button");
 			edit.type = "button";
 			edit.textContent = "Edit";
@@ -4655,6 +4939,13 @@ async function loadAgentsNow(): Promise<void> {
 	refreshRoutineEditorOptions();
 	refreshWorkflowEditorOptions();
 	renderSessionNavigation();
+	await loadAgentActivity();
+}
+
+function closeAgentMenus(except?: HTMLDetailsElement): void {
+	for (const menu of document.querySelectorAll<HTMLDetailsElement>(".agent-menu[open]")) {
+		if (menu !== except) menu.open = false;
+	}
 }
 
 async function deleteAgent(agent: AgentSummary): Promise<void> {
@@ -5022,7 +5313,11 @@ function openExternalConnection(connection: ExternalConnectionSummary): void {
 	element("external-prompt-label").childNodes[0].textContent = connection.inputLabel;
 	requiredElement<HTMLTextAreaElement>("external-prompt").placeholder =
 		`${connection.inputLabel} for ${connection.name}`;
-	requiredElement<HTMLInputElement>("external-cwd").value = session?.snapshot?.cwd ?? "";
+	const latestRun = externalRuns
+		.filter((run) => run.connectionId === connection.id)
+		.sort((left, right) => right.createdAt - left.createdAt)[0];
+	requiredElement<HTMLInputElement>("external-cwd").value =
+		localStorage.getItem(`pi-serve-external-cwd:${connection.id}`) ?? latestRun?.cwd ?? session?.snapshot?.cwd ?? "";
 	externalModel.replaceChildren(
 		...connection.models.map((entry) => {
 			const option = document.createElement("option");
@@ -5219,7 +5514,10 @@ function setBuilderDraftSelect(fieldId: string, value: unknown): void {
 
 function resizeComposer(): void {
 	input.style.height = "0";
-	input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+	const compact = window.matchMedia(
+		"(max-width: 1024px), (max-width: 1366px) and (hover: none) and (pointer: coarse)",
+	).matches;
+	input.style.height = `${Math.min(input.scrollHeight, compact ? 112 : 180)}px`;
 }
 
 function activePromptHistory(): PromptHistory | undefined {
@@ -5317,6 +5615,51 @@ function installPanelResizer(
 			resizer.removeEventListener("pointercancel", finish);
 			const width = currentWidth();
 			localStorage.setItem(storageKey, String(Math.round(width)));
+		};
+		resizer.addEventListener("pointermove", move);
+		resizer.addEventListener("pointerup", finish);
+		resizer.addEventListener("pointercancel", finish);
+	});
+}
+
+function installRailSectionResizer(): void {
+	const resizer = element("rail-section-resizer");
+	const sessionsPanel = element("sessions");
+	const activityPanel = element("agent-activity");
+	const minimum = 96;
+	const combinedHeight = () =>
+		sessionsPanel.getBoundingClientRect().height + activityPanel.getBoundingClientRect().height;
+	const setHeight = (value: number) => {
+		const height = Math.max(minimum, Math.min(combinedHeight() - minimum, value));
+		sessionsPanel.style.flexBasis = `${height}px`;
+		resizer.setAttribute("aria-valuenow", String(Math.round(height)));
+		return height;
+	};
+	const stored = Number(localStorage.getItem("pi-serve-sessions-height"));
+	if (Number.isFinite(stored) && stored >= minimum) setHeight(stored);
+	resizer.setAttribute("aria-valuemin", String(minimum));
+	resizer.addEventListener("keydown", (event) => {
+		if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+		event.preventDefault();
+		const height = setHeight(sessionsPanel.getBoundingClientRect().height + (event.key === "ArrowDown" ? 12 : -12));
+		localStorage.setItem("pi-serve-sessions-height", String(Math.round(height)));
+	});
+	resizer.addEventListener("pointerdown", (event) => {
+		const pointer = event as PointerEvent;
+		const startY = pointer.clientY;
+		const current = sessionsPanel.getBoundingClientRect().height;
+		resizer.classList.add("dragging");
+		resizer.setPointerCapture(pointer.pointerId);
+		const move = (moveEvent: PointerEvent) => setHeight(current + moveEvent.clientY - startY);
+		const finish = () => {
+			resizer.classList.remove("dragging");
+			resizer.removeEventListener("pointermove", move);
+			resizer.removeEventListener("pointerup", finish);
+			resizer.removeEventListener("pointercancel", finish);
+			localStorage.setItem(
+				"pi-serve-sessions-height",
+				String(Math.round(sessionsPanel.getBoundingClientRect().height)),
+			);
 		};
 		resizer.addEventListener("pointermove", move);
 		resizer.addEventListener("pointerup", finish);
@@ -5451,9 +5794,9 @@ function persistExternalConnectionTabs(): void {
 }
 
 function persistExternalRunTabs(): void {
-	localStorage.setItem("pi-serve-external-run-tabs", JSON.stringify(openExternalRunIds));
-	if (activeExternalRunId) localStorage.setItem("pi-serve-active-external-run", activeExternalRunId);
-	else localStorage.removeItem("pi-serve-active-external-run");
+	localStorage.setItem("pi-serve-external-run-tabs-v2", JSON.stringify(openExternalRunIds));
+	if (activeExternalRunId) localStorage.setItem("pi-serve-active-external-run-v2", activeExternalRunId);
+	else localStorage.removeItem("pi-serve-active-external-run-v2");
 }
 
 function readStoredStringArray(key: string): string[] {
@@ -5635,7 +5978,7 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 			: agent.name
 		: "Build a new agent";
 	builderLabel = agent ? `Edit ${agent.name}` : "Agent Builder";
-	activateTab("agent-builder");
+	activateTab(showConversation ? "agents-workspace" : "agent-builder");
 	activateBuilderTab("builder-profile-panel");
 	await closeBuilderChat(false);
 	if (!client) return;
@@ -5669,7 +6012,7 @@ function openBuilderChat(): void {
 	activeExternalConnectionId = undefined;
 	persistExternalRunTabs();
 	persistExternalConnectionTabs();
-	activateTab("agent-builder");
+	activateTab("agents-workspace");
 	mobilePanelNone.checked = true;
 	renderBuilderConversation(builderSession.snapshot);
 	renderSessionNavigation();
@@ -5772,8 +6115,7 @@ function renderAgentConversation(
 		modelPicker.refresh();
 	}
 	thinking.value = agent.thinking ?? session?.snapshot?.thinkingLevel ?? "off";
-	sessionPath.textContent = formatWorkingDirectory(agent.projectRoot);
-	sessionPath.title = agent.projectRoot;
+	setSessionPath(agent.projectRoot, agent.source === "managed" && activeTask === undefined);
 	sessionStats.textContent = activeTask
 		? `${agent.name} · ${agentTaskPhase(activeTask)}${activeTask.lastActivityAt ? ` · ${activityAge(activeTask.lastActivityAt)}` : ""}`
 		: agent.name;
@@ -5930,44 +6272,56 @@ async function loadAgentTasks(agent: AgentSummary): Promise<AgentTaskSummary[]> 
 	const payload: unknown = await response.json();
 	if (!isAgentTaskList(payload)) throw new Error("Agent task service returned an invalid response");
 	agentTasksByAgent.set(agent.id, payload.tasks);
-	if (activeSidebarAgent?.id === agent.id) renderAgentTaskHistory(payload.tasks);
 	return payload.tasks;
 }
 
-function renderAgentTaskHistory(tasks: AgentTaskSummary[]): void {
-	agentTaskList.replaceChildren(
-		...tasks.slice(0, 20).map((task) => {
-			const details = document.createElement("details");
-			details.className = "agent-history-entry";
-			details.dataset.status = task.status;
-			const summary = document.createElement("summary");
+async function loadAgentActivity(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/agent-tasks.json?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) throw new Error(`Could not load agent activity: HTTP ${response.status}`);
+	const payload: unknown = await response.json();
+	if (!isAgentTaskList(payload)) throw new Error("Agent task service returned an invalid response");
+	for (const agent of agents) {
+		agentTasksByAgent.set(
+			agent.id,
+			payload.tasks.filter((task) => task.agentId === agent.id),
+		);
+	}
+	renderAgentActivity(payload.tasks);
+}
+
+function renderAgentActivity(tasks: AgentTaskSummary[]): void {
+	const entries = [...tasks].sort((left, right) => right.createdAt - left.createdAt).slice(0, 30);
+	if (entries.length === 0) {
+		const empty = document.createElement("p");
+		empty.className = "agent-activity-empty";
+		empty.textContent = "No agent runs yet";
+		agentActivityList.replaceChildren(empty);
+		return;
+	}
+	agentActivityList.replaceChildren(
+		...entries.map((task) => {
+			const agent = agents.find((entry) => entry.id === task.agentId);
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "agent-activity-entry";
+			button.dataset.status = task.status;
+			button.disabled = !agent;
+			button.title = task.prompt;
 			const indicator = document.createElement("i");
-			indicator.className = "agent-history-status";
-			const prompt = document.createElement("span");
-			prompt.className = "agent-history-prompt";
-			prompt.textContent = task.prompt;
-			const time = document.createElement("time");
-			time.className = "agent-history-time";
-			time.dateTime = new Date(task.createdAt).toISOString();
-			time.textContent = task.status;
-			summary.append(indicator, prompt, time);
-			const body = document.createElement("div");
-			body.className = "agent-history-body";
-			if (task.result) appendText(body, task.result);
-			if (task.error) appendText(body, task.error, "run-error");
-			if (task.status === "failed" || task.status === "cancelled") {
-				const retry = document.createElement("button");
-				retry.type = "button";
-				retry.textContent = "Retry";
-				retry.addEventListener("click", () => {
-					void continueAgentTask(task.id, task.prompt).catch((error: unknown) =>
-						setStatus(error instanceof Error ? error.message : String(error), true),
-					);
-				});
-				body.append(retry);
-			}
-			details.append(summary, body);
-			return details;
+			indicator.className = "agent-activity-status";
+			const copy = document.createElement("span");
+			const name = document.createElement("strong");
+			name.textContent = agent?.name ?? task.agentId;
+			const prompt = document.createElement("small");
+			prompt.textContent = task.progressMessage ?? task.prompt;
+			copy.append(name, prompt);
+			const state = document.createElement("time");
+			state.dateTime = new Date(task.createdAt).toISOString();
+			state.textContent = task.status;
+			button.append(indicator, copy, state);
+			if (agent) button.addEventListener("click", () => void openAgent(agent));
+			return button;
 		}),
 	);
 }
@@ -6006,20 +6360,6 @@ async function cancelAgentTask(taskId: string): Promise<void> {
 	await loadSelectedAgent();
 }
 
-async function continueAgentTask(taskId: string, message: string): Promise<void> {
-	if (!capabilityToken) return;
-	const response = await fetch(
-		`/agent-tasks/${encodeURIComponent(taskId)}/continue?token=${encodeURIComponent(capabilityToken)}`,
-		{
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ message }),
-		},
-	);
-	if (!response.ok) throw new Error(await responseError(response, "Could not continue task"));
-	await loadSelectedAgent();
-}
-
 async function loadExternalRuns(): Promise<void> {
 	if (!capabilityToken) return;
 	const previousTabSignature = externalTabSignature();
@@ -6028,10 +6368,6 @@ async function loadExternalRuns(): Promise<void> {
 	const payload: unknown = await response.json();
 	if (!isExternalRunList(payload)) throw new Error("External run manager returned an invalid response");
 	externalRuns = payload.runs;
-	for (const run of externalRuns) {
-		if ((run.status === "starting" || run.status === "running") && !openExternalRunIds.includes(run.id))
-			openExternalRunIds.push(run.id);
-	}
 	for (let index = openExternalRunIds.length - 1; index >= 0; index--) {
 		if (!externalRuns.some((run) => run.id === openExternalRunIds[index])) openExternalRunIds.splice(index, 1);
 	}
@@ -6071,7 +6407,11 @@ async function loadExternalRuns(): Promise<void> {
 					use.type = "button";
 					use.textContent = "Send to Pi";
 					use.addEventListener("click", () => void sendExternalResultToPi(run));
-					actions.append(open, use);
+					const inspect = document.createElement("button");
+					inspect.type = "button";
+					inspect.textContent = "Inspect run";
+					inspect.addEventListener("click", () => openExternalRun(run));
+					actions.append(open, inspect, use);
 				}
 				if (run.status === "failed" || run.status === "aborted") {
 					const retry = document.createElement("button");
@@ -6080,7 +6420,7 @@ async function loadExternalRuns(): Promise<void> {
 					retry.addEventListener("click", () => void retryExternalRun(run));
 					const inspect = document.createElement("button");
 					inspect.type = "button";
-					inspect.textContent = "Open tab";
+					inspect.textContent = "Inspect run";
 					inspect.addEventListener("click", () => openExternalRun(run));
 					actions.append(inspect, retry);
 				}
@@ -6207,14 +6547,8 @@ async function startExternalRun(
 	const value: unknown = await response.json();
 	if (!isExternalRunSummary(value)) throw new Error("External run manager returned an invalid run");
 	externalRuns = [value, ...externalRuns.filter((entry) => entry.id !== value.id)];
-	if (activeExternalConnectionId === connectionId) {
-		if (!openExternalConnectionIds.includes(connectionId)) openExternalConnectionIds.push(connectionId);
-		persistExternalConnectionTabs();
-		const connection = externalConnections.find((entry) => entry.id === connectionId);
-		if (connection) renderExternalConversation(connection);
-	} else {
-		openExternalRun(value);
-	}
+	const connection = externalConnections.find((entry) => entry.id === connectionId);
+	if (connection) openExternalConnection(connection);
 	await loadExternalRuns();
 	setStatus(`Delegated to ${connectionId}`);
 }
@@ -6812,6 +7146,19 @@ form.addEventListener("submit", (event) => {
 	);
 });
 
+sessionPath.addEventListener("click", openSessionPathEditor);
+sessionPathCancel.addEventListener("click", closeSessionPathEditor);
+sessionPathInput.addEventListener("keydown", (event) => {
+	if (event.key === "Escape") closeSessionPathEditor();
+});
+sessionPathForm.addEventListener("submit", (event) => {
+	event.preventDefault();
+	void saveTargetPath(sessionPathInput.value).catch((error: unknown) => {
+		closeSessionPathEditor();
+		setStatus(error instanceof Error ? error.message : String(error), true);
+	});
+});
+
 async function submitComposer(): Promise<void> {
 	if (activeSubagentKey || activeExternalRunId) return;
 	if (activeExternalConnectionId) {
@@ -6867,10 +7214,21 @@ async function submitExternalComposer(connectionId: string): Promise<void> {
 	recordPromptHistory(prompt);
 	input.value = "";
 	resizeComposer();
-	const latest = externalRuns.find((run) => run.connectionId === connectionId);
-	const cwd = latest?.cwd ?? (requiredElement<HTMLInputElement>("external-cwd").value || session?.snapshot?.cwd);
+	const latest = externalRuns
+		.filter((run) => run.connectionId === connectionId)
+		.sort((left, right) => right.createdAt - left.createdAt)[0];
+	const cwd = requiredElement<HTMLInputElement>("external-cwd").value || latest?.cwd || session?.snapshot?.cwd;
 	if (!cwd) throw new Error("A working directory is required for the delegated chat");
-	await startExternalRun(connectionId, prompt, cwd, latest?.model ?? connection.defaultModel);
+	const selectedModel = modelRefFromValue(model.value);
+	if (
+		!selectedModel ||
+		!connection.models.some(
+			(candidate) => candidate.provider === selectedModel.provider && candidate.id === selectedModel.id,
+		)
+	) {
+		throw new Error("Select a model supported by this delegation connection");
+	}
+	await startExternalRun(connectionId, prompt, cwd, selectedModel);
 }
 
 async function submitBuilderComposer(): Promise<void> {
@@ -7109,6 +7467,14 @@ input.addEventListener("keydown", (event) => {
 model.addEventListener("change", () => {
 	const separator = model.value.indexOf("/");
 	if (separator < 1) return;
+	if (activeExternalConnectionId) {
+		const connection = externalConnections.find((entry) => entry.id === activeExternalConnectionId);
+		if (connection?.models.some((entry) => `${entry.provider}/${entry.id}` === model.value)) {
+			localStorage.setItem(`pi-serve-external-model:${connection.id}`, model.value);
+			setStatus(`${connection.name} · ${model.options[model.selectedIndex]?.textContent ?? model.value}`);
+		}
+		return;
+	}
 	const targetSession = builderActive ? builderSession : session;
 	if (!targetSession || activeAgentId || activeSubagentKey || activeExternalRunId || activeExternalConnectionId)
 		return;
@@ -7167,6 +7533,11 @@ newAgent.addEventListener("click", () => {
 	);
 });
 
+document.addEventListener("pointerdown", (event) => {
+	if (event.target instanceof Element && event.target.closest(".agent-menu")) return;
+	closeAgentMenus();
+});
+
 showConnectionForm.addEventListener("click", () => {
 	connectionForm.classList.toggle("hidden");
 	if (!connectionForm.classList.contains("hidden")) connectionUrl.focus();
@@ -7178,7 +7549,9 @@ openSettingsButton.addEventListener("click", () => {
 });
 settingsClose.addEventListener("click", closeSettings);
 window.addEventListener("keydown", (event) => {
-	if (event.key === "Escape" && !settingsWorkspace.classList.contains("hidden")) closeSettings();
+	if (event.key !== "Escape") return;
+	closeAgentMenus();
+	if (!settingsWorkspace.classList.contains("hidden")) closeSettings();
 });
 
 connectionForm.addEventListener("submit", (event) => {
@@ -7707,7 +8080,8 @@ window.setInterval(() => {
 		if (activeTab === "agents-workspace") {
 			if (activeSidebarAgent) await loadSelectedAgent();
 		}
-		if (activeTab === "agents-workspace" || openExternalRunIds.length > 0) await loadExternalRuns();
+		if (activeTab === "agents-workspace" || activeExternalConnectionId || openExternalRunIds.length > 0)
+			await loadExternalRuns();
 		if (activeTab === "agent-builder") await Promise.all([loadRoutines(), loadWorkflows()]);
 	})()
 		.catch(() => {})
@@ -7718,6 +8092,7 @@ window.setInterval(() => {
 
 installPanelResizer("left-resizer", "--rail-width", "pi-serve-rail-width", 1, 190, 420);
 installPanelResizer("right-resizer", "--details-width", "pi-serve-details-width", -1, 280, 560);
+installRailSectionResizer();
 resizeComposer();
 clearRoutineEditor();
 clearWorkflowEditor();

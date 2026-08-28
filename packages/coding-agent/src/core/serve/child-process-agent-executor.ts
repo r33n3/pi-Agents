@@ -1,4 +1,5 @@
 import { type ChildProcess, fork } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,7 +51,7 @@ export interface ChildProcessAgentExecutorOptions {
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
-const DEFAULT_HEARTBEAT_TIMEOUT_MS = 20_000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 90_000;
 const WATCHDOG_INTERVAL_MS = 1_000;
 const ABORT_GRACE_MS = 2_000;
 
@@ -84,6 +85,9 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 			effectiveContext.runId,
 			"worker-result.json",
 		);
+		const environment = workerEnvironment(this.#options.environment ?? process.env, capabilityToolNames);
+		const sourceTsconfig = sourceWorkerTsconfig(workerPath);
+		if (sourceTsconfig) environment.TSX_TSCONFIG_PATH = sourceTsconfig;
 		const execution = new ChildProcessExecution(
 			workerPath,
 			{
@@ -108,7 +112,7 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 			this.#options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
 			this.#options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
 			this.#options.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS,
-			workerEnvironment(this.#options.environment ?? process.env, capabilityToolNames),
+			environment,
 			effectiveContext,
 			new Map(capabilityTools.map((tool) => [tool.name, tool])),
 			this.#options.governedActions,
@@ -188,7 +192,7 @@ class ChildProcessExecution implements AgentExecution {
 		this.#child = fork(workerPath, [], {
 			cwd: start.type === "start" ? start.context.workspace : undefined,
 			env: environment,
-			execArgv: process.execArgv,
+			execArgv: sourceWorkerExecArgv(workerPath),
 			detached: process.platform !== "win32",
 			serialization: "advanced",
 			stdio: ["ignore", "ignore", "pipe", "ipc"],
@@ -671,6 +675,21 @@ function isFileNotFound(error: unknown): boolean {
 function defaultWorkerPath(): string {
 	const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
 	return fileURLToPath(new URL(`./agent-worker.${extension}`, import.meta.url));
+}
+
+function sourceWorkerTsconfig(workerPath: string): string | undefined {
+	if (!workerPath.endsWith(".ts")) return undefined;
+	const tsconfigPath = fileURLToPath(new URL("../../../../../tsconfig.json", import.meta.url));
+	return existsSync(tsconfigPath) ? tsconfigPath : undefined;
+}
+
+function sourceWorkerExecArgv(workerPath: string): string[] {
+	const execArgv = [...process.execArgv];
+	if (!workerPath.endsWith(".ts")) return execArgv;
+	if (execArgv.some((argument) => /[/\\]tsx[/\\]dist[/\\]loader\.mjs$/i.test(argument))) return execArgv;
+	const loaderUrl = new URL("../../../../../node_modules/tsx/dist/loader.mjs", import.meta.url);
+	if (!existsSync(fileURLToPath(loaderUrl))) return execArgv;
+	return [...execArgv, "--import", loaderUrl.href];
 }
 
 function isWorkerResponse(value: unknown): value is AgentWorkerResponse {

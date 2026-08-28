@@ -41,6 +41,7 @@ import { type ExternalConnectionDefinition, ExternalConnectionManager } from "./
 import { GoogleWorkspaceOAuth } from "./google-workspace-oauth.ts";
 import { createGoogleWorkspaceTools } from "./google-workspace-tools.ts";
 import { GovernedActionService } from "./governed-action-service.ts";
+import { createHermesConnectionModels } from "./hermes-connection.ts";
 import { InboundRoutingService } from "./inbound-routing-service.ts";
 import { PersonaCatalog, resolvePersonaProject } from "./persona-catalog.ts";
 import { PlaidConnectionService } from "./plaid-connection.ts";
@@ -495,11 +496,7 @@ export class ServeHost implements AsyncDisposable {
 		if (!claudeModels.some((model) => model.id === sonnet.id)) {
 			claudeModels.unshift({ ...sonnet, name: "Claude Sonnet 5" });
 		}
-		const hermesConfiguredModel = {
-			provider: "hermes",
-			id: "configured",
-			name: "Hermes configured model",
-		};
+		const hermesModels = createHermesConnectionModels(process.env);
 		const claudeSubscriptionLogin = new ClaudeSubscriptionLogin();
 		this.#claudeSubscriptionLogin = claudeSubscriptionLogin;
 		const externalConnections: ExternalConnectionDefinition[] = [
@@ -574,18 +571,16 @@ export class ServeHost implements AsyncDisposable {
 			{
 				id: "hermes",
 				name: "Hermes Agent",
-				description: "Delegate a goal to Hermes one-shot mode with its memory, skills, and tools.",
+				description: "Delegate a goal to Hermes one-shot mode with its memory, skills, tools, and selected model.",
 				inputLabel: "Goal",
 				provider: "hermes",
 				authentication: "configured",
 				billing: "configured",
-				available:
-					session.getToolDefinition("hermes_agent") !== undefined &&
-					openAiModels.some((model) => model.id === luna.id),
+				available: session.getToolDefinition("hermes_agent") !== undefined,
 				warning:
-					"GPT-5.6 Luna dispatches the request. Hermes uses the provider and model configured in Hermes and bypasses interactive approvals.",
-				defaultModel: hermesConfiguredModel,
-				models: [hermesConfiguredModel],
+					"The selected model runs inside Hermes. Local Ollama has no API charge; OpenAI and Anthropic choices use credentials loaded from .env.local. Hermes bypasses interactive approvals.",
+				defaultModel: hermesModels.defaultModel,
+				models: hermesModels.models,
 			},
 		];
 		this.#externalSessionExecutor = new AgentSessionExecutor(createExecutionSession);
@@ -608,7 +603,7 @@ export class ServeHost implements AsyncDisposable {
 					prompt: isClaude
 						? `Call claude_code immediately with this exact task, working directory, model, and authentication profile. Return its result without replacing it with your own work.\n\nTask: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}\n\nAuthentication: ${isClaudeSubscription ? "subscription" : "api-key"}`
 						: isHermes
-							? `Call hermes_agent immediately with this exact goal and working directory. Use Hermes's configured model and return its result without replacing it with your own work.\n\nGoal: ${request.prompt}\n\nWorking directory: ${request.cwd}`
+							? `Call hermes_agent immediately with this exact goal, working directory, and model. Return its result without replacing it with your own work.\n\nGoal: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}`
 							: request.prompt,
 					definition: {
 						id: `external-${request.connection.id}`,

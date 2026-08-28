@@ -1,0 +1,45 @@
+{
+	"schemaVersion": 1,
+	"currency": "USD",
+	"unit": "per-million-tokens",
+	"region": "us-east-1",
+	"serviceTier": "standard",
+	"routing": "in-region-or-geographic-cross-region",
+	"effectiveDate": "2026-08-28",
+	"sourceUrl": "https://aws.amazon.com/bedrock/pricing/",
+	"models": {
+		"deepseek.v3.2": {
+			"providers": ["amazon-bedrock", "bedrock-mantle"],
+			"input": 0.62,
+			"output": 1.85,
+			"cacheRead": 0,
+			"cacheWrite": 0
+		},
+		"moonshotai.kimi-k2.5": {
+			"providers": ["amazon-bedrock", "bedrock-mantle"],
+			"input": 0.6,
+			"output": 3,
+			"cacheRead": 0,
+			"cacheWrite": 0
+		},
+		"qwen.qwen3-coder-next": {
+			"providers": ["amazon-bedrock", "bedrock-mantle"],
+			"input": 0.5,
+			"output": 1.2,
+			"cacheRead": 0,
+			"cacheWrite": 0
+		},
+		"zai.glm-4.7": {
+			"providers": ["amazon-bedrock", "bedrock-mantle"],
+			"input": 0.6,
+			"output": 2.2,
+			"cacheRead": 0,
+			"cacheWrite": 0
+		}
+	},
+	"unpricedModels": {
+		"qwen.qwen3-coder-480b-a35b-instruct": {
+			"reason": "No matching public token rate was found on the AWS Bedrock pricing page on the effective date."
+		}
+	}
+}

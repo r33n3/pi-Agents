@@ -91,12 +91,14 @@ process.on("message", (message) => {
 
 async function runHostActionScenario(message) {
 	if (activePrompt === "host-action-crash") {
-		process.send?.({
+		const request = {
 			type: "host-action-request",
 			requestId: `request-${++requestCounter}`,
 			action: { family: "filesystem.read", path: "slow.txt" },
-		});
-		setTimeout(() => process.exit(7), 10);
+		};
+		const exitAfterDelivery = () => setTimeout(() => process.exit(7), 10);
+		if (process.send) process.send(request, exitAfterDelivery);
+		else exitAfterDelivery();
 		return;
 	}
 	let output;

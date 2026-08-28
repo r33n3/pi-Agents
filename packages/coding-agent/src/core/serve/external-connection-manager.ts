@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ModelRef } from "@earendil-works/pi-protocol";
-import type { AgentExecution } from "./agent-executor.ts";
+import type { AgentExecution, AgentExecutionPhase } from "./agent-executor.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
 export type ExternalConnectionRunStatus = "starting" | "running" | "succeeded" | "failed" | "aborted";
@@ -35,6 +35,9 @@ export interface ExternalConnectionRunRecord {
 	status: ExternalConnectionRunStatus;
 	createdAt: number;
 	startedAt?: number;
+	phase?: AgentExecutionPhase;
+	progress?: string;
+	lastActivityAt?: number;
 	finishedAt?: number;
 	artifactDirectory: string;
 	error?: string;
@@ -56,6 +59,7 @@ interface ActiveRun {
 	record: ExternalConnectionRunRecord;
 	execution: AgentExecution;
 	abortRequested: boolean;
+	unsubscribe: () => void;
 	completion?: Promise<void>;
 }
 
@@ -170,7 +174,12 @@ export class ExternalConnectionManager implements AsyncDisposable {
 				const execution = await this.#executionFactory({ runId, connection, prompt, cwd: record.cwd, model });
 				record.status = "running";
 				record.startedAt = Date.now();
-				const active: ActiveRun = { record, execution, abortRequested: false };
+				const active: ActiveRun = { record, execution, abortRequested: false, unsubscribe: () => {} };
+				active.unsubscribe = execution.subscribe((event) => {
+					record.phase = event.phase;
+					record.progress = externalProgressMessage(connection.name, event.phase);
+					record.lastActivityAt = event.timestamp;
+				});
 				this.#activeByRun.set(runId, active);
 				await this.#persistRecord(record);
 				active.completion = this.#settle(active);
@@ -234,6 +243,7 @@ export class ExternalConnectionManager implements AsyncDisposable {
 			record.status = active.abortRequested ? "aborted" : "failed";
 			record.error = error instanceof Error ? error.message : String(error);
 		} finally {
+			active.unsubscribe();
 			record.finishedAt = Date.now();
 			await this.#persistRecord(record);
 			this.#activeByRun.delete(record.id);
@@ -270,6 +280,9 @@ function parseRunRecord(value: unknown, artifactDirectory: string): ExternalConn
 		status: record.status,
 		createdAt: record.createdAt,
 		startedAt: typeof record.startedAt === "number" ? record.startedAt : undefined,
+		phase: isExecutionPhase(record.phase) ? record.phase : undefined,
+		progress: typeof record.progress === "string" ? record.progress : undefined,
+		lastActivityAt: typeof record.lastActivityAt === "number" ? record.lastActivityAt : undefined,
 		finishedAt: typeof record.finishedAt === "number" ? record.finishedAt : undefined,
 		artifactDirectory,
 		error: typeof record.error === "string" ? record.error : undefined,
@@ -287,6 +300,24 @@ function isRunStatus(value: unknown): value is ExternalConnectionRunStatus {
 	return (
 		value === "starting" || value === "running" || value === "succeeded" || value === "failed" || value === "aborted"
 	);
+}
+
+function isExecutionPhase(value: unknown): value is AgentExecutionPhase {
+	return (
+		value === "initializing" ||
+		value === "waiting-for-model" ||
+		value === "generating" ||
+		value === "running-tool" ||
+		value === "writing-results"
+	);
+}
+
+function externalProgressMessage(connectionName: string, phase: AgentExecutionPhase): string {
+	if (phase === "running-tool") return `${connectionName} is working`;
+	if (phase === "generating") return `${connectionName} is responding`;
+	if (phase === "writing-results") return "Saving result";
+	if (phase === "waiting-for-model") return `Waiting for ${connectionName}`;
+	return `Starting ${connectionName}`;
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

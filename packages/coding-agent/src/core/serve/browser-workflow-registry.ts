@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
@@ -284,6 +284,18 @@ export class BrowserWorkflowRegistry {
 			await this.#persist(active);
 			this.#store(active);
 			return cloneDefinition(active);
+		});
+	}
+
+	async delete(id: string): Promise<boolean> {
+		return this.#queue.run(async () => {
+			assertIdentifier(id, "workflow id");
+			if (!this.#definitions.has(id)) return false;
+			const directory = resolve(this.#root, id);
+			if (dirname(directory) !== this.#root) throw new Error("Browser workflow escapes the workflow root");
+			await rm(directory, { recursive: true });
+			this.#definitions.delete(id);
+			return true;
 		});
 	}
 

@@ -2,7 +2,12 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import type { AgentExecution, AgentExecutionResult } from "../src/core/serve/agent-executor.ts";
+import type {
+	AgentExecution,
+	AgentExecutionEvent,
+	AgentExecutionListener,
+	AgentExecutionResult,
+} from "../src/core/serve/agent-executor.ts";
 import {
 	type ExternalConnectionExecutionRequest,
 	ExternalConnectionManager,
@@ -19,6 +24,7 @@ class DeferredExecution implements AgentExecution {
 	resolve: (result: AgentExecutionResult) => void = () => {};
 	reject: (error: Error) => void = () => {};
 	aborted = false;
+	readonly listeners = new Set<AgentExecutionListener>();
 
 	constructor() {
 		this.result = new Promise((resolve, reject) => {
@@ -27,8 +33,13 @@ class DeferredExecution implements AgentExecution {
 		});
 	}
 
-	subscribe(): () => void {
-		return () => {};
+	subscribe(listener: AgentExecutionListener): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+
+	emit(event: AgentExecutionEvent): void {
+		for (const listener of this.listeners) listener(event);
 	}
 
 	abort(): Promise<void> {
@@ -124,5 +135,27 @@ describe("ExternalConnectionManager", () => {
 		await expect.poll(() => manager.getRun(run.id)?.status).toBe("failed");
 		expect(manager.getRun(run.id)?.error).toBe("HTTP 401: Missing Authentication header");
 		await expect(manager.readResult(run.id)).resolves.toBeUndefined();
+	});
+
+	test("exposes live execution progress while a delegation is running", async () => {
+		const { manager, executions } = await setup();
+		const run = await manager.start({ connectionId: "openai", prompt: "Long task" });
+		const timestamp = Date.now();
+		executions[0].emit({
+			kind: "progress",
+			phase: "running-tool",
+			message: "Using browser_open",
+			timestamp,
+		});
+
+		expect(manager.getRun(run.id)).toMatchObject({
+			status: "running",
+			phase: "running-tool",
+			progress: "OpenAI Agent is working",
+			lastActivityAt: timestamp,
+		});
+		executions[0].resolve({ output: "Done", transcript: [] });
+		await expect.poll(() => manager.getRun(run.id)?.status).toBe("succeeded");
+		expect(executions[0].listeners.size).toBe(0);
 	});
 });

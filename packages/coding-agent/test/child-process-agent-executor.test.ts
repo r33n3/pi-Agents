@@ -11,6 +11,7 @@ import { GovernedActionService } from "../src/core/serve/governed-action-service
 import { ServeAuditStore } from "../src/core/serve/serve-audit-store.ts";
 
 const workerPath = fileURLToPath(new URL("./fixtures/agent-worker-fixture.mjs", import.meta.url));
+const sourceWorkerPath = fileURLToPath(new URL("./fixtures/agent-worker-tsconfig-fixture.ts", import.meta.url));
 
 function context(prompt: string, runId = "run-1", workspace = process.cwd(), writable = false): AgentExecutionContext {
 	return {
@@ -65,6 +66,24 @@ describe("ChildProcessAgentExecutor", () => {
 		expect(events).toContainEqual(expect.objectContaining({ kind: "progress", message: "started" }));
 		await execution.dispose();
 		await executor.dispose();
+	});
+
+	test("resolves workspace source packages when a TypeScript worker runs outside the repository", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-agent-source-worker-"));
+		try {
+			const executor = new ChildProcessAgentExecutor({
+				agentDir: process.cwd(),
+				serveRoot,
+				capabilityToolNames: () => [],
+				workerPath: sourceWorkerPath,
+			});
+			const execution = await executor.start(context("source", "run-source", workspace));
+			await expect(execution.result).resolves.toMatchObject({ output: "workspace imports resolved" });
+			await execution.dispose();
+			await executor.dispose();
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+		}
 	});
 
 	test("returns a large transcript through the durable result artifact", async () => {
