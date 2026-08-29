@@ -57,7 +57,8 @@ variable names, or secret references manually.
 - The Sessions add button continues to connect or start Pi sessions; it does
   not open configuration.
 - Existing agent definitions, provider manifests, connection profiles,
-  capability grants, plugin records, and `.env.local` values remain readable.
+  capability grants, plugin records, and legacy `.env.local` values remain
+  readable through the credential migration contract.
 - Provider configuration and OAuth remain host-owned operations and never enter
   model context.
 - Agent Builder never becomes a second provider or credential manager.
@@ -79,8 +80,8 @@ Settings · <project name>
 
 Each setting that is not project-scoped carries an explicit scope badge:
 
-- **Project** — configuration stored for the project that launched this serve
-  host, including the temporary `.env.local` provider store;
+- **Project** — configuration and the optional encrypted workspace-vault
+  overlay for the project that launched this serve host;
 - **User** — resources installed under the user's Pi configuration; or
 - **Deployment** — serve-host capability, policy, connection metadata, and
   runtime state.
@@ -260,10 +261,10 @@ Security presents existing security controls without exposing secret values:
 - capability trust and review state; and
 - concise audit or diagnostic references when available.
 
-The first implementation does not invent a new credential vault. Project
-`.env.local` remains the temporary write-only store defined by the provider
-authentication specification. A future encrypted store may replace it behind
-the same provider authentication interface.
+Credential status and lifecycle use the encrypted user vault and optional
+workspace overlay defined by
+[pi-credential-vault-spec.md](pi-credential-vault-spec.md). Legacy project
+`.env.local` is exposed only through the explicit import and migration flow.
 
 ## Canonical status language
 
@@ -367,7 +368,8 @@ connection files, or infer credentials.
 
 No persistence migration is required for the initial cleanup:
 
-- provider environment values remain in the configured project store;
+- provider secret values migrate to the encrypted credential vault while safe
+  provider configuration remains readable;
 - connection profiles retain their IDs and statuses;
 - capability grants retain canonical capability and provider IDs;
 - agent definitions retain unresolved historical grants; and
@@ -492,7 +494,8 @@ session rail.
 
 - Replacing the provider authentication or capability broker services.
 - Introducing OpenBot, CopilotKit, AG-UI, PostgreSQL, or a Docker requirement.
-- Building a general encrypted credential vault in this UI cleanup.
+- Reimplementing vault cryptography or credential release inside the Settings
+  browser; Settings calls the credential broker's high-level operations.
 - Configuring arbitrary connected Pi chat sessions from the current host.
 - Automatically granting newly installed tools to existing agents.
 - Enabling unavailable Google service groups before their adapters exist.

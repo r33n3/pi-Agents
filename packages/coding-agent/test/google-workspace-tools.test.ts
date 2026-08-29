@@ -181,22 +181,24 @@ describe("createGoogleWorkspaceTools", () => {
 	});
 
 	test("normalizes message reads and bounds body text", async () => {
-		const request = vi.fn<typeof fetch>().mockResolvedValue(
-			new Response(
-				JSON.stringify({
-					id: "message-1",
-					threadId: "thread-1",
-					snippet: "Preview",
-					payload: {
-						headers: [
-							{ name: "Subject", value: "Subject" },
-							{ name: "X-Secret-Header", value: "not returned" },
-						],
-						mimeType: "text/plain",
-						body: { data: Buffer.from("Message body").toString("base64url") },
-					},
-				}),
-				{ status: 200 },
+		const request = vi.fn<typeof fetch>().mockImplementation(() =>
+			Promise.resolve(
+				new Response(
+					JSON.stringify({
+						id: "message-1",
+						threadId: "thread-1",
+						snippet: "Preview",
+						payload: {
+							headers: [
+								{ name: "Subject", value: "Subject" },
+								{ name: "X-Secret-Header", value: "not returned" },
+							],
+							mimeType: "text/plain",
+							body: { data: Buffer.from("Message body").toString("base64url") },
+						},
+					}),
+					{ status: 200 },
+				),
 			),
 		);
 		const tool = createGoogleWorkspaceTools({ approvals, environment, fetch: request }).find(
@@ -212,6 +214,15 @@ describe("createGoogleWorkspaceTools", () => {
 		expect(JSON.stringify(result)).toContain("Message body");
 		expect(JSON.stringify(result)).toContain("Subject");
 		expect(JSON.stringify(result)).not.toContain("X-Secret-Header");
+		const bounded = await tool.execute(
+			"read-2",
+			{ messageId: "message-1", maxBodyChars: 7 },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		expect(JSON.stringify(bounded)).toContain('\\"body\\": \\"Message\\"');
+		expect(JSON.stringify(bounded)).toContain('\\"truncated\\": true');
 	});
 
 	test("moves deleted messages to trash instead of requiring permanent-delete scope", async () => {
@@ -264,7 +275,11 @@ describe("createGoogleWorkspaceTools", () => {
 
 	test("resolves and refreshes credentials through the trusted store boundary", async () => {
 		environment.GOOGLE_OAUTH_EXPIRES_AT = "0";
-		const credentials = new ProviderEnvironmentStore(root, () => manifest, environment);
+		const credentials = new ProviderEnvironmentStore(root, () => manifest, {
+			environment,
+			platform: "linux",
+			passphrase: "correct horse battery staple",
+		});
 		const request = vi
 			.fn<typeof fetch>()
 			.mockResolvedValueOnce(

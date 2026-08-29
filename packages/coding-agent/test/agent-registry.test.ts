@@ -245,7 +245,7 @@ describe("AgentRegistry", () => {
 		).rejects.toThrow("must not be a filesystem root");
 	});
 
-	test("includes existing Pi Markdown agents without duplicating their definitions", async () => {
+	test("allows a managed override of a Pi Markdown agent without changing its source file", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-agent-registry-"));
 		roots.push(root);
 		const catalogDirectory = join(root, "agents");
@@ -254,10 +254,10 @@ describe("AgentRegistry", () => {
 		await mkdir(catalogDirectory, { recursive: true });
 		await mkdir(join(personaDirectory, "skeptical-engineer"), { recursive: true });
 		await writeFile(join(personaDirectory, "skeptical-engineer", "icon.webp"), "icon-bytes");
-		await writeFile(
-			join(catalogDirectory, "researcher.md"),
-			"---\nname: researcher\ndescription: Researches code\nmodel: ollama/qwen3.8:latest\ntools: read,grep,find\nmemory: none\n---\n\nReport findings with evidence.\n\n<!-- persona:start name=skeptical-engineer -->\nPersona\n<!-- persona:end -->\n",
-		);
+		const catalogPath = join(catalogDirectory, "researcher.md");
+		const catalogContent =
+			"---\nname: researcher\ndescription: Researches code\nmodel: ollama/qwen3.8:latest\ntools: read,grep,find\nmemory: none\n---\n\nReport findings with evidence.\n\n<!-- persona:start name=skeptical-engineer -->\nPersona\n<!-- persona:end -->\n";
+		await writeFile(catalogPath, catalogContent);
 		const agents = new AgentRegistry(join(root, "serve"), {
 			catalogDirectory,
 			personaDirectory,
@@ -280,14 +280,20 @@ describe("AgentRegistry", () => {
 			agents.save({
 				id: "researcher",
 				name: "Researcher",
-				description: "Duplicate",
+				description: "Managed override",
 				tools: [],
 				memory: "none",
-				persona: "Duplicate",
+				persona: "Updated instructions",
 				executor: "session",
 				permissionPolicy: "read-only",
 				schedules: [],
 			}),
-		).rejects.toThrow("managed by the Pi Markdown agent catalog");
+		).resolves.toMatchObject({ revision: 2, source: "managed", description: "Managed override" });
+		expect(await readFile(catalogPath, "utf8")).toBe(catalogContent);
+		expect(await agents.get("researcher")).toMatchObject({ source: "managed", description: "Managed override" });
+		expect(await agents.list()).toHaveLength(1);
+
+		await expect(agents.delete("researcher")).resolves.toBe(true);
+		expect(await agents.get("researcher")).toMatchObject({ source: "pi-agent", description: "Researches code" });
 	});
 });

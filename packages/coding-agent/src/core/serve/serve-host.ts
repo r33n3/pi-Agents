@@ -34,6 +34,7 @@ import { CapabilityConnectionRegistry } from "./capability-connection-registry.t
 import { ChildProcessAgentExecutor } from "./child-process-agent-executor.ts";
 import { ClaudeSubscriptionLogin } from "./claude-subscription-login.ts";
 import { CodexCliExecution, isCodexSubscriptionAvailable } from "./codex-cli-execution.ts";
+import { createCredentialApiTools } from "./credential-api-tools.ts";
 import { CurrentSessionService } from "./current-session-service.ts";
 import { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
 import { createEverydayDataTools } from "./everyday-data-tools.ts";
@@ -44,6 +45,7 @@ import { GovernedActionService } from "./governed-action-service.ts";
 import { createHermesConnectionModels } from "./hermes-connection.ts";
 import { InboundRoutingService } from "./inbound-routing-service.ts";
 import { PersonaCatalog, resolvePersonaProject } from "./persona-catalog.ts";
+import { PiAgentBundleInstaller } from "./pi-agent-bundle.ts";
 import { PlaidConnectionService } from "./plaid-connection.ts";
 import { createPlaidTools, PLAID_TOOL_NAMES } from "./plaid-tools.ts";
 import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
@@ -92,6 +94,7 @@ export class ServeHost implements AsyncDisposable {
 	#externalConnectionManager: ExternalConnectionManager | undefined;
 	#externalSessionExecutor: AgentSessionExecutor | undefined;
 	#claudeSubscriptionLogin: ClaudeSubscriptionLogin | undefined;
+	#providerEnvironment: ProviderEnvironmentStore | undefined;
 	#attachmentStore: ServeAttachmentStore | undefined;
 	#browserSessionManager: BrowserSessionManager | undefined;
 	#workspacePreviewServer: WorkspacePreviewServer | undefined;
@@ -217,12 +220,12 @@ export class ServeHost implements AsyncDisposable {
 			join(serveRoot, "capabilities", "everyday-data"),
 			everydayConfigurations,
 		);
-		const brokeredTools = [...everydayDataTools, ...createSearxngTools(process.env.SEARXNG_BASE_URL)];
-		session.registerCustomTools(brokeredTools);
+		const brokeredTools = [...everydayDataTools];
 		const capabilityConnections = new CapabilityConnectionRegistry(join(serveRoot, "capabilities", "connections"));
 		await capabilityConnections.initialize();
 		const capabilityApprovals = new CapabilityApprovalService(join(serveRoot, "capabilities", "approvals"));
 		await capabilityApprovals.initialize();
+		let providerEnvironment: ProviderEnvironmentStore | undefined;
 		const capabilityBroker = new CapabilityBroker(join(serveRoot, "capabilities"), {
 			activeToolNames: () => session.getAllTools().map((tool) => tool.name),
 			activeProviderSources: () =>
@@ -238,12 +241,46 @@ export class ServeHost implements AsyncDisposable {
 					.snapshot()
 					.some((connection) => connection.providerId === providerId && connection.status === "active"),
 			connectionResolver: (connectionId) => capabilityConnections.find(connectionId),
+			environmentValue: (name) => providerEnvironment?.environmentValue(name) ?? process.env[name],
 		});
-		await capabilityBroker.initialize();
-		const providerEnvironment = new ProviderEnvironmentStore(session.sessionManager.getCwd(), (providerId) =>
-			capabilityBroker.authenticationManifest(providerId),
+		providerEnvironment = new ProviderEnvironmentStore(
+			session.sessionManager.getCwd(),
+			(providerId) => capabilityBroker.authenticationManifest(providerId),
+			{
+				vaultPath: join(agentDir, "credentials", "v1", "vault.json"),
+				onProviderChanged: async (providerId, values) => {
+					const binding =
+						providerId === "openai-api"
+							? { runtimeId: "openai", field: "OPENAI_API_KEY" }
+							: providerId === "anthropic-api"
+								? { runtimeId: "anthropic", field: "ANTHROPIC_API_KEY" }
+								: providerId === "amazon-bedrock-api"
+									? { runtimeId: "amazon-bedrock", field: "AWS_BEARER_TOKEN_BEDROCK" }
+									: undefined;
+					if (!binding) return;
+					const value = values[binding.field]?.trim();
+					if (value) await modelRuntime.setRuntimeApiKey(binding.runtimeId, value);
+					else await modelRuntime.removeRuntimeApiKey(binding.runtimeId);
+				},
+			},
 		);
-		const googleWorkspaceOAuth = new GoogleWorkspaceOAuth(providerEnvironment, capabilityConnections);
+		this.#providerEnvironment = providerEnvironment;
+		await providerEnvironment.initialize();
+		for (const binding of [
+			{ providerId: "openai-api", runtimeId: "openai", field: "OPENAI_API_KEY" },
+			{ providerId: "anthropic-api", runtimeId: "anthropic", field: "ANTHROPIC_API_KEY" },
+			{ providerId: "amazon-bedrock-api", runtimeId: "amazon-bedrock", field: "AWS_BEARER_TOKEN_BEDROCK" },
+		]) {
+			const value = providerEnvironment.environmentValue(binding.field)?.trim();
+			if (value) await modelRuntime.setRuntimeApiKey(binding.runtimeId, value);
+		}
+		brokeredTools.push(...createSearxngTools(() => providerEnvironment.environmentValue("SEARXNG_BASE_URL")));
+		brokeredTools.push(...createCredentialApiTools((name) => providerEnvironment.environmentValue(name)));
+		session.registerCustomTools(brokeredTools);
+		await capabilityBroker.initialize();
+		const googleWorkspaceOAuth = new GoogleWorkspaceOAuth(providerEnvironment, capabilityConnections, {
+			environmentValue: (name) => providerEnvironment?.environmentValue(name),
+		});
 		const plaidConnections = new PlaidConnectionService(providerEnvironment, capabilityConnections, {
 			clientUserId: `pi-session-${session.sessionId}`,
 		});
@@ -314,16 +351,19 @@ export class ServeHost implements AsyncDisposable {
 			executionModelRuntime = modelRuntime,
 		) => {
 			const requestedModel = definition.model;
-			const agentModel = requestedModel
+			const resolvedAgentModel = requestedModel
 				? executionModelRuntime.getModel(requestedModel.provider, requestedModel.id)
 				: session.model;
-			if (!agentModel) {
+			if (!resolvedAgentModel) {
 				throw new Error(
 					requestedModel
 						? `Agent model ${requestedModel.provider}/${requestedModel.id} is unavailable`
 						: "No model is available for the agent run",
 				);
 			}
+			const agentModel = definition.budget?.maxTokens
+				? { ...resolvedAgentModel, maxTokens: Math.min(resolvedAgentModel.maxTokens, definition.budget.maxTokens) }
+				: resolvedAgentModel;
 			const isolated = definition.executor === "harness";
 			const scopedTools = isolated ? createScopedAgentTools(definition, workspace) : [];
 			const browserTools =
@@ -412,7 +452,9 @@ export class ServeHost implements AsyncDisposable {
 				id: context.runId,
 			});
 		const createOpenAiApiExecutionSession = async (context: Parameters<AgentSessionExecutor["start"]>[0]) => {
-			const apiKey = process.env.OPENAI_API_KEY?.trim();
+			const apiKey = (
+				await providerEnvironment.resolveTrusted("openai-api", ["OPENAI_API_KEY"])
+			).OPENAI_API_KEY?.trim();
 			if (!apiKey) throw new Error("OpenAI API requires OPENAI_API_KEY in project Settings");
 			const apiRuntime = await ModelRuntime.create({
 				credentials: new InMemoryCredentialStore(),
@@ -469,6 +511,11 @@ export class ServeHost implements AsyncDisposable {
 			},
 		});
 		await this.#workflowService.initialize();
+		const piAgentBundleInstaller = new PiAgentBundleInstaller(
+			join(serveRoot, "agent-package-installs"),
+			agentRegistry,
+			this.#workflowService,
+		);
 		const a2aAdapter = new A2aAdapter(agentRegistry, this.#agentTaskService);
 
 		const availableModels = modelRuntime.getAvailableSnapshot().map((model) => ({
@@ -496,7 +543,12 @@ export class ServeHost implements AsyncDisposable {
 		if (!claudeModels.some((model) => model.id === sonnet.id)) {
 			claudeModels.unshift({ ...sonnet, name: "Claude Sonnet 5" });
 		}
-		const hermesModels = createHermesConnectionModels(process.env);
+		const hermesModels = createHermesConnectionModels({
+			HERMES_DEFAULT_MODEL: providerEnvironment.environmentValue("HERMES_DEFAULT_MODEL"),
+			HERMES_MODELS: providerEnvironment.environmentValue("HERMES_MODELS"),
+			OPENAI_API_KEY: providerEnvironment.environmentValue("OPENAI_API_KEY"),
+			ANTHROPIC_API_KEY: providerEnvironment.environmentValue("ANTHROPIC_API_KEY"),
+		});
 		const claudeSubscriptionLogin = new ClaudeSubscriptionLogin();
 		this.#claudeSubscriptionLogin = claudeSubscriptionLogin;
 		const externalConnections: ExternalConnectionDefinition[] = [
@@ -531,7 +583,7 @@ export class ServeHost implements AsyncDisposable {
 				get available() {
 					return (
 						session.getToolDefinition("claude_code") !== undefined &&
-						Boolean(process.env.ANTHROPIC_API_KEY?.trim())
+						Boolean(providerEnvironment.environmentValue("ANTHROPIC_API_KEY")?.trim())
 					);
 				},
 				warning: "Usage is billed to the Anthropic API account configured by ANTHROPIC_API_KEY.",
@@ -562,7 +614,10 @@ export class ServeHost implements AsyncDisposable {
 				authentication: "api-key",
 				billing: "usage-based",
 				get available() {
-					return Boolean(process.env.OPENAI_API_KEY?.trim()) && openAiModels.some((model) => model.id === luna.id);
+					return (
+						Boolean(providerEnvironment.environmentValue("OPENAI_API_KEY")?.trim()) &&
+						openAiModels.some((model) => model.id === luna.id)
+					);
 				},
 				warning: "Usage is billed to the OpenAI API account configured by OPENAI_API_KEY.",
 				defaultModel: luna,
@@ -688,6 +743,8 @@ export class ServeHost implements AsyncDisposable {
 						prompt: definition.prompt,
 						source: "routine",
 						model: definition.model,
+						routine: { id: definition.id, revision: definition.revision, scheduledFor: Date.now() },
+						expectedDeliverable: { kind: "markdown", title: `${definition.name} result` },
 					});
 					return {
 						runId: task.id,
@@ -849,6 +906,7 @@ export class ServeHost implements AsyncDisposable {
 				googleWorkspaceOAuth,
 				plaidConnections,
 				claudeSubscriptionLogin,
+				piAgentBundleInstaller,
 			),
 			auxiliary: {
 				path: "/browser-stream",
@@ -891,6 +949,7 @@ export class ServeHost implements AsyncDisposable {
 			() => this.#externalConnectionManager?.dispose() ?? Promise.resolve(),
 			() => this.#externalSessionExecutor?.dispose() ?? Promise.resolve(),
 			() => this.#claudeSubscriptionLogin?.dispose() ?? Promise.resolve(),
+			() => this.#providerEnvironment?.dispose() ?? Promise.resolve(),
 			() => this.#attachmentStore?.dispose() ?? Promise.resolve(),
 			() => this.#browserSessionManager?.dispose() ?? Promise.resolve(),
 			() => this.#workspacePreviewServer?.close() ?? Promise.resolve(),

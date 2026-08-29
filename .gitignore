@@ -16,6 +16,7 @@ packages/ai/src/providers/.model-generation-*/
 # Environment
 .env
 .env.local
+.pi/vault/
 .env.*.local
 
 # Editor files

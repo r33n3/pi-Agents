@@ -19,6 +19,7 @@ export type RoutineTarget =
 
 export interface RoutineDefinition {
 	id: string;
+	revision: number;
 	name: string;
 	prompt: string;
 	enabled: boolean;
@@ -30,7 +31,7 @@ export interface RoutineDefinition {
 	cwd?: string;
 }
 
-export type RoutineDefinitionInput = Omit<RoutineDefinition, "id"> & { id?: string };
+export type RoutineDefinitionInput = Omit<RoutineDefinition, "id" | "revision"> & { id?: string };
 
 /** Owns durable routine definitions independently from their execution targets. */
 export class RoutineRegistry {
@@ -73,7 +74,9 @@ export class RoutineRegistry {
 	async save(input: RoutineDefinitionInput): Promise<RoutineDefinition> {
 		return this.#queue.run(async () => {
 			await this.initialize();
-			const definition = normalizeRoutine(input);
+			const normalized = normalizeRoutine(input);
+			const existing = await this.get(normalized.id);
+			const definition = { ...normalized, revision: (existing?.revision ?? 0) + 1 };
 			await this.validate(definition);
 			const target = resolve(this.#directory, `${definition.id}.json`);
 			const temporary = resolve(dirname(target), `.${definition.id}.${randomUUID()}.tmp`);
@@ -129,6 +132,10 @@ function normalizeRoutine(value: unknown): RoutineDefinition {
 	}
 	return {
 		id,
+		revision:
+			typeof input.revision === "number" && Number.isSafeInteger(input.revision) && input.revision > 0
+				? input.revision
+				: 1,
 		name,
 		prompt: requiredString(input.prompt, "prompt"),
 		enabled: input.enabled,

@@ -35,7 +35,11 @@ describe("GoogleWorkspaceOAuth", () => {
 		environment = { GOOGLE_CLIENT_ID: "client-id", GOOGLE_CLIENT_SECRET: "client-secret" };
 		connections = new CapabilityConnectionRegistry(join(root, "connections"));
 		await connections.initialize();
-		environmentStore = new ProviderEnvironmentStore(root, () => manifest, environment);
+		environmentStore = new ProviderEnvironmentStore(root, () => manifest, {
+			environment,
+			platform: "linux",
+			passphrase: "correct horse battery staple",
+		});
 	});
 
 	afterEach(async () => {
@@ -71,12 +75,15 @@ describe("GoogleWorkspaceOAuth", () => {
 			providerId: "google-workspace",
 			accountLabel: "operator@example.com",
 			capabilityIds: ["email.draft", "email.read"],
-			secretRef: "managed:project-environment/google-workspace",
+			secretRef: "vault:user/google-workspace",
 		});
 		const tokenRequest = request.mock.calls[0];
 		expect(String(tokenRequest?.[1]?.body)).toContain("code_verifier=");
-		const file = await readFile(join(root, ".env.local"), "utf8");
-		expect(file).toContain('GOOGLE_OAUTH_ACCESS_TOKEN="access-secret"');
+		await expect(readFile(join(root, ".env.local"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await environmentStore.metadata("google-workspace")).toMatchObject({
+			storage: "encrypted-user-vault",
+			configured: true,
+		});
 		expect(JSON.stringify(connection)).not.toContain("access-secret");
 		await expect(oauth.complete(authorization.searchParams.get("state")!, "replay")).rejects.toThrow(
 			"invalid or expired",

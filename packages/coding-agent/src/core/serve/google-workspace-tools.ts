@@ -61,14 +61,18 @@ export function createGoogleWorkspaceTools(options: GoogleWorkspaceToolOptions):
 		{
 			name: "google_workspace_email_read",
 			label: "email_read",
-			description: "Read one message from the connected Gmail account by message ID.",
-			parameters: Type.Object({ messageId: Type.String({ minLength: 1, maxLength: 256 }) }),
+			description: "Read one message from the connected Gmail account by message ID with an optional body limit.",
+			parameters: Type.Object({
+				messageId: Type.String({ minLength: 1, maxLength: 256 }),
+				maxBodyChars: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_MESSAGE_TEXT_CHARS })),
+			}),
 			executionMode: "parallel",
-			async execute(_id, { messageId }, signal) {
+			async execute(_id, { messageId, maxBodyChars = MAX_MESSAGE_TEXT_CHARS }, signal) {
 				return governedResult(options, "email.read", { messageId }, async () =>
 					textResult(
 						normalizeMessage(
 							await client.request(`/messages/${encodeURIComponent(messageId)}`, signal, { format: "full" }),
+							maxBodyChars,
 						),
 					),
 				);
@@ -401,7 +405,7 @@ function normalizeSearchResult(value: unknown): unknown {
 	};
 }
 
-function normalizeMessage(value: unknown): unknown {
+function normalizeMessage(value: unknown, maxBodyChars: number): unknown {
 	const input = record(value, "Gmail message response");
 	const payload = input.payload === undefined ? undefined : record(input.payload, "Gmail message payload");
 	const body = extractMessageText(payload);
@@ -422,8 +426,8 @@ function normalizeMessage(value: unknown): unknown {
 		internalDate: optionalString(input.internalDate),
 		sizeEstimate: optionalNonNegativeInteger(input.sizeEstimate),
 		headers,
-		body: body.slice(0, MAX_MESSAGE_TEXT_CHARS),
-		truncated: body.length > MAX_MESSAGE_TEXT_CHARS,
+		body: body.slice(0, maxBodyChars),
+		truncated: body.length > maxBodyChars,
 	};
 }
 

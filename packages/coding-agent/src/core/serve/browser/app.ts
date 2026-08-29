@@ -7,7 +7,13 @@ import type {
 	TranscriptItem,
 } from "@earendil-works/pi-protocol";
 import { createBrowserId } from "./browser-id.ts";
-import { getSessionCostPresentation } from "./model-pricing.ts";
+import { splitInlineThinking } from "./inline-thinking.ts";
+import {
+	getModelSelectionCostPresentations,
+	getSessionCostPresentation,
+	type ModelSelectionCostPresentation,
+	modelSelectionCostKey,
+} from "./model-pricing.ts";
 import { filterPresentedModels } from "./model-visibility.ts";
 import { installThemedSelect } from "./themed-select.ts";
 import { selectTranscriptWindow } from "./transcript-window.ts";
@@ -18,6 +24,15 @@ const capabilityToken = pageUrl.searchParams.get("token");
 const browserPopoutMode = pageUrl.searchParams.get("browserPopout") === "1";
 const requestedPreviewSessionId = pageUrl.searchParams.get("browserSession") ?? undefined;
 const recommendedAgentModel = { provider: "openai", id: "gpt-5.6-luna" } as const;
+const agentBuilderBootstrapPrefix =
+	"You are Agent Builder, a temporary specialist helping configure and deploy one local Pi agent.";
+const modelProviderLabels: Readonly<Record<string, string>> = {
+	"amazon-bedrock": "Bedrock",
+	"bedrock-mantle": "Bedrock Mantle",
+	anthropic: "Anthropic",
+	ollama: "Ollama",
+	openai: "OpenAI",
+};
 document.body.classList.toggle("browser-popout", browserPopoutMode);
 if (browserPopoutMode) document.title = "Pi Browser";
 
@@ -41,6 +56,7 @@ attachmentInput.classList.add("file-picker-input");
 const model = requiredElement<HTMLSelectElement>("model");
 const agentModel = requiredElement<HTMLSelectElement>("agent-model");
 const thinking = requiredElement<HTMLSelectElement>("thinking");
+const agentThinking = requiredElement<HTMLSelectElement>("agent-thinking");
 const phase = element("phase");
 const agentList = element("agent-list");
 const newAgent = requiredElement<HTMLButtonElement>("new-agent");
@@ -49,6 +65,8 @@ const selectedAgentPanel = element("selected-agent");
 const selectedAgentTitle = element("selected-agent-title");
 const selectedAgentMeta = element("selected-agent-meta");
 const agentActivityList = element("agent-activity-list");
+const attentionHeading = element("attention-heading");
+const openArtifactsButton = requiredElement<HTMLButtonElement>("open-artifacts");
 selectedAgentPanel.querySelector(".agent-run-history")?.remove();
 const routineList = element("routine-list");
 const routineEditor = createRoutineEditor();
@@ -119,6 +137,11 @@ const agentSubmit = (() => {
 	if (!value) throw new Error("Agent Builder submit control is missing");
 	return value;
 })();
+const agentCancel = document.createElement("button");
+agentCancel.type = "button";
+agentCancel.className = "secondary-action";
+agentCancel.textContent = "Cancel editing";
+agentSubmit.before(agentCancel);
 const agentValidation = document.createElement("p");
 agentValidation.className = "muted";
 agentValidation.setAttribute("role", "status");
@@ -129,12 +152,11 @@ const modelPicker = installThemedSelect(model);
 const agentModelPicker = installThemedSelect(agentModel);
 const externalModelPicker = installThemedSelect(externalModel);
 const routineModelPicker = installThemedSelect(routineEditor.model);
+const thinkingPicker = installThemedSelect(thinking, "simple");
+const agentThinkingPicker = installThemedSelect(agentThinking, "simple");
 
-let client: PiClient | undefined;
 let session: PiSessionHandle | undefined;
 let unsubscribeSession: Unsubscribe | undefined;
-let builderSession: PiSessionHandle | undefined;
-let unsubscribeBuilder: Unsubscribe | undefined;
 let builderActive = false;
 let builderLabel = "Agent Builder";
 let activeSidebarAgent: AgentSummary | undefined;
@@ -143,14 +165,20 @@ let activeAgentId: string | undefined;
 let activeSubagentKey: string | undefined;
 let activeExternalRunId = localStorage.getItem("pi-serve-active-external-run-v2") ?? undefined;
 let activeExternalConnectionId = localStorage.getItem("pi-serve-active-external-connection") ?? undefined;
+let activeArtifactId: string | undefined;
+const artifactLibraryId = "artifact-library";
 const openAgentIds: string[] = [];
 const openSubagentKeys: string[] = [];
 const openExternalRunIds = readStoredStringArray("pi-serve-external-run-tabs-v2");
 const openExternalConnectionIds = readStoredStringArray("pi-serve-external-connection-tabs");
+const openArtifactIds: string[] = [];
 const externalResultByRunId = new Map<string, string>();
 const subagentActivityByKey = new Map<string, SubagentActivity>();
 const agentConversationIds = new Map<string, string>();
 const agentTasksByAgent = new Map<string, AgentTaskSummary[]>();
+let attentionItems: AttentionSummary[] = [];
+let artifacts: ArtifactSummary[] = [];
+let activeArtifactObjectUrl: string | undefined;
 let activePreviewSessionId: string | undefined;
 let activePreviewSession: BrowserSessionSummary | undefined;
 let selectedPreviewSessionId = requestedPreviewSessionId;
@@ -173,7 +201,10 @@ let externalRuns: ExternalRunSummary[] = [];
 let renderedExternalRunSignature = "";
 let renderedExternalRunListSignature = "";
 let lastAppliedBuilderDraft = "";
+let agentBuilderBaseline = "";
+let agentBuilderFeedback = "";
 let availableModels: ModelMetadata[] = [];
+let modelCostPresentations: ReadonlyMap<string, ModelSelectionCostPresentation> = new Map();
 let agentModelsInitialized = false;
 let agents: AgentSummary[] = [];
 let personas: PersonaSummary[] = [];
@@ -186,6 +217,7 @@ let settingsReturnFocus: HTMLElement | undefined;
 let capabilityConnections: CapabilityConnectionSummary[] = [];
 let capabilitySnapshot: CapabilitySnapshot["broker"] | undefined;
 let capabilityCatalogSnapshot: CapabilitySnapshot | undefined;
+let credentialVaultStatus: CredentialVaultManagementStatus | undefined;
 const attachmentsBySession = new Map<string, AttachmentSummary[]>();
 
 interface AttachmentSummary {
@@ -285,6 +317,25 @@ interface CapabilityConnectionSummary {
 	status: "active" | "unhealthy" | "revoked";
 }
 
+interface CredentialVaultManagementStatus {
+	vault: {
+		path: string;
+		scope: "user" | "workspace";
+		initialized: boolean;
+		locked: boolean;
+		protection: "windows" | "passphrase" | "none";
+		generation?: number;
+		updatedAt?: string;
+		credentialCount?: number;
+	};
+	legacy: {
+		path: string;
+		configuredFields: Array<{ providerId: string; name: string; secret: boolean; sourceName: string }>;
+		migratedFields: Array<{ providerId: string; name: string; secret: boolean; sourceName: string }>;
+		unmanagedNames: string[];
+	};
+}
+
 type CapabilityConnectionState = "not-required" | "missing" | "unhealthy" | "not-granted" | "ready";
 
 interface CapabilityApprovalSummary {
@@ -336,14 +387,47 @@ interface AgentTaskSummary {
 	id: string;
 	conversationId: string;
 	agentId: string;
-	status: "queued" | "running" | "completed" | "failed" | "cancelled";
+	status:
+		| "queued"
+		| "running"
+		| "waiting_for_approval"
+		| "waiting_for_input"
+		| "stopping"
+		| "completed"
+		| "failed"
+		| "cancelled"
+		| "interrupted";
 	prompt: string;
 	createdAt: number;
 	phase?: "initializing" | "waiting-for-model" | "generating" | "running-tool" | "writing-results";
 	progressMessage?: string;
 	lastActivityAt?: number;
+	artifactIds: string[];
 	result?: string;
 	error?: string;
+}
+
+interface AttentionSummary {
+	id: string;
+	taskId: string;
+	kind: "approval" | "question" | "failure" | "completed";
+	status: "open" | "resolved" | "dismissed";
+	title: string;
+	summary: string;
+	createdAt: number;
+}
+
+interface ArtifactSummary {
+	id: string;
+	title: string;
+	kind: string;
+	taskId: string;
+	agentId?: string;
+	currentVersionId: string;
+	versionIds: string[];
+	createdAt: number;
+	updatedAt: number;
+	archivedAt?: number;
 }
 
 interface AgentMessageSummary {
@@ -504,6 +588,7 @@ const thinkingCollapseTimers = new Map<string, number>();
 const streamingThinking = new Set<string>();
 const expandedToolActivity = new Map<string, boolean>();
 const promptHistoryBySession = new Map<string, PromptHistory>();
+const pendingSessionConfigurationUpdates = new Map<string, Promise<SessionSnapshot>>();
 const MAX_PROMPT_HISTORY = 5;
 const transcriptVisibleCountBySession = new Map<string, number>();
 const TRANSCRIPT_WINDOW_SIZE = 80;
@@ -959,6 +1044,128 @@ function renderSettings(): void {
 	renderSettingsConnections();
 	renderSettingsCapabilities();
 	renderSettingsPlugins();
+	renderSettingsSecurity();
+}
+
+function renderSettingsSecurity(): void {
+	document.getElementById("settings-vault-card")?.remove();
+	const status = credentialVaultStatus;
+	const card = settingsCard(
+		"Credential vault",
+		status
+			? `${status.vault.scope === "user" ? "Shared user" : "Workspace"} · ${status.vault.protection}`
+			: "Loading encrypted credential storage",
+		status
+			? status.vault.initialized
+				? status.vault.locked
+					? "Locked"
+					: "Unlocked"
+				: "Setup required"
+			: "Loading",
+		"User",
+		"credential-vault",
+	);
+	card.id = "settings-vault-card";
+	if (!status) {
+		settingsSecurityList.prepend(card);
+		return;
+	}
+	appendText(
+		card,
+		status.vault.locked
+			? "Stored values are unavailable until this Pi host unlocks the vault."
+			: `${status.vault.credentialCount ?? 0} configured provider record${status.vault.credentialCount === 1 ? "" : "s"}.`,
+		"muted",
+	);
+	const legacyRemaining = status.legacy.configuredFields.filter(
+		(field) =>
+			!status.legacy.migratedFields.some(
+				(migrated) => migrated.providerId === field.providerId && migrated.name === field.name,
+			),
+	);
+	if (status.legacy.configuredFields.length > 0) {
+		appendText(
+			card,
+			`${status.legacy.migratedFields.length}/${status.legacy.configuredFields.length} declared .env.local values migrated.`,
+			"settings-state",
+		);
+	}
+	if (status.legacy.unmanagedNames.length > 0) {
+		appendText(
+			card,
+			`${status.legacy.unmanagedNames.length} legacy setting${status.legacy.unmanagedNames.length === 1 ? " is" : "s are"} not owned by a connection and remain in .env.local.`,
+			"settings-state",
+		);
+	}
+	const secretMutationAllowed = location.protocol === "https:" || isLoopbackHostname(location.hostname);
+	const passphrase = document.createElement("input");
+	passphrase.type = "password";
+	passphrase.autocomplete = "new-password";
+	passphrase.placeholder = "Vault passphrase for portable or recovery vaults";
+	passphrase.setAttribute("aria-label", "Credential vault passphrase");
+	passphrase.className = "settings-search";
+	if (!status.vault.initialized || status.vault.locked) card.append(passphrase);
+	const actions = document.createElement("div");
+	actions.className = "settings-actions";
+	if (!status.vault.initialized) {
+		actions.append(vaultActionButton("Initialize vault", "initialize", passphrase, secretMutationAllowed));
+	} else if (status.vault.locked) {
+		actions.append(vaultActionButton("Unlock", "unlock", passphrase, secretMutationAllowed));
+	} else {
+		actions.append(vaultActionButton("Lock", "lock", undefined, true));
+		if (legacyRemaining.length > 0) {
+			actions.append(vaultActionButton("Import .env.local", "migrate", undefined, secretMutationAllowed));
+		}
+		if (status.legacy.configuredFields.length > 0 && legacyRemaining.length === 0) {
+			const remove = vaultActionButton(
+				"Remove migrated entries",
+				"remove-migrated-legacy",
+				undefined,
+				secretMutationAllowed,
+			);
+			remove.classList.add("danger");
+			actions.append(remove);
+		}
+	}
+	if (!secretMutationAllowed) {
+		appendText(card, "Credential changes require this Pi host or authenticated HTTPS.", "muted");
+	}
+	card.append(actions);
+	const advanced = document.createElement("details");
+	advanced.className = "settings-advanced";
+	const summary = document.createElement("summary");
+	summary.textContent = "Storage details";
+	advanced.append(summary);
+	appendText(advanced, status.vault.path, "capability-meta");
+	if (status.legacy.configuredFields.length > 0)
+		appendText(advanced, `Legacy source: ${status.legacy.path}`, "capability-meta");
+	if (status.legacy.unmanagedNames.length > 0)
+		appendText(advanced, `Unmanaged: ${status.legacy.unmanagedNames.join(", ")}`, "capability-meta");
+	card.append(advanced);
+	settingsSecurityList.prepend(card);
+}
+
+function vaultActionButton(
+	label: string,
+	action: "initialize" | "unlock" | "lock" | "migrate" | "remove-migrated-legacy",
+	passphrase: HTMLInputElement | undefined,
+	enabled: boolean,
+): HTMLButtonElement {
+	const button = document.createElement("button");
+	button.type = "button";
+	button.textContent = label;
+	button.disabled = !enabled;
+	button.title = enabled ? "" : "Use Settings on the Pi host or over authenticated HTTPS";
+	button.addEventListener("click", () => {
+		if (action === "remove-migrated-legacy" && !window.confirm("Remove migrated secret assignments from .env.local?"))
+			return;
+		button.disabled = true;
+		void mutateCredentialVault(action, passphrase?.value).catch((error: unknown) => {
+			setStatus(error instanceof Error ? error.message : String(error), true);
+			button.disabled = false;
+		});
+	});
+	return button;
 }
 
 function renderSettingsModels(): void {
@@ -986,13 +1193,13 @@ function renderSettingsConnections(): void {
 	const providers = capabilityCatalogSnapshot?.broker.providers.filter((provider) => provider.authentication) ?? [];
 	const groupedProviders = [
 		{
-			title: "Web services",
-			description: "Search and extraction endpoints available to Pi and deployed agents.",
+			title: "API and web services",
+			description: "Credentials stored in your user vault.",
 			providers: providers.filter((provider) => provider.authentication?.kind === "environment"),
 		},
 		{
 			title: "Connected accounts",
-			description: "OAuth and other authenticated service accounts.",
+			description: "Authorized service accounts.",
 			providers: providers.filter((provider) => provider.authentication?.kind !== "environment"),
 		},
 	];
@@ -1016,8 +1223,8 @@ function renderSettingsConnections(): void {
 					? "Private web search"
 					: provider.id === "pi-firecrawl"
 						? "Web search, scrape, and crawl"
-						: (connection?.accountLabel ?? provider.source);
-			const card = settingsCard(provider.name, description, state, "Project", provider.id);
+						: (connection?.accountLabel ?? "");
+			const card = settingsCard(provider.name, description, state, "User", provider.id);
 			if (provider.id === "google-workspace") {
 				const icon = document.createElement("span");
 				icon.className = "settings-provider-icon";
@@ -1177,7 +1384,7 @@ function settingsCard(
 	badge.textContent = scope;
 	header.append(title, badge);
 	card.append(header);
-	appendText(card, description, "capability-meta");
+	if (description) appendText(card, description, "capability-meta");
 	appendText(
 		card,
 		state,
@@ -1358,7 +1565,6 @@ function renderAgentBrowserWorkflowGrants(): void {
 				checkbox.type = "checkbox";
 				const reference = `${workflow.id}@${workflow.version}`;
 				checkbox.checked = selected.has(reference);
-				checkbox.disabled = activeSidebarAgent?.source === "pi-agent";
 				checkbox.addEventListener("change", () => {
 					if (checkbox.checked) selected.add(reference);
 					else selected.delete(reference);
@@ -1366,7 +1572,7 @@ function renderAgentBrowserWorkflowGrants(): void {
 					if (selected.size > 0) {
 						requiredElement<HTMLSelectElement>("agent-browser-access").value = "loopback";
 						updateAgentToolGrant("browser", true);
-					}
+					} else updateAgentBuilderReadiness();
 				});
 				label.append(checkbox, `${workflow.name} · v${workflow.version}`);
 				return label;
@@ -1803,6 +2009,7 @@ function render(snapshot: SessionSnapshot): void {
 	}
 	if (activeExternalRunId) return;
 	if (activeExternalConnectionId) return;
+	if (activeArtifactId) return;
 	if (builderActive) return;
 	if (activeAgentId) return;
 	const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
@@ -1814,12 +2021,13 @@ function render(snapshot: SessionSnapshot): void {
 	);
 	const earlier =
 		window.hiddenCount > 0 ? renderEarlierMessages(snapshot, window.hiddenCount, window.visibleCount) : [];
-	transcript.replaceChildren(...earlier, ...window.items.map(renderItem));
+	transcript.replaceChildren(...earlier, ...window.items.map(builderDisplayItem).map(renderItem));
 	setBusy(snapshot);
 	replacePrimaryModelOptions(availableModels);
 	model.value = `${snapshot.model.provider}/${snapshot.model.id}`;
 	modelPicker.refresh();
 	thinking.value = snapshot.thinkingLevel;
+	updateThinkingLevelAvailability(thinking, model.value, snapshot.thinkingLevel);
 	input.disabled = false;
 	input.placeholder = "Message Pi…";
 	input.setAttribute("aria-label", "Message Pi");
@@ -1846,7 +2054,19 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 		activateTab("agent-builder");
 		mobilePanelRight.checked = true;
 	});
-	heading.append(title, advanced);
+	const apply = document.createElement("button");
+	apply.type = "button";
+	apply.id = "builder-chat-apply";
+	apply.className = "primary-action";
+	apply.textContent = activeSidebarAgent ? "Apply update" : "Create agent";
+	apply.title = "Apply the reviewed agent configuration without another model call";
+	apply.addEventListener("click", () => agentForm.requestSubmit());
+	const cancel = document.createElement("button");
+	cancel.type = "button";
+	cancel.className = "secondary-action";
+	cancel.textContent = "Exit editing";
+	cancel.addEventListener("click", () => void closeBuilderChat());
+	heading.append(title, advanced, apply, cancel);
 	const guidance = document.createElement("p");
 	guidance.className = "muted";
 	guidance.textContent =
@@ -1854,12 +2074,13 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 			? "Describe the outcome, working folder, and access the agent needs. Agent Builder will ask for anything missing."
 			: "Continue refining the agent here, or review the generated settings.";
 	guide.append(heading, guidance);
-	transcript.replaceChildren(guide, ...snapshot.transcript.map(renderItem));
+	transcript.replaceChildren(guide, ...snapshot.transcript.map(builderDisplayItem).map(renderItem));
 	setBusy(snapshot);
 	replacePrimaryModelOptions(availableModels);
 	model.value = `${snapshot.model.provider}/${snapshot.model.id}`;
 	modelPicker.refresh();
 	thinking.value = snapshot.thinkingLevel;
+	updateThinkingLevelAvailability(thinking, model.value, snapshot.thinkingLevel);
 	input.disabled = false;
 	input.placeholder = `Message ${builderLabel}…`;
 	input.setAttribute("aria-label", `Message ${builderLabel}`);
@@ -1872,7 +2093,37 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 	renderSessionStats(snapshot);
 	setStatus(projectRoot || "Configure and deploy a local agent");
 	if (nearBottom) transcript.scrollTop = transcript.scrollHeight;
-	applyAgentBuilderDraftFromTranscript();
+	applyLatestAgentBuilderDraft(snapshot);
+	updateAgentBuilderReadiness();
+}
+
+function builderDisplayItem(item: TranscriptItem): TranscriptItem {
+	if (item.role === "assistant")
+		return {
+			...item,
+			content: item.content.map((content) => {
+				if (content.type !== "text") return content;
+				const visible = content.text.replace(/\s*\[AGENT_DRAFT\][\s\S]*?\[\/AGENT_DRAFT\]\s*/g, "\n").trim();
+				return { ...content, text: visible || "Draft ready to review." };
+			}),
+		};
+	if (item.role !== "user") return item;
+	const requestMarker = "\nUser request: ";
+	return {
+		...item,
+		content: item.content.map((content) => {
+			if (content.type !== "text") return content;
+			if (!content.text.startsWith(agentBuilderBootstrapPrefix)) return content;
+			const requestStart = content.text.lastIndexOf(requestMarker);
+			return {
+				...content,
+				text:
+					requestStart >= 0
+						? content.text.slice(requestStart + requestMarker.length).trim()
+						: "Update agent settings",
+			};
+		}),
+	};
 }
 
 function renderExternalRun(run: ExternalRunSummary): void {
@@ -2210,7 +2461,13 @@ function renderItem(item: TranscriptItem): HTMLElement {
 	article.append(label);
 
 	for (const [index, content] of item.content.entries()) {
-		if (content.type === "text") appendText(article, content.text);
+		if (content.type === "text" && item.role === "assistant") {
+			for (const [segmentIndex, segment] of splitInlineThinking(content.text).entries()) {
+				if (segment.type === "thinking")
+					article.append(renderThinkingActivity(item, segment.text, index * 1_000 + segmentIndex));
+				else appendText(article, segment.text);
+			}
+		} else if (content.type === "text") appendText(article, content.text);
 		else if (item.role === "assistant" && content.type === "thinking") {
 			article.append(renderThinkingActivity(item, content.thinking, index));
 		} else if (content.type === "toolCall" && content.toolName !== "subagent") {
@@ -2236,10 +2493,14 @@ function renderThinkingActivity(
 	index: number,
 ): HTMLDetailsElement {
 	const thinkingId = `${item.id}:${index}`;
+	return renderThinkingDisclosure(thinkingId, content, item.status === "streaming");
+}
+
+function renderThinkingDisclosure(thinkingId: string, content: string, streaming: boolean): HTMLDetailsElement {
 	const details = document.createElement("details");
-	details.className = `thinking-activity${item.status === "streaming" ? " is-streaming" : ""}`;
+	details.className = `thinking-activity${streaming ? " is-streaming" : ""}`;
 	details.dataset.thinkingId = thinkingId;
-	if (item.status === "streaming") {
+	if (streaming) {
 		streamingThinking.add(thinkingId);
 	}
 	details.open = expandedThinking.get(thinkingId) ?? false;
@@ -2247,7 +2508,7 @@ function renderThinkingActivity(
 
 	const summary = document.createElement("summary");
 	const label = document.createElement("span");
-	label.textContent = item.status === "streaming" ? "Thinking" : "Thought process";
+	label.textContent = streaming ? "Thinking" : "Thought process";
 	const dots = document.createElement("span");
 	dots.className = "thinking-dots";
 	dots.setAttribute("aria-hidden", "true");
@@ -2259,7 +2520,7 @@ function renderThinkingActivity(
 	body.textContent = content;
 	details.append(summary, body);
 
-	if (item.status !== "streaming" && streamingThinking.delete(thinkingId) && !thinkingCollapseTimers.has(thinkingId)) {
+	if (!streaming && streamingThinking.delete(thinkingId) && !thinkingCollapseTimers.has(thinkingId)) {
 		thinkingCollapseTimers.set(
 			thinkingId,
 			window.setTimeout(() => {
@@ -2469,9 +2730,14 @@ function appendText(parent: HTMLElement, text: string, className?: string): void
 	parent.append(block);
 }
 
+function modelOptionLabel(entry: { provider: string; name: string }): string {
+	return `${entry.name} · ${modelProviderLabels[entry.provider] ?? entry.provider}`;
+}
+
 function populateModels(models: readonly ModelMetadata[], includeAgentModels = false): void {
 	const presentedModels = filterPresentedModels(models);
 	availableModels = presentedModels;
+	modelCostPresentations = getModelSelectionCostPresentations(presentedModels);
 	replacePrimaryModelOptions(presentedModels);
 	if (!includeAgentModels) return;
 	const inherit = document.createElement("option");
@@ -2483,7 +2749,8 @@ function populateModels(models: readonly ModelMetadata[], includeAgentModels = f
 			const option = document.createElement("option");
 			option.value = `${entry.provider}/${entry.id}`;
 			const recommended = entry.provider === recommendedAgentModel.provider && entry.id === recommendedAgentModel.id;
-			option.textContent = `${entry.provider} / ${entry.name}${recommended ? " · Recommended" : ""}`;
+			option.textContent = `${modelOptionLabel(entry)}${recommended ? " · Recommended" : ""}`;
+			applyModelCostPresentation(option, entry);
 			return option;
 		}),
 	);
@@ -2504,16 +2771,72 @@ function replacePrimaryModelOptions(models: readonly { provider: string; id: str
 	const options = models.map((entry) => {
 		const option = document.createElement("option");
 		option.value = `${entry.provider}/${entry.id}`;
-		option.textContent = `${entry.provider} / ${entry.name}`;
+		option.textContent = modelOptionLabel(entry);
+		applyModelCostPresentation(option, entry);
 		return option;
 	});
 	model.replaceChildren(...options);
 	modelPicker.refresh();
 }
 
+function applyModelCostPresentation(option: HTMLOptionElement, modelRef: { provider: string; id: string }): void {
+	const presentation = modelCostPresentations.get(modelSelectionCostKey(modelRef.provider, modelRef.id));
+	if (!presentation) return;
+	option.dataset.optionAccent = presentation.color;
+	option.dataset.optionKind = presentation.band;
+	option.title = presentation.title;
+}
+
 function modelRefFromValue(value: string): { provider: string; id: string } | undefined {
 	const separator = value.indexOf("/");
 	return separator > 0 ? { provider: value.slice(0, separator), id: value.slice(separator + 1) } : undefined;
+}
+
+function updateThinkingLevelAvailability(
+	select: HTMLSelectElement,
+	modelValue: string,
+	preferredLevel?: ThinkingLevel,
+): void {
+	const modelRef = modelRefFromValue(modelValue);
+	const metadata = modelRef
+		? availableModels.find((entry) => entry.provider === modelRef.provider && entry.id === modelRef.id)
+		: undefined;
+	if (!metadata) {
+		for (const option of select.options) {
+			option.disabled = false;
+			option.style.color = "#f4f4f5";
+			option.style.backgroundColor = "#17171b";
+			delete option.dataset.thinkingSupported;
+			option.removeAttribute("title");
+		}
+		select.removeAttribute("title");
+		if (preferredLevel) select.value = preferredLevel;
+		refreshThinkingPicker(select);
+		return;
+	}
+
+	const supportedLevels = new Set<ThinkingLevel>(metadata.supportedThinkingLevels);
+	for (const option of select.options) {
+		const level = option.value as ThinkingLevel;
+		const supported = supportedLevels.has(level);
+		option.disabled = !supported;
+		option.dataset.thinkingSupported = String(supported);
+		option.style.color = supported ? "#f4f4f5" : "#666873";
+		option.style.backgroundColor = supported ? "#17171b" : "#111114";
+		option.title = supported
+			? `${level} thinking is supported by ${metadata.name}`
+			: `${metadata.name} does not support ${level} thinking`;
+	}
+
+	if (preferredLevel && supportedLevels.has(preferredLevel)) select.value = preferredLevel;
+	if (!supportedLevels.has(select.value as ThinkingLevel)) select.value = metadata.supportedThinkingLevels[0];
+	select.title = `${metadata.name} supports ${metadata.supportedThinkingLevels.join(", ")} thinking. Unsupported levels are disabled.`;
+	refreshThinkingPicker(select);
+}
+
+function refreshThinkingPicker(select: HTMLSelectElement): void {
+	if (select === thinking) thinkingPicker.refresh();
+	else if (select === agentThinking) agentThinkingPicker.refresh();
 }
 
 function socketUrl(controlUrl: string): { label: string; url: string } {
@@ -2592,11 +2915,11 @@ function renderSessionNavigation(): void {
 			wrapper.className = "session-tab-wrap";
 			wrapper.classList.toggle(
 				"active",
-				!builderActive &&
-					!activeAgentId &&
+				!activeAgentId &&
 					!activeSubagentKey &&
 					!activeExternalConnectionId &&
 					!activeExternalRunId &&
+					!activeArtifactId &&
 					target.key === activeTargetKey,
 			);
 			const button = document.createElement("button");
@@ -2604,11 +2927,11 @@ function renderSessionNavigation(): void {
 			button.className = "session-tab";
 			button.classList.toggle(
 				"active",
-				!builderActive &&
-					!activeAgentId &&
+				!activeAgentId &&
 					!activeSubagentKey &&
 					!activeExternalConnectionId &&
 					!activeExternalRunId &&
+					!activeArtifactId &&
 					target.key === activeTargetKey,
 			);
 			const sessionName = sessionDisplayName(target);
@@ -2620,7 +2943,6 @@ function renderSessionNavigation(): void {
 			wrapper.append(button);
 			return wrapper;
 		}),
-		...(builderSession ? [renderBuilderSessionTab()] : []),
 		...openAgentIds.flatMap((agentId) => {
 			const agent = agents.find((entry) => entry.id === agentId);
 			if (!agent) return [];
@@ -2710,6 +3032,28 @@ function renderSessionNavigation(): void {
 			wrapper.append(button, close);
 			return [wrapper];
 		}),
+		...openArtifactIds.flatMap((artifactId) => {
+			const artifact = artifacts.find((entry) => entry.id === artifactId);
+			if (!artifact) return [];
+			const wrapper = document.createElement("div");
+			wrapper.className = "session-tab-wrap";
+			wrapper.classList.toggle("active", artifact.id === activeArtifactId);
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "session-tab artifact-session-tab";
+			button.textContent = artifact.title;
+			button.title = `Open ${artifact.title}`;
+			button.addEventListener("click", () => void openArtifact(artifact.id));
+			const close = document.createElement("button");
+			close.type = "button";
+			close.className = "session-tab-close";
+			close.textContent = "×";
+			close.title = `Close ${artifact.title}`;
+			close.setAttribute("aria-label", close.title);
+			close.addEventListener("click", () => closeArtifactTab(artifact.id));
+			wrapper.append(button, close);
+			return [wrapper];
+		}),
 	);
 	connectionList.replaceChildren(
 		...[...connections.values()].map((entry) => {
@@ -2739,10 +3083,10 @@ function renderSessionNavigation(): void {
 				button.className = "session-select";
 				button.classList.toggle(
 					"active",
-					!builderActive &&
-						!activeAgentId &&
+					!activeAgentId &&
 						!activeSubagentKey &&
 						!activeExternalRunId &&
+						!activeArtifactId &&
 						target.key === activeTargetKey,
 				);
 				const name = document.createElement("strong");
@@ -2765,37 +3109,22 @@ function renderSessionNavigation(): void {
 	);
 }
 
-function renderBuilderSessionTab(): HTMLDivElement {
-	const wrapper = document.createElement("div");
-	wrapper.className = "session-tab-wrap";
-	wrapper.classList.toggle("active", builderActive);
-	const button = document.createElement("button");
-	button.type = "button";
-	button.className = "session-tab builder-session-tab";
-	button.textContent = builderLabel;
-	button.title = "Continue configuring this agent";
-	button.addEventListener("click", openBuilderChat);
-	const close = document.createElement("button");
-	close.type = "button";
-	close.className = "session-tab-close";
-	close.textContent = "×";
-	close.title = "Close Agent Builder";
-	close.setAttribute("aria-label", close.title);
-	close.addEventListener("click", () => void closeBuilderChat());
-	wrapper.append(button, close);
-	return wrapper;
-}
-
-async function switchSession(target: SessionTarget): Promise<void> {
+async function switchSession(target: SessionTarget, preserveWorkspace = false): Promise<void> {
 	if (target.key === activeTargetKey && session?.attached) {
-		builderActive = false;
-		activeAgentId = undefined;
-		activeSubagentKey = undefined;
-		activeExternalRunId = undefined;
-		activeExternalConnectionId = undefined;
-		persistExternalRunTabs();
-		persistExternalConnectionTabs();
-		if (session.snapshot) render(session.snapshot);
+		if (!preserveWorkspace) {
+			builderActive = false;
+			activeAgentId = undefined;
+			activeSubagentKey = undefined;
+			activeExternalRunId = undefined;
+			activeExternalConnectionId = undefined;
+			activeArtifactId = undefined;
+			persistExternalRunTabs();
+			persistExternalConnectionTabs();
+		}
+		if (session.snapshot) {
+			if (builderActive) renderBuilderConversation(session.snapshot);
+			else render(session.snapshot);
+		}
 		renderSessionNavigation();
 		renderAttachments();
 		return;
@@ -2810,16 +3139,25 @@ async function switchSession(target: SessionTarget): Promise<void> {
 	await session?.dispose().catch(() => {});
 	session = await entry.client.attachSession(target.session.id);
 	activeTargetKey = target.key;
-	builderActive = false;
-	activeAgentId = undefined;
-	activeSubagentKey = undefined;
-	activeExternalRunId = undefined;
-	activeExternalConnectionId = undefined;
-	persistExternalRunTabs();
-	persistExternalConnectionTabs();
+	if (!preserveWorkspace) {
+		builderActive = false;
+		activeAgentId = undefined;
+		activeSubagentKey = undefined;
+		activeExternalRunId = undefined;
+		activeExternalConnectionId = undefined;
+		activeArtifactId = undefined;
+		persistExternalRunTabs();
+		persistExternalConnectionTabs();
+	}
 	populateModels(entry.client.snapshot?.models ?? []);
-	unsubscribeSession = session.subscribe(render);
-	if (session.snapshot) render(session.snapshot);
+	unsubscribeSession = session.subscribe((snapshot) => {
+		if (builderActive) renderBuilderConversation(snapshot);
+		else render(snapshot);
+	});
+	if (session.snapshot) {
+		if (builderActive) renderBuilderConversation(session.snapshot);
+		else render(session.snapshot);
+	}
 	renderSessionNavigation();
 	renderAttachments();
 	void loadPreview().catch((error: unknown) =>
@@ -3949,7 +4287,6 @@ async function connect(): Promise<void> {
 	setStatus("Connecting to Pi…");
 	const restoredExternalConnectionId = activeExternalConnectionId;
 	const primary = await addConnection(location.href, true);
-	client = primary.client;
 	populateModels(primary.client.snapshot?.models ?? [], true);
 	const initial = sessionTargets().find((target) => target.connectionId === primary.id);
 	if (!initial) throw new Error("The active Pi session is unavailable");
@@ -3968,11 +4305,65 @@ async function connect(): Promise<void> {
 			loadCapabilityConnections()
 				.then(() => Promise.all([loadCapabilities(), loadWaveTwoControls()]))
 				.catch(() => {}),
+			loadCredentialVault().catch(() => {}),
 			loadExternalConnections()
 				.then(loadExternalRuns)
 				.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true)),
 		]);
 	}, 0);
+}
+
+async function loadCredentialVault(): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/credential-vault?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load credential vault"));
+	const payload: unknown = await response.json();
+	if (!isCredentialVaultManagementStatus(payload)) throw new Error("Credential vault returned an invalid response");
+	credentialVaultStatus = payload;
+	renderSettingsSecurity();
+}
+
+async function mutateCredentialVault(
+	action: "initialize" | "unlock" | "lock" | "migrate" | "remove-migrated-legacy",
+	passphrase?: string,
+): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/credential-vault?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ action, ...(passphrase ? { passphrase } : {}) }),
+	});
+	if (!response.ok) throw new Error(await responseError(response, "Credential vault operation failed"));
+	await Promise.all([loadCredentialVault(), loadCapabilities()]);
+	setStatus(
+		action === "migrate"
+			? "Legacy credentials imported"
+			: action === "remove-migrated-legacy"
+				? "Migrated legacy entries removed"
+				: `Credential vault ${action === "initialize" ? "initialized" : `${action}ed`}`,
+	);
+}
+
+function isCredentialVaultManagementStatus(value: unknown): value is CredentialVaultManagementStatus {
+	if (typeof value !== "object" || value === null || !("vault" in value) || !("legacy" in value)) return false;
+	const vault = value.vault;
+	const legacy = value.legacy;
+	return (
+		typeof vault === "object" &&
+		vault !== null &&
+		"initialized" in vault &&
+		typeof vault.initialized === "boolean" &&
+		"locked" in vault &&
+		typeof vault.locked === "boolean" &&
+		typeof legacy === "object" &&
+		legacy !== null &&
+		"configuredFields" in legacy &&
+		Array.isArray(legacy.configuredFields) &&
+		"migratedFields" in legacy &&
+		Array.isArray(legacy.migratedFields) &&
+		"unmanagedNames" in legacy &&
+		Array.isArray(legacy.unmanagedNames)
+	);
 }
 
 function installAgentEvents(): void {
@@ -4471,6 +4862,7 @@ function renderBrokeredCapabilities(broker: CapabilitySnapshot["broker"], query:
 function providerConfigurationForm(provider: CapabilityProvider): HTMLFormElement {
 	const form = document.createElement("form");
 	form.className = "configuration-form provider-configuration-form";
+	const configurationAllowed = location.protocol === "https:" || isLoopbackHostname(location.hostname);
 	const connections = capabilityConnections.filter(
 		(entry) => entry.providerId === provider.id && entry.status === "active" && entry.id !== "plaid-all",
 	);
@@ -4495,6 +4887,8 @@ function providerConfigurationForm(provider: CapabilityProvider): HTMLFormElemen
 		if (field.operatorEditable === false) continue;
 		const label = document.createElement("label");
 		label.textContent = `${field.label}${field.required ? " *" : ""}`;
+		const fieldRow = document.createElement("div");
+		fieldRow.className = "provider-field-row";
 		const input = field.options ? document.createElement("select") : document.createElement("input");
 		input.name = field.env;
 		if (input instanceof HTMLInputElement) {
@@ -4508,31 +4902,46 @@ function providerConfigurationForm(provider: CapabilityProvider): HTMLFormElemen
 				input.append(option);
 			}
 		}
+		input.disabled = !configurationAllowed;
 		if (!field.secret && field.value) input.value = field.value;
 		if (input instanceof HTMLInputElement) {
-			input.placeholder = field.configured ? "Configured; leave blank to keep" : "Not configured";
+			input.placeholder = field.configured ? "Configured" : "Enter value";
 		}
-		label.append(input);
+		const store = providerFieldActionButton("store", `Save ${field.label} to vault`);
+		store.disabled = !configurationAllowed || (input instanceof HTMLInputElement && input.value === "");
+		store.addEventListener("click", () => {
+			const value = input.value;
+			if (!value) return;
+			store.disabled = true;
+			void configureCapabilityProviderField(provider.id, field.env, value, false).catch((error: unknown) => {
+				setStatus(error instanceof Error ? error.message : String(error), true);
+				store.disabled = false;
+			});
+		});
+		input.addEventListener("input", () => {
+			store.disabled = !configurationAllowed || input.value === "";
+		});
+		fieldRow.append(input, store);
 		if (field.configured) {
-			const clearLabel = document.createElement("label");
-			clearLabel.className = "capability-grant";
-			const clear = document.createElement("input");
-			clear.type = "checkbox";
-			clear.dataset.clearEnvironment = field.env;
-			clearLabel.append(clear, " Clear saved value");
-			label.append(clearLabel);
+			const remove = providerFieldActionButton("remove", `Remove ${field.label} from vault`);
+			remove.disabled = !configurationAllowed;
+			remove.classList.add("danger");
+			remove.addEventListener("click", () => {
+				if (!window.confirm(`Remove ${field.label} from the encrypted vault?`)) return;
+				remove.disabled = true;
+				void configureCapabilityProviderField(provider.id, field.env, "", true).catch((error: unknown) => {
+					setStatus(error instanceof Error ? error.message : String(error), true);
+					remove.disabled = false;
+				});
+			});
+			fieldRow.append(remove);
 		}
+		label.append(fieldRow);
 		form.append(label);
 	}
-	const save = document.createElement("button");
-	save.type = "submit";
-	save.textContent =
-		provider.authentication?.kind === "oauth2"
-			? "Save OAuth configuration"
-			: provider.authentication?.kind === "plaid-link"
-				? "Save Plaid configuration"
-				: "Save configuration";
-	form.append(save);
+	if (!configurationAllowed) {
+		appendText(form, "Edit credentials on this Pi host or through authenticated HTTPS.", "muted");
+	}
 	if (provider.authentication?.kind === "oauth2" || provider.authentication?.kind === "plaid-link") {
 		if (provider.authentication.capabilityGroups?.length) {
 			form.append(providerCapabilityPermissions(provider, connection));
@@ -4577,11 +4986,27 @@ function providerConfigurationForm(provider: CapabilityProvider): HTMLFormElemen
 	}
 	form.addEventListener("submit", (event) => {
 		event.preventDefault();
-		void configureCapabilityProvider(provider.id, form).catch((error: unknown) =>
-			setStatus(error instanceof Error ? error.message : String(error), true),
-		);
 	});
 	return form;
+}
+
+function providerFieldActionButton(action: "store" | "remove", label: string): HTMLButtonElement {
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "provider-field-action";
+	button.title = label;
+	button.setAttribute("aria-label", label);
+	const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+	icon.setAttribute("viewBox", "0 0 24 24");
+	icon.setAttribute("aria-hidden", "true");
+	const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+	path.setAttribute(
+		"d",
+		action === "store" ? "M4 12h14m-5-5 5 5-5 5M5 5v14" : "M4 7h16m-10 4v6m4-6v6M9 7l1-3h4l1 3m-9 0 1 14h10l1-14",
+	);
+	icon.append(path);
+	button.append(icon);
+	return button;
 }
 
 function providerCapabilityPermissions(
@@ -4707,26 +5132,24 @@ function isLoopbackHostname(hostname: string): boolean {
 	return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" || hostname === "[::1]";
 }
 
-async function configureCapabilityProvider(providerId: string, form: HTMLFormElement): Promise<void> {
+async function configureCapabilityProviderField(
+	providerId: string,
+	name: string,
+	value: string,
+	clear: boolean,
+): Promise<void> {
 	if (!capabilityToken) return;
-	const values: Record<string, string> = {};
-	for (const input of form.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[name]")) {
-		if (input.value !== "") values[input.name] = input.value;
-	}
-	const clear = [...form.querySelectorAll<HTMLInputElement>("input[data-clear-environment]:checked")].map(
-		(input) => input.dataset.clearEnvironment ?? "",
-	);
 	const response = await fetch(
 		`/capability-providers/${encodeURIComponent(providerId)}/configuration?token=${encodeURIComponent(capabilityToken)}`,
 		{
 			method: "PUT",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ values, clear }),
+			body: JSON.stringify({ values: clear ? {} : { [name]: value }, clear: clear ? [name] : [] }),
 		},
 	);
 	if (!response.ok) throw new Error(await responseError(response, "Could not configure provider"));
 	await loadCapabilities();
-	setStatus("Provider configuration saved");
+	setStatus(clear ? "Vault value removed" : "Vault value saved");
 }
 
 function capabilityProviderButton(label: string, action: () => void): HTMLButtonElement {
@@ -4797,6 +5220,7 @@ function updateAgentCapabilityGrant(capability: BrokeredCapability, enabled: boo
 	}
 	requiredElement<HTMLInputElement>("agent-capabilities").value = JSON.stringify(grants);
 	updateBuilderCapabilitySummary();
+	updateAgentBuilderReadiness();
 }
 
 function selectedAgentTools(): Set<string> {
@@ -4814,6 +5238,7 @@ function updateAgentToolGrant(tool: string, enabled: boolean): void {
 	else tools.delete(tool);
 	requiredElement<HTMLInputElement>("agent-tools").value = [...tools].sort().join(",");
 	updateBuilderCapabilitySummary();
+	updateAgentBuilderReadiness();
 }
 
 function updateBuilderCapabilitySummary(): void {
@@ -5305,6 +5730,7 @@ function openExternalConnection(connection: ExternalConnectionSummary): void {
 	activeSubagentKey = undefined;
 	activeExternalRunId = undefined;
 	activeExternalConnectionId = connection.id;
+	activeArtifactId = undefined;
 	if (!openExternalConnectionIds.includes(connection.id)) openExternalConnectionIds.push(connection.id);
 	requiredElement<HTMLInputElement>("external-id").value = connection.id;
 	element("external-title").textContent = connection.name;
@@ -5322,7 +5748,8 @@ function openExternalConnection(connection: ExternalConnectionSummary): void {
 		...connection.models.map((entry) => {
 			const option = document.createElement("option");
 			option.value = `${entry.provider}/${entry.id}`;
-			option.textContent = `${entry.provider} / ${entry.name}`;
+			option.textContent = modelOptionLabel(entry);
+			applyModelCostPresentation(option, entry);
 			return option;
 		}),
 	);
@@ -5368,6 +5795,44 @@ const builderRequirements: BuilderRequirement[] = [
 	{ fieldId: "agent-project-root", label: "Project folder", panelId: "builder-profile-panel" },
 	{ fieldId: "agent-persona", label: "Persona instructions", panelId: "builder-profile-panel" },
 ];
+
+const agentBuilderTrackedFieldIds = [
+	"agent-id",
+	"agent-name",
+	"agent-description",
+	"agent-project-root",
+	"agent-persona-select",
+	"agent-persona",
+	"agent-model",
+	"agent-thinking",
+	"agent-executor",
+	"agent-permissions",
+	"agent-browser-access",
+	"agent-browser-runtime",
+	"agent-browser-profile-kind",
+	"agent-browser-profile-id",
+	"agent-tools",
+	"agent-capabilities",
+	"agent-browser-workflows",
+	"agent-delegates",
+	"agent-a2a",
+] as const;
+
+function agentBuilderDraftSignature(): string {
+	return JSON.stringify(
+		agentBuilderTrackedFieldIds.map((fieldId) => {
+			const field = requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(fieldId);
+			return [fieldId, field instanceof HTMLInputElement && field.type === "checkbox" ? field.checked : field.value];
+		}),
+	);
+}
+
+function agentBuilderConfigurationError(): string | undefined {
+	const permissions = requiredElement<HTMLSelectElement>("agent-permissions").value;
+	if (permissions === "read-only" && selectedAgentTools().has("write"))
+		return "Read-only agents cannot enable the write tool.";
+	return undefined;
+}
 
 function installAgentBuilderStepControls(): void {
 	const panelIds = [
@@ -5430,23 +5895,31 @@ function missingBuilderRequirements(): BuilderRequirement[] {
 }
 
 function updateAgentBuilderReadiness(): void {
-	const catalogManaged = activeSidebarAgent?.source === "pi-agent";
 	const missing = missingBuilderRequirements();
-	const ready = missing.length === 0 && !catalogManaged;
-	agentSubmit.disabled = catalogManaged;
-	agentSubmit.setAttribute("aria-disabled", String(!ready));
-	agentSubmit.title = ready
-		? "Save and deploy this agent"
-		: catalogManaged
-			? "This definition is managed by the Pi Markdown agent catalog"
-			: `Required: ${missing.map((entry) => entry.label).join(", ")}`;
-	agentSubmit.style.opacity = ready ? "" : ".55";
-	agentValidation.className = ready || catalogManaged ? "muted" : "run-error";
-	agentValidation.textContent = catalogManaged
-		? "Managed by the Pi Markdown agent catalog. Edit its schedule here; edit the Markdown definition to change the agent."
-		: ready
-			? "Ready to deploy. Optional capabilities, delegation, and automation can be added now or later."
-			: `Complete ${missing.map((entry) => entry.label).join(", ")} before deployment.`;
+	const ready = missing.length === 0;
+	const configurationError = agentBuilderConfigurationError();
+	const dirty = agentBuilderDraftSignature() !== agentBuilderBaseline;
+	const canApply = ready && configurationError === undefined && dirty;
+	agentSubmit.disabled = !canApply;
+	agentSubmit.setAttribute("aria-disabled", String(!canApply));
+	agentSubmit.title = !ready
+		? `Required: ${missing.map((entry) => entry.label).join(", ")}`
+		: (configurationError ?? (dirty ? "Apply these changes to the agent" : "No changes to apply"));
+	agentSubmit.style.opacity = canApply ? "" : ".55";
+	const chatApply = document.getElementById("builder-chat-apply");
+	if (chatApply instanceof HTMLButtonElement) {
+		chatApply.disabled = !canApply;
+		chatApply.setAttribute("aria-disabled", String(!canApply));
+		chatApply.title = agentSubmit.title;
+	}
+	agentValidation.className = ready && configurationError === undefined ? "muted" : "run-error";
+	agentValidation.textContent = !ready
+		? `Complete ${missing.map((entry) => entry.label).join(", ")} before deployment.`
+		: configurationError
+			? configurationError
+			: dirty
+				? "Unsaved changes. Review them, then apply the update."
+				: agentBuilderFeedback || "No changes to apply.";
 	const incompletePanels = new Set(missing.map((entry) => entry.panelId));
 	for (const tab of document.querySelectorAll<HTMLButtonElement>("[data-builder-tab]")) {
 		const base = tab.dataset.baseLabel ?? tab.textContent?.replace(/[ ✓•]+$/, "") ?? "Step";
@@ -5458,7 +5931,19 @@ function updateAgentBuilderReadiness(): void {
 function validateAgentBuilder(): boolean {
 	updateAgentBuilderReadiness();
 	const first = missingBuilderRequirements()[0];
-	if (!first) return true;
+	if (!first) {
+		const configurationError = agentBuilderConfigurationError();
+		if (configurationError) {
+			activateBuilderTab("builder-tools-panel");
+			setStatus(configurationError, true);
+			return false;
+		}
+		if (agentBuilderDraftSignature() === agentBuilderBaseline) {
+			setStatus("No agent changes to apply");
+			return false;
+		}
+		return true;
+	}
 	activateBuilderTab(first.panelId);
 	const field = requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(first.fieldId);
 	field.focus();
@@ -5467,11 +5952,13 @@ function validateAgentBuilder(): boolean {
 	return false;
 }
 
-function applyAgentBuilderDraftFromTranscript(): void {
-	const content = transcript.textContent ?? "";
-	const matches = [...content.matchAll(/\[AGENT_DRAFT\]([\s\S]*?)\[\/AGENT_DRAFT\]/g)];
-	const encoded = matches.at(-1)?.[1]?.trim();
+function applyLatestAgentBuilderDraft(snapshot: SessionSnapshot): void {
+	const encoded = latestAgentBuilderDraftFromSnapshot(snapshot);
 	if (!encoded || encoded === lastAppliedBuilderDraft) return;
+	applyAgentBuilderDraft(encoded);
+}
+
+function applyAgentBuilderDraft(encoded: string): void {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(encoded);
@@ -5481,24 +5968,69 @@ function applyAgentBuilderDraftFromTranscript(): void {
 	const draft = objectRecord(parsed);
 	if (!draft) return;
 	lastAppliedBuilderDraft = encoded;
+	agentBuilderFeedback = "";
+	const warnings: string[] = [];
 	setBuilderDraftText("agent-name", draft.name);
 	setBuilderDraftText("agent-description", draft.description);
 	setBuilderDraftText("agent-project-root", draft.projectRoot);
-	setBuilderDraftText("agent-persona", draft.persona);
-	setBuilderDraftSelect("agent-model", draft.model);
+	if (typeof draft.personaId === "string" && personas.some((entry) => entry.id === draft.personaId)) {
+		if (personaSelect.value !== draft.personaId) {
+			personaSelect.value = draft.personaId;
+			updatePersonaPreview(true);
+		}
+	} else if (typeof draft.persona === "string") {
+		const persona = personas.find((entry) => entry.id === draft.persona);
+		if (persona && personaSelect.value !== persona.id) {
+			personaSelect.value = persona.id;
+			updatePersonaPreview(true);
+		} else if (!persona) setBuilderDraftText("agent-persona", draft.persona);
+	}
+	if (!setBuilderDraftSelect("agent-model", draft.model)) warnings.push(`Unavailable model ${String(draft.model)}`);
 	setBuilderDraftSelect("agent-thinking", draft.thinking);
 	setBuilderDraftSelect("agent-executor", draft.executor);
 	setBuilderDraftSelect("agent-permissions", draft.permissionPolicy);
 	setBuilderDraftSelect("agent-browser-access", draft.browserAccess);
-	if (Array.isArray(draft.tools) && draft.tools.every((entry) => typeof entry === "string"))
-		requiredElement<HTMLInputElement>("agent-tools").value = draft.tools.join(",");
+	if (Array.isArray(draft.tools) && draft.tools.every((entry) => typeof entry === "string")) {
+		const permissions = requiredElement<HTMLSelectElement>("agent-permissions").value;
+		if (permissions === "read-only" && draft.tools.includes("write"))
+			warnings.push("Ignored write tool because the draft is read-only");
+		else requiredElement<HTMLInputElement>("agent-tools").value = draft.tools.join(",");
+	}
 	if (Array.isArray(draft.delegateAgentIds) && draft.delegateAgentIds.every((entry) => typeof entry === "string"))
 		requiredElement<HTMLInputElement>("agent-delegates").value = draft.delegateAgentIds.join(", ");
 	updateAgentBrowserProfileFields();
+	agentModelPicker.refresh();
+	updateThinkingLevelAvailability(
+		agentThinking,
+		agentModel.value || (session?.snapshot ? `${session.snapshot.model.provider}/${session.snapshot.model.id}` : ""),
+		agentThinking.value as ThinkingLevel,
+	);
+	agentThinkingPicker.refresh();
 	updateAgentBuilderReadiness();
 	element("builder-title").textContent = requiredElement<HTMLInputElement>("agent-name").value || "Build a new agent";
 	void loadCapabilities().catch(() => {});
-	setStatus("Agent Builder applied a draft. Review each step, then save and deploy.");
+	setStatus(
+		warnings.length > 0
+			? `Agent Builder applied the valid draft fields. ${warnings.join(". ")}.`
+			: "Agent Builder applied a draft. Review each step, then apply the update.",
+		warnings.length > 0,
+	);
+}
+
+function latestAgentBuilderDraft(content: string): string | undefined {
+	const matches = [...content.matchAll(/\[AGENT_DRAFT\]([\s\S]*?)\[\/AGENT_DRAFT\]/g)];
+	return matches.at(-1)?.[1]?.trim();
+}
+
+function latestAgentBuilderDraftFromSnapshot(snapshot: SessionSnapshot | undefined): string {
+	if (!snapshot) return "";
+	const text = snapshot.transcript
+		.filter((item) => item.role === "assistant")
+		.flatMap((item) => item.content)
+		.filter((content) => content.type === "text")
+		.map((content) => content.text)
+		.join("\n");
+	return latestAgentBuilderDraft(text) ?? "";
 }
 
 function setBuilderDraftText(fieldId: string, value: unknown): void {
@@ -5506,23 +6038,29 @@ function setBuilderDraftText(fieldId: string, value: unknown): void {
 	requiredElement<HTMLInputElement | HTMLTextAreaElement>(fieldId).value = value.trim();
 }
 
-function setBuilderDraftSelect(fieldId: string, value: unknown): void {
-	if (typeof value !== "string") return;
+function setBuilderDraftSelect(fieldId: string, value: unknown): boolean {
+	if (typeof value !== "string") return true;
 	const select = requiredElement<HTMLSelectElement>(fieldId);
-	if ([...select.options].some((option) => option.value === value)) select.value = value;
+	if (![...select.options].some((option) => option.value === value)) return false;
+	select.value = value;
+	return true;
 }
 
 function resizeComposer(): void {
-	input.style.height = "0";
+	const minimumHeight = 44;
 	const compact = window.matchMedia(
 		"(max-width: 1024px), (max-width: 1366px) and (hover: none) and (pointer: coarse)",
 	).matches;
-	input.style.height = `${Math.min(input.scrollHeight, compact ? 112 : 180)}px`;
+	const maximumHeight = compact ? 112 : 180;
+	input.style.height = "auto";
+	const nextHeight = input.value.length === 0 ? minimumHeight : Math.max(minimumHeight, input.scrollHeight);
+	input.style.height = `${Math.min(nextHeight, maximumHeight)}px`;
+	input.style.overflowY = nextHeight > maximumHeight ? "auto" : "hidden";
 }
 
 function activePromptHistory(): PromptHistory | undefined {
 	const key = builderActive
-		? builderSession?.id
+		? `builder:${activeSidebarAgent?.id ?? "new"}:${session?.id ?? ""}`
 		: activeAgentId
 			? `agent:${activeAgentId}`
 			: activeExternalConnectionId
@@ -5678,6 +6216,7 @@ async function openAgent(agent?: AgentSummary): Promise<void> {
 	activeSubagentKey = undefined;
 	activeExternalRunId = undefined;
 	activeExternalConnectionId = undefined;
+	activeArtifactId = undefined;
 	persistExternalRunTabs();
 	persistExternalConnectionTabs();
 	if (!openAgentIds.includes(agent.id)) openAgentIds.push(agent.id);
@@ -5709,6 +6248,7 @@ function openSubagentInspector(key: string): void {
 	activeSubagentKey = key;
 	activeExternalRunId = undefined;
 	activeExternalConnectionId = undefined;
+	activeArtifactId = undefined;
 	persistExternalRunTabs();
 	persistExternalConnectionTabs();
 	mobilePanelNone.checked = true;
@@ -5735,6 +6275,7 @@ function openExternalRun(run: ExternalRunSummary): void {
 	activeSubagentKey = undefined;
 	activeExternalConnectionId = undefined;
 	activeExternalRunId = run.id;
+	activeArtifactId = undefined;
 	if (!openExternalRunIds.includes(run.id)) openExternalRunIds.push(run.id);
 	persistExternalRunTabs();
 	persistExternalConnectionTabs();
@@ -5912,29 +6453,321 @@ function closeAgentTab(agentId: string): void {
 	renderAttachments();
 }
 
+async function openArtifact(artifactId: string): Promise<void> {
+	if (!capabilityToken) return;
+	let artifact = artifacts.find((entry) => entry.id === artifactId);
+	if (!artifact) {
+		const response = await fetch(
+			`/artifacts/${encodeURIComponent(artifactId)}?token=${encodeURIComponent(capabilityToken)}`,
+		);
+		if (!response.ok) throw new Error(await responseError(response, "Could not open artifact"));
+		const payload: unknown = await response.json();
+		if (!isArtifactSummary(payload)) throw new Error("Artifact service returned an invalid record");
+		artifact = payload;
+		artifacts = [artifact, ...artifacts.filter((entry) => entry.id !== artifactId)];
+	}
+	if (!openArtifactIds.includes(artifactId)) openArtifactIds.push(artifactId);
+	builderActive = false;
+	activeAgentId = undefined;
+	activeSubagentKey = undefined;
+	activeExternalRunId = undefined;
+	activeExternalConnectionId = undefined;
+	activeArtifactId = artifactId;
+	mobilePanelNone.checked = true;
+	await renderArtifact(artifact);
+	renderSessionNavigation();
+}
+
+async function openArtifactLibrary(): Promise<void> {
+	if (!capabilityToken) return;
+	if (artifacts.length === 0) await loadAgentActivity();
+	builderActive = false;
+	activeAgentId = undefined;
+	activeSubagentKey = undefined;
+	activeExternalRunId = undefined;
+	activeExternalConnectionId = undefined;
+	activeArtifactId = artifactLibraryId;
+	mobilePanelNone.checked = true;
+	renderArtifactLibrary();
+	renderSessionNavigation();
+}
+
+function renderArtifactLibrary(): void {
+	if (activeArtifactId !== artifactLibraryId) return;
+	const heading = document.createElement("header");
+	heading.className = "artifact-header";
+	const identity = document.createElement("div");
+	const title = document.createElement("strong");
+	title.textContent = "Artifacts";
+	const meta = document.createElement("span");
+	meta.textContent = `${artifacts.filter((artifact) => artifact.archivedAt === undefined).length} available`;
+	identity.append(title, meta);
+	const close = document.createElement("button");
+	close.type = "button";
+	close.textContent = "×";
+	close.title = "Close artifact library";
+	close.setAttribute("aria-label", close.title);
+	close.addEventListener("click", closeArtifactLibrary);
+	const actions = document.createElement("nav");
+	actions.className = "artifact-actions";
+	actions.append(close);
+	heading.append(identity, actions);
+
+	const controls = document.createElement("div");
+	controls.className = "artifact-library-controls";
+	const search = document.createElement("input");
+	search.type = "search";
+	search.placeholder = "Search artifacts";
+	search.setAttribute("aria-label", "Search artifacts");
+	const kind = document.createElement("select");
+	kind.setAttribute("aria-label", "Filter artifacts by type");
+	for (const value of ["all", ...new Set(artifacts.map((artifact) => artifact.kind))]) {
+		const option = document.createElement("option");
+		option.value = value;
+		option.textContent = value === "all" ? "All types" : value.replaceAll("_", " ");
+		kind.append(option);
+	}
+	controls.append(search, kind);
+	const results = document.createElement("section");
+	results.className = "artifact-library-results";
+	const renderResults = () => {
+		const query = search.value.trim().toLowerCase();
+		const visible = artifacts
+			.filter((artifact) => artifact.archivedAt === undefined)
+			.filter((artifact) => kind.value === "all" || artifact.kind === kind.value)
+			.filter((artifact) => !query || artifact.title.toLowerCase().includes(query))
+			.sort((left, right) => right.updatedAt - left.updatedAt);
+		if (visible.length === 0) {
+			const empty = document.createElement("p");
+			empty.className = "settings-empty";
+			empty.textContent = "No matching artifacts";
+			results.replaceChildren(empty);
+			return;
+		}
+		results.replaceChildren(
+			...visible.map((artifact) => {
+				const button = document.createElement("button");
+				button.type = "button";
+				button.className = "artifact-library-card";
+				const name = document.createElement("strong");
+				name.textContent = artifact.title;
+				const details = document.createElement("span");
+				details.textContent = `${artifact.kind.replaceAll("_", " ")} · ${activityAge(artifact.updatedAt)}`;
+				button.append(name, details);
+				button.addEventListener("click", () => void openArtifact(artifact.id));
+				return button;
+			}),
+		);
+	};
+	search.addEventListener("input", renderResults);
+	kind.addEventListener("change", renderResults);
+	renderResults();
+	const content = document.createElement("section");
+	content.className = "artifact-library";
+	content.append(controls, results);
+	transcript.replaceChildren(heading, content);
+	transcript.scrollTop = 0;
+	phase.textContent = "artifacts";
+	input.disabled = true;
+	input.placeholder = "Artifact library";
+	send.disabled = true;
+	model.disabled = true;
+	modelPicker.refresh();
+	thinking.disabled = true;
+	attachmentButton.disabled = true;
+	attachmentInput.disabled = true;
+	setSessionPath(session?.snapshot?.cwd ?? "Artifacts", false);
+	sessionStats.textContent = "Recent results";
+	sessionStats.title = "Managed artifacts";
+	setStatus("Artifacts");
+}
+
+function closeArtifactLibrary(): void {
+	if (activeArtifactId !== artifactLibraryId) return;
+	activeArtifactId = undefined;
+	if (session?.snapshot) render(session.snapshot);
+	renderSessionNavigation();
+	renderAttachments();
+}
+
+async function renderArtifact(artifact: ArtifactSummary, versionId = artifact.currentVersionId): Promise<void> {
+	if (!capabilityToken || activeArtifactId !== artifact.id) return;
+	if (activeArtifactObjectUrl) {
+		URL.revokeObjectURL(activeArtifactObjectUrl);
+		activeArtifactObjectUrl = undefined;
+	}
+	const header = document.createElement("header");
+	header.className = "artifact-header";
+	const identity = document.createElement("div");
+	const title = document.createElement("strong");
+	title.textContent = artifact.title;
+	const meta = document.createElement("span");
+	meta.textContent = `${artifact.kind.replaceAll("_", " ")} · updated ${activityAge(artifact.updatedAt)}`;
+	identity.append(title, meta);
+	const actions = document.createElement("nav");
+	actions.className = "artifact-actions";
+	const version = document.createElement("select");
+	version.title = "Artifact version";
+	version.setAttribute("aria-label", "Artifact version");
+	for (const [index, id] of artifact.versionIds.entries()) {
+		const option = document.createElement("option");
+		option.value = id;
+		option.textContent = `v${index + 1}`;
+		version.append(option);
+	}
+	version.value = versionId;
+	version.addEventListener("change", () => void renderArtifact(artifact, version.value));
+	actions.append(version);
+	const originTask = [...agentTasksByAgent.values()].flat().find((task) => task.id === artifact.taskId);
+	const originAgent = artifact.agentId ? agents.find((entry) => entry.id === artifact.agentId) : undefined;
+	if (originAgent) {
+		const origin = document.createElement("button");
+		origin.type = "button";
+		origin.textContent = "↖";
+		origin.title = `Back to ${originAgent.name}`;
+		origin.setAttribute("aria-label", origin.title);
+		origin.addEventListener("click", () => void openAgent(originAgent));
+		actions.append(origin);
+	}
+	const refresh = document.createElement("button");
+	refresh.type = "button";
+	refresh.textContent = "↻";
+	refresh.title = "Refresh through the originating agent";
+	refresh.setAttribute("aria-label", refresh.title);
+	refresh.addEventListener("click", () => {
+		void refreshArtifact(artifact.id).catch((error: unknown) =>
+			setStatus(error instanceof Error ? error.message : String(error), true),
+		);
+	});
+	actions.append(refresh);
+	if (versionId !== artifact.currentVersionId) {
+		const restore = document.createElement("button");
+		restore.type = "button";
+		restore.textContent = "↶";
+		restore.title = "Restore this version as a new version";
+		restore.setAttribute("aria-label", restore.title);
+		restore.addEventListener("click", () => {
+			void restoreArtifactVersion(artifact.id, versionId).catch((error: unknown) =>
+				setStatus(error instanceof Error ? error.message : String(error), true),
+			);
+		});
+		actions.append(restore);
+	}
+	const download = document.createElement("a");
+	download.textContent = "↓";
+	download.title = "Download";
+	download.setAttribute("aria-label", "Download artifact");
+	download.href = `/artifacts/${encodeURIComponent(artifact.id)}/content?version=${encodeURIComponent(versionId)}&token=${encodeURIComponent(capabilityToken)}`;
+	actions.append(download);
+	header.append(identity, actions);
+	const content = document.createElement("section");
+	content.className = "artifact-content";
+	const previewUrl = `/artifacts/${encodeURIComponent(artifact.id)}/preview?version=${encodeURIComponent(versionId)}&token=${encodeURIComponent(capabilityToken)}`;
+	if (artifact.kind === "image") {
+		const image = document.createElement("img");
+		image.src = previewUrl;
+		image.alt = artifact.title;
+		content.append(image);
+	} else if (artifact.kind === "html" || artifact.kind === "pdf") {
+		const response = await fetch(previewUrl);
+		if (!response.ok) throw new Error(await responseError(response, "Could not preview artifact"));
+		const objectUrl = URL.createObjectURL(await response.blob());
+		if (activeArtifactId !== artifact.id) {
+			URL.revokeObjectURL(objectUrl);
+			return;
+		}
+		activeArtifactObjectUrl = objectUrl;
+		const frame = document.createElement("iframe");
+		frame.src = objectUrl;
+		frame.title = artifact.title;
+		frame.setAttribute("sandbox", "");
+		content.append(frame);
+	} else if (artifact.kind === "text" || artifact.kind === "markdown" || artifact.kind === "dataset") {
+		const response = await fetch(previewUrl);
+		if (!response.ok) throw new Error(await responseError(response, "Could not preview artifact"));
+		const body = document.createElement("div");
+		body.className = "agent-message-content artifact-text";
+		appendAgentMarkdown(body, await response.text());
+		content.append(body);
+	} else {
+		const unavailable = document.createElement("div");
+		unavailable.className = "artifact-text";
+		unavailable.textContent = "Preview is not available for this format. Download the artifact to open it locally.";
+		content.append(unavailable);
+	}
+	if (activeArtifactId !== artifact.id) return;
+	transcript.replaceChildren(header, content);
+	transcript.scrollTop = 0;
+	phase.textContent = "artifact";
+	input.disabled = true;
+	input.placeholder = "Artifact preview";
+	send.disabled = true;
+	model.disabled = true;
+	modelPicker.refresh();
+	thinking.disabled = true;
+	attachmentButton.disabled = true;
+	attachmentInput.disabled = true;
+	setSessionPath(originAgent?.projectRoot ?? session?.snapshot?.cwd ?? "Artifact", false);
+	sessionStats.textContent = `${artifact.versionIds.length} version${artifact.versionIds.length === 1 ? "" : "s"}`;
+	sessionStats.title = `Created by task ${originTask?.id ?? artifact.taskId}`;
+	setStatus(artifact.title);
+}
+
+async function refreshArtifact(artifactId: string): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(
+		`/artifacts/${encodeURIComponent(artifactId)}/refresh?token=${encodeURIComponent(capabilityToken)}`,
+		{ method: "POST" },
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not refresh artifact"));
+	setStatus("Artifact refresh started");
+	await loadAgentActivity();
+}
+
+async function restoreArtifactVersion(artifactId: string, versionId: string): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(
+		`/artifacts/${encodeURIComponent(artifactId)}/restore?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ versionId }),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not restore artifact version"));
+	await loadAgentActivity();
+	const artifact = artifacts.find((entry) => entry.id === artifactId);
+	if (artifact) await renderArtifact(artifact);
+	setStatus("Artifact version restored");
+}
+
+function closeArtifactTab(artifactId: string): void {
+	const index = openArtifactIds.indexOf(artifactId);
+	if (index >= 0) openArtifactIds.splice(index, 1);
+	if (activeArtifactId !== artifactId) {
+		renderSessionNavigation();
+		return;
+	}
+	activeArtifactId = undefined;
+	if (activeArtifactObjectUrl) {
+		URL.revokeObjectURL(activeArtifactObjectUrl);
+		activeArtifactObjectUrl = undefined;
+	}
+	const fallbackId = openArtifactIds.at(-1);
+	if (fallbackId) {
+		void openArtifact(fallbackId);
+		return;
+	}
+	if (session?.snapshot) render(session.snapshot);
+	renderSessionNavigation();
+	renderAttachments();
+}
+
 async function openAgentBuilder(agent?: AgentSummary, showConversation = true): Promise<void> {
 	activeSidebarAgent = agent;
+	agentBuilderFeedback = "";
 	agentForm.reset();
 	const catalogAgent = agent?.source === "pi-agent";
-	for (const id of [
-		"agent-name",
-		"agent-description",
-		"agent-project-root",
-		"agent-persona-select",
-		"agent-persona",
-		"agent-model",
-		"agent-thinking",
-		"agent-executor",
-		"agent-permissions",
-		"agent-browser-access",
-		"agent-browser-runtime",
-		"agent-browser-profile-kind",
-		"agent-browser-profile-id",
-		"agent-delegates",
-		"agent-a2a",
-	]) {
-		requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(id).disabled = catalogAgent;
-	}
 	requiredElement<HTMLInputElement>("agent-id").value = agent?.id ?? "";
 	requiredElement<HTMLInputElement>("agent-name").value = agent?.name ?? "";
 	requiredElement<HTMLTextAreaElement>("agent-description").value = agent?.description ?? "";
@@ -5970,32 +6803,34 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 			? recommendedModelValue
 			: "";
 	agentModelPicker.refresh();
+	updateThinkingLevelAvailability(
+		requiredElement<HTMLSelectElement>("agent-thinking"),
+		agentModel.value || (session?.snapshot ? `${session.snapshot.model.provider}/${session.snapshot.model.id}` : ""),
+		agent?.thinking ?? "high",
+	);
 	updatePersonaPreview();
+	agentBuilderBaseline = agentBuilderDraftSignature();
 	updateAgentBuilderReadiness();
 	element("builder-title").textContent = agent
 		? catalogAgent
-			? `${agent.name} · Pi agent catalog`
+			? `${agent.name} · catalog source`
 			: agent.name
 		: "Build a new agent";
 	builderLabel = agent ? `Edit ${agent.name}` : "Agent Builder";
+	agentSubmit.textContent = agent ? "Apply and update agent" : "Create agent";
+	agentCancel.textContent = agent ? "Cancel editing" : "Cancel agent";
 	activateTab(showConversation ? "agents-workspace" : "agent-builder");
 	activateBuilderTab("builder-profile-panel");
-	await closeBuilderChat(false);
-	if (!client) return;
-	builderSession = await client.createSession({ name: agent ? `builder:${agent.id}` : "builder:new" });
-	builderActive = showConversation;
-	if (showConversation) {
-		activeAgentId = undefined;
-		activeSubagentKey = undefined;
-		activeExternalRunId = undefined;
-		activeExternalConnectionId = undefined;
-		persistExternalRunTabs();
-		persistExternalConnectionTabs();
-	}
-	unsubscribeBuilder = builderSession.subscribe((snapshot) => {
-		if (builderActive) renderBuilderConversation(snapshot);
-	});
-	if (showConversation && builderSession.snapshot) renderBuilderConversation(builderSession.snapshot);
+	builderActive = true;
+	activeAgentId = undefined;
+	activeSubagentKey = undefined;
+	activeExternalRunId = undefined;
+	activeExternalConnectionId = undefined;
+	activeArtifactId = undefined;
+	persistExternalRunTabs();
+	persistExternalConnectionTabs();
+	lastAppliedBuilderDraft = latestAgentBuilderDraftFromSnapshot(session?.snapshot);
+	if (session?.snapshot) renderBuilderConversation(session.snapshot);
 	if (showConversation) mobilePanelNone.checked = true;
 	renderSessionNavigation();
 	refreshRoutineEditorOptions();
@@ -6003,38 +6838,15 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 	await Promise.all([loadCapabilities(), loadRoutines()]).catch(() => {});
 }
 
-function openBuilderChat(): void {
-	if (!builderSession?.snapshot) return;
-	builderActive = true;
-	activeAgentId = undefined;
-	activeSubagentKey = undefined;
-	activeExternalRunId = undefined;
-	activeExternalConnectionId = undefined;
-	persistExternalRunTabs();
-	persistExternalConnectionTabs();
-	activateTab("agents-workspace");
-	mobilePanelNone.checked = true;
-	renderBuilderConversation(builderSession.snapshot);
-	renderSessionNavigation();
-}
-
-async function closeBuilderChat(restoreMainChat = true): Promise<void> {
-	const closingSession = builderSession;
-	builderSession = undefined;
+function closeBuilderChat(): void {
 	builderActive = false;
-	unsubscribeBuilder?.();
-	unsubscribeBuilder = undefined;
-	if (closingSession && closingSession.snapshot?.phase !== "idle") await closingSession.abort().catch(() => {});
-	await closingSession?.dispose().catch(() => {});
-	if (!restoreMainChat) {
-		renderSessionNavigation();
-		return;
-	}
 	activeSidebarAgent = undefined;
 	activateTab("agents-workspace");
+	mobilePanelNone.checked = true;
 	if (session?.snapshot) render(session.snapshot);
 	renderSessionNavigation();
 	renderAttachments();
+	setStatus("Ready");
 }
 
 function loadSelectedAgent(): Promise<void> {
@@ -6078,8 +6890,16 @@ function renderAgentConversation(
 	messages: AgentMessageSummary[],
 	tasks: AgentTaskSummary[],
 ): void {
-	const activeTask = tasks.find((task) => task.status === "queued" || task.status === "running");
-	const items = messages.map((message) => renderAgentMessage(agent, message));
+	const activeTask = tasks.find((task) =>
+		["queued", "running", "waiting_for_approval", "waiting_for_input", "stopping"].includes(task.status),
+	);
+	const items = messages.map((message) =>
+		renderAgentMessage(
+			agent,
+			message,
+			tasks.find((task) => task.id === message.taskId),
+		),
+	);
 	if (activeTask) {
 		const running = document.createElement("article");
 		running.className = "message assistant agent-running";
@@ -6115,6 +6935,7 @@ function renderAgentConversation(
 		modelPicker.refresh();
 	}
 	thinking.value = agent.thinking ?? session?.snapshot?.thinkingLevel ?? "off";
+	updateThinkingLevelAvailability(thinking, model.value, thinking.value as ThinkingLevel);
 	setSessionPath(agent.projectRoot, agent.source === "managed" && activeTask === undefined);
 	sessionStats.textContent = activeTask
 		? `${agent.name} · ${agentTaskPhase(activeTask)}${activeTask.lastActivityAt ? ` · ${activityAge(activeTask.lastActivityAt)}` : ""}`
@@ -6132,7 +6953,11 @@ function activityAge(timestamp: number): string {
 	return seconds < 60 ? `${seconds}s ago` : `${Math.floor(seconds / 60)}m ago`;
 }
 
-function renderAgentMessage(agent: AgentSummary, message: AgentMessageSummary): HTMLElement {
+function renderAgentMessage(
+	agent: AgentSummary,
+	message: AgentMessageSummary,
+	task: AgentTaskSummary | undefined,
+): HTMLElement {
 	const article = document.createElement("article");
 	article.className = `message ${message.role === "agent" ? "assistant" : "user"}`;
 	const label = document.createElement("div");
@@ -6140,8 +6965,27 @@ function renderAgentMessage(agent: AgentSummary, message: AgentMessageSummary): 
 	label.textContent = message.role === "agent" ? agent.name : "you";
 	const body = document.createElement("div");
 	body.className = "agent-message-content";
-	appendAgentMarkdown(body, message.text);
+	if (message.role === "agent") {
+		for (const [index, segment] of splitInlineThinking(message.text).entries()) {
+			if (segment.type === "thinking")
+				body.append(renderThinkingDisclosure(`${message.id}:${index}`, segment.text, false));
+			else appendAgentMarkdown(body, segment.text);
+		}
+	} else appendAgentMarkdown(body, message.text);
 	article.append(label, body);
+	if (message.role === "agent" && task?.artifactIds.length) {
+		const outputs = document.createElement("div");
+		outputs.className = "message-artifacts";
+		for (const artifactId of task.artifactIds) {
+			const artifact = artifacts.find((entry) => entry.id === artifactId);
+			const open = document.createElement("button");
+			open.type = "button";
+			open.textContent = artifact?.title ?? "Open result";
+			open.addEventListener("click", () => void openArtifact(artifactId));
+			outputs.append(open);
+		}
+		article.append(outputs);
+	}
 	return article;
 }
 
@@ -6277,53 +7121,216 @@ async function loadAgentTasks(agent: AgentSummary): Promise<AgentTaskSummary[]> 
 
 async function loadAgentActivity(): Promise<void> {
 	if (!capabilityToken) return;
-	const response = await fetch(`/agent-tasks.json?token=${encodeURIComponent(capabilityToken)}`);
-	if (!response.ok) throw new Error(`Could not load agent activity: HTTP ${response.status}`);
-	const payload: unknown = await response.json();
+	const [taskResponse, attentionResponse, artifactResponse] = await Promise.all([
+		fetch(`/agent-tasks.json?token=${encodeURIComponent(capabilityToken)}`),
+		fetch(`/attention.json?status=open&token=${encodeURIComponent(capabilityToken)}`),
+		fetch(`/artifacts.json?token=${encodeURIComponent(capabilityToken)}`),
+	]);
+	if (!taskResponse.ok) throw new Error(`Could not load agent activity: HTTP ${taskResponse.status}`);
+	if (!attentionResponse.ok) throw new Error(`Could not load Attention: HTTP ${attentionResponse.status}`);
+	if (!artifactResponse.ok) throw new Error(`Could not load artifacts: HTTP ${artifactResponse.status}`);
+	const payload: unknown = await taskResponse.json();
 	if (!isAgentTaskList(payload)) throw new Error("Agent task service returned an invalid response");
+	const attentionPayload: unknown = await attentionResponse.json();
+	const artifactPayload: unknown = await artifactResponse.json();
+	attentionItems = attentionFromPayload(attentionPayload);
+	artifacts = artifactsFromPayload(artifactPayload);
 	for (const agent of agents) {
 		agentTasksByAgent.set(
 			agent.id,
 			payload.tasks.filter((task) => task.agentId === agent.id),
 		);
 	}
-	renderAgentActivity(payload.tasks);
+	renderAgentActivity(payload.tasks, attentionItems);
+	if (activeArtifactId === artifactLibraryId) {
+		renderArtifactLibrary();
+	} else if (activeArtifactId) {
+		const artifact = artifacts.find((entry) => entry.id === activeArtifactId);
+		if (artifact) await renderArtifact(artifact);
+	}
 }
 
-function renderAgentActivity(tasks: AgentTaskSummary[]): void {
-	const entries = [...tasks].sort((left, right) => right.createdAt - left.createdAt).slice(0, 30);
-	if (entries.length === 0) {
+function renderAgentActivity(tasks: AgentTaskSummary[], attention: AttentionSummary[]): void {
+	const active = tasks
+		.filter((task) =>
+			["queued", "running", "waiting_for_approval", "waiting_for_input", "stopping"].includes(task.status),
+		)
+		.sort((left, right) => right.createdAt - left.createdAt);
+	const priority = { approval: 0, question: 1, failure: 2, completed: 3 } as const;
+	const openAttention = attention
+		.filter((item) => item.status === "open")
+		.sort((left, right) => priority[left.kind] - priority[right.kind] || right.createdAt - left.createdAt);
+	attentionHeading.textContent = openAttention.length > 0 ? `Attention · ${openAttention.length}` : "Attention";
+	openArtifactsButton.disabled = artifacts.length === 0;
+	if (active.length === 0 && openAttention.length === 0) {
 		const empty = document.createElement("p");
 		empty.className = "agent-activity-empty";
-		empty.textContent = "No agent runs yet";
+		empty.textContent = "Nothing needs attention";
 		agentActivityList.replaceChildren(empty);
 		return;
 	}
 	agentActivityList.replaceChildren(
-		...entries.map((task) => {
-			const agent = agents.find((entry) => entry.id === task.agentId);
-			const button = document.createElement("button");
-			button.type = "button";
-			button.className = "agent-activity-entry";
-			button.dataset.status = task.status;
-			button.disabled = !agent;
-			button.title = task.prompt;
-			const indicator = document.createElement("i");
-			indicator.className = "agent-activity-status";
-			const copy = document.createElement("span");
-			const name = document.createElement("strong");
-			name.textContent = agent?.name ?? task.agentId;
-			const prompt = document.createElement("small");
-			prompt.textContent = task.progressMessage ?? task.prompt;
-			copy.append(name, prompt);
-			const state = document.createElement("time");
-			state.dateTime = new Date(task.createdAt).toISOString();
-			state.textContent = task.status;
-			button.append(indicator, copy, state);
-			if (agent) button.addEventListener("click", () => void openAgent(agent));
-			return button;
-		}),
+		...active.slice(0, 5).map((task) => renderTaskActivityEntry(task)),
+		...openAttention.slice(0, 5).map((item) => renderAttentionEntry(item, tasks)),
 	);
+}
+
+function renderTaskActivityEntry(task: AgentTaskSummary): HTMLButtonElement {
+	const agent = agents.find((entry) => entry.id === task.agentId);
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "agent-activity-entry";
+	button.dataset.status = task.status;
+	button.disabled = !agent;
+	button.title = task.prompt;
+	const indicator = document.createElement("i");
+	indicator.className = "agent-activity-status";
+	const copy = document.createElement("span");
+	const name = document.createElement("strong");
+	name.textContent = agent?.name ?? task.agentId;
+	const prompt = document.createElement("small");
+	prompt.textContent = task.progressMessage ?? task.prompt;
+	copy.append(name, prompt);
+	const state = document.createElement("time");
+	state.dateTime = new Date(task.createdAt).toISOString();
+	state.textContent = agentTaskPhase(task);
+	button.append(indicator, copy, state);
+	if (agent) button.addEventListener("click", () => void openAgent(agent));
+	return button;
+}
+
+function renderAttentionEntry(item: AttentionSummary, tasks: AgentTaskSummary[]): HTMLDivElement {
+	const task = tasks.find((entry) => entry.id === item.taskId);
+	const agent = task ? agents.find((entry) => entry.id === task.agentId) : undefined;
+	const row = document.createElement("div");
+	row.className = "attention-entry-wrap";
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "agent-activity-entry attention-entry";
+	button.dataset.status = item.kind === "failure" ? "failed" : item.kind;
+	button.title = item.summary;
+	const indicator = document.createElement("i");
+	indicator.className = "agent-activity-status";
+	const copy = document.createElement("span");
+	const title = document.createElement("strong");
+	title.textContent = item.title;
+	const summary = document.createElement("small");
+	summary.textContent = item.summary;
+	copy.append(title, summary);
+	const state = document.createElement("time");
+	state.dateTime = new Date(item.createdAt).toISOString();
+	state.textContent = item.kind;
+	button.append(indicator, copy, state);
+	button.addEventListener("click", () => {
+		const artifactId = task?.artifactIds[0];
+		if (artifactId) void openArtifact(artifactId);
+		else if (agent) void openAgent(agent);
+	});
+	row.append(button);
+	if (item.kind === "failure" && task) {
+		const retry = document.createElement("button");
+		retry.type = "button";
+		retry.className = "attention-inline-action";
+		retry.textContent = "↻";
+		retry.title = "Retry";
+		retry.setAttribute("aria-label", `Retry ${item.title}`);
+		retry.addEventListener("click", () => void retryAgentTask(task.id));
+		row.append(retry);
+	}
+	if (item.kind === "failure" || item.kind === "completed") {
+		const dismiss = document.createElement("button");
+		dismiss.type = "button";
+		dismiss.className = "attention-inline-action";
+		dismiss.textContent = "×";
+		dismiss.title = "Dismiss";
+		dismiss.setAttribute("aria-label", `Dismiss ${item.title}`);
+		dismiss.addEventListener("click", () => void dismissAttention(item.id));
+		row.append(dismiss);
+	}
+	return row;
+}
+
+function attentionFromPayload(value: unknown): AttentionSummary[] {
+	if (typeof value !== "object" || value === null || !("items" in value) || !Array.isArray(value.items)) return [];
+	return value.items.filter(isAttentionSummary);
+}
+
+function isAttentionSummary(value: unknown): value is AttentionSummary {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"id" in value &&
+		typeof value.id === "string" &&
+		"taskId" in value &&
+		typeof value.taskId === "string" &&
+		"kind" in value &&
+		["approval", "question", "failure", "completed"].includes(String(value.kind)) &&
+		"status" in value &&
+		["open", "resolved", "dismissed"].includes(String(value.status)) &&
+		"title" in value &&
+		typeof value.title === "string" &&
+		"summary" in value &&
+		typeof value.summary === "string" &&
+		"createdAt" in value &&
+		typeof value.createdAt === "number"
+	);
+}
+
+function artifactsFromPayload(value: unknown): ArtifactSummary[] {
+	if (typeof value !== "object" || value === null || !("artifacts" in value) || !Array.isArray(value.artifacts)) {
+		return [];
+	}
+	return value.artifacts.filter(isArtifactSummary);
+}
+
+function isArtifactSummary(value: unknown): value is ArtifactSummary {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"id" in value &&
+		typeof value.id === "string" &&
+		"title" in value &&
+		typeof value.title === "string" &&
+		"kind" in value &&
+		typeof value.kind === "string" &&
+		"taskId" in value &&
+		typeof value.taskId === "string" &&
+		"currentVersionId" in value &&
+		typeof value.currentVersionId === "string" &&
+		"versionIds" in value &&
+		Array.isArray(value.versionIds) &&
+		value.versionIds.every((entry) => typeof entry === "string") &&
+		"createdAt" in value &&
+		typeof value.createdAt === "number" &&
+		"updatedAt" in value &&
+		typeof value.updatedAt === "number" &&
+		(!("archivedAt" in value) || value.archivedAt === undefined || typeof value.archivedAt === "number")
+	);
+}
+
+async function dismissAttention(id: string): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(
+		`/attention/${encodeURIComponent(id)}/dismiss?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not dismiss Attention item"));
+	await loadAgentActivity();
+}
+
+async function retryAgentTask(taskId: string): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(
+		`/agent-tasks/${encodeURIComponent(taskId)}/retry?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not retry task"));
+	await loadAgentActivity();
+	if (activeSidebarAgent) await loadSelectedAgent();
 }
 
 function isAgentTaskList(value: unknown): value is { tasks: AgentTaskSummary[] } {
@@ -6341,9 +7348,22 @@ function isAgentTaskList(value: unknown): value is { tasks: AgentTaskSummary[] }
 			"conversationId" in entry &&
 			typeof entry.conversationId === "string" &&
 			"status" in entry &&
-			["queued", "running", "completed", "failed", "cancelled"].includes(String(entry.status)) &&
+			[
+				"queued",
+				"running",
+				"waiting_for_approval",
+				"waiting_for_input",
+				"stopping",
+				"completed",
+				"failed",
+				"cancelled",
+				"interrupted",
+			].includes(String(entry.status)) &&
 			"createdAt" in entry &&
 			typeof entry.createdAt === "number" &&
+			"artifactIds" in entry &&
+			Array.isArray(entry.artifactIds) &&
+			entry.artifactIds.every((artifactId: unknown) => typeof artifactId === "string") &&
 			(!("error" in entry) || entry.error === undefined || typeof entry.error === "string"),
 	);
 }
@@ -6691,7 +7711,8 @@ function refreshRoutineModels(selected = routineEditor.model.value): void {
 		...targetModels.map((entry) => {
 			const option = document.createElement("option");
 			option.value = `${entry.provider}/${entry.id}`;
-			option.textContent = `${entry.provider} / ${entry.name}`;
+			option.textContent = modelOptionLabel(entry);
+			applyModelCostPresentation(option, entry);
 			return option;
 		}),
 	);
@@ -7117,6 +8138,13 @@ async function reconnect(entry: ConnectionEntry): Promise<void> {
 	if (reconnecting.has(entry.id)) return;
 	reconnecting.add(entry.id);
 	const activeSessionId = activeTargetKey?.startsWith(`${entry.id}:`) ? session?.id : undefined;
+	const preserveWorkspace =
+		builderActive ||
+		activeAgentId !== undefined ||
+		activeSubagentKey !== undefined ||
+		activeExternalRunId !== undefined ||
+		activeExternalConnectionId !== undefined ||
+		activeArtifactId !== undefined;
 	setStatus("Disconnected. Reconnecting…", true);
 	while (!entry.client.disposed) {
 		await new Promise((resolve) => window.setTimeout(resolve, 1000));
@@ -7128,7 +8156,7 @@ async function reconnect(entry: ConnectionEntry): Promise<void> {
 			);
 			if (target) {
 				activeTargetKey = undefined;
-				await switchSession(target);
+				await switchSession(target, preserveWorkspace);
 			} else setStatus(`Reconnected to ${entry.label}`);
 			reconnecting.delete(entry.id);
 			return;
@@ -7231,33 +8259,88 @@ async function submitExternalComposer(connectionId: string): Promise<void> {
 	await startExternalRun(connectionId, prompt, cwd, selectedModel);
 }
 
+function agentBuilderModelCandidates(prompt: string): string {
+	const normalizedPrompt = prompt.toLowerCase();
+	const compactPrompt = normalizedPrompt.replace(/[^a-z0-9]/g, "");
+	const matches = availableModels.filter((entry) => {
+		const provider = entry.provider.toLowerCase();
+		const providerLabel = modelProviderLabels[entry.provider]?.toLowerCase();
+		const id = entry.id.toLowerCase().replace(/[^a-z0-9]/g, "");
+		const name = entry.name.toLowerCase().replace(/[^a-z0-9]/g, "");
+		return (
+			normalizedPrompt.includes(provider) ||
+			(providerLabel !== undefined && normalizedPrompt.includes(providerLabel)) ||
+			(id.length >= 4 && compactPrompt.includes(id)) ||
+			(name.length >= 4 && compactPrompt.includes(name))
+		);
+	});
+	const values = new Set<string>();
+	if (agentModel.value) values.add(agentModel.value);
+	for (const entry of matches) values.add(`${entry.provider}/${entry.id}`);
+	if (values.size === 0) values.add(`${recommendedAgentModel.provider}/${recommendedAgentModel.id}`);
+	return [...values].slice(0, 40).join(", ");
+}
+
 async function submitBuilderComposer(): Promise<void> {
-	const chatSession = builderSession;
+	const chatSession = session;
 	if (!chatSession) return;
+	await pendingSessionConfigurationUpdates.get(chatSession.id);
 	if (chatSession.snapshot?.phase !== "idle") {
 		await chatSession.abort();
 		return;
 	}
 	const prompt = input.value.trim();
 	if (!prompt) return;
+	if (/^(?:apply|save|confirm|proceed)(?:\s+(?:this|the))?\s+(?:update|change|draft)(?:\s+now)?[.!]?$/i.test(prompt)) {
+		const latestDraft = latestAgentBuilderDraftFromSnapshot(chatSession.snapshot);
+		if (latestDraft && latestDraft !== lastAppliedBuilderDraft) applyAgentBuilderDraft(latestDraft);
+		if (agentBuilderDraftSignature() === agentBuilderBaseline) {
+			setStatus("No drafted agent changes are ready to apply", true);
+			return;
+		}
+		recordPromptHistory(prompt);
+		input.value = "";
+		resizeComposer();
+		agentForm.requestSubmit();
+		return;
+	}
 	recordPromptHistory(prompt);
 	input.value = "";
 	resizeComposer();
+	const editingExistingAgent = requiredElement<HTMLInputElement>("agent-id").value.length > 0;
 	const message = [
-		"You are Agent Builder, a temporary specialist helping configure and deploy one local Pi agent.",
+		agentBuilderBootstrapPrefix,
 		"Ask concise questions and recommend concrete settings. The visible configuration form remains the source of truth.",
-		"When you have enough information for a useful draft, end with exactly one machine-readable marker. Use one-line valid JSON and omit unknown optional fields:",
-		'[AGENT_DRAFT]{"name":"...","description":"...","projectRoot":"...","persona":"...","model":"provider/model","thinking":"high","executor":"harness","permissionPolicy":"read-only","browserAccess":"disabled","tools":["read"],"delegateAgentIds":[]}[/AGENT_DRAFT]',
-		"The console applies that marker to the form. Tell the user to review the populated steps before deployment.",
+		"Do not call agent_deploy or modify agent files. Return a draft marker only; the user applies the reviewed form.",
+		editingExistingAgent
+			? "This is an edit. Include only fields the user explicitly requested to change; omit every unchanged field."
+			: "This is a new agent. Include every required field that is known and omit unknown optional fields.",
+		'End with exactly one one-line JSON marker. For a model-only edit, use: [AGENT_DRAFT]{"model":"provider/model"}[/AGENT_DRAFT]',
+		"Never invent a model ID. Use an exact candidate below. If there is one clear match, use it without asking; otherwise ask the user to choose in Advanced configuration.",
+		`Exact model candidates for this request: ${agentBuilderModelCandidates(prompt)}`,
+		"The console applies valid marker fields to the draft only. Tell the user to review and apply the update.",
 		`Current name: ${requiredElement<HTMLInputElement>("agent-name").value || "not set"}`,
 		`Current description: ${requiredElement<HTMLTextAreaElement>("agent-description").value || "not set"}`,
 		`Current project folder: ${requiredElement<HTMLInputElement>("agent-project-root").value || "not set"}`,
-		`Current persona: ${requiredElement<HTMLTextAreaElement>("agent-persona").value || "not set"}`,
+		`Current persona profile: ${personaSelect.value || "custom"}. Omit persona fields unless the user requested a persona change.`,
 		`Current tools: ${requiredElement<HTMLInputElement>("agent-tools").value || "none"}`,
 		`Current model: ${agentModel.value || "inherit current session"}`,
+		`Current thinking: ${agentThinking.value}`,
+		`Current executor: ${requiredElement<HTMLSelectElement>("agent-executor").value}`,
+		`Current permission policy: ${requiredElement<HTMLSelectElement>("agent-permissions").value}`,
+		`Current browser access: ${requiredElement<HTMLSelectElement>("agent-browser-access").value}`,
+		`Current delegates: ${requiredElement<HTMLInputElement>("agent-delegates").value || "none"}`,
 		`User request: ${prompt}`,
 	].join("\n");
-	await chatSession.prompt(message);
+	try {
+		await chatSession.prompt(message);
+	} catch (error) {
+		if (!input.value.trim()) {
+			input.value = prompt;
+			resizeComposer();
+		}
+		throw error;
+	}
 }
 
 async function submitAgentComposer(agentId: string): Promise<void> {
@@ -7266,7 +8349,9 @@ async function submitAgentComposer(agentId: string): Promise<void> {
 	if (!agent) throw new Error("The selected agent is unavailable");
 	const activeTask = agentTasksByAgent
 		.get(agentId)
-		?.find((task) => task.status === "queued" || task.status === "running");
+		?.find((task) =>
+			["queued", "running", "waiting_for_approval", "waiting_for_input", "stopping"].includes(task.status),
+		);
 	if (activeTask) {
 		await cancelAgentTask(activeTask.id);
 		return;
@@ -7457,7 +8542,7 @@ input.addEventListener("keydown", (event) => {
 		event.shiftKey ||
 		event.isComposing ||
 		activeSubagentKey !== undefined ||
-		(!activeAgentId && (builderActive ? builderSession?.snapshot?.phase : session?.snapshot?.phase) !== "idle")
+		(!activeAgentId && session?.snapshot?.phase !== "idle")
 	)
 		return;
 	event.preventDefault();
@@ -7475,21 +8560,63 @@ model.addEventListener("change", () => {
 		}
 		return;
 	}
-	const targetSession = builderActive ? builderSession : session;
+	updateThinkingLevelAvailability(thinking, model.value, thinking.value as ThinkingLevel);
+	const targetSession = session;
 	if (!targetSession || activeAgentId || activeSubagentKey || activeExternalRunId || activeExternalConnectionId)
 		return;
-	void targetSession
-		.setModel({ provider: model.value.slice(0, separator), id: model.value.slice(separator + 1) })
-		.catch((error: unknown) => setStatus(String(error), true));
+	trackSessionConfigurationUpdate(
+		targetSession,
+		targetSession.setModel({ provider: model.value.slice(0, separator), id: model.value.slice(separator + 1) }),
+		`Switching to ${model.options[model.selectedIndex]?.textContent ?? model.value}…`,
+	);
+});
+
+agentModel.addEventListener("change", () => {
+	const agentThinking = requiredElement<HTMLSelectElement>("agent-thinking");
+	const inheritedModel = session?.snapshot ? `${session.snapshot.model.provider}/${session.snapshot.model.id}` : "";
+	updateThinkingLevelAvailability(
+		agentThinking,
+		agentModel.value || inheritedModel,
+		agentThinking.value as ThinkingLevel,
+	);
 });
 
 thinking.addEventListener("change", () => {
-	const targetSession = builderActive ? builderSession : session;
+	const targetSession = session;
 	if (targetSession && !activeAgentId && !activeSubagentKey && !activeExternalRunId && !activeExternalConnectionId)
-		void targetSession
-			.setThinking(thinking.value as ThinkingLevel)
-			.catch((error: unknown) => setStatus(String(error), true));
+		trackSessionConfigurationUpdate(
+			targetSession,
+			targetSession.setThinking(thinking.value as ThinkingLevel),
+			`Switching thinking to ${thinking.value}…`,
+		);
 });
+
+function trackSessionConfigurationUpdate(
+	targetSession: PiSessionHandle,
+	update: Promise<SessionSnapshot>,
+	pendingMessage: string,
+): void {
+	pendingSessionConfigurationUpdates.set(targetSession.id, update);
+	setStatus(pendingMessage);
+	void update.then(
+		() => {
+			if (pendingSessionConfigurationUpdates.get(targetSession.id) === update)
+				pendingSessionConfigurationUpdates.delete(targetSession.id);
+			setStatus(builderActive ? `${builderLabel} ready` : "Ready");
+		},
+		(error: unknown) => {
+			if (pendingSessionConfigurationUpdates.get(targetSession.id) === update)
+				pendingSessionConfigurationUpdates.delete(targetSession.id);
+			if (targetSession.snapshot) {
+				model.value = `${targetSession.snapshot.model.provider}/${targetSession.snapshot.model.id}`;
+				modelPicker.refresh();
+				thinking.value = targetSession.snapshot.thinkingLevel;
+				updateThinkingLevelAvailability(thinking, model.value, targetSession.snapshot.thinkingLevel);
+			}
+			setStatus(error instanceof Error ? error.message : String(error), true);
+		},
+	);
+}
 
 for (const button of document.querySelectorAll<HTMLButtonElement>("[data-tab]")) {
 	button.addEventListener("click", () => {
@@ -7505,7 +8632,7 @@ for (const button of document.querySelectorAll<HTMLButtonElement>("[data-tab]"))
 				.then(loadSelectedAgent)
 				.catch((error: unknown) => setStatus(String(error), true));
 		if (tab === "agent-builder") {
-			if (builderSession) void loadCapabilities().catch((error: unknown) => setStatus(String(error), true));
+			if (builderActive) void loadCapabilities().catch((error: unknown) => setStatus(String(error), true));
 			else void openAgentBuilder(undefined, false).catch((error: unknown) => setStatus(String(error), true));
 		}
 	});
@@ -7546,6 +8673,11 @@ showConnectionForm.addEventListener("click", () => {
 openSettingsButton.addEventListener("click", () => {
 	mobilePanelNone.checked = true;
 	openSettings("models");
+});
+openArtifactsButton.addEventListener("click", () => {
+	void openArtifactLibrary().catch((error: unknown) =>
+		setStatus(error instanceof Error ? error.message : String(error), true),
+	);
 });
 settingsClose.addEventListener("click", closeSettings);
 window.addEventListener("keydown", (event) => {
@@ -7634,7 +8766,8 @@ agentForm.addEventListener("submit", (event) => {
 		schedules: activeSidebarAgent?.schedules ?? [],
 	};
 	const path = id ? `/agents/${encodeURIComponent(id)}` : "/agents";
-	setStatus("Saving agent definition…");
+	const savedAgentName = definition.name;
+	setStatus(id ? "Updating agent…" : "Creating agent…");
 	void fetch(`${path}?token=${encodeURIComponent(capabilityToken)}`, {
 		method: id ? "PUT" : "POST",
 		headers: { "content-type": "application/json" },
@@ -7653,17 +8786,24 @@ agentForm.addEventListener("submit", (event) => {
 				);
 			}
 			const saved: unknown = await response.json();
-			setStatus("Agent definition saved");
 			void (async () => {
 				await loadAgents();
 				await Promise.all([loadRoutines(), loadWorkflows()]);
-				if (typeof saved === "object" && saved !== null && "id" in saved && typeof saved.id === "string") {
-					const agent = agents.find((entry) => entry.id === saved.id);
-					if (agent) {
-						await closeBuilderChat(false);
-						await openAgent(agent);
-					}
+				const savedId =
+					typeof saved === "object" && saved !== null && "id" in saved && typeof saved.id === "string"
+						? saved.id
+						: id;
+				if (savedId) {
+					requiredElement<HTMLInputElement>("agent-id").value = savedId;
+					activeSidebarAgent = agents.find((entry) => entry.id === savedId) ?? activeSidebarAgent;
 				}
+				builderLabel = `Edit ${savedAgentName}`;
+				agentSubmit.textContent = "Apply and update agent";
+				agentCancel.textContent = "Cancel editing";
+				agentBuilderBaseline = agentBuilderDraftSignature();
+				agentBuilderFeedback = id ? `Agent ${savedAgentName} updated.` : `Agent ${savedAgentName} created.`;
+				updateAgentBuilderReadiness();
+				setStatus(agentBuilderFeedback);
 			})().catch((error: unknown) => {
 				setStatus(
 					`Agent saved; background refresh failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -7671,8 +8811,15 @@ agentForm.addEventListener("submit", (event) => {
 				);
 			});
 		})
-		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+		.catch((error: unknown) => {
+			const message = error instanceof Error ? error.message : String(error);
+			agentValidation.className = "run-error";
+			agentValidation.textContent = message;
+			setStatus(message, true);
+		});
 });
+
+agentCancel.addEventListener("click", () => void closeBuilderChat());
 
 personaSelect.addEventListener("change", () => {
 	updatePersonaPreview(true);

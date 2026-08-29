@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, test } from "vitest";
 import type {
 	AgentExecution,
@@ -78,7 +79,7 @@ class FakeExecutor implements AgentExecutor {
 	}
 }
 
-async function setup(): Promise<{
+async function setup(budget?: { maxTokens?: number; maxCostUsd?: number }): Promise<{
 	root: string;
 	registry: AgentRegistry;
 	executor: FakeExecutor;
@@ -97,6 +98,7 @@ async function setup(): Promise<{
 		executor: "harness",
 		permissionPolicy: "read-only",
 		schedules: [],
+		budget,
 	});
 	const executor = new FakeExecutor();
 	return { root, registry, executor, runs: new AgentRunManager(registry, executor, join(root, "artifacts")) };
@@ -128,6 +130,36 @@ describe("AgentRunManager", () => {
 		await expect(runs.abort(run.id)).resolves.toMatchObject({ status: "aborted" });
 		expect(executor.executions[0].aborted).toBe(true);
 		await expect.poll(() => runs.get(run.id)?.finishedAt).toBeTypeOf("number");
+	});
+
+	test("fails a completed execution whose measured usage exceeds its package budget", async () => {
+		const { executor, runs } = await setup({ maxTokens: 5, maxCostUsd: 0.01 });
+		const run = await runs.start("research", "Bounded task");
+		const transcript: AgentMessage[] = [
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "Too large" }],
+				api: "openai-responses",
+				provider: "openai",
+				model: "fixture",
+				usage: {
+					input: 10,
+					output: 6,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 16,
+					cost: { input: 0, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.02 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			},
+		];
+		executor.executions[0]!.resolve({ output: "Too large", transcript });
+		await expect(runs.waitForCompletion(run.id)).resolves.toMatchObject({
+			status: "failed",
+			error: "Agent output token budget exceeded: 6 > 5",
+			usage: { inputTokens: 10, outputTokens: 6, totalTokens: 16, costUsd: 0.02 },
+		});
 	});
 
 	test("persists worker phase and activity while a run is active", async () => {

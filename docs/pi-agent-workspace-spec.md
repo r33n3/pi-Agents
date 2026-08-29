@@ -306,6 +306,15 @@ attempt; they are not the authoritative conversation model.
 
 ## Shared state and artifacts
 
+Durable run recovery, operator attention, contract review, and permission modes
+are defined by the
+[durable work and attention specification](pi-durable-work-attention-spec.md).
+Artifact identity, versioning, preview, refresh, provenance, and retention are
+defined by the
+[artifact workspace specification](pi-artifact-workspace-spec.md). Those
+documents refine this section without creating a separate task or execution
+model.
+
 Agents do not implicitly share private memory or transcripts. Coordination uses
 explicit state:
 

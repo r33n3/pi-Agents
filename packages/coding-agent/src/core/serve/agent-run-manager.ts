@@ -2,12 +2,25 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ModelRef } from "@earendil-works/pi-protocol";
-import type { AgentExecution, AgentExecutionEvent, AgentExecutionPhase, AgentExecutor } from "./agent-executor.ts";
+import type {
+	AgentExecution,
+	AgentExecutionEvent,
+	AgentExecutionPhase,
+	AgentExecutionResult,
+	AgentExecutor,
+} from "./agent-executor.ts";
 import type { AgentDefinition, AgentRegistry } from "./agent-registry.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
 export type AgentRunStatus = "starting" | "running" | "succeeded" | "failed" | "aborted";
 export type AgentRunSource = "manual" | "routine";
+
+export interface AgentRunUsage {
+	inputTokens: number;
+	outputTokens: number;
+	totalTokens: number;
+	costUsd: number;
+}
 
 export interface AgentRunRecord {
 	id: string;
@@ -26,6 +39,7 @@ export interface AgentRunRecord {
 	error?: string;
 	model?: ModelRef;
 	agentRevision: number;
+	usage?: AgentRunUsage;
 }
 
 interface ActiveRun {
@@ -35,6 +49,7 @@ interface ActiveRun {
 	workspaceWritable: boolean;
 	abortRequested: boolean;
 	resourceKeys: string[];
+	budget?: AgentDefinition["budget"];
 	unsubscribe: () => void;
 	progressPersistence: Promise<void>;
 	lastProgressPersistedAt: number;
@@ -177,6 +192,7 @@ export class AgentRunManager implements AsyncDisposable {
 					workspaceWritable: definition.permissionPolicy === "workspace-write",
 					abortRequested: false,
 					resourceKeys: requiredResources,
+					budget: definition.budget,
 					unsubscribe: () => {},
 					progressPersistence: Promise.resolve(),
 					lastProgressPersistedAt: record.startedAt,
@@ -247,7 +263,10 @@ export class AgentRunManager implements AsyncDisposable {
 					"utf8",
 				),
 			]);
-			record.status = active.abortRequested ? "aborted" : "succeeded";
+			record.usage = summarizeExecutionUsage(result);
+			const budgetError = active.abortRequested ? undefined : budgetViolation(record.usage, active.budget);
+			record.status = active.abortRequested ? "aborted" : budgetError ? "failed" : "succeeded";
+			record.error = budgetError;
 		} catch (error) {
 			record.status = active.abortRequested ? "aborted" : "failed";
 			record.error = error instanceof Error ? error.message : String(error);
@@ -362,6 +381,47 @@ function parseRunRecord(value: unknown, artifactDirectory: string): AgentRunReco
 			record.agentRevision > 0
 				? record.agentRevision
 				: 1,
+		usage: record.usage === undefined ? undefined : parseRunUsage(record.usage),
+	};
+}
+
+function summarizeExecutionUsage(result: AgentExecutionResult): AgentRunUsage {
+	const usage: AgentRunUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 };
+	for (const message of result.transcript) {
+		if (message.role !== "assistant" && message.role !== "toolResult") continue;
+		const item = message.usage;
+		if (!item) continue;
+		usage.inputTokens += item.input;
+		usage.outputTokens += item.output;
+		usage.totalTokens += item.totalTokens || item.input + item.output + item.cacheRead + item.cacheWrite;
+		usage.costUsd += item.cost.total;
+	}
+	return usage;
+}
+
+function budgetViolation(usage: AgentRunUsage, budget: AgentDefinition["budget"]): string | undefined {
+	if (budget?.maxTokens !== undefined && usage.outputTokens > budget.maxTokens) {
+		return `Agent output token budget exceeded: ${usage.outputTokens} > ${budget.maxTokens}`;
+	}
+	if (budget?.maxCostUsd !== undefined && usage.costUsd > budget.maxCostUsd) {
+		return `Agent cost budget exceeded: ${usage.costUsd} > ${budget.maxCostUsd}`;
+	}
+	return undefined;
+}
+
+function parseRunUsage(value: unknown): AgentRunUsage {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Invalid run usage");
+	const usage = value as Record<string, unknown>;
+	const number = (field: string): number => {
+		const item = usage[field];
+		if (typeof item !== "number" || !Number.isFinite(item) || item < 0) throw new Error("Invalid run usage");
+		return item;
+	};
+	return {
+		inputTokens: number("inputTokens"),
+		outputTokens: number("outputTokens"),
+		totalTokens: number("totalTokens"),
+		costUsd: number("costUsd"),
 	};
 }
 

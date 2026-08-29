@@ -34,9 +34,13 @@ describe("PlaidConnectionService", () => {
 		connections = new CapabilityConnectionRegistry(join(root, "connections"));
 		await connections.initialize();
 		credentials = new ProviderEnvironmentStore(root, () => manifest, {
-			PLAID_CLIENT_ID: "client-id",
-			PLAID_SECRET: "client-secret",
-			PLAID_ENV: "sandbox",
+			environment: {
+				PLAID_CLIENT_ID: "client-id",
+				PLAID_SECRET: "client-secret",
+				PLAID_ENV: "sandbox",
+			},
+			platform: "linux",
+			passphrase: "correct horse battery staple",
 		});
 	});
 
@@ -110,8 +114,7 @@ describe("PlaidConnectionService", () => {
 			{ accountId: "account-1", institutionName: "Test Bank", balances: { current: 42.5 } },
 		]);
 		await expect(service.listAccounts(["plaid-000000000000000000000000"])).rejects.toThrow("was not found");
-		const persisted = await readFile(join(root, ".env.local"), "utf8");
-		expect(persisted).toContain("PLAID_ITEMS_JSON=");
+		await expect(readFile(join(root, ".env.local"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 		expect((await credentials.status("plaid")).fields.find((field) => field.env === "PLAID_ITEMS_JSON")).toEqual(
 			expect.objectContaining({ configured: true, secret: true }),
 		);

@@ -40,6 +40,7 @@ export interface AgentDefinition {
 	name: string;
 	description: string;
 	model?: ModelRef;
+	budget?: { maxTokens?: number; maxCostUsd?: number };
 	thinking?: ThinkingLevel;
 	tools: string[];
 	capabilities: AgentCapabilityGrant[];
@@ -138,20 +139,18 @@ export class AgentRegistry {
 		await this.initialize();
 		const files = (await readdir(this.#definitionsDir)).filter((file) => file.endsWith(".json")).sort();
 		const managed = await Promise.all(files.map((file) => this.#read(resolve(this.#definitionsDir, file))));
-		const definitions = new Map(managed.map((definition) => [definition.id, definition]));
-		for (const definition of await this.#listCatalog()) definitions.set(definition.id, definition);
+		const definitions = new Map((await this.#listCatalog()).map((definition) => [definition.id, definition]));
+		for (const definition of managed) definitions.set(definition.id, definition);
 		return [...definitions.values()].sort((left, right) => left.name.localeCompare(right.name));
 	}
 
 	async get(id: string): Promise<AgentDefinition | undefined> {
 		assertIdentifier(id, "agent id");
 		await this.initialize();
-		const catalogDefinition = await this.#readCatalog(id);
-		if (catalogDefinition) return catalogDefinition;
 		try {
 			return await this.#read(resolve(this.#definitionsDir, `${id}.json`));
 		} catch (error) {
-			if (isNodeError(error) && error.code === "ENOENT") return undefined;
+			if (isNodeError(error) && error.code === "ENOENT") return this.#readCatalog(id);
 			throw error;
 		}
 	}
@@ -173,10 +172,8 @@ export class AgentRegistry {
 			} catch (error) {
 				if (!isNodeError(error) || error.code !== "ENOENT") throw error;
 			}
-			const definition = { ...normalized, revision: (previous?.revision ?? 0) + 1 };
-			if (await this.#readCatalog(definition.id)) {
-				throw new Error(`Agent ${definition.id} is managed by the Pi Markdown agent catalog`);
-			}
+			const catalogDefinition = previous ? undefined : await this.#readCatalog(normalized.id);
+			const definition = { ...normalized, revision: (previous?.revision ?? catalogDefinition?.revision ?? 0) + 1 };
 			for (const delegateId of definition.delegateAgentIds) {
 				if (delegateId === definition.id) throw new Error("An agent cannot delegate to itself");
 				if (!(await this.get(delegateId))) throw new Error(`Delegate agent ${delegateId} was not found`);
@@ -186,7 +183,10 @@ export class AgentRegistry {
 			const temporary = resolve(dirname(target), `.${definition.id}.${randomUUID()}.tmp`);
 			await writeFile(temporary, `${JSON.stringify(definition, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
 			await rename(temporary, target);
-			this.#emit({ type: previous ? "agent.updated" : "agent.created", agentId: definition.id });
+			this.#emit({
+				type: previous || catalogDefinition ? "agent.updated" : "agent.created",
+				agentId: definition.id,
+			});
 			return definition;
 		});
 	}
@@ -213,7 +213,6 @@ export class AgentRegistry {
 	async delete(id: string): Promise<boolean> {
 		assertIdentifier(id, "agent id");
 		return this.#queue.run(async () => {
-			if (await this.#readCatalog(id)) throw new Error(`Agent ${id} is managed by the Pi Markdown agent catalog`);
 			try {
 				await unlink(resolveWithin(this.#definitionsDir, `${id}.json`, "definition"));
 				this.#emit({ type: "agent.removed", agentId: id });
@@ -291,6 +290,7 @@ export class AgentRegistry {
 			name,
 			description: requiredString(frontmatter.description, "description"),
 			model: parseCatalogModel(frontmatter.model),
+			budget: undefined,
 			thinking: undefined,
 			tools,
 			capabilities: [],
@@ -351,6 +351,7 @@ function normalizeDefinition(value: unknown, defaultWorkspace: string): AgentDef
 		name,
 		description: requiredString(input.description, "description"),
 		model: normalizeModel(input.model),
+		budget: normalizeBudget(input.budget),
 		thinking: normalizeThinking(input.thinking),
 		tools: [...new Set(tools)],
 		capabilities,
@@ -458,6 +459,24 @@ function normalizeModel(value: unknown): ModelRef | undefined {
 	if (value === undefined) return undefined;
 	const model = record(value, "model");
 	return { provider: requiredString(model.provider, "model.provider"), id: requiredString(model.id, "model.id") };
+}
+
+function normalizeBudget(value: unknown): AgentDefinition["budget"] {
+	if (value === undefined) return undefined;
+	const budget = record(value, "budget");
+	const maxTokens = budget.maxTokens;
+	const maxCostUsd = budget.maxCostUsd;
+	if (maxTokens !== undefined && (!Number.isSafeInteger(maxTokens) || Number(maxTokens) < 1)) {
+		throw new Error("budget.maxTokens must be a positive integer");
+	}
+	if (maxCostUsd !== undefined && (typeof maxCostUsd !== "number" || !Number.isFinite(maxCostUsd) || maxCostUsd < 0)) {
+		throw new Error("budget.maxCostUsd must be a non-negative number");
+	}
+	if (maxTokens === undefined && maxCostUsd === undefined) return undefined;
+	return {
+		maxTokens: maxTokens === undefined ? undefined : Number(maxTokens),
+		maxCostUsd: maxCostUsd === undefined ? undefined : maxCostUsd,
+	};
 }
 
 function comparableModelText(value: string): string {

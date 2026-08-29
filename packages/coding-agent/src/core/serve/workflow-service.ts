@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import type { TSchema } from "typebox";
+import { Compile } from "typebox/compile";
 import type { AgentRegistry } from "./agent-registry.ts";
+import type { AgentRunUsage } from "./agent-run-manager.ts";
 import type { AgentTask, AgentTaskService } from "./agent-task-service.ts";
 import type { BrowserOwner, BrowserWorkspace } from "./browser-session-manager.ts";
 import type { BrowserWorkflowRunner } from "./browser-workflow-runner.ts";
@@ -14,6 +17,8 @@ export interface AgentWorkflowNode {
 	kind?: "agent";
 	agentId: string;
 	prompt: string;
+	outputSchema?: Record<string, unknown>;
+	required?: boolean;
 }
 
 export interface BrowserWorkflowNode {
@@ -22,6 +27,7 @@ export interface BrowserWorkflowNode {
 	workflowId: string;
 	workflowVersion: number;
 	parameters: Record<string, string | number | boolean>;
+	required?: boolean;
 }
 
 export type WorkflowNode = AgentWorkflowNode | BrowserWorkflowNode;
@@ -54,15 +60,25 @@ export interface WorkflowRun {
 	finishedAt?: number;
 	taskIds: string[];
 	browserRunIds: string[];
+	nodeResults: WorkflowNodeRun[];
 	result?: string;
 	error?: string;
 }
 
-interface WorkflowNodeResult {
-	id: string;
+export interface WorkflowNodeRun {
+	nodeId: string;
 	label: string;
-	completed: boolean;
+	status: "completed" | "failed" | "blocked";
+	required: boolean;
+	predecessorNodeIds: string[];
+	startedAt: number;
+	finishedAt: number;
 	agentTaskId?: string;
+	usage?: AgentRunUsage;
+	outputContract?: {
+		status: "passed" | "failed" | "not-declared";
+		findings: string[];
+	};
 	result?: string;
 	error?: string;
 }
@@ -188,6 +204,7 @@ export class WorkflowService {
 			createdAt: Date.now(),
 			taskIds: [],
 			browserRunIds: [],
+			nodeResults: [],
 		};
 		this.#runs.set(run.id, run);
 		await this.#persistRun(run);
@@ -219,16 +236,14 @@ export class WorkflowService {
 
 	async #execute(definition: WorkflowDefinition, run: WorkflowRun): Promise<void> {
 		try {
-			const ordered = topologicalOrder(definition);
-			const results =
-				definition.pattern === "parallel"
-					? await this.#executeParallel(definition, run, ordered)
-					: await this.#executeSequential(definition, run, ordered);
+			const results = await this.#executeGraph(definition, run);
 			if (definition.pattern === "supervisor") {
 				const supervisorAgentId = definition.supervisorAgentId;
 				if (!supervisorAgentId) throw new Error("Supervisor workflow is missing its supervisor agent");
+				const conversation = await this.#tasks.createConversation(supervisorAgentId);
 				const task = await this.#tasks.submit({
 					agentId: supervisorAgentId,
+					conversationId: conversation.id,
 					source: "workflow",
 					workflowRunId: run.id,
 					prompt: [
@@ -260,40 +275,69 @@ export class WorkflowService {
 		}
 	}
 
-	async #executeSequential(
-		definition: WorkflowDefinition,
-		run: WorkflowRun,
-		ordered: WorkflowNode[],
-	): Promise<WorkflowNodeResult[]> {
-		const results: WorkflowNodeResult[] = [];
-		for (const node of ordered) {
-			const completed = await this.#executeNode(node, run, results.at(-1));
-			results.push(completed);
-			if (!completed.completed && definition.failurePolicy === "stop") {
-				throw new Error(completed.error ?? `Workflow node ${node.id} failed`);
+	async #executeGraph(definition: WorkflowDefinition, run: WorkflowRun): Promise<WorkflowNodeRun[]> {
+		const ordered = topologicalOrder(definition);
+		const predecessors = predecessorMap(definition);
+		const pending = new Set(ordered.map((node) => node.id));
+		const results = new Map<string, WorkflowNodeRun>();
+		const concurrency = definition.pattern === "sequential" ? 1 : definition.maxConcurrency;
+		while (pending.size > 0) {
+			let stopError: Error | undefined;
+			const ready = ordered
+				.filter((node) => pending.has(node.id))
+				.filter((node) => predecessors.get(node.id)!.every((predecessor) => results.has(predecessor)))
+				.slice(0, concurrency);
+			if (ready.length === 0) throw new Error("Workflow graph has no executable node");
+			const executable: WorkflowNode[] = [];
+			for (const node of ready) {
+				const predecessorIds = predecessors.get(node.id)!;
+				const failedPredecessor = predecessorIds
+					.map((id) => results.get(id)!)
+					.find((result) => result.status !== "completed");
+				if (failedPredecessor) {
+					const now = Date.now();
+					const blocked: WorkflowNodeRun = {
+						nodeId: node.id,
+						label: workflowNodeLabel(node),
+						status: "blocked",
+						required: node.required !== false,
+						predecessorNodeIds: predecessorIds,
+						startedAt: now,
+						finishedAt: now,
+						error: `Blocked by failed predecessor ${failedPredecessor.nodeId}`,
+					};
+					results.set(node.id, blocked);
+					pending.delete(node.id);
+					if (blocked.required && definition.failurePolicy === "stop") stopError = new Error(blocked.error);
+				} else {
+					executable.push(node);
+				}
 			}
+			const completed = await Promise.all(
+				executable.map((node) =>
+					this.#executeNode(
+						node,
+						run,
+						predecessors.get(node.id)!.map((id) => results.get(id)!),
+					),
+				),
+			);
+			for (const result of completed) {
+				results.set(result.nodeId, result);
+				pending.delete(result.nodeId);
+				if (result.status !== "completed" && result.required && definition.failurePolicy === "stop") {
+					stopError ??= new Error(result.error ?? `Workflow node ${result.nodeId} failed`);
+				}
+			}
+			run.nodeResults = ordered.flatMap((node) => (results.has(node.id) ? [results.get(node.id)!] : []));
+			await this.#persistRun(run);
+			if (stopError) throw stopError;
 		}
-		return results;
+		return ordered.map((node) => results.get(node.id)!);
 	}
 
-	async #executeParallel(
-		definition: WorkflowDefinition,
-		run: WorkflowRun,
-		ordered: WorkflowNode[],
-	): Promise<WorkflowNodeResult[]> {
-		const results: WorkflowNodeResult[] = [];
-		for (let offset = 0; offset < ordered.length; offset += definition.maxConcurrency) {
-			const batch = ordered.slice(offset, offset + definition.maxConcurrency);
-			const completed = await Promise.all(batch.map((node) => this.#executeNode(node, run)));
-			results.push(...completed);
-			const failed = completed.find((result) => !result.completed);
-			if (failed && definition.failurePolicy === "stop")
-				throw new Error(failed.error ?? "Parallel workflow task failed");
-		}
-		return results;
-	}
-
-	async #executeNode(node: WorkflowNode, run: WorkflowRun, prior?: WorkflowNodeResult): Promise<WorkflowNodeResult> {
+	async #executeNode(node: WorkflowNode, run: WorkflowRun, predecessors: WorkflowNodeRun[]): Promise<WorkflowNodeRun> {
+		const startedAt = Date.now();
 		if (node.kind === "browser-workflow") {
 			if (!this.#browser) throw new Error("Browser workflow runtime is unavailable");
 			const execution = await this.#browser.runner.startExecute(
@@ -305,25 +349,39 @@ export class WorkflowService {
 			await this.#persistRun(run);
 			const completed = await execution.completion;
 			return {
-				id: completed.id,
+				nodeId: node.id,
 				label: `${node.workflowId}@${node.workflowVersion}`,
-				completed: completed.status === "completed",
+				status: completed.status === "completed" ? "completed" : "failed",
+				required: node.required !== false,
+				predecessorNodeIds: predecessors.map((result) => result.nodeId),
+				startedAt,
+				finishedAt: Date.now(),
 				result: completed.status === "completed" ? JSON.stringify(completed) : undefined,
 				error: completed.error,
 			};
 		}
+		const predecessorTasks = predecessors.flatMap((result) => (result.agentTaskId ? [result.agentTaskId] : []));
+		const conversation = await this.#tasks.createConversation(node.agentId);
 		const task = await this.#tasks.submit({
 			agentId: node.agentId,
+			conversationId: conversation.id,
 			source: "workflow",
 			workflowRunId: run.id,
-			parentTaskId: prior?.agentTaskId,
-			prompt: [run.prompt, node.prompt, prior?.result ? `Previous result:\n${prior.result}` : undefined]
+			parentTaskId: predecessorTasks.at(-1),
+			prompt: [
+				`Workflow runtime started at ${new Date(run.createdAt).toISOString()}. Resolve relative dates from this timestamp and the requested timezone.`,
+				run.prompt,
+				node.prompt,
+				...predecessors.flatMap((result) =>
+					result.result ? [`Predecessor ${result.nodeId} result:\n${result.result}`] : [],
+				),
+			]
 				.filter((value): value is string => value !== undefined)
 				.join("\n\n"),
 		});
 		run.taskIds.push(task.id);
 		await this.#persistRun(run);
-		return workflowResult(await this.#tasks.waitForCompletion(task.id));
+		return workflowResult(node, predecessors, startedAt, await this.#tasks.waitForCompletion(task.id));
 	}
 
 	async #validateAgents(definition: WorkflowDefinition): Promise<void> {
@@ -378,6 +436,7 @@ function normalizeWorkflow(value: unknown): WorkflowDefinition {
 					Number.MAX_SAFE_INTEGER,
 				),
 				parameters: normalizeWorkflowParameters(node.parameters, `workflow.nodes[${index}].parameters`),
+				required: optionalBoolean(node.required, `workflow.nodes[${index}].required`) ?? true,
 			};
 		}
 		if (node.kind !== undefined && node.kind !== "agent") {
@@ -388,6 +447,11 @@ function normalizeWorkflow(value: unknown): WorkflowDefinition {
 			kind: "agent",
 			agentId: requiredIdentifier(node.agentId, `workflow.nodes[${index}].agentId`),
 			prompt: requiredString(node.prompt, `workflow.nodes[${index}].prompt`),
+			outputSchema:
+				node.outputSchema === undefined
+					? undefined
+					: parseOutputSchema(node.outputSchema, `workflow.nodes[${index}].outputSchema`),
+			required: optionalBoolean(node.required, `workflow.nodes[${index}].required`) ?? true,
 		};
 	});
 	if (new Set(nodes.map((node) => node.id)).size !== nodes.length) throw new Error("workflow node ids must be unique");
@@ -423,6 +487,9 @@ function normalizeWorkflow(value: unknown): WorkflowDefinition {
 		throw new Error("supervisorAgentId is required for supervisor workflows");
 	}
 	topologicalOrder(definition);
+	if (workflowDepth(definition) > maxDelegationDepth) {
+		throw new Error(`workflow graph exceeds maxDelegationDepth ${maxDelegationDepth}`);
+	}
 	return definition;
 }
 
@@ -470,6 +537,9 @@ function parseWorkflowRun(value: unknown): WorkflowRun {
 		finishedAt: typeof input.finishedAt === "number" ? input.finishedAt : undefined,
 		taskIds: [...input.taskIds],
 		browserRunIds: Array.isArray(input.browserRunIds) ? [...input.browserRunIds] : [],
+		nodeResults: Array.isArray(input.nodeResults)
+			? input.nodeResults.map((entry, index) => parseWorkflowNodeRun(entry, `workflow run nodeResults[${index}]`))
+			: [],
 		result: typeof input.result === "string" ? input.result : undefined,
 		error: typeof input.error === "string" ? input.error : undefined,
 	};
@@ -479,24 +549,183 @@ function cloneDefinition(definition: WorkflowDefinition): WorkflowDefinition {
 	return {
 		...definition,
 		nodes: definition.nodes.map((node) =>
-			node.kind === "browser-workflow" ? { ...node, parameters: { ...node.parameters } } : { ...node },
+			node.kind === "browser-workflow"
+				? { ...node, parameters: { ...node.parameters } }
+				: { ...node, outputSchema: node.outputSchema ? structuredClone(node.outputSchema) : undefined },
 		),
 		edges: definition.edges.map((edge) => ({ ...edge })),
 	};
 }
 
 function cloneRun(run: WorkflowRun): WorkflowRun {
-	return { ...run, taskIds: [...run.taskIds], browserRunIds: [...run.browserRunIds] };
+	return {
+		...run,
+		taskIds: [...run.taskIds],
+		browserRunIds: [...run.browserRunIds],
+		nodeResults: run.nodeResults.map((result) => ({
+			...result,
+			predecessorNodeIds: [...result.predecessorNodeIds],
+			usage: result.usage ? { ...result.usage } : undefined,
+			outputContract: result.outputContract
+				? { status: result.outputContract.status, findings: [...result.outputContract.findings] }
+				: undefined,
+		})),
+	};
 }
 
-function workflowResult(task: AgentTask): WorkflowNodeResult {
+function workflowResult(
+	node: AgentWorkflowNode,
+	predecessors: WorkflowNodeRun[],
+	startedAt: number,
+	task: AgentTask,
+): WorkflowNodeRun {
+	const contract = assessOutputContract(node.outputSchema, task.result);
 	return {
-		id: task.id,
+		nodeId: node.id,
 		label: task.agentId,
-		completed: task.status === "completed",
+		status: task.status === "completed" && contract.status !== "failed" ? "completed" : "failed",
+		required: node.required !== false,
+		predecessorNodeIds: predecessors.map((result) => result.nodeId),
+		startedAt,
+		finishedAt: Date.now(),
 		agentTaskId: task.id,
+		usage: task.usage ? { ...task.usage } : undefined,
+		outputContract: contract,
 		result: task.result,
-		error: task.error,
+		error:
+			task.error ??
+			(contract.status === "failed" ? `Output contract failed: ${contract.findings.join(", ")}` : undefined),
+	};
+}
+
+function parseOutputSchema(value: unknown, name: string): Record<string, unknown> {
+	const schema = structuredClone(object(value, name));
+	try {
+		Compile(schema as TSchema);
+	} catch (error) {
+		throw new Error(
+			`${name} is not a supported JSON schema: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	return schema;
+}
+
+function assessOutputContract(
+	schema: Record<string, unknown> | undefined,
+	result: string | undefined,
+): NonNullable<WorkflowNodeRun["outputContract"]> {
+	if (!schema || Object.keys(schema).length === 0) return { status: "not-declared", findings: [] };
+	if (result === undefined) return { status: "failed", findings: ["PI_OUTPUT_MISSING"] };
+	const parsed = parseJsonResult(result);
+	if (!parsed) return { status: "failed", findings: ["PI_OUTPUT_NOT_JSON"] };
+	return Compile(schema as TSchema).Check(parsed.value)
+		? {
+				status: "passed",
+				findings:
+					parsed.normalization === "fence"
+						? ["PI_OUTPUT_JSON_FENCE_NORMALIZED"]
+						: parsed.normalization === "trailing"
+							? ["PI_OUTPUT_TRAILING_JSON_NORMALIZED"]
+							: [],
+			}
+		: { status: "failed", findings: ["PI_OUTPUT_SCHEMA_MISMATCH"] };
+}
+
+function parseJsonResult(result: string): { value: unknown; normalization: "none" | "fence" | "trailing" } | undefined {
+	const trimmed = result.trim();
+	try {
+		return { value: JSON.parse(trimmed), normalization: "none" };
+	} catch {
+		const fenced = [...result.matchAll(/```json\s*([\s\S]*?)\s*```/gi)];
+		if (fenced.length === 1 && fenced[0]?.[1] !== undefined) {
+			try {
+				return { value: JSON.parse(fenced[0][1]), normalization: "fence" };
+			} catch {
+				// Continue to the terminal JSON check.
+			}
+		}
+		const terminalCandidates: unknown[] = [];
+		for (let index = 0; index < trimmed.length; index++) {
+			if (trimmed[index] !== "{" && trimmed[index] !== "[") continue;
+			try {
+				terminalCandidates.push(JSON.parse(trimmed.slice(index)));
+			} catch {
+				// Only a JSON value consuming the remainder is a candidate.
+			}
+		}
+		return terminalCandidates.length === 1 ? { value: terminalCandidates[0], normalization: "trailing" } : undefined;
+	}
+}
+
+function parseOutputContract(value: unknown, name: string): NonNullable<WorkflowNodeRun["outputContract"]> {
+	const input = object(value, name);
+	if (!Array.isArray(input.findings)) throw new Error(`${name}.findings must be an array`);
+	return {
+		status: oneOf(input.status, ["passed", "failed", "not-declared"], `${name}.status`),
+		findings: input.findings.map((finding, index) => requiredString(finding, `${name}.findings[${index}]`)),
+	};
+}
+
+function workflowNodeLabel(node: WorkflowNode): string {
+	return node.kind === "browser-workflow" ? `${node.workflowId}@${node.workflowVersion}` : node.agentId;
+}
+
+function predecessorMap(definition: WorkflowDefinition): Map<string, string[]> {
+	const predecessors = new Map(definition.nodes.map((node) => [node.id, [] as string[]]));
+	for (const edge of definition.edges) predecessors.get(edge.to)!.push(edge.from);
+	return predecessors;
+}
+
+function workflowDepth(definition: WorkflowDefinition): number {
+	const predecessors = predecessorMap(definition);
+	const depth = new Map<string, number>();
+	for (const node of topologicalOrder(definition)) {
+		const priorDepths = predecessors.get(node.id)!.map((predecessor) => depth.get(predecessor)!);
+		depth.set(node.id, priorDepths.length === 0 ? 1 : Math.max(...priorDepths) + 1);
+	}
+	return Math.max(...depth.values());
+}
+
+function parseWorkflowNodeRun(value: unknown, name: string): WorkflowNodeRun {
+	const input = object(value, name);
+	if (
+		!Array.isArray(input.predecessorNodeIds) ||
+		!input.predecessorNodeIds.every((entry) => typeof entry === "string")
+	) {
+		throw new Error(`${name}.predecessorNodeIds must be an array of strings`);
+	}
+	return {
+		nodeId: requiredIdentifier(input.nodeId, `${name}.nodeId`),
+		label: requiredString(input.label, `${name}.label`),
+		status: oneOf(input.status, ["completed", "failed", "blocked"], `${name}.status`),
+		required: optionalBoolean(input.required, `${name}.required`) ?? true,
+		predecessorNodeIds: [...input.predecessorNodeIds],
+		startedAt: requiredNumber(input.startedAt, `${name}.startedAt`),
+		finishedAt: requiredNumber(input.finishedAt, `${name}.finishedAt`),
+		agentTaskId: typeof input.agentTaskId === "string" ? input.agentTaskId : undefined,
+		usage: input.usage === undefined ? undefined : parseWorkflowUsage(input.usage, `${name}.usage`),
+		outputContract:
+			input.outputContract === undefined
+				? undefined
+				: parseOutputContract(input.outputContract, `${name}.outputContract`),
+		result: typeof input.result === "string" ? input.result : undefined,
+		error: typeof input.error === "string" ? input.error : undefined,
+	};
+}
+
+function parseWorkflowUsage(value: unknown, name: string): AgentRunUsage {
+	const input = object(value, name);
+	const number = (field: string): number => {
+		const item = input[field];
+		if (typeof item !== "number" || !Number.isFinite(item) || item < 0)
+			throw new Error(`${name}.${field} is invalid`);
+		return item;
+	};
+	return {
+		inputTokens: number("inputTokens"),
+		outputTokens: number("outputTokens"),
+		totalTokens: number("totalTokens"),
+		costUsd: number("costUsd"),
 	};
 }
 
@@ -550,6 +779,12 @@ function positiveInteger(value: unknown, name: string, maximum: number): number 
 
 function requiredNumber(value: unknown, name: string): number {
 	if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${name} must be a number`);
+	return value;
+}
+
+function optionalBoolean(value: unknown, name: string): boolean | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "boolean") throw new Error(`${name} must be a boolean`);
 	return value;
 }
 

@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { isClaudeSubscriptionAvailable, resolveClaudeCommand } from "./claude-cli-auth.ts";
+import { scopedSubprocessEnvironment } from "./scoped-subprocess-environment.ts";
 
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1_000;
 const OUTPUT_LIMIT = 8_000;
@@ -58,7 +59,7 @@ export class ClaudeSubscriptionLogin implements AsyncDisposable {
 			this.#status = { status: "succeeded", authenticated: true };
 			return this.getStatus();
 		}
-		const environment = { ...process.env };
+		const environment = scopedSubprocessEnvironment();
 		delete environment.ANTHROPIC_API_KEY;
 		delete environment.CLAUDECODE;
 		this.#output = "";

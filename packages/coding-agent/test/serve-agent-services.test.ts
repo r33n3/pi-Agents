@@ -53,7 +53,26 @@ class ImmediateExecution implements AgentExecution {
 }
 
 class ImmediateExecutor implements AgentExecutor {
+	readonly contexts: AgentExecutionContext[] = [];
+	readonly #failAgentId: string | undefined;
+
+	constructor(failAgentId?: string) {
+		this.#failAgentId = failAgentId;
+	}
+
 	start(context: AgentExecutionContext): Promise<AgentExecution> {
+		this.contexts.push(context);
+		if (context.definition.id === this.#failAgentId) {
+			const result = Promise.reject<AgentExecutionResult>(new Error(`${context.definition.name} failed`));
+			void result.catch(() => {});
+			return Promise.resolve({
+				result,
+				subscribe: () => () => {},
+				abort: () => Promise.resolve(),
+				dispose: () => Promise.resolve(),
+				[Symbol.asyncDispose]: () => Promise.resolve(),
+			});
+		}
 		return Promise.resolve(new ImmediateExecution(`${context.definition.name}: ${context.prompt}`));
 	}
 
@@ -121,13 +140,14 @@ class WorkflowNodeBrowserDriver implements BrowserDriver {
 	async dispose(): Promise<void> {}
 }
 
-async function setup() {
+async function setup(failAgentId?: string) {
 	const root = await mkdtemp(join(tmpdir(), "pi-agent-services-"));
 	roots.push(root);
 	const registry = new AgentRegistry(join(root, "registry"), { defaultWorkspace: root });
 	for (const [id, a2a] of [
 		["researcher", true],
 		["reviewer", false],
+		["writer", false],
 	] as const) {
 		await registry.save({
 			id,
@@ -143,11 +163,12 @@ async function setup() {
 			a2a: { enabled: a2a },
 		});
 	}
-	const runs = new AgentRunManager(registry, new ImmediateExecutor(), join(root, "runs"));
+	const executor = new ImmediateExecutor(failAgentId);
+	const runs = new AgentRunManager(registry, executor, join(root, "runs"));
 	await runs.initialize();
 	const tasks = new AgentTaskService(registry, runs, join(root, "tasks"));
 	await tasks.initialize();
-	return { root, registry, tasks };
+	return { root, registry, tasks, executor };
 }
 
 describe("agent workflows and A2A", () => {
@@ -178,6 +199,124 @@ describe("agent workflows and A2A", () => {
 		await restored.initialize();
 		expect(restored.getDefinition("research-review")).toMatchObject({ pattern: "parallel", maxConcurrency: 2 });
 		expect(restored.getRun(run.id)).toMatchObject({ status: "completed" });
+		await tasks.dispose();
+	});
+
+	test("isolates repeated workflow runs from prior agent conversation state", async () => {
+		const { root, registry, tasks } = await setup();
+		const workflows = new WorkflowService(join(root, "workflows"), registry, tasks);
+		await workflows.initialize();
+		await workflows.save({
+			id: "isolated-research",
+			name: "Isolated research",
+			pattern: "sequential",
+			nodes: [{ id: "research", agentId: "researcher", prompt: "Research" }],
+			edges: [],
+			maxConcurrency: 1,
+			maxDelegationDepth: 1,
+			failurePolicy: "stop",
+		});
+		const first = await workflows.start("isolated-research", "First run");
+		await workflows.waitForCompletion(first.id);
+		const second = await workflows.start("isolated-research", "Second run");
+		await workflows.waitForCompletion(second.id);
+		const workflowTasks = tasks.listTasks({ agentId: "researcher" }).filter((task) => task.source === "workflow");
+		expect(workflowTasks).toHaveLength(2);
+		expect(new Set(workflowTasks.map((task) => task.conversationId)).size).toBe(2);
+		await tasks.dispose();
+	});
+
+	test("waits for every predecessor and supplies complete fan-in context", async () => {
+		const { root, registry, tasks, executor } = await setup();
+		const workflows = new WorkflowService(join(root, "workflows"), registry, tasks);
+		await workflows.initialize();
+		await workflows.save({
+			id: "research-review-write",
+			name: "Research review write",
+			pattern: "parallel",
+			nodes: [
+				{ id: "research", agentId: "researcher", prompt: "Research" },
+				{ id: "review", agentId: "reviewer", prompt: "Review" },
+				{ id: "write", agentId: "writer", prompt: "Write" },
+			],
+			edges: [
+				{ from: "research", to: "write" },
+				{ from: "review", to: "write" },
+			],
+			maxConcurrency: 2,
+			maxDelegationDepth: 2,
+			failurePolicy: "stop",
+		});
+		const started = await workflows.start("research-review-write", "Assess the design");
+		const completed = await workflows.waitForCompletion(started.id);
+		expect(completed).toMatchObject({
+			status: "completed",
+			nodeResults: [
+				{ nodeId: "research", status: "completed", predecessorNodeIds: [] },
+				{ nodeId: "review", status: "completed", predecessorNodeIds: [] },
+				{ nodeId: "write", status: "completed", predecessorNodeIds: ["research", "review"] },
+			],
+		});
+		const writerPrompt = executor.contexts.find((context) => context.definition.id === "writer")?.prompt;
+		expect(writerPrompt).toContain("Predecessor research result:");
+		expect(writerPrompt).toContain("Predecessor review result:");
+		await tasks.dispose();
+	});
+
+	test("rejects workflow graphs deeper than the declared delegation limit", async () => {
+		const { root, registry, tasks } = await setup();
+		const workflows = new WorkflowService(join(root, "workflows"), registry, tasks);
+		await workflows.initialize();
+		await expect(
+			workflows.save({
+				id: "too-deep",
+				name: "Too deep",
+				pattern: "sequential",
+				nodes: [
+					{ id: "one", agentId: "researcher", prompt: "One" },
+					{ id: "two", agentId: "reviewer", prompt: "Two" },
+					{ id: "three", agentId: "writer", prompt: "Three" },
+				],
+				edges: [
+					{ from: "one", to: "two" },
+					{ from: "two", to: "three" },
+				],
+				maxConcurrency: 1,
+				maxDelegationDepth: 2,
+				failurePolicy: "stop",
+			}),
+		).rejects.toThrow("exceeds maxDelegationDepth 2");
+		await tasks.dispose();
+	});
+
+	test("persists required node failure evidence before stopping the workflow", async () => {
+		const { root, registry, tasks } = await setup("researcher");
+		const workflows = new WorkflowService(join(root, "workflows"), registry, tasks);
+		await workflows.initialize();
+		await workflows.save({
+			id: "required-failure",
+			name: "Required failure",
+			pattern: "sequential",
+			nodes: [
+				{ id: "research", agentId: "researcher", prompt: "Research" },
+				{ id: "write", agentId: "writer", prompt: "Write" },
+			],
+			edges: [{ from: "research", to: "write" }],
+			maxConcurrency: 1,
+			maxDelegationDepth: 2,
+			failurePolicy: "stop",
+		});
+		const started = await workflows.start("required-failure", "Assess the design");
+		await expect(workflows.waitForCompletion(started.id)).resolves.toMatchObject({
+			status: "failed",
+			nodeResults: [{ nodeId: "research", status: "failed", required: true }],
+		});
+		const restored = new WorkflowService(join(root, "workflows"), registry, tasks);
+		await restored.initialize();
+		expect(restored.getRun(started.id)).toMatchObject({
+			status: "failed",
+			nodeResults: [{ nodeId: "research", status: "failed", required: true }],
+		});
 		await tasks.dispose();
 	});
 

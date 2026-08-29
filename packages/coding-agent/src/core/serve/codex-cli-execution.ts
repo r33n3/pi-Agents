@@ -8,6 +8,7 @@ import type {
 	AgentExecutionListener,
 	AgentExecutionResult,
 } from "./agent-executor.ts";
+import { scopedSubprocessEnvironment } from "./scoped-subprocess-environment.ts";
 
 const STDERR_LIMIT = 16_000;
 
@@ -22,7 +23,7 @@ export class CodexCliExecution implements AgentExecution {
 
 	constructor(input: { cwd: string; prompt: string; model: string }) {
 		const command = resolveCodexCommand();
-		const environment = { ...process.env };
+		const environment = scopedSubprocessEnvironment();
 		// Codex supports both ChatGPT and API-key authentication. This execution profile is
 		// explicitly subscription-backed, so an inherited API key must never change billing.
 		delete environment.OPENAI_API_KEY;
@@ -145,7 +146,7 @@ export function isCodexCliAvailable(): boolean {
 export function isCodexSubscriptionAvailable(): boolean {
 	try {
 		const command = resolveCodexCommand();
-		const environment = { ...process.env };
+		const environment = scopedSubprocessEnvironment();
 		delete environment.OPENAI_API_KEY;
 		delete environment.OPENAI_ORG_ID;
 		const result = spawnSync(command.executable, [...command.prefix, "login", "status"], {

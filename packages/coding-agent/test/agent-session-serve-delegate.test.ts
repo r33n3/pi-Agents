@@ -1,4 +1,5 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import { encodeServerMessage } from "@earendil-works/pi-protocol";
 import { describe, expect, test } from "vitest";
 import type { AgentSession, AgentSessionEvent } from "../src/core/agent-session.ts";
 import {
@@ -86,5 +87,53 @@ describe("AgentSessionServeDelegate", () => {
 			isError: false,
 		});
 		expect(delegate.snapshot().transcript).toEqual([]);
+	});
+
+	test("removes provider-specific usage fields from protocol snapshots", () => {
+		const session = {
+			sessionId: "session-1",
+			sessionName: "test",
+			sessionManager: { getCwd: () => "C:\\workspace" },
+			model: { provider: "anthropic", id: "claude-haiku-4-5" },
+			thinkingLevel: "medium",
+			isIdle: true,
+			isCompacting: false,
+			retryAttempt: 0,
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "ok" }],
+					provider: "anthropic",
+					model: "claude-haiku-4-5-20251001",
+					usage: {
+						input: 10,
+						output: 4,
+						cacheRead: 100,
+						cacheWrite: 50,
+						totalTokens: 164,
+						cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 },
+						cacheWrite1h: 50,
+					},
+					stopReason: "stop",
+					timestamp: 100,
+				},
+			],
+			pendingMessageCount: 0,
+			getSteeringMessages: () => [],
+		} as unknown as AgentSession;
+		const snapshot = new AgentSessionServeDelegate(session, 100).snapshot();
+		const transcriptItem = snapshot.transcript[0];
+		expect(transcriptItem?.role).toBe("assistant");
+		if (transcriptItem?.role !== "assistant") throw new Error("Expected an assistant transcript item");
+
+		expect(transcriptItem.usage).toEqual({
+			input: 10,
+			output: 4,
+			cacheRead: 100,
+			cacheWrite: 50,
+			totalTokens: 164,
+			cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 },
+		});
+		expect(() => encodeServerMessage({ type: "event", event: { type: "session_snapshot", snapshot } })).not.toThrow();
 	});
 });

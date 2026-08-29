@@ -20,6 +20,7 @@ export interface GoogleWorkspaceOAuthOptions {
 	fetch?: typeof fetch;
 	now?: () => number;
 	environment?: NodeJS.ProcessEnv;
+	environmentValue?: (name: string) => string | undefined;
 }
 
 /** Owns the Google authorization-code lifecycle without exposing tokens to HTTP callers. */
@@ -28,7 +29,7 @@ export class GoogleWorkspaceOAuth {
 	readonly #connections: CapabilityConnectionRegistry;
 	readonly #fetch: typeof fetch;
 	readonly #now: () => number;
-	readonly #environment: NodeJS.ProcessEnv;
+	readonly #environmentValue: (name: string) => string | undefined;
 	readonly #pending = new Map<string, PendingAuthorization>();
 
 	constructor(
@@ -40,7 +41,8 @@ export class GoogleWorkspaceOAuth {
 		this.#connections = connections;
 		this.#fetch = options.fetch ?? fetch;
 		this.#now = options.now ?? Date.now;
-		this.#environment = options.environment ?? process.env;
+		const environment = options.environment ?? process.env;
+		this.#environmentValue = options.environmentValue ?? ((name) => environment[name]);
 	}
 
 	start(
@@ -48,11 +50,11 @@ export class GoogleWorkspaceOAuth {
 		capabilityIds: readonly string[],
 		initiatorToken?: string,
 	): { authorizationUrl: string; expiresAt: string } {
-		const clientId = requiredEnvironment(this.#environment, "GOOGLE_CLIENT_ID");
+		const clientId = requiredString(this.#environmentValue("GOOGLE_CLIENT_ID"), "GOOGLE_CLIENT_ID");
 		const normalizedCapabilities = normalizeCapabilities(capabilityIds);
 		const state = randomBytes(32).toString("base64url");
 		const verifier = randomBytes(48).toString("base64url");
-		const redirectUri = callbackUri(this.#environment.GOOGLE_OAUTH_REDIRECT_URI, origin);
+		const redirectUri = callbackUri(this.#environmentValue("GOOGLE_OAUTH_REDIRECT_URI"), origin);
 		const expiresAt = this.#now() + STATE_TTL_MS;
 		this.#prune();
 		this.#pending.set(state, {
@@ -238,10 +240,6 @@ function matchesTokenDigest(expected: string, value: string | undefined): boolea
 	if (!value) return false;
 	const actual = tokenDigest(value);
 	return timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
-}
-
-function requiredEnvironment(environment: NodeJS.ProcessEnv, name: string): string {
-	return requiredString(environment[name], name);
 }
 
 function requiredCredential(credentials: Readonly<Record<string, string>>, name: string): string {

@@ -148,8 +148,8 @@ function normalizeProfile(value: unknown): CapabilityConnectionProfile {
 	const id = requiredString(input.id, "id");
 	assertIdentifier(id, "connection id");
 	const secretRef = requiredString(input.secretRef, "secretRef");
-	if (!/^(env|os|managed):[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(secretRef)) {
-		throw new Error("secretRef must use an env:, os:, or managed: reference");
+	if (!/^(env|os|managed|vault|external):[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(secretRef)) {
+		throw new Error("secretRef must use an env:, os:, managed:, vault:, or external: reference");
 	}
 	const status = input.status;
 	if (status !== "active" && status !== "unhealthy" && status !== "revoked") {

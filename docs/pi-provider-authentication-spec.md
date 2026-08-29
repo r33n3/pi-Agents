@@ -40,9 +40,11 @@ connector required -> configuration required -> authorization required
 - Secret values are write-only. The browser receives configured/not-configured
   status, never stored values.
 
-For the temporary local deployment, provider configuration and OAuth tokens are
-stored in the project `.env.local`. A later secret-store implementation may
-replace that storage without changing browser, broker, agent, or plugin APIs.
+Provider configuration is split between safe Pi settings and the encrypted
+credential store defined by
+[pi-credential-vault-spec.md](pi-credential-vault-spec.md). Existing project
+`.env.local` values are a read-only migration source and explicit legacy
+fallback; new secrets and OAuth tokens are written to the vault.
 
 ## Design
 
@@ -89,21 +91,23 @@ names, multiline values, NUL bytes, and values beyond the bounded field size
 are rejected. URL fields require an absolute HTTP(S) URL. Duplicate manifest
 environment names are invalid.
 
-### `.env.local` storage
+### Credential storage
 
-The store:
+The encrypted credential store:
 
-- resolves exactly `<project root>/.env.local`;
-- preserves comments, blank lines, ordering, and unrelated entries;
-- replaces declared assignments or appends missing assignments;
-- quotes and escapes values deterministically;
-- writes through a same-directory temporary file and atomic replacement;
-- updates the current process only after persistence succeeds;
+- stores shared accounts in the user vault and project-only credentials in the
+  validated workspace overlay;
+- persists only fields declared by the provider manifest;
+- keeps safe non-secret provider configuration outside the vault;
+- writes authenticated ciphertext through atomic replacement;
+- releases only declared fields to trusted provider adapters;
 - never returns values through snapshots, logs, errors, or audit records; and
-- serializes writes so simultaneous provider saves cannot lose updates.
+- uses inter-process locking and generations so simultaneous provider saves
+  cannot lose updates.
 
-Clearing a field removes its assignment and process value. `.env.local` remains
-gitignored.
+Clearing a field revokes the selected vault value. The parent serve process is
+not hydrated with stored credentials. `.env.local` remains gitignored and is
+handled by the explicit, non-destructive migration flow.
 
 ### OAuth
 
@@ -178,8 +182,9 @@ booleans, connection/account state, and available actions only.
 ## Recovery and concurrency
 
 - Configuration writes run independently of Pi turns and agent workers.
-- On startup, the service validates `.env.local` presence without exposing
-  values and reconstructs connection health.
+- On startup, the service loads safe vault metadata without exposing values and
+  reconstructs connection health. A locked vault remains visible as a
+  remediable state.
 - OAuth state is intentionally process-local and expires after ten minutes;
   restart requires starting authorization again.
 - Agent definitions retain grants while a connection is unavailable, but new

@@ -1,11 +1,12 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
+import { scopedSubprocessEnvironment } from "./scoped-subprocess-environment.ts";
 
 /** Reports whether Claude Code has a subscription login that works without an API key. */
 export function isClaudeSubscriptionAvailable(): boolean {
 	try {
-		const environment = { ...process.env };
+		const environment = scopedSubprocessEnvironment();
 		delete environment.ANTHROPIC_API_KEY;
 		delete environment.CLAUDECODE;
 		const command = resolveClaudeCommand();

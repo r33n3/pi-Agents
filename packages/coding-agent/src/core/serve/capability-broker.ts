@@ -421,6 +421,7 @@ const WAVE_TWO_DEFINITIONS: readonly CapabilityDefinition[] = [
 	...readDefinitions("feeds", ["read"]),
 	...readDefinitions("sites", ["monitor"]),
 	...readDefinitions("events", ["search"]),
+	...readDefinitions("news", ["search"]),
 	...readDefinitions("finance", ["quotes", "filings", "watchlist", "accounts", "transactions", "spending"]),
 ];
 
@@ -438,6 +439,84 @@ const WAVE_TWO_MANIFESTS: readonly CapabilityProviderManifest[] = [
 			...bindings(["sites.monitor"], "site_monitor_check"),
 			...bindings(["finance.watchlist"], "finance_watchlist_list"),
 		],
+	},
+	{
+		id: "currents-news",
+		name: "Currents News",
+		source: "builtin:currents-news",
+		version: "1",
+		permissions: ["public news search", "Currents credential"],
+		authentication: {
+			kind: "environment",
+			fields: [{ env: "CURRENTS_NEW_API_KEY", label: "Currents API key", required: true, secret: true }],
+		},
+		bindings: [...bindings(["news.search"], "currents_search_news")],
+	},
+	{
+		id: "finnhub",
+		name: "Finnhub",
+		source: "builtin:finnhub",
+		version: "1",
+		permissions: ["market quote read", "Finnhub credential"],
+		authentication: {
+			kind: "environment",
+			fields: [{ env: "FINNHUB_API_KEY", label: "Finnhub API key", required: true, secret: true }],
+		},
+		bindings: [...bindings(["finance.quotes"], "finnhub_quote")],
+	},
+	{
+		id: "tiingo",
+		name: "Tiingo",
+		source: "builtin:tiingo",
+		version: "1",
+		permissions: ["market price read", "Tiingo credential"],
+		authentication: {
+			kind: "environment",
+			fields: [{ env: "TIINGO_API_KEY", label: "Tiingo API key", required: true, secret: true }],
+		},
+		bindings: [...bindings(["finance.quotes"], "tiingo_price")],
+	},
+	{
+		id: "apify",
+		name: "Apify",
+		source: "builtin:apify",
+		version: "1",
+		permissions: ["dataset read", "Apify credential"],
+		configurationOnly: true,
+		authentication: {
+			kind: "environment",
+			fields: [{ env: "APIFY_API_KEY", label: "Apify API key", required: true, secret: true }],
+		},
+		bindings: [],
+	},
+	{
+		id: "amazon-bedrock-api",
+		name: "Amazon Bedrock API",
+		source: "builtin:amazon-bedrock-api",
+		version: "1",
+		permissions: ["usage-based Amazon Bedrock model access"],
+		configurationOnly: true,
+		authentication: {
+			kind: "environment",
+			fields: [{ env: "AWS_BEARER_TOKEN_BEDROCK", label: "Bedrock bearer token", required: true, secret: true }],
+		},
+		bindings: [],
+	},
+	{
+		id: "hermes-configuration",
+		name: "Hermes Configuration",
+		source: "builtin:hermes-configuration",
+		version: "1",
+		permissions: ["Hermes model configuration"],
+		configurationOnly: true,
+		authentication: {
+			kind: "environment",
+			fields: [
+				{ env: "HERMES_DEFAULT_MODEL", label: "Default Hermes model", required: false, secret: false },
+				{ env: "HERMES_MODELS", label: "Available Hermes models", required: false, secret: false },
+			],
+		},
+		bindings: [],
 	},
 	productivityManifest("google-workspace", "Google Workspace", "google_workspace", [
 		"email",

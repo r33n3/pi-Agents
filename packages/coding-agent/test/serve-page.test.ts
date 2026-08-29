@@ -142,7 +142,7 @@ describe("createServePage", () => {
 		const environment: NodeJS.ProcessEnv = {};
 		capabilityBroker = new CapabilityBroker(join(root, "capabilities"), {
 			activeToolNames: () => ["fixture_search"],
-			environmentValue: (name) => environment[name],
+			environmentValue: (name) => providerEnvironment?.environmentValue(name) ?? environment[name],
 			definitions: [
 				{
 					id: "web.search",
@@ -180,7 +180,11 @@ describe("createServePage", () => {
 		providerEnvironment = new ProviderEnvironmentStore(
 			root,
 			(providerId) => capabilityBroker.authenticationManifest(providerId),
-			environment,
+			{
+				environment,
+				platform: "linux",
+				passphrase: "correct horse battery staple",
+			},
 		);
 		everydayConfigurations = new EverydayConfigurationRegistry(join(root, "everyday"));
 		await everydayConfigurations.initialize();
@@ -326,11 +330,15 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("Delete recorded workflow");
 		expect(bundleText).toContain("Signed-in profiles");
 		expect(bundleText).toContain("tool-activity-summary");
-		expect(bundleText).toContain("Web services");
+		expect(bundleText).toContain("API and web services");
 		expect(bundleText).toContain("Configured \\xB7 review required");
 		expect(bundleText).toContain("tool-activity-state");
 		expect(bundleText).toContain("tokens remaining");
 		expect(bundleText).toContain("Estimated session cost in US dollars");
+		expect(bundleText).toContain("Filter models");
+		expect(bundleText).toContain("All cost bands");
+		expect(bundleText).toContain("Unsupported levels are disabled.");
+		expect(bundleText).toContain("thinkingSupported");
 		expect(bundleText).toContain("showPicker");
 		expect(bundleText).toContain("browser-session-tabs");
 		expect(bundleText).toContain("Active browsers");
@@ -338,8 +346,16 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("Pop out browser");
 		expect(bundleText).toContain("agent-session-tab");
 		expect(bundleText).toContain("Active agent conversation");
-		expect(bundleText).toContain("builder-session-tab");
-		expect(bundleText).toContain("Continue configuring this agent");
+		expect(bundleText).not.toContain("builder-session-tab");
+		expect(bundleText).toContain("Apply and update agent");
+		expect(bundleText).toContain("Exit editing");
+		expect(bundleText).toContain("Do not call agent_deploy or modify agent files");
+		expect(bundleText).toContain("No changes to apply.");
+		expect(bundleText).toContain("Unsaved changes. Review them, then apply the update.");
+		expect(bundleText).toContain("Never invent a model ID");
+		expect(bundleText).toContain("provider/model");
+		expect(bundleText).toContain("Apply the reviewed agent configuration without another model call");
+		expect(bundleText).toContain("No drafted agent changes are ready to apply");
 		expect(bundleText).toContain("Configure and deploy a local agent");
 		expect(bundleText).toContain("builder-settings-stack");
 		expect(bundleText).toContain("Choose the model and reasoning depth.");
@@ -354,6 +370,9 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("Access not granted");
 		expect(bundleText).toContain("Financial data");
 		expect(bundleText).toContain("Google access");
+		expect(bundleText).toContain("Credential vault");
+		expect(bundleText).toContain("Import .env.local");
+		expect(bundleText).toContain("Credential changes require this Pi host or authenticated HTTPS.");
 		expect(bundleText).toContain("to request");
 		expect(bundleText).toContain("supported");
 		expect(bundleText).toContain("Needs attention");
@@ -460,6 +479,24 @@ describe("createServePage", () => {
 		expect(await response.json()).toMatchObject({
 			connections: [{ id: "openai", defaultModel: { provider: "openai", id: "gpt-5.6-luna" } }],
 		});
+	});
+
+	test("manages vault lock state without returning credential values", async () => {
+		const initial = await fetch(`${origin}/credential-vault?token=secret-token`);
+		expect(initial.status).toBe(200);
+		expect(initial.headers.get("cache-control")).toBe("no-store");
+		expect(await initial.json()).toMatchObject({ vault: { initialized: true, locked: false } });
+		await providerEnvironment.configure("fixture-search", { values: { FIXTURE_TOKEN: "secret-value" } });
+		const locked = await fetch(`${origin}/credential-vault?token=secret-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action: "lock" }),
+		});
+		expect(await locked.json()).toMatchObject({ initialized: true, locked: true });
+		const status = await fetch(`${origin}/credential-vault?token=secret-token`);
+		const text = await status.text();
+		expect(JSON.parse(text)).toMatchObject({ vault: { locked: true } });
+		expect(text).not.toContain("secret-value");
 	});
 
 	test("requires review before enabling a capability provider over HTTP", async () => {

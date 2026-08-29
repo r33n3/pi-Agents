@@ -20,11 +20,12 @@ interface SearxngResult {
 	score?: number;
 }
 
-/** Creates a search tool bound to one explicitly configured SearXNG service. */
-export function createSearxngTools(baseUrl: string | undefined): ToolDefinition[] {
-	if (!baseUrl?.trim()) return [];
-	const endpoint = searchEndpoint(baseUrl);
-	const policy = new BrowserPolicy(browserAccessForUrl(endpoint.href));
+/** Creates a search tool that resolves its explicitly configured SearXNG service for each call. */
+export function createSearxngTools(baseUrl: string | undefined | (() => string | undefined)): ToolDefinition[] {
+	if (typeof baseUrl !== "function") {
+		if (!baseUrl?.trim()) return [];
+		searchEndpoint(baseUrl);
+	}
 	return [
 		{
 			name: "searxng_search",
@@ -35,6 +36,10 @@ export function createSearxngTools(baseUrl: string | undefined): ToolDefinition[
 			parameters: searchParameters,
 			executionMode: "parallel",
 			async execute(_toolCallId, { query, categories, language, timeRange, maxResults = 10 }, signal) {
+				const configured = typeof baseUrl === "function" ? baseUrl() : baseUrl;
+				if (!configured?.trim()) throw new Error("SearXNG is not configured in Settings > Connections");
+				const endpoint = searchEndpoint(configured);
+				const policy = new BrowserPolicy(browserAccessForUrl(endpoint.href));
 				const url = new URL(endpoint);
 				url.searchParams.set("q", query);
 				url.searchParams.set("format", "json");

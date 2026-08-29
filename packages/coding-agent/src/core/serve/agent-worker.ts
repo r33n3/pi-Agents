@@ -110,16 +110,19 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 		if (request.modelApiKey && definition.model) {
 			await services.modelRuntime.setRuntimeApiKey(definition.model.provider, request.modelApiKey);
 		}
-		const model = definition.model
+		const resolvedModel = definition.model
 			? services.modelRuntime.getModel(definition.model.provider, definition.model.id)
 			: services.modelRuntime.getAvailableSnapshot()[0];
-		if (!model) {
+		if (!resolvedModel) {
 			throw new Error(
 				definition.model
 					? `Agent model ${definition.model.provider}/${definition.model.id} is unavailable`
 					: "No model is available for the agent run",
 			);
 		}
+		const model = definition.budget?.maxTokens
+			? { ...resolvedModel, maxTokens: Math.min(resolvedModel.maxTokens, definition.budget.maxTokens) }
+			: resolvedModel;
 		const isolated = definition.executor === "harness";
 		const customTools = (
 			isolated ? [...createScopedAgentTools(definition, workspace, hostScopedFileOperations)] : []

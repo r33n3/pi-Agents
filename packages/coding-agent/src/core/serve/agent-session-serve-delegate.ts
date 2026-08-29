@@ -9,6 +9,7 @@ import type {
 	ThinkingLevel,
 	ToolTranscriptItem,
 	TranscriptItem,
+	Usage,
 	UserTranscriptItem,
 } from "@earendil-works/pi-protocol";
 import {
@@ -156,6 +157,7 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 				return [this.assistantItem(message)];
 			case "toolResult": {
 				const details = sanitizeProtocolDetails(message.details);
+				const usage = this.protocolUsage(message.usage);
 				const common = {
 					id: this.idFor(message),
 					role: "tool" as const,
@@ -164,7 +166,7 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 					input: this.toolInput(message.toolCallId),
 					content: message.content,
 					...(details === undefined ? {} : { details }),
-					usage: message.usage,
+					...(usage === undefined ? {} : { usage }),
 					timestamp: message.timestamp,
 				};
 				return [
@@ -251,13 +253,14 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 			if (part.type === "thinking") return { type: "thinking" as const, thinking: part.thinking };
 			return { type: "toolCall" as const, toolCallId: part.id, toolName: part.name, input: part.arguments };
 		});
+		const usage = this.protocolUsage(message.usage);
 		const common = {
 			id: this.idFor(message),
 			role: "assistant" as const,
 			content,
 			model: { provider: message.provider, id: message.model },
 			responseModel: message.responseModel,
-			usage: message.usage,
+			...(usage === undefined ? {} : { usage }),
 			timestamp: message.timestamp,
 		};
 		if (message.stopReason === "error")
@@ -266,6 +269,25 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 			return { ...common, status: "aborted", stopReason: "aborted", errorMessage: message.errorMessage };
 		if (message.stopReason === "length") return { ...common, status: "complete", stopReason: "length" };
 		return { ...common, status: "complete", stopReason: message.stopReason === "toolUse" ? "toolUse" : "stop" };
+	}
+
+	private protocolUsage(usage: Extract<AgentMessage, { role: "assistant" }>["usage"] | undefined): Usage | undefined {
+		if (usage === undefined) return undefined;
+		return {
+			input: usage.input,
+			output: usage.output,
+			cacheRead: usage.cacheRead,
+			cacheWrite: usage.cacheWrite,
+			...(usage.reasoning === undefined ? {} : { reasoning: usage.reasoning }),
+			totalTokens: usage.totalTokens,
+			cost: {
+				input: usage.cost.input,
+				output: usage.cost.output,
+				cacheRead: usage.cost.cacheRead,
+				cacheWrite: usage.cost.cacheWrite,
+				total: usage.cost.total,
+			},
+		};
 	}
 
 	private userContent(
