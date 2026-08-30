@@ -129,7 +129,7 @@ class SessionExecution implements AgentExecution {
 		].join("\n\n");
 		try {
 			await this.#session.prompt(instructions, { source: "rpc" });
-			return { output: lastAssistantText(this.#session.messages), transcript: [...this.#session.messages] };
+			return agentExecutionResultFromMessages(this.#session.messages);
 		} finally {
 			this.#emit({ kind: "progress", phase: "writing-results", message: "settled", timestamp: Date.now() });
 		}
@@ -148,14 +148,23 @@ function sessionEventPhase(type: string): AgentExecutionPhase {
 	return "waiting-for-model";
 }
 
-function lastAssistantText(messages: readonly AgentMessage[]): string {
+export function agentExecutionResultFromMessages(messages: readonly AgentMessage[]): AgentExecutionResult {
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
 		if (message.role !== "assistant") continue;
-		return message.content
-			.filter((entry) => entry.type === "text")
-			.map((entry) => entry.text)
-			.join("\n");
+		if (message.stopReason === "error") {
+			throw new Error(message.errorMessage || "Agent model request failed");
+		}
+		if (message.stopReason === "aborted") {
+			throw new Error(message.errorMessage || "Agent model request was aborted");
+		}
+		return {
+			output: message.content
+				.filter((entry) => entry.type === "text")
+				.map((entry) => entry.text)
+				.join("\n"),
+			transcript: [...messages],
+		};
 	}
-	return "";
+	throw new Error("Agent model returned no assistant response");
 }

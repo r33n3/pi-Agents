@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { TSchema } from "typebox";
 import type { AgentSession } from "../agent-session.ts";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../agent-session-services.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import { SessionManager } from "../session-manager.ts";
-import type { AgentExecutionPhase } from "./agent-executor.ts";
+import { type AgentExecutionPhase, agentExecutionResultFromMessages } from "./agent-executor.ts";
 import type {
 	AgentWorkerCapabilityToolResponseMessage,
 	AgentWorkerHostAction,
@@ -244,11 +244,12 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 		].join("\n\n");
 		await emitProgress("waiting-for-model", "Waiting for model response");
 		await activeSession.prompt(instructions, { source: "rpc" });
+		const result = agentExecutionResultFromMessages(activeSession.messages);
 		await emitProgress("writing-results", "Writing durable run results");
 		await writeResultArtifact(request.resultPath, {
 			status: "succeeded",
-			output: lastAssistantText(activeSession.messages),
-			transcript: [...activeSession.messages],
+			output: result.output,
+			transcript: [...result.transcript],
 		});
 		response = { type: "result" };
 	} catch (error) {
@@ -405,16 +406,4 @@ function handleHostActionResponse(message: AgentWorkerHostActionResponseMessage)
 function rejectPendingHostActions(error: Error): void {
 	for (const pending of pendingHostActions.values()) pending.reject(error);
 	pendingHostActions.clear();
-}
-
-function lastAssistantText(messages: readonly AgentMessage[]): string {
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index];
-		if (message.role !== "assistant") continue;
-		return message.content
-			.filter((entry) => entry.type === "text")
-			.map((entry) => entry.text)
-			.join("\n");
-	}
-	return "";
 }

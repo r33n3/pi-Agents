@@ -206,6 +206,33 @@ describe("AgentRunManager", () => {
 		await runs.waitForCompletion(review.id);
 	});
 
+	test("runs a temporary specialist without adding it to the agent catalog", async () => {
+		const { root, registry, executor, runs } = await setup();
+		const before = await registry.list();
+		const run = await runs.startTemporarySpecialist("research", "Inspect one bounded concern");
+
+		expect(run.agentId).toMatch(/^temporary-[0-9a-f-]+$/);
+		expect(run.temporarySourceAgentId).toBe("research");
+		expect(executor.contexts[0]).toMatchObject({
+			definition: {
+				id: run.agentId,
+				name: "Research specialist",
+				permissionPolicy: "read-only",
+			},
+		});
+		expect(await registry.list()).toEqual(before);
+
+		executor.executions[0]!.resolve({ output: "Specialist result", transcript: [] });
+		await expect(runs.waitForCompletion(run.id)).resolves.toMatchObject({
+			status: "succeeded",
+			temporarySourceAgentId: "research",
+		});
+		await expect(readFile(join(root, "artifacts", run.agentId, run.id, "result.md"), "utf8")).resolves.toBe(
+			"Specialist result\n",
+		);
+		expect(await registry.list()).toEqual(before);
+	});
+
 	test("serializes a workspace writer against other agents in the same project", async () => {
 		const { registry, executor, runs } = await setup();
 		await registry.save({

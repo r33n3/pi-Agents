@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { PiServer } from "@earendil-works/pi-server";
 import type { AgentSession } from "../agent-session.ts";
@@ -9,6 +10,7 @@ import { DefaultResourceLoader } from "../resource-loader.ts";
 import { createAgentSession } from "../sdk.ts";
 import { SessionManager } from "../session-manager.ts";
 import { A2aAdapter } from "./a2a-adapter.ts";
+import { AgentBuildLifecycleService } from "./agent-build-lifecycle-service.ts";
 import { AgentSessionExecutor } from "./agent-executor.ts";
 import { type AgentDefinition, AgentRegistry } from "./agent-registry.ts";
 import { createAgentRegistryTools } from "./agent-registry-tools.ts";
@@ -46,12 +48,14 @@ import { createHermesConnectionModels } from "./hermes-connection.ts";
 import { InboundRoutingService } from "./inbound-routing-service.ts";
 import { PersonaCatalog, resolvePersonaProject } from "./persona-catalog.ts";
 import { PiAgentBundleInstaller } from "./pi-agent-bundle.ts";
+import { PiAgentTeamLauncher } from "./pi-agent-team-launcher.ts";
 import { PlaidConnectionService } from "./plaid-connection.ts";
 import { createPlaidTools, PLAID_TOOL_NAMES } from "./plaid-tools.ts";
 import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
 import { PluginManagementService } from "./plugin-management-service.ts";
 import { ProviderEnvironmentStore } from "./provider-environment-store.ts";
 import { RoutineRegistry } from "./routine-registry.ts";
+import { RunSkillPromotionService } from "./run-skill-promotion-service.ts";
 import { createScopedAgentTools } from "./scoped-agent-tools.ts";
 import { createSearxngTools } from "./searxng-tools.ts";
 import { ServeAttachmentStore } from "./serve-attachment-store.ts";
@@ -60,6 +64,7 @@ import { createServePage } from "./serve-page.ts";
 import { WebSocketListener } from "./websocket-listener.ts";
 import { WorkflowService } from "./workflow-service.ts";
 import { WorkspacePreviewServer } from "./workspace-preview-server.ts";
+import { WtkAgentFactoryClient } from "./wtk-agent-factory-client.ts";
 
 export interface ServeHostOptions {
 	agentDir: string;
@@ -500,6 +505,13 @@ export class ServeHost implements AsyncDisposable {
 		});
 		this.#agentRunManager = new AgentRunManager(agentRegistry, executor, join(serveRoot, "runs"));
 		await this.#agentRunManager.initialize();
+		const agentBuildLifecycle = new AgentBuildLifecycleService(serveRoot, agentRegistry, this.#agentRunManager);
+		await agentBuildLifecycle.initialize();
+		const runSkillPromotion = new RunSkillPromotionService(
+			this.#agentRunManager,
+			join(agentDir, "skills"),
+			agentBuildLifecycle,
+		);
 		this.#agentTaskService = new AgentTaskService(agentRegistry, this.#agentRunManager, serveRoot);
 		await this.#agentTaskService.initialize();
 		this.#workflowService = new WorkflowService(join(serveRoot, "workflows"), agentRegistry, this.#agentTaskService, {
@@ -516,6 +528,23 @@ export class ServeHost implements AsyncDisposable {
 			agentRegistry,
 			this.#workflowService,
 		);
+		await piAgentBundleInstaller.initialize();
+		const piAgentTeamLauncher = new PiAgentTeamLauncher(
+			piAgentBundleInstaller,
+			this.#agentTaskService,
+			this.#workflowService,
+			capabilityConnections,
+		);
+		const configuredWtkRoot = providerEnvironment.environmentValue("PI_WTK_ROOT")?.trim();
+		const siblingWtkRoot = resolve(session.sessionManager.getCwd(), "..", "WTK-Dev");
+		const wtkRoot = configuredWtkRoot || (existsSync(join(siblingWtkRoot, ".wtk")) ? siblingWtkRoot : undefined);
+		const wtkAgentFactory = wtkRoot
+			? new WtkAgentFactoryClient({
+					origin: providerEnvironment.environmentValue("PI_WTK_CONTROL_URL")?.trim() || "http://127.0.0.1:7878",
+					root: wtkRoot,
+					accessToken: providerEnvironment.environmentValue("WTK_DASHBOARD_ACCESS_TOKEN"),
+				})
+			: undefined;
 		const a2aAdapter = new A2aAdapter(agentRegistry, this.#agentTaskService);
 
 		const availableModels = modelRuntime.getAvailableSnapshot().map((model) => ({
@@ -703,6 +732,7 @@ export class ServeHost implements AsyncDisposable {
 				if (definition.target.kind !== "agent") return;
 				const target = await agentRegistry.get(definition.target.agentId);
 				if (!target) throw new Error(`Routine agent ${definition.target.agentId} was not found`);
+				await agentBuildLifecycle.assertAutomationAllowed(definition.target.agentId);
 				capabilityBroker.validateUnattendedGrants(target.capabilities, target.executor);
 			},
 		);
@@ -735,6 +765,7 @@ export class ServeHost implements AsyncDisposable {
 					};
 				}
 				if (definition.target.kind === "agent") {
+					await agentBuildLifecycle.assertAutomationAllowed(definition.target.agentId);
 					const target = await agentRegistry.get(definition.target.agentId);
 					if (!target) throw new Error(`Routine agent ${definition.target.agentId} was not found`);
 					capabilityBroker.validateUnattendedGrants(target.capabilities, target.executor);
@@ -907,6 +938,10 @@ export class ServeHost implements AsyncDisposable {
 				plaidConnections,
 				claudeSubscriptionLogin,
 				piAgentBundleInstaller,
+				piAgentTeamLauncher,
+				wtkAgentFactory,
+				runSkillPromotion,
+				agentBuildLifecycle,
 			),
 			auxiliary: {
 				path: "/browser-stream",

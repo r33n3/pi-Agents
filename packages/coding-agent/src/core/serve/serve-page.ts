@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { A2A_MEDIA_TYPE, type A2aAdapter, A2aError, type A2aTask } from "./a2a-adapter.ts";
+import type { AgentBuildLifecycleService } from "./agent-build-lifecycle-service.ts";
 import type { AgentDefinitionInput, AgentRegistry } from "./agent-registry.ts";
 import type { AgentRoutineScheduler } from "./agent-routine-scheduler.ts";
 import type { AgentRunManager } from "./agent-run-manager.ts";
@@ -20,12 +21,15 @@ import type { GoogleWorkspaceOAuth } from "./google-workspace-oauth.ts";
 import type { InboundRoute, InboundRoutingService } from "./inbound-routing-service.ts";
 import type { PersonaCatalog } from "./persona-catalog.ts";
 import { type PiAgentBundleInstaller, parsePiAgentBundleBindings } from "./pi-agent-bundle.ts";
+import type { PiAgentTeamLauncher } from "./pi-agent-team-launcher.ts";
 import type { PlaidConnectionService } from "./plaid-connection.ts";
 import type { PluginManagementService } from "./plugin-management-service.ts";
 import type { ProviderEnvironmentStore } from "./provider-environment-store.ts";
 import type { RoutineDefinitionInput, RoutineRegistry } from "./routine-registry.ts";
+import type { RunSkillPromotionService } from "./run-skill-promotion-service.ts";
 import type { ServeAttachment, ServeAttachmentStore } from "./serve-attachment-store.ts";
 import type { WorkflowDefinitionInput, WorkflowService } from "./workflow-service.ts";
+import type { WtkAgentFactoryClient } from "./wtk-agent-factory-client.ts";
 
 const SECURITY_HEADERS = {
 	"cache-control": "no-store",
@@ -62,6 +66,10 @@ export function createServePage(
 	plaidConnections?: PlaidConnectionService,
 	claudeSubscriptionLogin?: ClaudeSubscriptionLogin,
 	piAgentBundleInstaller?: PiAgentBundleInstaller,
+	piAgentTeamLauncher?: PiAgentTeamLauncher,
+	wtkAgentFactory?: WtkAgentFactoryClient,
+	runSkillPromotion?: RunSkillPromotionService,
+	agentBuildLifecycle?: AgentBuildLifecycleService,
 ): (request: IncomingMessage, response: ServerResponse) => void {
 	return (request, response) => {
 		void serveRequest(
@@ -92,6 +100,10 @@ export function createServePage(
 			plaidConnections,
 			claudeSubscriptionLogin,
 			piAgentBundleInstaller,
+			piAgentTeamLauncher,
+			wtkAgentFactory,
+			runSkillPromotion,
+			agentBuildLifecycle,
 		).catch((error: unknown) => {
 			if (response.headersSent) {
 				response.end();
@@ -132,6 +144,10 @@ async function serveRequest(
 	plaidConnections: PlaidConnectionService | undefined,
 	claudeSubscriptionLogin: ClaudeSubscriptionLogin | undefined,
 	piAgentBundleInstaller: PiAgentBundleInstaller | undefined,
+	piAgentTeamLauncher: PiAgentTeamLauncher | undefined,
+	wtkAgentFactory: WtkAgentFactoryClient | undefined,
+	runSkillPromotion: RunSkillPromotionService | undefined,
+	agentBuildLifecycle: AgentBuildLifecycleService | undefined,
 ): Promise<void> {
 	const url = new URL(request.url ?? "/", "http://localhost");
 	if (url.pathname === "/capability-oauth/google-workspace/callback") {
@@ -148,6 +164,14 @@ async function serveRequest(
 		!matchesCapabilityToken(token, bearer ?? null)
 	) {
 		response.writeHead(403, SECURITY_HEADERS).end();
+		return;
+	}
+	if (url.pathname === "/agent-teams" || url.pathname.startsWith("/agent-teams/")) {
+		await servePiAgentTeam(request, response, url, piAgentTeamLauncher);
+		return;
+	}
+	if (url.pathname === "/agent-team-factory" || url.pathname.startsWith("/agent-team-factory/")) {
+		await serveWtkAgentFactory(request, response, url, wtkAgentFactory, piAgentTeamLauncher);
 		return;
 	}
 	if (url.pathname === "/agent-events") {
@@ -252,12 +276,20 @@ async function serveRequest(
 		await serveAgents(request, response, url, agentRegistry);
 		return;
 	}
+	if (
+		url.pathname === "/agent-builds.json" ||
+		url.pathname === "/agent-builds" ||
+		url.pathname.startsWith("/agent-builds/")
+	) {
+		await serveAgentBuilds(request, response, url, agentBuildLifecycle);
+		return;
+	}
 	if (url.pathname === "/runs.json" || url.pathname === "/runs" || url.pathname.startsWith("/runs/")) {
-		await serveRuns(request, response, url, agentRunManager);
+		await serveRuns(request, response, url, agentRunManager, runSkillPromotion);
 		return;
 	}
 	if (url.pathname === "/routines.json" || url.pathname === "/routines" || url.pathname.startsWith("/routines/")) {
-		await serveRoutines(request, response, url, routineRegistry, agentRoutineScheduler);
+		await serveRoutines(request, response, url, routineRegistry, agentRoutineScheduler, agentBuildLifecycle);
 		return;
 	}
 	if (url.pathname === "/external-connections.json") {
@@ -1805,6 +1837,7 @@ async function serveRoutines(
 	url: URL,
 	registry: RoutineRegistry | undefined,
 	scheduler: AgentRoutineScheduler | undefined,
+	agentBuildLifecycle: AgentBuildLifecycleService | undefined,
 ): Promise<void> {
 	if (!registry || !scheduler) {
 		json(response, 503, { error: "Routine service is unavailable" });
@@ -1844,7 +1877,12 @@ async function serveRoutines(
 	}
 	if (request.method === "POST" && suffix === "") {
 		try {
-			const saved = await registry.save((await readJsonBody(request)) as RoutineDefinitionInput);
+			const { input, automationConfirmed } = routineSaveInput(await readJsonBody(request));
+			requireAutomationConfirmation(input, automationConfirmed);
+			const saved = await registry.save(input);
+			if (saved.enabled && saved.target.kind === "agent") {
+				await agentBuildLifecycle?.markAutomated(saved.target.agentId, saved.id);
+			}
 			await scheduler.refresh();
 			json(response, 201, saved);
 		} catch (error) {
@@ -1856,10 +1894,14 @@ async function serveRoutines(
 	}
 	if (request.method === "PUT" && suffix !== "") {
 		try {
-			const input = (await readJsonBody(request)) as RoutineDefinitionInput;
+			const { input, automationConfirmed } = routineSaveInput(await readJsonBody(request));
 			if (input.id !== undefined && input.id !== suffix)
 				throw new Error("Routine id does not match the request path");
+			requireAutomationConfirmation(input, automationConfirmed);
 			const saved = await registry.save({ ...input, id: suffix });
+			if (saved.enabled && saved.target.kind === "agent") {
+				await agentBuildLifecycle?.markAutomated(saved.target.agentId, saved.id);
+			}
 			await scheduler.refresh();
 			json(response, 200, saved);
 		} catch (error) {
@@ -1886,6 +1928,20 @@ async function serveRoutines(
 		return;
 	}
 	response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST, PUT, DELETE" }).end();
+}
+
+function routineSaveInput(value: unknown): { input: RoutineDefinitionInput; automationConfirmed: boolean } {
+	const body = object(value, "routine definition");
+	const automationConfirmed = body.automationConfirmed === true;
+	const input = { ...body };
+	delete input.automationConfirmed;
+	return { input: input as RoutineDefinitionInput, automationConfirmed };
+}
+
+function requireAutomationConfirmation(input: RoutineDefinitionInput, automationConfirmed: boolean): void {
+	if (input.enabled && input.target.kind === "agent" && !automationConfirmed) {
+		throw new Error("Confirm this schedule explicitly before enabling agent automation");
+	}
 }
 
 async function serveExternalRuns(
@@ -1967,6 +2023,7 @@ async function serveRuns(
 	response: ServerResponse,
 	url: URL,
 	runManager: AgentRunManager | undefined,
+	runSkillPromotion: RunSkillPromotionService | undefined,
 ): Promise<void> {
 	if (!runManager) {
 		json(response, 503, { error: "Agent run manager is unavailable" });
@@ -2012,6 +2069,48 @@ async function serveRuns(
 		}
 		return;
 	}
+	if (request.method === "POST" && suffix === "temporary") {
+		try {
+			const body = object(await readJsonBody(request), "temporary specialist request");
+			json(
+				response,
+				202,
+				await runManager.startTemporarySpecialist(
+					requiredString(body.agentId, "agentId"),
+					requiredString(body.prompt, "prompt"),
+				),
+			);
+		} catch (error) {
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid temporary specialist request",
+			});
+		}
+		return;
+	}
+	if (request.method === "POST" && suffix.endsWith("/promote-skill")) {
+		if (!runSkillPromotion) {
+			json(response, 503, { error: "Skill promotion is unavailable" });
+			return;
+		}
+		try {
+			const body = object(await readJsonBody(request), "skill promotion request");
+			json(
+				response,
+				201,
+				await runSkillPromotion.promote({
+					runId: suffix.slice(0, -"/promote-skill".length),
+					name: requiredString(body.name, "name"),
+					description: requiredString(body.description, "description"),
+					instructions: requiredString(body.instructions, "instructions"),
+				}),
+			);
+		} catch (error) {
+			json(response, 400, {
+				error: error instanceof Error ? error.message : "Invalid skill promotion request",
+			});
+		}
+		return;
+	}
 	if (request.method === "POST" && suffix.endsWith("/abort")) {
 		try {
 			json(response, 200, await runManager.abort(suffix.slice(0, -"/abort".length)));
@@ -2023,6 +2122,90 @@ async function serveRuns(
 		return;
 	}
 	response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+}
+
+async function serveAgentBuilds(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	lifecycle: AgentBuildLifecycleService | undefined,
+): Promise<void> {
+	if (!lifecycle) {
+		json(response, 503, { error: "Agent build lifecycle is unavailable" });
+		return;
+	}
+	const suffix =
+		url.pathname === "/agent-builds.json" || url.pathname === "/agent-builds"
+			? ""
+			: decodeURIComponent(url.pathname.slice("/agent-builds/".length));
+	try {
+		if (request.method === "GET" && suffix === "") {
+			json(response, 200, { builds: await lifecycle.list() });
+			return;
+		}
+		if (request.method === "POST" && suffix === "draft") {
+			const body = object(await readJsonBody(request), "agent build draft");
+			json(
+				response,
+				201,
+				await lifecycle.createDraft({
+					name: requiredString(body.name, "name"),
+					objective: requiredString(body.objective, "objective"),
+					projectRoot: requiredString(body.projectRoot, "projectRoot"),
+				}),
+			);
+			return;
+		}
+		if (request.method === "POST" && suffix === "for-agent") {
+			const body = object(await readJsonBody(request), "agent build lookup");
+			json(response, 200, await lifecycle.ensureForAgent(requiredString(body.agentId, "agentId")));
+			return;
+		}
+		if (request.method === "GET" && suffix !== "") {
+			json(response, 200, await lifecycle.get(suffix));
+			return;
+		}
+		if (request.method === "PUT" && suffix !== "" && !suffix.includes("/")) {
+			const body = object(await readJsonBody(request), "agent build draft");
+			json(
+				response,
+				200,
+				await lifecycle.updateDraft(suffix, {
+					name: requiredString(body.name, "name"),
+					objective: requiredString(body.objective, "objective"),
+					projectRoot: requiredString(body.projectRoot, "projectRoot"),
+				}),
+			);
+			return;
+		}
+		if (request.method === "POST" && suffix.endsWith("/link-agent")) {
+			const body = object(await readJsonBody(request), "agent build link");
+			json(
+				response,
+				200,
+				await lifecycle.linkAgent(suffix.slice(0, -"/link-agent".length), requiredString(body.agentId, "agentId")),
+			);
+			return;
+		}
+		if (request.method === "POST" && suffix.endsWith("/proof")) {
+			const body = object(await readJsonBody(request), "agent build proof");
+			json(
+				response,
+				202,
+				await lifecycle.startProof(suffix.slice(0, -"/proof".length), requiredString(body.prompt, "prompt")),
+			);
+			return;
+		}
+		if (request.method === "POST" && suffix.endsWith("/proof-review")) {
+			const body = object(await readJsonBody(request), "agent build proof review");
+			if (typeof body.accepted !== "boolean") throw new Error("accepted must be a boolean");
+			json(response, 200, await lifecycle.reviewProof(suffix.slice(0, -"/proof-review".length), body.accepted));
+			return;
+		}
+		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST, PUT" }).end();
+	} catch (error) {
+		json(response, 400, { error: error instanceof Error ? error.message : "Invalid agent build request" });
+	}
 }
 
 async function serveAgents(
@@ -2129,6 +2312,167 @@ async function servePiAgentPackage(
 		json(response, 201, await installer.install(bundle, bindings));
 	} catch (error) {
 		json(response, 400, { error: error instanceof Error ? error.message : "Invalid Pi agent package request" });
+	}
+}
+
+async function servePiAgentTeam(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	launcher: PiAgentTeamLauncher | undefined,
+): Promise<void> {
+	if (!launcher) {
+		json(response, 503, { error: "Pi agent team launcher is unavailable" });
+		return;
+	}
+	try {
+		if (request.method === "GET" && url.pathname === "/agent-teams") {
+			json(
+				response,
+				200,
+				launcher.state(requiredString(url.searchParams.get("coordinatorAgentId"), "coordinatorAgentId")),
+			);
+			return;
+		}
+		if (request.method !== "POST") {
+			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+			return;
+		}
+		const input = object(await readJsonBody(request, 1024 * 1024), "Pi agent team request");
+		if (url.pathname.endsWith("/prepare")) {
+			json(response, 200, launcher.prepare(input.bundle, input.bindings));
+			return;
+		}
+		if (url.pathname.endsWith("/run")) {
+			json(
+				response,
+				202,
+				await launcher.run(
+					requiredString(input.coordinatorAgentId, "coordinatorAgentId"),
+					requiredString(input.prompt, "prompt"),
+				),
+			);
+			return;
+		}
+		if (url.pathname.endsWith("/cancel")) {
+			json(
+				response,
+				200,
+				await launcher.cancel(
+					requiredString(input.coordinatorAgentId, "coordinatorAgentId"),
+					requiredString(input.runId, "runId"),
+				),
+			);
+			return;
+		}
+		if (!url.pathname.endsWith("/launch")) throw new Error("Unknown Pi agent team operation");
+		json(
+			response,
+			201,
+			await launcher.launch(
+				input.bundle,
+				input.bindings,
+				requiredString(input.approvalDigest, "approvalDigest"),
+				requiredString(input.reviewedBy, "reviewedBy"),
+			),
+		);
+	} catch (error) {
+		json(response, 400, { error: error instanceof Error ? error.message : "Invalid Pi agent team request" });
+	}
+}
+
+async function serveWtkAgentFactory(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	factory: WtkAgentFactoryClient | undefined,
+	launcher: PiAgentTeamLauncher | undefined,
+): Promise<void> {
+	if (!factory || !launcher) {
+		json(response, url.pathname === "/agent-team-factory" ? 200 : 503, {
+			configured: false,
+			available: false,
+			message: "Canonical WTK builder is not configured",
+		});
+		return;
+	}
+	try {
+		if (request.method === "GET" && url.pathname === "/agent-team-factory") {
+			json(response, 200, await factory.status());
+			return;
+		}
+		if (request.method === "GET" && url.pathname.endsWith("/operation")) {
+			json(response, 200, await factory.operation(requiredString(url.searchParams.get("id"), "id")));
+			return;
+		}
+		if (request.method !== "POST") {
+			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+			return;
+		}
+		const input = object(await readJsonBody(request, 64 * 1024), "WTK agent factory request");
+		if (url.pathname.endsWith("/operation/control")) {
+			const action = requiredString(input.action, "action");
+			if (action !== "cancel" && action !== "pause" && action !== "resume" && action !== "steer") {
+				throw new Error("action must be cancel, pause, resume, or steer");
+			}
+			json(
+				response,
+				200,
+				await factory.controlOperation(
+					requiredString(input.operationId, "operationId"),
+					action,
+					optionalString(input.message, "message"),
+				),
+			);
+			return;
+		}
+		if (url.pathname.endsWith("/intake/start")) {
+			json(response, 202, await factory.startIntake(requiredString(input.input, "input")));
+			return;
+		}
+		if (url.pathname.endsWith("/intake/message")) {
+			json(
+				response,
+				202,
+				await factory.continueIntake(
+					requiredString(input.sessionId, "sessionId"),
+					requiredString(input.input, "input"),
+				),
+			);
+			return;
+		}
+		if (url.pathname.endsWith("/research")) {
+			json(response, 202, await factory.research(requiredString(input.goalRecordPath, "goalRecordPath")));
+			return;
+		}
+		if (url.pathname.endsWith("/build")) {
+			json(
+				response,
+				202,
+				await factory.build(requiredString(input.pkgId, "pkgId"), requiredString(input.handoffPath, "handoffPath")),
+			);
+			return;
+		}
+		if (url.pathname.endsWith("/deliver")) {
+			json(response, 202, await factory.deliver(requiredString(input.pkgId, "pkgId")));
+			return;
+		}
+		if (url.pathname.endsWith("/prepare")) {
+			const model = object(input.model, "model");
+			json(
+				response,
+				200,
+				launcher.prepareWithLocalDefaults(
+					await factory.loadBundle(requiredString(input.pkgId, "pkgId")),
+					requiredString(input.projectRoot, "projectRoot"),
+					{ provider: requiredString(model.provider, "model.provider"), id: requiredString(model.id, "model.id") },
+				),
+			);
+			return;
+		}
+		throw new Error("Unknown WTK agent factory operation");
+	} catch (error) {
+		json(response, 400, { error: error instanceof Error ? error.message : "Invalid WTK agent factory request" });
 	}
 }
 
@@ -2305,16 +2649,16 @@ function renderPage(token: string): string {
 .mobile-panel-state{position:fixed;opacity:0;pointer-events:none}.mobile-panel-toggle,.mobile-panel-close,.mobile-panel-scrim,.mobile-session-add{display:none}@media(max-width:1024px),(max-width:1366px) and (hover:none) and (pointer:coarse){body{display:block}main{height:100dvh}.resizer{display:none!important}.rail,.details{display:flex!important;position:fixed;z-index:50;top:0;bottom:0;width:min(88vw,360px);height:100dvh;box-shadow:0 0 48px rgba(0,0,0,.62);transition:transform .2s ease,visibility .2s;visibility:hidden}.rail{left:0;transform:translateX(-105%)}.details{right:0;transform:translateX(105%)}#mobile-panel-left:checked~.rail,#mobile-panel-right:checked~.details{transform:translateX(0);visibility:visible}.mobile-panel-scrim{position:fixed;z-index:40;inset:0;background:rgba(0,0,0,.58);backdrop-filter:blur(2px)}#mobile-panel-left:checked~.mobile-panel-scrim,#mobile-panel-right:checked~.mobile-panel-scrim{display:block}.mobile-panel-toggle,.mobile-panel-close{align-items:center;justify-content:center;width:44px;height:44px;border:1px solid var(--line);border-radius:10px;color:var(--text);background:var(--surface);cursor:pointer}.mobile-panel-toggle{display:flex;flex:0 0 44px}.mobile-session-add{display:grid;width:34px;height:34px;flex:0 0 34px;place-items:center;border:0;border-radius:8px;background:transparent;color:var(--muted);font-size:22px}.mobile-session-add:hover,.mobile-session-add:focus-visible{background:var(--surface2);color:var(--text)}.mobile-panel-toggle svg,.mobile-panel-close svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.mobile-panel-close{position:fixed;z-index:60;top:8px}.mobile-panel-close-left{left:min(calc(88vw - 52px),308px)}.mobile-panel-close-right{right:8px}#mobile-panel-left:checked~.mobile-panel-close-left,#mobile-panel-right:checked~.mobile-panel-close-right{display:flex}.rail>.section-title{padding-right:48px;margin-top:12px}.rail .rail-heading{position:static;z-index:3}.rail-panel{padding-bottom:68px}.rail #open-settings{position:absolute;z-index:2;right:14px;bottom:calc(14px + env(safe-area-inset-bottom));width:44px;height:44px;border:1px solid var(--line);background:var(--surface2);color:var(--text);box-shadow:0 10px 26px rgba(0,0,0,.4)}.details>.tabs{padding-right:48px}.header{padding:7px 10px;min-height:59px}.session-tabs{flex:1}#session-path{margin-left:0;max-width:28%}}@media(max-width:620px){#session-path{display:none}.session-tab{max-width:140px}.rail,.details{width:min(92vw,360px)}.mobile-panel-close-left{left:min(calc(92vw - 52px),308px)}}
 .composer-meta #session-path{display:block;min-width:0;max-width:42%;margin:0;padding:0;overflow:hidden;border:0;background:transparent;color:var(--muted);font:inherit;text-align:left;text-overflow:ellipsis;white-space:nowrap}.composer-meta #session-path:not(:disabled){color:var(--pi);text-decoration:underline;text-decoration-color:transparent;text-underline-offset:3px}.composer-meta #session-path:not(:disabled):hover{max-width:55%;text-decoration-color:currentColor}.composer-meta #session-path:disabled{cursor:default}.composer-meta #session-path-form{display:flex;min-width:220px;max-width:58%;align-items:center;gap:4px}.composer-meta #session-path-input{min-width:0;flex:1;border:1px solid var(--line);border-radius:6px;background:#131316;color:var(--text);padding:5px 7px;font:inherit}.composer-meta #session-path-form button{width:25px;height:25px;flex:0 0 25px;border:1px solid var(--line);border-radius:6px;background:var(--surface2);color:var(--text);padding:0}.composer-meta #status{flex:1}.composer-meta #session-stats{flex:0 1 auto}@media(max-width:620px){.composer-meta #session-path{display:block;max-width:46%}.composer-meta #session-path-form{min-width:0;max-width:68%;flex:1}.composer-meta #status:not(.error){display:none}}
 body.browser-popout{display:block}body.browser-popout>.mobile-panel-state,body.browser-popout>.mobile-panel-scrim,body.browser-popout>.mobile-panel-close,body.browser-popout .mobile-panel-toggle{display:none!important}body.browser-popout>.rail,body.browser-popout>.resizer,body.browser-popout>main{display:none}body.browser-popout>.details{position:fixed;inset:0;display:flex!important;width:auto;height:100dvh;padding:0;background:var(--bg);transform:none;visibility:visible}body.browser-popout>.details>.tabs{display:none}body.browser-popout>.details>[data-panel]{display:none}body.browser-popout>.details>#browser{display:block!important;flex:1;overflow:auto}body.browser-popout .preview-card{min-height:100%;margin:0;padding:12px;border:0;border-radius:0}body.browser-popout .preview-frame{min-height:calc(100vh - 275px)}body.browser-popout .preview-frame img{max-height:calc(100vh - 275px)}
-.agent-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.agent-entry-card{position:relative;min-width:0}.agent-grid .agent-entry{display:grid;width:100%;min-height:112px;place-items:center;margin:0;text-align:center}.agent-grid .agent-icon{width:52px;height:52px}.agent-menu{position:absolute;z-index:3;top:5px;right:5px}.agent-menu>summary{display:grid;width:28px;height:28px;place-items:center;border-radius:50%;color:var(--muted);cursor:pointer;list-style:none}.agent-menu>summary::-webkit-details-marker{display:none}.agent-menu[open]>summary{background:var(--surface2);color:var(--text)}.agent-menu>div{position:absolute;top:30px;right:0;display:grid;width:108px;padding:5px;border:1px solid var(--line);border-radius:8px;background:#151519;box-shadow:0 12px 30px #000}.agent-menu button{border:0;border-radius:5px;background:transparent;color:var(--text);padding:7px;text-align:left}.agent-menu button:hover{background:var(--surface2)}.agent-menu button.danger{color:var(--danger)}.agent-menu button:disabled{opacity:.4}.agent-workspace-actions{display:flex;justify-content:flex-end}.agent-workspace-actions button{width:32px;height:32px;border:1px solid var(--line);border-radius:50%;background:var(--surface2);color:var(--text)}.agent-chat-card{display:grid;gap:8px}.agent-chat{display:grid;gap:8px;max-height:360px;overflow:auto}.agent-chat-message{padding:9px 11px;border-radius:10px;background:#151519;white-space:pre-wrap}.agent-chat-message.user{margin-left:16%;background:#202d3d}.agent-chat-message.agent{margin-right:10%}#selected-agent-chat-form{display:flex;gap:6px}#selected-agent-prompt{min-width:0;flex:1;resize:vertical;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:9px}#selected-agent-send{width:36px;height:36px;align-self:end;border:0;border-radius:50%;background:var(--text);color:var(--bg)}.builder-panel>label,.workflow-editor label,#routine-editor label{display:grid;gap:5px;margin:9px 0;color:var(--muted);font-size:11px}.builder-panel>label input,.builder-panel>label textarea,.builder-panel>label select,#plugin-form input,#plugin-form select,.workflow-editor input,.workflow-editor textarea,.workflow-editor select,#routine-editor input,#routine-editor textarea,#routine-editor select{width:100%;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}.workflow-editor textarea{min-height:88px;font-family:ui-monospace,monospace}.persona-preview{display:block;width:84px;height:84px;margin:8px auto;border-radius:12px;object-fit:cover}#agent-form{display:flex;justify-content:flex-end;margin-top:10px}#agent-form button,#plugin-form button{border:0;border-radius:8px;background:var(--pi);color:#07101b;padding:9px 13px;font-weight:700}#plugin-form{display:grid;gap:8px;padding:10px}#plugin-form label{display:grid;gap:5px;color:var(--muted);font-size:11px}
+.agent-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.agent-entry-card{position:relative;min-width:0}.agent-grid .agent-entry{display:grid;width:100%;min-height:112px;place-items:center;margin:0;text-align:center}.agent-grid .agent-icon{width:52px;height:52px}.agent-draft-card .agent-entry{border-style:dashed}.agent-draft-card .agent-entry>span:last-child{display:grid;gap:3px}.agent-draft-card small{color:var(--muted);font-size:10px}.agent-menu{position:absolute;z-index:3;top:5px;right:5px}.agent-menu>summary{display:grid;width:28px;height:28px;place-items:center;border-radius:50%;color:var(--muted);cursor:pointer;list-style:none}.agent-menu>summary::-webkit-details-marker{display:none}.agent-menu[open]>summary{background:var(--surface2);color:var(--text)}.agent-menu>div{position:absolute;top:30px;right:0;display:grid;width:108px;padding:5px;border:1px solid var(--line);border-radius:8px;background:#151519;box-shadow:0 12px 30px #000}.agent-menu button{border:0;border-radius:5px;background:transparent;color:var(--text);padding:7px;text-align:left}.agent-menu button:hover{background:var(--surface2)}.agent-menu button.danger{color:var(--danger)}.agent-menu button:disabled{opacity:.4}.agent-workspace-actions{display:flex;justify-content:flex-end}.agent-workspace-actions button{width:32px;height:32px;border:1px solid var(--line);border-radius:50%;background:var(--surface2);color:var(--text)}.agent-chat-card{display:grid;gap:8px}.agent-chat{display:grid;gap:8px;max-height:360px;overflow:auto}.agent-chat-message{padding:9px 11px;border-radius:10px;background:#151519;white-space:pre-wrap}.agent-chat-message.user{margin-left:16%;background:#202d3d}.agent-chat-message.agent{margin-right:10%}#selected-agent-chat-form{display:flex;gap:6px}#selected-agent-prompt{min-width:0;flex:1;resize:vertical;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:9px}#selected-agent-send{width:36px;height:36px;align-self:end;border:0;border-radius:50%;background:var(--text);color:var(--bg)}.builder-panel>label,.workflow-editor label,#routine-editor label{display:grid;gap:5px;margin:9px 0;color:var(--muted);font-size:11px}.builder-panel>label input,.builder-panel>label textarea,.builder-panel>label select,#plugin-form input,#plugin-form select,.workflow-editor input,.workflow-editor textarea,.workflow-editor select,#routine-editor input,#routine-editor textarea,#routine-editor select{width:100%;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}.workflow-editor textarea{min-height:88px;font-family:ui-monospace,monospace}.persona-preview{display:block;width:84px;height:84px;margin:8px auto;border-radius:12px;object-fit:cover}#agent-form{display:flex;justify-content:flex-end;margin-top:10px}#agent-form button,#plugin-form button{border:0;border-radius:8px;background:var(--pi);color:#07101b;padding:9px 13px;font-weight:700}#plugin-form{display:grid;gap:8px;padding:10px}#plugin-form label{display:grid;gap:5px;color:var(--muted);font-size:11px}
 .agent-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.agent-entry-card{position:relative;min-width:0}.agent-grid .agent-entry{display:grid;width:100%;min-height:112px;place-items:center;margin:0;text-align:center}.agent-grid .agent-icon{width:52px;height:52px}.agent-menu{position:absolute;z-index:3;top:5px;right:5px}.agent-menu>summary{display:grid;width:28px;height:28px;place-items:center;border-radius:50%;color:var(--muted);cursor:pointer;list-style:none}.agent-menu>summary::-webkit-details-marker{display:none}.agent-menu[open]>summary{background:var(--surface2);color:var(--text)}.agent-menu>div{position:absolute;top:30px;right:0;display:grid;width:108px;padding:5px;border:1px solid var(--line);border-radius:8px;background:#151519;box-shadow:0 12px 30px #000}.agent-menu button{border:0;border-radius:5px;background:transparent;color:var(--text);padding:7px;text-align:left}.agent-menu button:hover{background:var(--surface2)}.agent-menu button.danger{color:var(--danger)}.agent-menu button:disabled{opacity:.4}.agent-workspace-actions{display:flex;justify-content:flex-end}.agent-workspace-actions button{width:32px;height:32px;border:1px solid var(--line);border-radius:50%;background:var(--surface2);color:var(--text)}.agent-chat-card{display:grid;gap:8px}.agent-chat{display:grid;gap:8px;max-height:360px;overflow:auto}.agent-chat-message{padding:9px 11px;border-radius:10px;background:#151519;white-space:pre-wrap}.agent-chat-message.user{margin-left:16%;background:#202d3d}.agent-chat-message.agent{margin-right:10%}#selected-agent-chat-form{display:flex;gap:6px}#selected-agent-prompt{min-width:0;flex:1;resize:vertical;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:9px}#selected-agent-send{width:36px;height:36px;align-self:end;border:0;border-radius:50%;background:var(--text);color:var(--bg)}.builder-panel>label,.workflow-editor label,#routine-editor label{display:grid;gap:5px;margin:9px 0;color:var(--muted);font-size:11px}.builder-panel>label input,.builder-panel>label textarea,.builder-panel>label select,#plugin-form input,#plugin-form select,.configuration-form input,.configuration-form select,.workflow-editor input,.workflow-editor textarea,.workflow-editor select,#routine-editor input,#routine-editor textarea,#routine-editor select{width:100%;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}.workflow-editor textarea{min-height:88px;font-family:ui-monospace,monospace}.persona-preview{display:block;width:84px;height:84px;margin:8px auto;border-radius:12px;object-fit:cover}#agent-form{display:flex;justify-content:flex-end;margin-top:10px}#agent-form button,#plugin-form button,.configuration-form button{border:0;border-radius:8px;background:var(--pi);color:#07101b;padding:9px 13px;font-weight:700}#plugin-form,.configuration-form{display:grid;gap:8px;padding:10px}#plugin-form label,.configuration-form label{display:grid;gap:5px;color:var(--muted);font-size:11px}.capability-connection-summary{display:flex;align-items:center;justify-content:space-between;gap:8px}.capability-connection-card .danger{border:1px solid var(--danger);background:transparent;color:var(--danger)}
 .provider-account{padding:8px 10px;border:1px solid #28523f;border-radius:8px;background:#10251d;color:#8fd2ae;font-size:11px;overflow-wrap:anywhere}.provider-field-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:6px}.configuration-form .provider-field-row input,.configuration-form .provider-field-row select{min-width:0}.configuration-form .provider-field-action{display:grid;width:36px;height:36px;min-height:36px;place-items:center;padding:0;border:1px solid var(--line);border-radius:8px;background:var(--surface2);color:var(--pi)}.configuration-form .provider-field-action.danger{border-color:var(--line);color:var(--danger)}.provider-field-action svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.provider-field-action:disabled{opacity:.35}.provider-permissions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.provider-permissions-title{grid-column:1/-1;color:var(--text);font-size:11px;font-weight:700}.provider-service{min-width:0;margin:0;padding:8px;border:1px solid var(--line);border-radius:8px}.provider-service legend{display:flex;max-width:100%;align-items:center;gap:6px;padding:0 4px;color:var(--text);font-size:11px;font-weight:700}.provider-service-state{color:var(--muted);font-size:8px;font-weight:400;text-transform:uppercase}.provider-service-state.available{color:#72c49a}.configuration-form .provider-capability{display:flex;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:6px;margin:5px 0;color:var(--text);overflow-wrap:anywhere}.configuration-form .provider-capability input{width:auto}.configuration-form .provider-capability:has(input:disabled){color:var(--muted);opacity:.55}@media(max-width:520px){.provider-permissions{grid-template-columns:1fr}}
 .browser-profiles>summary{cursor:pointer}.browser-profile-description{margin:8px 0;font-size:10px;line-height:1.4}.browser-profile-row{display:flex;align-items:center;justify-content:space-between;padding:7px 2px;border-top:1px solid var(--line)}.browser-profile-row button{width:28px;height:28px;border:1px solid var(--line);border-radius:50%;background:transparent;color:var(--muted)}
 .builder-tabs{overflow-x:auto;scrollbar-width:none}.builder-tabs::-webkit-scrollbar{display:none}.builder-tabs button{flex:0 0 auto;min-width:max-content;padding-inline:9px;font-size:10px;white-space:nowrap}.builder-panel{max-width:100%;overflow-x:hidden}#agent-builder>.card{max-width:100%;overflow:hidden}#routine-editor{min-width:0}.routine-actions{min-width:0;flex-wrap:wrap}.routine-actions button{min-width:calc(50% - 4px)}
-[data-tab="agent-builder"]{display:none}.builder-guide{max-width:820px;margin:0 0 24px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:color-mix(in srgb,var(--surface) 92%,transparent)}.builder-guide-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.builder-guide-heading strong{font-size:15px}.builder-guide-heading .secondary-action{flex:0 0 auto;padding:7px 10px}.builder-guide p{margin:8px 0 0;line-height:1.45}@media(max-width:620px){.builder-guide-heading{align-items:flex-start;flex-direction:column}.builder-guide-heading .secondary-action{width:100%}}
+[data-tab="agent-builder"]{display:none}.builder-guide{max-width:820px;margin:0 0 24px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:color-mix(in srgb,var(--surface) 92%,transparent)}.builder-guide-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.builder-guide-heading strong{margin-right:auto;font-size:15px}.builder-guide-heading .secondary-action{flex:0 0 auto;padding:7px 10px}.builder-guide p{margin:8px 0 0;line-height:1.45}.builder-stage{padding:4px 8px;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:10px;white-space:nowrap}.builder-stage[data-stage="testing"]{border-color:var(--pi);color:var(--pi);animation:pulse 1s infinite alternate}.builder-stage[data-stage="proof-ready"],.builder-stage[data-stage="proven"],.builder-stage[data-stage="promoted"],.builder-stage[data-stage="automated"]{border-color:#55b685;color:#55b685}.builder-stage[data-stage="needs-refinement"]{border-color:var(--danger);color:var(--danger)}.lifecycle-action{flex:0 0 auto;border:1px solid color-mix(in srgb,var(--pi) 65%,var(--line));border-radius:8px;background:color-mix(in srgb,var(--pi) 14%,var(--surface2));color:var(--text);padding:7px 10px;font-weight:700}.lifecycle-action:disabled{opacity:.55}.proof-review-dialog{display:grid;gap:12px;padding:18px}.proof-review-dialog pre{max-height:min(54vh,520px);overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;border:1px solid var(--line);border-radius:9px;background:#101013}.team-review{display:grid;gap:12px;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}.team-review>p{margin:0}.team-review-members{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.team-review-members>div{min-width:0;padding:10px;border:1px solid var(--line);border-radius:9px;background:var(--bg)}.team-review-members strong,.team-review-members span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.team-review-members span{margin-top:4px;color:var(--muted);font-size:11px}.team-review .primary-action{justify-self:start}@media(max-width:620px){.builder-guide-heading{align-items:stretch;flex-direction:column}.builder-guide-heading .secondary-action,.builder-guide-heading .primary-action,.builder-guide-heading .lifecycle-action,.team-review .primary-action{width:100%}.builder-stage{align-self:flex-start}.team-review-members{grid-template-columns:1fr}}
 .agent-workspace-actions{justify-content:flex-start}.agent-workspace-actions button{display:grid;width:28px;height:28px;place-items:center;border:0;border-radius:0;background:transparent;color:var(--muted);font-size:20px;line-height:1}.agent-workspace-actions button:hover{background:var(--surface2);color:var(--text)}
 .session-tab-wrap{display:flex;align-items:center;min-width:0;border:1px solid transparent;border-radius:8px}.session-tab-wrap.active{background:var(--surface);border-color:var(--line)}.session-tab-wrap .session-tab{border:0;background:transparent}.agent-session-tab,.builder-session-tab{color:var(--pi)}.session-tab-close{display:grid;width:26px;height:26px;flex:0 0 26px;place-items:center;border:0;border-radius:50%;background:transparent;color:var(--muted)}.session-tab-close:hover{background:var(--surface2);color:var(--text)}.agent-summary-card{display:grid;gap:4px}.agent-summary-card strong{margin:0}.agent-summary-card span{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-run-history>summary{cursor:pointer}.agent-history-entry{margin-top:8px;border:1px solid var(--line);border-radius:8px;background:#151519}.agent-history-entry>summary{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:7px;align-items:center;padding:9px;cursor:pointer;list-style:none}.agent-history-entry>summary::-webkit-details-marker{display:none}.agent-history-status{width:7px;height:7px;border-radius:50%;background:var(--muted)}.agent-history-entry[data-status="running"] .agent-history-status,.agent-history-entry[data-status="queued"] .agent-history-status{background:var(--pi)}.agent-history-entry[data-status="failed"] .agent-history-status{background:var(--danger)}.agent-history-prompt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-history-time{font-size:9px;color:var(--muted)}.agent-history-body{display:grid;gap:8px;padding:0 9px 9px;white-space:pre-wrap;overflow-wrap:anywhere}.agent-history-body button{justify-self:start;border:1px solid var(--danger);border-radius:6px;background:transparent;color:var(--danger);padding:5px 8px}.agent-message-content{display:grid;gap:9px;overflow-wrap:anywhere}.agent-message-content p,.agent-message-content pre,.agent-message-content ul,.agent-message-content ol{margin:0}.agent-message-content pre{overflow:auto;padding:10px;border:1px solid var(--line);border-radius:8px;background:#121216;font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre}.agent-message-content code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.agent-message-content :not(pre)>code{padding:1px 4px;border-radius:4px;background:var(--surface2)}.agent-message-content h2,.agent-message-content h3{margin:6px 0 0;font-size:1em}.agent-running{display:flex;align-items:center;gap:8px;color:var(--muted);font-style:italic}.agent-running i{width:6px;height:6px;border-radius:50%;background:var(--pi);animation:pulse 1s infinite alternate}
 .context-meter{--context-color:var(--pi);--context-used:0%;display:inline-block;width:15px;height:15px;flex:0 0 15px;border-radius:50%;background:conic-gradient(var(--context-color) var(--context-used),var(--line) 0);box-shadow:inset 0 0 0 3px var(--bg);outline:none}.context-meter[data-level="warning"]{--context-color:#e4ba68}.context-meter[data-level="critical"]{--context-color:var(--danger)}.context-meter:focus-visible{box-shadow:inset 0 0 0 3px var(--bg),0 0 0 2px var(--pi)}#session-stats,.session-stat-totals{display:flex;align-items:center;gap:7px}.session-stat{display:inline-flex;align-items:baseline;gap:1px}.session-stat-input .session-stat-symbol{color:#ef6b6b}.session-stat-output .session-stat-symbol,.session-stat-cost{color:#43c58a}.file-picker-input{position:fixed;left:-10000px;width:1px;height:1px;opacity:0;pointer-events:none}.rail-heading{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;padding:4px 8px 10px;color:var(--muted);font-size:10px;letter-spacing:.12em;text-transform:uppercase}.rail-heading button{display:grid;width:28px;height:28px;place-items:center;border:0;border-radius:50%;background:transparent;color:var(--muted);font-size:20px;line-height:1}.rail-heading button:hover{background:var(--surface2);color:var(--text)}
-.sessions-panel{flex:0 0 42%;min-height:96px}.agent-activity-panel{flex:1 1 auto;min-height:96px}.rail-section-resizer{position:relative;z-index:3;height:6px;flex:0 0 6px;margin:2px 0;background:var(--line);cursor:row-resize;touch-action:none}.rail-section-resizer:hover,.rail-section-resizer.dragging{background:var(--pi)}.agent-activity-heading{flex:0 0 auto;padding-top:8px}.agent-activity-heading #open-artifacts{margin-left:auto;width:28px;height:28px;border:0;border-radius:7px;background:transparent;color:var(--muted)}.agent-activity-heading #open-artifacts:hover{background:var(--surface2);color:var(--text)}.agent-activity-heading #open-artifacts:disabled{opacity:.3;cursor:default}.agent-activity-heading #open-artifacts svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.agent-activity-entry{display:grid;width:100%;min-width:0;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:8px;margin-top:6px;padding:9px;border:1px solid transparent;border-radius:9px;background:transparent;color:var(--text);text-align:left}.agent-activity-entry:hover{border-color:var(--line);background:var(--surface)}.agent-activity-entry:disabled{opacity:.5;cursor:not-allowed}.agent-activity-entry>span{display:grid;min-width:0;gap:3px}.agent-activity-entry strong,.agent-activity-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-activity-entry strong{font-size:11px}.agent-activity-entry small,.agent-activity-entry time{color:var(--muted);font-size:9px}.agent-activity-status{width:7px;height:7px;border-radius:50%;background:var(--muted)}.agent-activity-entry[data-status="queued"] .agent-activity-status,.agent-activity-entry[data-status="running"] .agent-activity-status,.agent-activity-entry[data-status="waiting_for_approval"] .agent-activity-status,.agent-activity-entry[data-status="waiting_for_input"] .agent-activity-status,.agent-activity-entry[data-status="stopping"] .agent-activity-status{background:var(--pi);animation:pulse 1s infinite alternate}.agent-activity-entry[data-status="failed"] .agent-activity-status,.agent-activity-entry[data-status="interrupted"] .agent-activity-status{background:var(--danger)}.agent-activity-entry[data-status="completed"] .agent-activity-status{background:#55b685}.agent-activity-empty{padding:8px;color:var(--muted);font-size:10px}.attention-entry-wrap{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:3px}.attention-inline-action{width:27px;height:27px;border:0;border-radius:7px;background:transparent;color:var(--muted)}.attention-inline-action:hover{background:var(--surface2);color:var(--text)}.message-artifacts{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}.message-artifacts button{border:1px solid var(--line);border-radius:8px;background:var(--surface2);color:var(--pi);padding:7px 9px}.artifact-session-tab{color:#7db4f3}.artifact-header{position:sticky;top:0;z-index:2;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}.artifact-header>div{display:grid;min-width:0;gap:3px}.artifact-header strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.artifact-header span{color:var(--muted);font-size:10px}.artifact-actions{display:flex;align-items:center;gap:5px}.artifact-actions select{height:32px;border:1px solid var(--line);border-radius:8px;background:#131316;color:var(--text);padding:0 6px}.artifact-actions button,.artifact-actions a{display:grid;width:32px;height:32px;place-items:center;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--text);text-decoration:none}.artifact-content{min-width:0;min-height:0;margin-top:12px;overflow:auto}.artifact-content img{display:block;max-width:100%;height:auto;margin:auto}.artifact-content iframe{width:100%;height:max(60vh,480px);border:1px solid var(--line);border-radius:10px;background:#fff}.artifact-text{max-width:900px;margin:auto;padding:18px;border:1px solid var(--line);border-radius:12px;background:var(--surface);overflow-wrap:anywhere}.artifact-library{display:grid;gap:12px;margin-top:12px}.artifact-library-controls{display:grid;grid-template-columns:minmax(0,1fr) 160px;gap:8px}.artifact-library-controls input,.artifact-library-controls select{min-width:0;border:1px solid var(--line);border-radius:9px;background:#131316;color:var(--text);padding:10px}.artifact-library-results{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px}.artifact-library-card{display:grid;min-width:0;gap:6px;border:1px solid var(--line);border-radius:11px;background:var(--surface);color:var(--text);padding:13px;text-align:left}.artifact-library-card:hover{background:var(--surface2)}.artifact-library-card strong,.artifact-library-card span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.artifact-library-card span{color:var(--muted);font-size:10px}.delegation-panel-host{position:relative;z-index:3;flex:0 0 auto;min-width:0;min-height:0;overflow:hidden}.delegation-panel-host>.card{width:100%;max-height:min(38vh,340px);overflow-x:hidden;overflow-y:auto;margin:8px 0 0;padding:10px}.delegation-panel-host>.card>summary{position:sticky;top:0;z-index:1;padding:3px 0 7px;background:var(--surface)}
+.sessions-panel{flex:0 0 42%;min-height:96px}.agent-activity-panel{flex:1 1 auto;min-height:96px}.rail-section-resizer{position:relative;z-index:3;height:6px;flex:0 0 6px;margin:2px 0;background:var(--line);cursor:row-resize;touch-action:none}.rail-section-resizer:hover,.rail-section-resizer.dragging{background:var(--pi)}.agent-activity-heading{flex:0 0 auto;padding-top:8px}.agent-activity-heading #open-artifacts{margin-left:auto;width:28px;height:28px;border:0;border-radius:7px;background:transparent;color:var(--muted)}.agent-activity-heading #open-artifacts:hover{background:var(--surface2);color:var(--text)}.agent-activity-heading #open-artifacts:disabled{opacity:.3;cursor:default}.agent-activity-heading #open-artifacts svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}.agent-activity-entry{display:grid;width:100%;min-width:0;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:8px;margin-top:6px;padding:9px;border:1px solid transparent;border-radius:9px;background:transparent;color:var(--text);text-align:left}.agent-activity-entry:hover{border-color:var(--line);background:var(--surface)}.agent-activity-entry:disabled{opacity:.5;cursor:not-allowed}.agent-activity-entry>span{display:grid;min-width:0;gap:3px}.agent-activity-entry strong,.agent-activity-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-activity-entry strong{font-size:11px}.agent-activity-entry small,.agent-activity-entry time{color:var(--muted);font-size:9px}.agent-activity-status{width:7px;height:7px;border-radius:50%;background:var(--muted)}.agent-activity-entry[data-status="queued"] .agent-activity-status,.agent-activity-entry[data-status="running"] .agent-activity-status,.agent-activity-entry[data-status="waiting_for_approval"] .agent-activity-status,.agent-activity-entry[data-status="waiting_for_input"] .agent-activity-status,.agent-activity-entry[data-status="stopping"] .agent-activity-status{background:var(--pi);animation:pulse 1s infinite alternate}.agent-activity-entry[data-status="failed"] .agent-activity-status,.agent-activity-entry[data-status="interrupted"] .agent-activity-status{background:var(--danger)}.agent-activity-entry[data-status="completed"] .agent-activity-status{background:#55b685}.agent-activity-empty{padding:8px;color:var(--muted);font-size:10px}.attention-entry-wrap{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,auto);align-items:center;gap:3px}.attention-inline-action{width:27px;height:27px;border:0;border-radius:7px;background:transparent;color:var(--muted)}.attention-inline-action:hover{background:var(--surface2);color:var(--text)}.attention-inline-action:disabled{opacity:.35;cursor:not-allowed}.promotion-dialog{width:min(560px,calc(100vw - 24px));max-height:min(760px,calc(100dvh - 24px));border:1px solid var(--line);border-radius:14px;background:var(--surface);color:var(--text);padding:0;box-shadow:0 24px 80px #000b}.promotion-dialog::backdrop{background:#000a}.promotion-dialog form{display:grid;gap:12px;padding:18px;overflow:auto}.promotion-dialog label{display:grid;gap:6px;color:var(--muted);font-size:11px}.promotion-dialog input,.promotion-dialog textarea{width:100%;min-width:0;border:1px solid var(--line);border-radius:9px;background:#131316;color:var(--text);padding:10px}.promotion-dialog textarea{min-height:76px;resize:vertical}.promotion-dialog label:nth-of-type(3) textarea{min-height:170px}.promotion-dialog details{min-width:0}.promotion-dialog details pre{max-height:180px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}.promotion-actions{display:flex;justify-content:flex-end;gap:8px}.message-artifacts{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}.message-artifacts button{border:1px solid var(--line);border-radius:8px;background:var(--surface2);color:var(--pi);padding:7px 9px}.artifact-session-tab{color:#7db4f3}.artifact-header{position:sticky;top:0;z-index:2;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}.artifact-header>div{display:grid;min-width:0;gap:3px}.artifact-header strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.artifact-header span{color:var(--muted);font-size:10px}.artifact-actions{display:flex;align-items:center;gap:5px}.artifact-actions select{height:32px;border:1px solid var(--line);border-radius:8px;background:#131316;color:var(--text);padding:0 6px}.artifact-actions button,.artifact-actions a{display:grid;width:32px;height:32px;place-items:center;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--text);text-decoration:none}.artifact-content{min-width:0;min-height:0;margin-top:12px;overflow:auto}.artifact-content img{display:block;max-width:100%;height:auto;margin:auto}.artifact-content iframe{width:100%;height:max(60vh,480px);border:1px solid var(--line);border-radius:10px;background:#fff}.artifact-text{max-width:900px;margin:auto;padding:18px;border:1px solid var(--line);border-radius:12px;background:var(--surface);overflow-wrap:anywhere}.artifact-library{display:grid;gap:12px;margin-top:12px}.artifact-library-controls{display:grid;grid-template-columns:minmax(0,1fr) 160px;gap:8px}.artifact-library-controls input,.artifact-library-controls select{min-width:0;border:1px solid var(--line);border-radius:9px;background:#131316;color:var(--text);padding:10px}.artifact-library-results{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px}.artifact-library-card{display:grid;min-width:0;gap:6px;border:1px solid var(--line);border-radius:11px;background:var(--surface);color:var(--text);padding:13px;text-align:left}.artifact-library-card:hover{background:var(--surface2)}.artifact-library-card strong,.artifact-library-card span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.artifact-library-card span{color:var(--muted);font-size:10px}.delegation-panel-host{position:relative;z-index:3;flex:0 0 auto;min-width:0;min-height:0;overflow:hidden}.delegation-panel-host>.card{width:100%;max-height:min(38vh,340px);overflow-x:hidden;overflow-y:auto;margin:8px 0 0;padding:10px}.delegation-panel-host>.card>summary{position:sticky;top:0;z-index:1;padding:3px 0 7px;background:var(--surface)}
 .builder-settings-stack{display:grid;gap:8px}.builder-settings-group{border:1px solid var(--line);border-radius:11px;background:rgba(17,17,20,.72);overflow:hidden}.builder-settings-group>summary{display:flex;align-items:center;gap:10px;min-height:54px;padding:10px 12px;cursor:pointer;list-style:none}.builder-settings-group>summary::-webkit-details-marker{display:none}.builder-settings-group>summary:before{content:"›";flex:0 0 auto;color:var(--muted);font-size:18px;line-height:1;transition:transform .15s}.builder-settings-group[open]>summary:before{transform:rotate(90deg)}.builder-settings-summary-copy{display:grid;min-width:0;gap:2px}.builder-settings-title{color:var(--text);font-size:12px;font-weight:650}.builder-settings-description{color:var(--muted);font-size:9px;line-height:1.35}.builder-settings-status{margin-left:auto;flex:0 0 auto;border:1px solid var(--line);border-radius:999px;padding:3px 7px;color:var(--muted);font-size:9px}.builder-settings-body{padding:0 10px 10px;border-top:1px solid var(--line)}.builder-settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;padding-top:10px}.builder-settings-grid>label{display:grid;min-width:0;gap:5px;color:var(--muted);font-size:10px}.builder-settings-grid>label input,.builder-settings-grid>label select{width:100%;min-width:0;background:#131316;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}.builder-settings-grid>#capability-list,.builder-settings-grid>.capability-section{grid-column:1/-1}.builder-settings-grid>#capability-list:empty:after{content:"No capabilities loaded";display:block;padding:10px;color:var(--muted);font-size:10px}.builder-settings-grid .capability-section{margin:0}.builder-settings-grid #capability-search{min-width:0}.builder-settings-grid #capability-list{display:grid;gap:7px}.builder-settings-grid #capability-list>.capability-section{margin:0}.builder-settings-grid #plugin-form{padding:9px}.builder-settings-grid .themed-select{min-width:0}@media(max-width:420px){.builder-settings-grid{grid-template-columns:1fr}}
 @media(max-width:1024px),(max-width:1366px) and (hover:none) and (pointer:coarse){.rail{padding-bottom:72px}.rail #open-settings{z-index:10}.delegation-panel-host>.card{max-height:min(32dvh,280px)}.artifact-header{padding:10px}.artifact-content iframe{height:calc(100dvh - 250px);min-height:360px}.artifact-library-results{grid-template-columns:1fr}}@media(max-width:620px){.artifact-library-controls{grid-template-columns:1fr}.artifact-text{padding:13px}.artifact-actions button,.artifact-actions a{width:36px;height:36px}}
 .capability-grant{display:flex;align-items:center;min-width:0;gap:7px;color:var(--text)}.capability-grant span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.capability-body>label{display:grid;gap:5px;margin-top:9px;color:var(--muted);font-size:10px}.capability-body select{width:100%;min-width:0;padding:8px;border:1px solid var(--line);border-radius:7px;background:#131316;color:var(--text)}

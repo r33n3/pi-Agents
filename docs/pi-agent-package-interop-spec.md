@@ -25,6 +25,12 @@ WTK semantics from an AgentHub manifest. Provider/model identities, project
 paths, capability accounts, and credentials are consumer-host bindings and do
 not enter the canonical WTK package.
 
+Pi remains a complete standalone agent runtime. Native conversational agent
+creation, editing, execution, delegation, improvement, scheduling, skills,
+memory, and isolated workers do not require WTK. WTK is an optional canonical
+catalog/compiler boundary when a portable, independently qualified package is
+desired.
+
 ## Bundle v1
 
 `pi.agents.bundle.v1` contains:
@@ -72,9 +78,12 @@ contract, bundle, adapter, execution form, workflow run, node outcomes, and
 task identities. Each node carries measured token/cost usage and a verdict for
 its declared role budget. Pi caps per-response output tokens before model
 execution and fails terminal tasks whose cumulative measured usage exceeds a
-declared ceiling. WTK grants a `deployable` assessment only when the identities
-and reviewed bindings match, every required node completed, and every declared
-budget has a matching passing receipt.
+declared ceiling. Pi reports factual execution status only. It does not judge
+the WTK goal, issue qualification, or authorize a deployable catalog claim.
+WTK may call the exact run `execution-proven` when identities and reviewed
+bindings match, every required node completed, and every declared budget has a
+matching passing receipt; goal accomplishment still requires separate WTK
+evaluation and control evidence.
 
 ## Runtime instruction compilation
 
@@ -110,13 +119,12 @@ The reference vertical slice is a daily-mail team:
 
 ## Remaining slices
 
-1. Add operator-facing binding flags/control API for external-adapter validate,
-   install, and smoke after ordinary package delivery.
-2. Add a settings import/binding review that calls the same authenticated API.
-3. Run the daily-mail compiled-runtime smoke with faux/local models and retain
-   every attempt.
-4. Wire the passing WTK Pi evidence assessment into AgentHub catalog readiness;
-   an unassessed or mismatched package remains `compile-only`.
+1. Finish independent deterministic fixtures and goal evaluators before a WTK
+   package can move beyond `execution-proven`.
+2. Keep retained target evidence separate from catalog readiness and promotion
+   authority; an unassessed or mismatched package remains compile-only.
+3. Validate concurrent prepare/launch review staleness and active-run rebinding
+   across restart and LAN clients.
 
 ## Validation baseline
 
@@ -137,8 +145,9 @@ supervisor, in fresh per-node conversations. Both required nodes completed,
 their JSON output contracts passed, and their measured costs remained within
 the package-declared ceilings.
 
-The retained Pi runtime evidence records `verdict: goal-accomplished`, and the
-independent WTK assessment records `claim: deployable`, for bundle digest
+The retained historical Pi runtime evidence records
+`verdict: goal-accomplished`, and the historical WTK assessment records
+`claim: deployable`, for bundle digest
 `25d8af773ff4deb70abfd4e72b339c2b5d0e2530adaec384a5c40842cc58bd14`.
 The proof reviewed the exact America/Chicago calendar day `2026-08-28`, using
 the Gmail query `after:1787893200 before:1787979600`, and produced the expected
@@ -146,8 +155,24 @@ HTML report, index, and state artifacts. The report was independently checked
 for the document/viewport contract, responsive styling, the exact reviewed
 query, and 20 native `details`/`summary` message disclosures.
 
-This is a date-bound compiled-runtime attestation for the exact package,
+This is a date-bound compiled-runtime observation for the exact package,
 contract, bundle, reviewed bindings, and workflow run. It does not publish an
-AgentHub claim. General recurring proof still needs a target-independent way to
+AgentHub claim, and its accomplishment/deployable labels are superseded by the
+fact-only execution contract above. General recurring proof still needs a target-independent way to
 bind derived date inputs to cross-field output assertions; static JSON Schema
 cannot express that relationship by itself.
+
+## Live retained code-review proof (2026-08-30)
+
+The canonical WTK package `provide-an-automated-offline-code-review` compiled
+to the Pi target, installed with reviewed consumer-local bindings, and executed
+both required roles successfully as Pi workflow run
+`970c4a3a-47b2-4f98-9c10-233a4130172d`. Both role output contracts passed.
+Pi retained the workflow plus attempt records, transcripts, and results.
+
+WTK imported copies of those exact artifacts under one SHA-256-bound source
+manifest and assessed the target run as `execution-proven`. Rebuilt WTK
+qualification remains correctly blocked: target smoke is 1/1 passing, while
+three deterministic fixture partitions and 17 goal obligations remain
+unevaluated. The runtime proof does not imply goal accomplishment,
+qualification, catalog acceptance, or promotion authority.

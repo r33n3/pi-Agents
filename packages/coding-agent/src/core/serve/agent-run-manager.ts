@@ -39,6 +39,7 @@ export interface AgentRunRecord {
 	error?: string;
 	model?: ModelRef;
 	agentRevision: number;
+	temporarySourceAgentId?: string;
 	usage?: AgentRunUsage;
 }
 
@@ -143,77 +144,22 @@ export class AgentRunManager implements AsyncDisposable {
 		model?: ModelRef,
 	): Promise<AgentRunRecord> {
 		return this.#queue.run(async () => {
-			if (this.#disposed) throw new Error("Agent run manager is disposed");
-			if (prompt.trim() === "") throw new Error("Agent run prompt is required");
 			const definition = await this.#registry.get(agentId);
 			if (!definition) throw new Error(`Agent ${agentId} was not found`);
-			if (this.#activeByRun.size >= this.#maxConcurrentRuns) throw new Error("Agent run capacity is reached");
-			if (this.#activeByAgent.has(agentId)) throw new Error(`Agent ${agentId} already has an active run`);
-			const workspace = this.#registry.workspacePath(definition);
-			const workspaceKey = process.platform === "win32" ? resolve(workspace).toLowerCase() : resolve(workspace);
-			if (hasWorkspaceConflict(definition, this.#activeByWorkspace.get(workspaceKey))) {
-				throw new Error(`Agent project ${workspace} already has an active run`);
-			}
-			const requiredResources = resourceKeys(definition);
-			const busyResource = requiredResources.find((key) => this.#activeByResource.has(key));
-			if (busyResource) throw new Error(`Agent resource ${busyResource} already has an active run`);
-			const runId = randomUUID();
-			const artifactDirectory = resolve(this.#artifactsRoot, agentId, runId);
-			const record: AgentRunRecord = {
-				id: runId,
-				agentId,
-				prompt: prompt.trim(),
-				source,
-				status: "starting",
-				createdAt: Date.now(),
-				artifactDirectory,
-				model,
-				agentRevision: definition.revision,
+			return this.#startDefinition(definition, prompt, source, model);
+		});
+	}
+
+	async startTemporarySpecialist(sourceAgentId: string, prompt: string, model?: ModelRef): Promise<AgentRunRecord> {
+		return this.#queue.run(async () => {
+			const sourceDefinition = await this.#registry.get(sourceAgentId);
+			if (!sourceDefinition) throw new Error(`Agent ${sourceAgentId} was not found`);
+			const definition: AgentDefinition = {
+				...sourceDefinition,
+				id: `temporary-${randomUUID()}`,
+				name: `${sourceDefinition.name} specialist`,
 			};
-			this.#records.set(runId, record);
-			await this.#persistRecord(record);
-			try {
-				const execution = await this.#executor.start({
-					runId,
-					definition: model ? { ...definition, model } : definition,
-					workspace,
-					prompt: record.prompt,
-				});
-				record.status = "running";
-				record.startedAt = Date.now();
-				record.phase = "initializing";
-				record.progressMessage = "Starting isolated agent worker";
-				record.lastActivityAt = record.startedAt;
-				record.lastHeartbeatAt = record.startedAt;
-				const active: ActiveRun = {
-					record,
-					execution,
-					workspaceKey,
-					workspaceWritable: definition.permissionPolicy === "workspace-write",
-					abortRequested: false,
-					resourceKeys: requiredResources,
-					budget: definition.budget,
-					unsubscribe: () => {},
-					progressPersistence: Promise.resolve(),
-					lastProgressPersistedAt: record.startedAt,
-				};
-				active.unsubscribe = execution.subscribe((event) => this.#recordProgress(active, event));
-				this.#activeByAgent.set(agentId, active);
-				const workspaceRuns = this.#activeByWorkspace.get(workspaceKey) ?? new Set<ActiveRun>();
-				workspaceRuns.add(active);
-				this.#activeByWorkspace.set(workspaceKey, workspaceRuns);
-				this.#activeByRun.set(runId, active);
-				for (const key of requiredResources) this.#activeByResource.set(key, active);
-				await this.#persistRecord(record);
-				active.completion = this.#settle(active);
-				return { ...record };
-			} catch (error) {
-				record.status = "failed";
-				record.finishedAt = Date.now();
-				record.error = error instanceof Error ? error.message : String(error);
-				await this.#persistRecord(record);
-				throw error;
-			}
+			return this.#startDefinition(definition, prompt, "manual", model, sourceAgentId);
 		});
 	}
 
@@ -248,6 +194,85 @@ export class AgentRunManager implements AsyncDisposable {
 
 	[Symbol.asyncDispose](): Promise<void> {
 		return this.dispose();
+	}
+
+	async #startDefinition(
+		definition: AgentDefinition,
+		prompt: string,
+		source: AgentRunSource,
+		model?: ModelRef,
+		temporarySourceAgentId?: string,
+	): Promise<AgentRunRecord> {
+		if (this.#disposed) throw new Error("Agent run manager is disposed");
+		if (prompt.trim() === "") throw new Error("Agent run prompt is required");
+		if (this.#activeByRun.size >= this.#maxConcurrentRuns) throw new Error("Agent run capacity is reached");
+		if (this.#activeByAgent.has(definition.id)) throw new Error(`Agent ${definition.id} already has an active run`);
+		const workspace = this.#registry.workspacePath(definition);
+		const workspaceKey = process.platform === "win32" ? resolve(workspace).toLowerCase() : resolve(workspace);
+		if (hasWorkspaceConflict(definition, this.#activeByWorkspace.get(workspaceKey))) {
+			throw new Error(`Agent project ${workspace} already has an active run`);
+		}
+		const requiredResources = resourceKeys(definition);
+		const busyResource = requiredResources.find((key) => this.#activeByResource.has(key));
+		if (busyResource) throw new Error(`Agent resource ${busyResource} already has an active run`);
+		const runId = randomUUID();
+		const artifactDirectory = resolve(this.#artifactsRoot, definition.id, runId);
+		const record: AgentRunRecord = {
+			id: runId,
+			agentId: definition.id,
+			prompt: prompt.trim(),
+			source,
+			status: "starting",
+			createdAt: Date.now(),
+			artifactDirectory,
+			model,
+			agentRevision: definition.revision,
+			temporarySourceAgentId,
+		};
+		this.#records.set(runId, record);
+		await this.#persistRecord(record);
+		try {
+			const execution = await this.#executor.start({
+				runId,
+				definition: model ? { ...definition, model } : definition,
+				workspace,
+				prompt: record.prompt,
+			});
+			record.status = "running";
+			record.startedAt = Date.now();
+			record.phase = "initializing";
+			record.progressMessage = "Starting isolated agent worker";
+			record.lastActivityAt = record.startedAt;
+			record.lastHeartbeatAt = record.startedAt;
+			const active: ActiveRun = {
+				record,
+				execution,
+				workspaceKey,
+				workspaceWritable: definition.permissionPolicy === "workspace-write",
+				abortRequested: false,
+				resourceKeys: requiredResources,
+				budget: definition.budget,
+				unsubscribe: () => {},
+				progressPersistence: Promise.resolve(),
+				lastProgressPersistedAt: record.startedAt,
+			};
+			active.unsubscribe = execution.subscribe((event) => this.#recordProgress(active, event));
+			this.#activeByAgent.set(definition.id, active);
+			const workspaceRuns = this.#activeByWorkspace.get(workspaceKey) ?? new Set<ActiveRun>();
+			workspaceRuns.add(active);
+			this.#activeByWorkspace.set(workspaceKey, workspaceRuns);
+			this.#activeByRun.set(runId, active);
+			for (const key of requiredResources) this.#activeByResource.set(key, active);
+			await this.#persistRecord(record);
+			active.completion = this.#settle(active);
+			return { ...record };
+		} catch (error) {
+			record.status = "failed";
+			record.finishedAt = Date.now();
+			record.error = error instanceof Error ? error.message : String(error);
+			await this.#persistRecord(record);
+			throw error;
+		}
 	}
 
 	async #settle(active: ActiveRun): Promise<void> {
@@ -381,6 +406,8 @@ function parseRunRecord(value: unknown, artifactDirectory: string): AgentRunReco
 			record.agentRevision > 0
 				? record.agentRevision
 				: 1,
+		temporarySourceAgentId:
+			typeof record.temporarySourceAgentId === "string" ? record.temporarySourceAgentId : undefined,
 		usage: record.usage === undefined ? undefined : parseRunUsage(record.usage),
 	};
 }

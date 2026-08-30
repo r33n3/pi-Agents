@@ -13,6 +13,8 @@ The package adds:
 
 - `configure_agent`, a model-facing tool for creating or updating agents under
   `~/.pi/agent/agents`.
+- Confirmed recurring schedules. The default replaces an agent's existing
+  schedule in place; an additional schedule must be explicitly requested.
 - `/persona`, an interactive command for applying personas from
   [r33n3/Personas](https://github.com/r33n3/Personas).
 
@@ -21,5 +23,7 @@ as local paths or remote URL segments. For example, `Greybeard` resolves to
 `greybeard`. Persona instructions and icons are cached under
 `~/.pi/agent/personas`.
 
-Recurring routines and multi-agent workflows are configured through `pi --serve`,
-which owns their persistent schedules and run history.
+`configure_agent` never chooses a schedule time. The user must explicitly confirm
+the cadence. Repeating the same schedule is idempotent, while changing it updates
+the existing Windows scheduled task instead of creating a duplicate. Multi-agent
+workflows and their run history remain managed through `pi --serve`.

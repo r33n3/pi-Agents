@@ -147,6 +147,13 @@ agentValidation.className = "muted";
 agentValidation.setAttribute("role", "status");
 agentValidation.setAttribute("aria-live", "polite");
 agentForm.before(agentValidation);
+const teamPackageInput = document.createElement("input");
+teamPackageInput.type = "file";
+teamPackageInput.accept = "application/json,.json";
+teamPackageInput.multiple = true;
+teamPackageInput.className = "hidden";
+teamPackageInput.setAttribute("aria-label", "Open WTK team bundle and runtime files");
+document.body.append(teamPackageInput);
 installAgentBuilderStepControls();
 const modelPicker = installThemedSelect(model);
 const agentModelPicker = installThemedSelect(agentModel);
@@ -176,6 +183,7 @@ const externalResultByRunId = new Map<string, string>();
 const subagentActivityByKey = new Map<string, SubagentActivity>();
 const agentConversationIds = new Map<string, string>();
 const agentTasksByAgent = new Map<string, AgentTaskSummary[]>();
+const agentTeamStates = new Map<string, AgentTeamState>();
 let attentionItems: AttentionSummary[] = [];
 let artifacts: ArtifactSummary[] = [];
 let activeArtifactObjectUrl: string | undefined;
@@ -203,10 +211,20 @@ let renderedExternalRunListSignature = "";
 let lastAppliedBuilderDraft = "";
 let agentBuilderBaseline = "";
 let agentBuilderFeedback = "";
+let activeAgentImprovement: AgentImprovementContext | undefined;
+let activeAgentBuild: AgentBuildRecord | undefined;
+let agentBuildDraftTimer: number | undefined;
+let agentBuildPollTimer: number | undefined;
+let pendingTeamPackage: PendingTeamPackage | undefined;
+let teamLaunchBusy = false;
+let teamFactoryAvailable = false;
+let teamFactoryBusy = false;
+let teamFactoryDraft = readStoredTeamFactoryDraft();
 let availableModels: ModelMetadata[] = [];
 let modelCostPresentations: ReadonlyMap<string, ModelSelectionCostPresentation> = new Map();
 let agentModelsInitialized = false;
 let agents: AgentSummary[] = [];
+let agentBuilds: AgentBuildRecord[] = [];
 let personas: PersonaSummary[] = [];
 let agentEvents: EventSource | undefined;
 let agentsLoadPromise: Promise<void> | undefined;
@@ -225,6 +243,51 @@ interface AttachmentSummary {
 	name: string;
 	mimeType: string;
 	size: number;
+}
+
+interface PiAgentTeamPreview {
+	schemaVersion: "pi.agents.team-preview.v1";
+	approvalDigest: string;
+	team: {
+		name: string;
+		coordinatorRoleId: string;
+		roles: Array<{
+			id: string;
+			name: string;
+			model: { provider: string; id: string };
+			permissionPolicy: "read-only" | "workspace-write";
+			toolNames: string[];
+			capabilityGrantCount: number;
+		}>;
+		workflow: { nodeCount: number; maxConcurrency: number };
+	};
+	bindings: { projectRoot: string; credentialRefs: string[] };
+}
+
+interface PendingTeamPackage {
+	bundle: unknown;
+	bindings: unknown;
+	preview: PiAgentTeamPreview;
+}
+
+type TeamFactoryPhase = "intake" | "research" | "build" | "deliver" | "prepare" | "failed";
+
+interface TeamFactoryDraft {
+	sessionId?: string;
+	operationId?: string;
+	phase: TeamFactoryPhase;
+	pkgId?: string;
+	reviewReady?: boolean;
+	paused?: boolean;
+	messages: Array<{ role: "user" | "assistant"; text: string }>;
+}
+
+interface TeamFactoryOperation {
+	id: string;
+	status: "queued" | "running" | "paused" | "succeeded" | "failed" | "cancelled";
+	result?: unknown;
+	error?: { message: string };
+	progress?: { message: string };
 }
 
 interface CapabilityEntry {
@@ -402,9 +465,51 @@ interface AgentTaskSummary {
 	phase?: "initializing" | "waiting-for-model" | "generating" | "running-tool" | "writing-results";
 	progressMessage?: string;
 	lastActivityAt?: number;
+	attemptIds: string[];
 	artifactIds: string[];
 	result?: string;
 	error?: string;
+}
+
+interface AgentImprovementContext {
+	route: "repair" | "refine" | "diagnose";
+	scope: "auto" | "agent" | "team";
+	objective: string;
+	successCriteria: string;
+	baselineRevision: number;
+	task?: Pick<AgentTaskSummary, "id" | "status" | "prompt" | "attemptIds" | "result" | "error">;
+}
+
+type AgentBuildStage =
+	| "draft"
+	| "ready-to-test"
+	| "testing"
+	| "proof-ready"
+	| "needs-refinement"
+	| "proven"
+	| "promoted"
+	| "automated";
+
+interface AgentBuildRecord {
+	id: string;
+	revision: number;
+	name: string;
+	objective: string;
+	projectRoot: string;
+	stage: AgentBuildStage;
+	agentId?: string;
+	agentRevision?: number;
+	proof?: {
+		runId: string;
+		agentRevision: number;
+		prompt: string;
+		status: "running" | "succeeded" | "failed" | "aborted";
+		finishedAt?: number;
+	};
+	skill?: { name: string; path: string; sourceRunId: string };
+	routineIds: string[];
+	createdAt: number;
+	updatedAt: number;
 }
 
 interface AttentionSummary {
@@ -2044,7 +2149,35 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 	const heading = document.createElement("div");
 	heading.className = "builder-guide-heading";
 	const title = document.createElement("strong");
-	title.textContent = activeSidebarAgent ? `Refine ${activeSidebarAgent.name}` : "Build an agent";
+	title.textContent = pendingTeamPackage
+		? pendingTeamPackage.preview.team.name
+		: teamFactoryDraft && !activeSidebarAgent
+			? "Build a canonical agent team"
+			: activeSidebarAgent && activeAgentImprovement
+				? `${improvementRouteLabel(activeAgentImprovement.route)} ${activeSidebarAgent.name}`
+				: activeSidebarAgent
+					? `Refine ${activeSidebarAgent.name}`
+					: "Build an agent or team";
+	const lifecycle = document.createElement("span");
+	lifecycle.className = "builder-stage";
+	lifecycle.dataset.stage = activeAgentBuild?.stage ?? "draft";
+	lifecycle.textContent = agentBuildStageLabel(activeAgentBuild);
+	const openTeam = document.createElement("button");
+	openTeam.type = "button";
+	openTeam.className = "secondary-action";
+	openTeam.textContent = pendingTeamPackage ? "Change package" : "Import package";
+	openTeam.title = "Open the bundle.json and runtime.json generated by the WTK pi-agents target";
+	openTeam.addEventListener("click", () => teamPackageInput.click());
+	const useWtk = document.createElement("button");
+	useWtk.type = "button";
+	useWtk.className = "secondary-action";
+	useWtk.textContent = "Build canonical package";
+	useWtk.title = "Use the optional WTK catalog and compiler for this team";
+	useWtk.addEventListener("click", () => {
+		teamFactoryDraft = { phase: "intake", messages: [] };
+		persistTeamFactoryDraft();
+		if (session?.snapshot) renderBuilderConversation(session.snapshot);
+	});
 	const advanced = document.createElement("button");
 	advanced.type = "button";
 	advanced.className = "secondary-action";
@@ -2066,16 +2199,67 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 	cancel.className = "secondary-action";
 	cancel.textContent = "Exit editing";
 	cancel.addEventListener("click", () => void closeBuilderChat());
-	heading.append(title, advanced, apply, cancel);
+	if (pendingTeamPackage) heading.append(title, openTeam, cancel);
+	else {
+		heading.append(title, lifecycle, openTeam, advanced, apply);
+		const lifecycleAction = agentBuildLifecycleAction();
+		if (lifecycleAction) heading.append(lifecycleAction);
+		if (teamFactoryAvailable && !teamFactoryDraft && !activeSidebarAgent) heading.append(useWtk);
+		if (teamFactoryDraft?.reviewReady && !activeSidebarAgent) {
+			const approveBrief = document.createElement("button");
+			approveBrief.type = "button";
+			approveBrief.className = "primary-action";
+			approveBrief.disabled = teamFactoryBusy;
+			approveBrief.textContent = "Approve brief";
+			approveBrief.addEventListener("click", () => void submitTeamFactory("confirm", "Approve brief"));
+			heading.append(approveBrief);
+		}
+		if (teamFactoryBusy && teamFactoryDraft?.operationId && !activeSidebarAgent) {
+			const stopBuild = document.createElement("button");
+			stopBuild.type = "button";
+			stopBuild.className = "secondary-action danger-action";
+			stopBuild.textContent = "Stop build";
+			stopBuild.addEventListener("click", () => void controlTeamFactoryOperation("cancel"));
+			heading.append(stopBuild);
+		}
+		heading.append(cancel);
+	}
 	const guidance = document.createElement("p");
 	guidance.className = "muted";
-	guidance.textContent =
-		snapshot.transcript.length === 0
-			? "Describe the outcome, working folder, and access the agent needs. Agent Builder will ask for anything missing."
-			: "Continue refining the agent here, or review the generated settings.";
+	guidance.textContent = pendingTeamPackage
+		? "Review the compiled team and its local bindings before launch."
+		: teamFactoryDraft && !activeSidebarAgent
+			? teamFactoryBusy
+				? "WTK is building the canonical package. You can leave this view and return without stopping it."
+				: "Continue the optional canonical package build here. Pi remains usable without WTK."
+			: activeSidebarAgent && activeAgentImprovement
+				? `${activeAgentImprovement.objective} Success: ${activeAgentImprovement.successCriteria}`
+				: snapshot.transcript.length === 0
+					? "Describe the outcome, working folder, and access the agent needs. Pi will build the agent locally."
+					: "Continue refining the agent here, or review the generated settings.";
 	guide.append(heading, guidance);
-	transcript.replaceChildren(guide, ...snapshot.transcript.map(builderDisplayItem).map(renderItem));
+	if (activeAgentBuild?.stage === "testing" && agentBuildPollTimer === undefined) {
+		agentBuildPollTimer = window.setTimeout(() => {
+			agentBuildPollTimer = undefined;
+			void refreshActiveAgentBuild().catch((error: unknown) =>
+				setStatus(error instanceof Error ? error.message : String(error), true),
+			);
+		}, 1_500);
+	}
+	if (pendingTeamPackage) guide.append(renderTeamPackageReview(pendingTeamPackage.preview));
+	transcript.replaceChildren(
+		guide,
+		...(teamFactoryDraft && !activeSidebarAgent
+			? teamFactoryDraft.messages.map(renderTeamFactoryMessage)
+			: snapshot.transcript.map(builderDisplayItem).map(renderItem)),
+	);
 	setBusy(snapshot);
+	if (teamFactoryBusy) {
+		model.disabled = true;
+		thinking.disabled = true;
+		send.disabled = true;
+		phase.textContent = teamFactoryDraft?.phase ?? "building";
+	}
 	replacePrimaryModelOptions(availableModels);
 	model.value = `${snapshot.model.provider}/${snapshot.model.id}`;
 	modelPicker.refresh();
@@ -2093,8 +2277,664 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 	renderSessionStats(snapshot);
 	setStatus(projectRoot || "Configure and deploy a local agent");
 	if (nearBottom) transcript.scrollTop = transcript.scrollHeight;
-	applyLatestAgentBuilderDraft(snapshot);
+	if (!teamFactoryDraft || activeSidebarAgent) applyLatestAgentBuilderDraft(snapshot);
 	updateAgentBuilderReadiness();
+}
+
+function agentBuildStageLabel(record: AgentBuildRecord | undefined): string {
+	if (!record) return "Name the draft";
+	return {
+		draft: "Draft saved",
+		"ready-to-test": "Ready to test",
+		testing: "Testing",
+		"proof-ready": "Review proof",
+		"needs-refinement": "Refine and retry",
+		proven: "Proof accepted",
+		promoted: "Skill created",
+		automated: "Automated",
+	}[record.stage];
+}
+
+function agentBuildLifecycleAction(): HTMLButtonElement | undefined {
+	const build = activeAgentBuild;
+	if (!build || build.stage === "draft" || build.stage === "automated") return undefined;
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "lifecycle-action";
+	if (build.stage === "testing") {
+		button.textContent = "Testing…";
+		button.disabled = true;
+		return button;
+	}
+	if (build.stage === "proof-ready") {
+		button.textContent = "Review proof";
+		button.addEventListener("click", () => void openAgentBuildProofReview());
+		return button;
+	}
+	if (build.stage === "proven") {
+		button.textContent = "Save as skill";
+		button.addEventListener("click", () => void openLifecycleSkillPromotion());
+		return button;
+	}
+	if (build.stage === "promoted") {
+		button.textContent = "Add routine";
+		button.addEventListener("click", () => void stageRoutineFromBuild());
+		return button;
+	}
+	button.textContent = build.stage === "needs-refinement" ? "Try again" : "Try agent";
+	button.addEventListener("click", openAgentBuildProofDialog);
+	return button;
+}
+
+function openAgentBuildProofDialog(): void {
+	if (!activeAgentBuild?.agentId) {
+		setStatus("Create the agent before running a proof", true);
+		return;
+	}
+	const build = activeAgentBuild;
+	const dialog = document.createElement("dialog");
+	dialog.className = "promotion-dialog";
+	const form = document.createElement("form");
+	form.method = "dialog";
+	const heading = document.createElement("strong");
+	heading.textContent = `Try ${build.name}`;
+	const explanation = document.createElement("p");
+	explanation.className = "muted";
+	explanation.textContent = "Run one concrete task. Automation stays locked until you review the retained result.";
+	const prompt = document.createElement("textarea");
+	prompt.required = true;
+	prompt.maxLength = 16_384;
+	prompt.value = `Prove this agent can complete its goal: ${build.objective}`;
+	const label = document.createElement("label");
+	label.append(document.createTextNode("One-time proof task"), prompt);
+	const actions = document.createElement("div");
+	actions.className = "promotion-actions";
+	const cancel = document.createElement("button");
+	cancel.type = "button";
+	cancel.className = "secondary-action";
+	cancel.textContent = "Cancel";
+	cancel.addEventListener("click", () => dialog.close());
+	const run = document.createElement("button");
+	run.type = "submit";
+	run.textContent = "Run proof";
+	actions.append(cancel, run);
+	form.append(heading, explanation, label, actions);
+	form.addEventListener("submit", (event) => {
+		event.preventDefault();
+		if (!form.reportValidity() || !capabilityToken) return;
+		run.disabled = true;
+		void fetch(`/agent-builds/${encodeURIComponent(build.id)}/proof?token=${encodeURIComponent(capabilityToken)}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ prompt: prompt.value }),
+		})
+			.then(async (response) => {
+				if (!response.ok) throw new Error(await responseError(response, "Could not start proof"));
+				const payload: unknown = await response.json();
+				if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid proof");
+				activeAgentBuild = payload;
+				dialog.close();
+				if (session?.snapshot) renderBuilderConversation(session.snapshot);
+				setStatus(`Testing ${build.name} in an isolated one-time run`);
+			})
+			.catch((error: unknown) => {
+				run.disabled = false;
+				setStatus(error instanceof Error ? error.message : String(error), true);
+			});
+	});
+	dialog.addEventListener("close", () => dialog.remove());
+	dialog.append(form);
+	document.body.append(dialog);
+	dialog.showModal();
+	prompt.focus();
+	prompt.select();
+}
+
+async function openAgentBuildProofReview(): Promise<void> {
+	if (!capabilityToken || !activeAgentBuild?.proof) return;
+	const build = activeAgentBuild;
+	const proof = activeAgentBuild.proof;
+	const response = await fetch(
+		`/runs/${encodeURIComponent(proof.runId)}/result?token=${encodeURIComponent(capabilityToken)}`,
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load proof result"));
+	const result = await response.text();
+	const dialog = document.createElement("dialog");
+	dialog.className = "promotion-dialog proof-review-dialog";
+	const heading = document.createElement("strong");
+	heading.textContent = `Review ${build.name} proof`;
+	const explanation = document.createElement("p");
+	explanation.className = "muted";
+	explanation.textContent = "Accept only if this result proves the current agent revision can repeat the task safely.";
+	const output = document.createElement("pre");
+	output.textContent = result;
+	const actions = document.createElement("div");
+	actions.className = "promotion-actions";
+	const refine = document.createElement("button");
+	refine.type = "button";
+	refine.className = "secondary-action";
+	refine.textContent = "Needs refinement";
+	const accept = document.createElement("button");
+	accept.type = "button";
+	accept.textContent = "Accept proof";
+	const review = async (accepted: boolean): Promise<void> => {
+		const reviewResponse = await fetch(
+			`/agent-builds/${encodeURIComponent(build.id)}/proof-review?token=${encodeURIComponent(capabilityToken)}`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ accepted }),
+			},
+		);
+		if (!reviewResponse.ok) throw new Error(await responseError(reviewResponse, "Could not review proof"));
+		const payload: unknown = await reviewResponse.json();
+		if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid review");
+		activeAgentBuild = payload;
+		dialog.close();
+		if (!accepted) {
+			input.value = `Refine ${build.name} using this rejected proof as evidence. Keep the smallest safe change.`;
+			resizeComposer();
+			input.focus();
+		}
+		if (session?.snapshot) renderBuilderConversation(session.snapshot);
+		setStatus(
+			accepted ? "Proof accepted. Review and save it as a reusable skill." : "Proof rejected. Refine and retry.",
+		);
+	};
+	refine.addEventListener("click", () => void review(false).catch((error: unknown) => setStatus(String(error), true)));
+	accept.addEventListener("click", () => void review(true).catch((error: unknown) => setStatus(String(error), true)));
+	actions.append(refine, accept);
+	dialog.append(heading, explanation, output, actions);
+	dialog.addEventListener("close", () => dialog.remove());
+	document.body.append(dialog);
+	dialog.showModal();
+}
+
+async function openLifecycleSkillPromotion(): Promise<void> {
+	if (!capabilityToken || !activeAgentBuild?.proof || !activeSidebarAgent) return;
+	const response = await fetch(
+		`/runs/${encodeURIComponent(activeAgentBuild.proof.runId)}/result?token=${encodeURIComponent(capabilityToken)}`,
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load proof result"));
+	openSkillPromotionReview(
+		{
+			id: activeAgentBuild.proof.runId,
+			conversationId: "",
+			agentId: activeSidebarAgent.id,
+			status: "completed",
+			prompt: activeAgentBuild.proof.prompt,
+			createdAt: activeAgentBuild.proof.finishedAt ?? Date.now(),
+			attemptIds: [activeAgentBuild.proof.runId],
+			artifactIds: [],
+			result: await response.text(),
+		},
+		activeSidebarAgent,
+	);
+}
+
+async function stageRoutineFromBuild(): Promise<void> {
+	if (!activeAgentBuild?.proof || !activeSidebarAgent) return;
+	await stageRoutineFromTask(
+		{
+			id: activeAgentBuild.proof.runId,
+			conversationId: "",
+			agentId: activeSidebarAgent.id,
+			status: "completed",
+			prompt: activeAgentBuild.proof.prompt,
+			createdAt: activeAgentBuild.proof.finishedAt ?? Date.now(),
+			attemptIds: [activeAgentBuild.proof.runId],
+			artifactIds: [],
+		},
+		activeSidebarAgent,
+	);
+}
+
+function renderTeamPackageReview(preview: PiAgentTeamPreview): HTMLElement {
+	const card = document.createElement("section");
+	card.className = "team-review";
+	const summary = document.createElement("p");
+	summary.textContent = `${preview.team.roles.length} members · ${preview.team.workflow.nodeCount} steps · up to ${preview.team.workflow.maxConcurrency} concurrent`;
+	const members = document.createElement("div");
+	members.className = "team-review-members";
+	for (const role of preview.team.roles) {
+		const member = document.createElement("div");
+		const name = document.createElement("strong");
+		name.textContent = role.name;
+		const detail = document.createElement("span");
+		detail.textContent = `${role.model.id} · ${role.permissionPolicy}${role.id === preview.team.coordinatorRoleId ? " · coordinator" : ""}`;
+		member.append(name, detail);
+		members.append(member);
+	}
+	const access = document.createElement("p");
+	access.className = "muted";
+	access.textContent = `${formatWorkingDirectory(preview.bindings.projectRoot)} · ${preview.bindings.credentialRefs.length} credential reference${preview.bindings.credentialRefs.length === 1 ? "" : "s"}`;
+	const launch = document.createElement("button");
+	launch.type = "button";
+	launch.className = "primary-action";
+	launch.disabled = teamLaunchBusy;
+	launch.textContent = teamLaunchBusy ? "Launching…" : "Launch team";
+	launch.addEventListener("click", () => {
+		void launchPendingTeamPackage().catch((error: unknown) =>
+			setStatus(error instanceof Error ? error.message : String(error), true),
+		);
+	});
+	card.append(summary, members, access, launch);
+	return card;
+}
+
+function renderTeamFactoryMessage(message: TeamFactoryDraft["messages"][number]): HTMLElement {
+	const element = document.createElement("article");
+	element.className = `message ${message.role}`;
+	const text = document.createElement("div");
+	text.textContent = message.text;
+	element.append(text);
+	return element;
+}
+
+async function prepareTeamPackageFiles(files: readonly File[]): Promise<void> {
+	if (!capabilityToken) throw new Error("The capability token is missing");
+	const documents: unknown[] = [];
+	for (const file of files) documents.push(JSON.parse(await file.text()) as unknown);
+	let bundle: unknown;
+	let bindings: unknown;
+	for (const document of documents) {
+		if (!isJsonObject(document)) continue;
+		if (document.schemaVersion === "pi.agents.bundle.v1") bundle = document;
+		if (document.schemaVersion === "wtk.pi-agents-runtime.v1") bindings = document.bindings;
+		if (document.bundle !== undefined) bundle = document.bundle;
+		if (document.bindings !== undefined && document.schemaVersion !== "pi.agents.bundle.v1") {
+			bindings = document.bindings;
+		}
+	}
+	if (bundle === undefined || bindings === undefined) {
+		throw new Error("Select the WTK pi-agents bundle.json and runtime.json files together");
+	}
+	setStatus("Reviewing WTK team package…");
+	const response = await fetch(`/agent-teams/prepare?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ bundle, bindings }),
+	});
+	if (!response.ok) throw new Error(await responseError(response, "Could not prepare WTK team package"));
+	const preview: unknown = await response.json();
+	if (!isPiAgentTeamPreview(preview)) throw new Error("Pi returned an invalid team preview");
+	pendingTeamPackage = { bundle, bindings, preview };
+	if (session?.snapshot) renderBuilderConversation(session.snapshot);
+	setStatus("Team package ready to review");
+}
+
+async function launchPendingTeamPackage(): Promise<void> {
+	if (!capabilityToken || !pendingTeamPackage || teamLaunchBusy) return;
+	teamLaunchBusy = true;
+	if (session?.snapshot) renderBuilderConversation(session.snapshot);
+	setStatus("Launching team…");
+	try {
+		const response = await fetch(`/agent-teams/launch?token=${encodeURIComponent(capabilityToken)}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				bundle: pendingTeamPackage.bundle,
+				bindings: pendingTeamPackage.bindings,
+				approvalDigest: pendingTeamPackage.preview.approvalDigest,
+				reviewedBy: "pi-serve-operator",
+			}),
+		});
+		if (!response.ok) throw new Error(await responseError(response, "Could not launch WTK team"));
+		const result: unknown = await response.json();
+		const coordinatorAgentId = teamLaunchCoordinatorAgentId(result);
+		pendingTeamPackage = undefined;
+		teamFactoryDraft = undefined;
+		persistTeamFactoryDraft();
+		if (agentsLoadPromise) await agentsLoadPromise;
+		await loadAgentsNow();
+		const coordinator = agents.find((agent) => agent.id === coordinatorAgentId);
+		if (!coordinator) throw new Error("The installed team coordinator is not available");
+		await openAgent(coordinator);
+		setStatus(`Team ready · ${coordinator.name}`);
+	} finally {
+		teamLaunchBusy = false;
+		if (pendingTeamPackage && session?.snapshot) renderBuilderConversation(session.snapshot);
+	}
+}
+
+async function loadTeamFactoryStatus(): Promise<void> {
+	if (!capabilityToken || activeSidebarAgent) return;
+	const response = await fetch(`/agent-team-factory?token=${encodeURIComponent(capabilityToken)}`);
+	if (!response.ok) throw new Error(await responseError(response, "Could not inspect the canonical team builder"));
+	const value: unknown = await response.json();
+	teamFactoryAvailable = isJsonObject(value) && value.available === true;
+	if (teamFactoryDraft?.operationId && !teamFactoryBusy) {
+		teamFactoryBusy = true;
+		if (session?.snapshot) renderBuilderConversation(session.snapshot);
+		void followTeamFactoryOperation(teamFactoryDraft.operationId)
+			.catch((error: unknown) => {
+				if (!teamFactoryDraft) return;
+				teamFactoryDraft.phase = "failed";
+				teamFactoryDraft.operationId = undefined;
+				teamFactoryDraft.messages.push({
+					role: "assistant",
+					text: error instanceof Error ? error.message : "Canonical team build failed",
+				});
+				persistTeamFactoryDraft();
+				setStatus(error instanceof Error ? error.message : String(error), true);
+			})
+			.finally(() => {
+				teamFactoryBusy = false;
+				if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
+			});
+	} else if (
+		teamFactoryAvailable &&
+		teamFactoryDraft?.phase === "prepare" &&
+		teamFactoryDraft.pkgId &&
+		!pendingTeamPackage
+	) {
+		teamFactoryBusy = true;
+		void prepareBuiltTeam(teamFactoryDraft.pkgId)
+			.catch((error: unknown) => {
+				if (teamFactoryDraft) teamFactoryDraft.phase = "failed";
+				persistTeamFactoryDraft();
+				setStatus(error instanceof Error ? error.message : String(error), true);
+			})
+			.finally(() => {
+				teamFactoryBusy = false;
+				if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
+			});
+	}
+}
+
+async function submitTeamFactory(prompt: string, displayPrompt = prompt): Promise<void> {
+	if (!capabilityToken || teamFactoryBusy) return;
+	teamFactoryDraft ??= { phase: "intake", messages: [] };
+	teamFactoryDraft.messages.push({ role: "user", text: displayPrompt });
+	teamFactoryBusy = true;
+	persistTeamFactoryDraft();
+	if (session?.snapshot) renderBuilderConversation(session.snapshot);
+	try {
+		if (teamFactoryDraft.paused && teamFactoryDraft.operationId) {
+			teamFactoryDraft.paused = false;
+			const operation = await controlTeamFactoryOperation("resume", prompt);
+			if (operation) await followTeamFactoryOperation(operation.id);
+			return;
+		}
+		if (teamFactoryDraft.phase === "failed" && teamFactoryDraft.pkgId) {
+			teamFactoryDraft.phase = "prepare";
+			await prepareBuiltTeam(teamFactoryDraft.pkgId);
+			return;
+		}
+		const path = teamFactoryDraft.sessionId
+			? "/agent-team-factory/intake/message"
+			: "/agent-team-factory/intake/start";
+		const response = await fetch(`${path}?token=${encodeURIComponent(capabilityToken)}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				input: prompt,
+				...(teamFactoryDraft.sessionId ? { sessionId: teamFactoryDraft.sessionId } : {}),
+			}),
+		});
+		if (!response.ok) throw new Error(await responseError(response, "WTK could not start the team brief"));
+		const accepted = teamFactoryAccepted(await response.json());
+		teamFactoryDraft.sessionId = accepted.sessionId ?? teamFactoryDraft.sessionId;
+		teamFactoryDraft.operationId = accepted.operation.id;
+		persistTeamFactoryDraft();
+		await followTeamFactoryOperation(accepted.operation.id);
+	} catch (error) {
+		teamFactoryDraft.phase = "failed";
+		teamFactoryDraft.operationId = undefined;
+		teamFactoryDraft.messages.push({
+			role: "assistant",
+			text: error instanceof Error ? error.message : "Canonical team build failed",
+		});
+		persistTeamFactoryDraft();
+		setStatus(error instanceof Error ? error.message : String(error), true);
+	} finally {
+		teamFactoryBusy = false;
+		if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
+	}
+}
+
+async function followTeamFactoryOperation(operationId: string): Promise<void> {
+	if (!capabilityToken || !teamFactoryDraft) return;
+	for (;;) {
+		const response = await fetch(
+			`/agent-team-factory/operation?id=${encodeURIComponent(operationId)}&token=${encodeURIComponent(capabilityToken)}`,
+		);
+		if (!response.ok) throw new Error(await responseError(response, "Could not read WTK build progress"));
+		const operation = teamFactoryOperation(await response.json());
+		if (operation.progress?.message) setStatus(operation.progress.message);
+		if (operation.status === "failed" || operation.status === "cancelled") {
+			throw new Error(operation.error?.message ?? `WTK operation ${operation.status}`);
+		}
+		if (operation.status === "paused") {
+			teamFactoryDraft.paused = true;
+			teamFactoryDraft.messages.push({
+				role: "assistant",
+				text: "Build paused at a safe boundary. Send direction here to resume it.",
+			});
+			persistTeamFactoryDraft();
+			return;
+		}
+		if (operation.status === "succeeded") {
+			teamFactoryDraft.operationId = undefined;
+			persistTeamFactoryDraft();
+			await advanceTeamFactory(operation.result);
+			return;
+		}
+		await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+	}
+}
+
+async function controlTeamFactoryOperation(
+	action: "cancel" | "pause" | "resume" | "steer",
+	message?: string,
+): Promise<TeamFactoryOperation | undefined> {
+	if (!capabilityToken || !teamFactoryDraft?.operationId) return undefined;
+	const response = await fetch(`/agent-team-factory/operation/control?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ operationId: teamFactoryDraft.operationId, action, ...(message ? { message } : {}) }),
+	});
+	if (!response.ok) throw new Error(await responseError(response, `Could not ${action} WTK build`));
+	const operation = teamFactoryOperation(await response.json());
+	teamFactoryDraft.operationId = operation.id;
+	teamFactoryDraft.paused = operation.status === "paused";
+	if (action === "cancel") teamFactoryDraft.phase = "failed";
+	persistTeamFactoryDraft();
+	return operation;
+}
+
+async function advanceTeamFactory(resultValue: unknown): Promise<void> {
+	if (!capabilityToken || !teamFactoryDraft) return;
+	const result = isJsonObject(resultValue) ? resultValue : {};
+	if (teamFactoryDraft.phase === "intake") {
+		teamFactoryDraft.sessionId = typeof result.sessionId === "string" ? result.sessionId : teamFactoryDraft.sessionId;
+		teamFactoryDraft.reviewReady = result.reviewReady === true;
+		const response =
+			isJsonObject(result.conversationMove) && typeof result.conversationMove.response === "string"
+				? result.conversationMove.response
+				: typeof result.prompt === "string"
+					? result.prompt
+					: undefined;
+		if (response) teamFactoryDraft.messages.push({ role: "assistant", text: response });
+		if (result.done !== true) {
+			persistTeamFactoryDraft();
+			return;
+		}
+		const goalRecordPath = typeStringValue(result.relativeRecordPath) ?? typeStringValue(result.recordPath);
+		if (!goalRecordPath) throw new Error("WTK completed intake without a goal record");
+		teamFactoryDraft.phase = "research";
+		teamFactoryDraft.reviewReady = false;
+		teamFactoryDraft.messages.push({
+			role: "assistant",
+			text: "Build brief approved. Researching the package design…",
+		});
+		persistTeamFactoryDraft();
+		await startTeamFactoryOperation("/agent-team-factory/research", { goalRecordPath });
+		return;
+	}
+	if (teamFactoryDraft.phase === "research") {
+		const build = isJsonObject(result.next) && isJsonObject(result.next.build) ? result.next.build : undefined;
+		const body = build && isJsonObject(build.body) ? build.body : undefined;
+		const pkgId = typeStringValue(body?.pkgId) ?? typeStringValue(result.pkgId);
+		const handoffPath = typeStringValue(body?.handoffPath) ?? typeStringValue(result.handoffPath);
+		if (!pkgId || !handoffPath) throw new Error("WTK research did not produce a build handoff");
+		teamFactoryDraft.phase = "build";
+		teamFactoryDraft.pkgId = pkgId;
+		teamFactoryDraft.messages.push({
+			role: "assistant",
+			text: "Research complete. Compiling the canonical agent package…",
+		});
+		persistTeamFactoryDraft();
+		await startTeamFactoryOperation("/agent-team-factory/build", { pkgId, handoffPath });
+		return;
+	}
+	if (teamFactoryDraft.phase === "build") {
+		if (!teamFactoryDraft.pkgId) throw new Error("WTK build lost its package identifier");
+		teamFactoryDraft.phase = "deliver";
+		teamFactoryDraft.messages.push({
+			role: "assistant",
+			text: "Package compiled. Producing the Pi runtime projection…",
+		});
+		persistTeamFactoryDraft();
+		await startTeamFactoryOperation("/agent-team-factory/deliver", { pkgId: teamFactoryDraft.pkgId });
+		return;
+	}
+	if (teamFactoryDraft.phase === "deliver") {
+		if (!teamFactoryDraft.pkgId) throw new Error("WTK delivery lost its package identifier");
+		teamFactoryDraft.phase = "prepare";
+		persistTeamFactoryDraft();
+		await prepareBuiltTeam(teamFactoryDraft.pkgId);
+	}
+}
+
+async function startTeamFactoryOperation(path: string, body: Record<string, unknown>): Promise<void> {
+	if (!capabilityToken || !teamFactoryDraft) return;
+	const response = await fetch(`${path}?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (!response.ok) throw new Error(await responseError(response, "WTK could not advance the build"));
+	const accepted = teamFactoryAccepted(await response.json());
+	teamFactoryDraft.operationId = accepted.operation.id;
+	persistTeamFactoryDraft();
+	await followTeamFactoryOperation(accepted.operation.id);
+}
+
+async function prepareBuiltTeam(pkgId: string): Promise<void> {
+	if (!capabilityToken || !teamFactoryDraft) return;
+	const selectedModel = (agentModel.value || model.value).split("/");
+	if (selectedModel.length < 2) throw new Error("Select a model before reviewing the generated team");
+	const provider = selectedModel.shift()!;
+	const id = selectedModel.join("/");
+	const projectRoot = requiredElement<HTMLInputElement>("agent-project-root").value.trim();
+	const response = await fetch(`/agent-team-factory/prepare?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ pkgId, projectRoot, model: { provider, id } }),
+	});
+	if (!response.ok) throw new Error(await responseError(response, "Could not bind the generated team locally"));
+	const value: unknown = await response.json();
+	if (!isJsonObject(value) || !isPiAgentTeamPreview(value.preview))
+		throw new Error("Pi returned an invalid generated team review");
+	pendingTeamPackage = { bundle: value.bundle, bindings: value.bindings, preview: value.preview };
+	teamFactoryDraft.messages.push({
+		role: "assistant",
+		text: "Canonical package ready. Review its members, model, access, and workspace before launch.",
+	});
+	persistTeamFactoryDraft();
+	setStatus("Team package ready to review");
+}
+
+function teamFactoryAccepted(value: unknown): { operation: TeamFactoryOperation; sessionId?: string } {
+	if (!isJsonObject(value)) throw new Error("WTK returned an invalid accepted operation");
+	return {
+		operation: teamFactoryOperation(value.operation),
+		...(typeof value.sessionId === "string" ? { sessionId: value.sessionId } : {}),
+	};
+}
+
+function teamFactoryOperation(value: unknown): TeamFactoryOperation {
+	if (!isJsonObject(value) || typeof value.id !== "string" || typeof value.status !== "string") {
+		throw new Error("WTK returned an invalid operation");
+	}
+	if (!["queued", "running", "paused", "succeeded", "failed", "cancelled"].includes(value.status)) {
+		throw new Error(`WTK returned unsupported status ${value.status}`);
+	}
+	return {
+		id: value.id,
+		status: value.status as TeamFactoryOperation["status"],
+		...(value.result !== undefined ? { result: value.result } : {}),
+		...(isJsonObject(value.error) && typeof value.error.message === "string"
+			? { error: { message: value.error.message } }
+			: {}),
+		...(isJsonObject(value.progress) && typeof value.progress.message === "string"
+			? { progress: { message: value.progress.message } }
+			: {}),
+	};
+}
+
+function persistTeamFactoryDraft(): void {
+	if (teamFactoryDraft) localStorage.setItem("pi-team-factory-draft-v1", JSON.stringify(teamFactoryDraft));
+	else localStorage.removeItem("pi-team-factory-draft-v1");
+}
+
+function readStoredTeamFactoryDraft(): TeamFactoryDraft | undefined {
+	try {
+		const raw = localStorage.getItem("pi-team-factory-draft-v1");
+		if (!raw) return undefined;
+		const value: unknown = JSON.parse(raw);
+		if (!isJsonObject(value) || !Array.isArray(value.messages) || typeof value.phase !== "string") return undefined;
+		const phases: TeamFactoryPhase[] = ["intake", "research", "build", "deliver", "prepare", "failed"];
+		if (!phases.includes(value.phase as TeamFactoryPhase)) return undefined;
+		const messages = value.messages.filter(
+			(message): message is { role: "user" | "assistant"; text: string } =>
+				isJsonObject(message) &&
+				(message.role === "user" || message.role === "assistant") &&
+				typeof message.text === "string",
+		);
+		return {
+			phase: value.phase as TeamFactoryPhase,
+			messages,
+			...(typeof value.sessionId === "string" ? { sessionId: value.sessionId } : {}),
+			...(typeof value.operationId === "string" ? { operationId: value.operationId } : {}),
+			...(typeof value.pkgId === "string" ? { pkgId: value.pkgId } : {}),
+			...(typeof value.reviewReady === "boolean" ? { reviewReady: value.reviewReady } : {}),
+			...(typeof value.paused === "boolean" ? { paused: value.paused } : {}),
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function typeStringValue(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPiAgentTeamPreview(value: unknown): value is PiAgentTeamPreview {
+	if (!isJsonObject(value) || value.schemaVersion !== "pi.agents.team-preview.v1") return false;
+	if (typeof value.approvalDigest !== "string" || !isJsonObject(value.team) || !isJsonObject(value.bindings)) {
+		return false;
+	}
+	return (
+		typeof value.team.name === "string" &&
+		typeof value.team.coordinatorRoleId === "string" &&
+		Array.isArray(value.team.roles) &&
+		isJsonObject(value.team.workflow) &&
+		typeof value.bindings.projectRoot === "string" &&
+		Array.isArray(value.bindings.credentialRefs)
+	);
+}
+
+function teamLaunchCoordinatorAgentId(value: unknown): string {
+	if (!isJsonObject(value) || !isJsonObject(value.target) || typeof value.target.coordinatorAgentId !== "string") {
+		throw new Error("Pi returned an invalid team launch result");
+	}
+	return value.target.coordinatorAgentId;
 }
 
 function builderDisplayItem(item: TranscriptItem): TranscriptItem {
@@ -5284,15 +6124,23 @@ function loadAgents(): Promise<void> {
 
 async function loadAgentsNow(): Promise<void> {
 	if (!capabilityToken) return;
-	const response = await fetch(`/agents.json?token=${encodeURIComponent(capabilityToken)}`);
+	const [response, buildsResponse] = await Promise.all([
+		fetch(`/agents.json?token=${encodeURIComponent(capabilityToken)}`),
+		fetch(`/agent-builds.json?token=${encodeURIComponent(capabilityToken)}`),
+	]);
 	if (!response.ok) throw new Error(`Could not load agents: HTTP ${response.status}`);
+	if (!buildsResponse.ok) throw new Error(`Could not load agent drafts: HTTP ${buildsResponse.status}`);
 	const payload: unknown = await response.json();
+	const buildsPayload: unknown = await buildsResponse.json();
 	if (!isAgentList(payload)) throw new Error("Agent registry returned an invalid response");
+	if (!isAgentBuildList(buildsPayload)) throw new Error("Agent build service returned an invalid response");
 	agents = payload.agents;
+	agentBuilds = buildsPayload.builds;
 	for (let index = openAgentIds.length - 1; index >= 0; index -= 1) {
 		if (!agents.some((agent) => agent.id === openAgentIds[index])) openAgentIds.splice(index, 1);
 	}
 	agentList.replaceChildren(
+		...agentBuilds.filter((build) => !build.agentId).map(renderAgentBuildDraftCard),
 		...payload.agents.map((agent) => {
 			const card = document.createElement("div");
 			card.className = "agent-entry-card";
@@ -5335,6 +6183,10 @@ async function loadAgentsNow(): Promise<void> {
 			edit.type = "button";
 			edit.textContent = "Edit";
 			edit.addEventListener("click", () => void openAgentBuilder(agent));
+			const improve = document.createElement("button");
+			improve.type = "button";
+			improve.textContent = "Improve";
+			improve.addEventListener("click", () => openAgentImprovementReview(agent));
 			const duplicate = document.createElement("button");
 			duplicate.type = "button";
 			duplicate.textContent = "Duplicate";
@@ -5355,7 +6207,7 @@ async function loadAgentsNow(): Promise<void> {
 						setStatus(error instanceof Error ? error.message : String(error), true),
 					),
 			);
-			actions.append(edit, duplicate, remove);
+			actions.append(edit, improve, duplicate, remove);
 			menu.append(menuButton, actions);
 			card.append(button, menu);
 			return card;
@@ -5365,6 +6217,43 @@ async function loadAgentsNow(): Promise<void> {
 	refreshWorkflowEditorOptions();
 	renderSessionNavigation();
 	await loadAgentActivity();
+}
+
+function renderAgentBuildDraftCard(build: AgentBuildRecord): HTMLElement {
+	const card = document.createElement("div");
+	card.className = "agent-entry-card agent-draft-card";
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "nav-item agent-entry";
+	button.title = build.objective;
+	const icon = document.createElement("span");
+	icon.className = "agent-icon";
+	icon.textContent = "○";
+	const copy = document.createElement("span");
+	const name = document.createElement("strong");
+	name.className = "agent-name";
+	name.textContent = build.name;
+	const state = document.createElement("small");
+	state.textContent = "Draft";
+	copy.append(name, state);
+	button.append(icon, copy);
+	button.addEventListener("click", () => void resumeAgentBuildDraft(build));
+	card.append(button);
+	return card;
+}
+
+async function resumeAgentBuildDraft(build: AgentBuildRecord): Promise<void> {
+	await openAgentBuilder();
+	activeAgentBuild = build;
+	requiredElement<HTMLInputElement>("agent-name").value = build.name;
+	requiredElement<HTMLTextAreaElement>("agent-description").value = build.objective.startsWith("Refine the purpose")
+		? ""
+		: build.objective;
+	requiredElement<HTMLInputElement>("agent-project-root").value = build.projectRoot;
+	updateAgentBuilderReadiness();
+	if (session?.snapshot) renderBuilderConversation(session.snapshot);
+	input.focus();
+	setStatus(`Resumed draft ${build.name}`);
 }
 
 function closeAgentMenus(except?: HTMLDetailsElement): void {
@@ -5454,6 +6343,13 @@ function isAgentList(value: unknown): value is { agents: AgentSummary[] } {
 			"schedules" in entry &&
 			Array.isArray(entry.schedules),
 	);
+}
+
+function isAgentBuildList(value: unknown): value is { builds: AgentBuildRecord[] } {
+	if (typeof value !== "object" || value === null || !("builds" in value) || !Array.isArray(value.builds)) {
+		return false;
+	}
+	return value.builds.every(isAgentBuildRecord);
 }
 
 async function loadPersonas(): Promise<void> {
@@ -5952,6 +6848,112 @@ function validateAgentBuilder(): boolean {
 	return false;
 }
 
+function agentBuildDraftInput(): { name: string; objective: string; projectRoot: string } | undefined {
+	const name = requiredElement<HTMLInputElement>("agent-name").value.trim();
+	const projectRoot = requiredElement<HTMLInputElement>("agent-project-root").value.trim();
+	if (!name || !projectRoot) return undefined;
+	const description = requiredElement<HTMLTextAreaElement>("agent-description").value.trim();
+	return {
+		name,
+		objective: description || `Refine the purpose and expected outcome of ${name}.`,
+		projectRoot,
+	};
+}
+
+function scheduleAgentBuildDraftPersistence(): void {
+	if (activeAgentBuild?.agentId) return;
+	if (agentBuildDraftTimer !== undefined) window.clearTimeout(agentBuildDraftTimer);
+	agentBuildDraftTimer = window.setTimeout(() => {
+		agentBuildDraftTimer = undefined;
+		void persistAgentBuildDraft().catch((error: unknown) =>
+			setStatus(error instanceof Error ? error.message : String(error), true),
+		);
+	}, 350);
+}
+
+async function persistAgentBuildDraft(): Promise<void> {
+	if (!capabilityToken || activeAgentBuild?.agentId) return;
+	const draft = agentBuildDraftInput();
+	if (!draft) return;
+	const path = activeAgentBuild ? `/agent-builds/${encodeURIComponent(activeAgentBuild.id)}` : "/agent-builds/draft";
+	const response = await fetch(`${path}?token=${encodeURIComponent(capabilityToken)}`, {
+		method: activeAgentBuild ? "PUT" : "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(draft),
+	});
+	if (!response.ok) throw new Error(await responseError(response, "Could not save agent draft"));
+	const payload: unknown = await response.json();
+	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid draft");
+	activeAgentBuild = payload;
+	if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
+}
+
+async function loadAgentBuildForAgent(agentId: string): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(`/agent-builds/for-agent?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ agentId }),
+	});
+	if (!response.ok) throw new Error(await responseError(response, "Could not load agent build lifecycle"));
+	const payload: unknown = await response.json();
+	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid record");
+	activeAgentBuild = payload;
+}
+
+async function linkActiveAgentBuild(agentId: string): Promise<void> {
+	if (!capabilityToken) return;
+	if (!activeAgentBuild) {
+		await loadAgentBuildForAgent(agentId);
+		return;
+	}
+	const response = await fetch(
+		`/agent-builds/${encodeURIComponent(activeAgentBuild.id)}/link-agent?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ agentId }),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not link the agent build"));
+	const payload: unknown = await response.json();
+	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid record");
+	activeAgentBuild = payload;
+}
+
+async function refreshActiveAgentBuild(): Promise<void> {
+	if (!capabilityToken || !activeAgentBuild) return;
+	const response = await fetch(
+		`/agent-builds/${encodeURIComponent(activeAgentBuild.id)}?token=${encodeURIComponent(capabilityToken)}`,
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not refresh agent build lifecycle"));
+	const payload: unknown = await response.json();
+	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid record");
+	activeAgentBuild = payload;
+	if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
+}
+
+function isAgentBuildRecord(value: unknown): value is AgentBuildRecord {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const record = value as Partial<AgentBuildRecord>;
+	return (
+		typeof record.id === "string" &&
+		typeof record.name === "string" &&
+		typeof record.objective === "string" &&
+		typeof record.projectRoot === "string" &&
+		[
+			"draft",
+			"ready-to-test",
+			"testing",
+			"proof-ready",
+			"needs-refinement",
+			"proven",
+			"promoted",
+			"automated",
+		].includes(String(record.stage))
+	);
+}
+
 function applyLatestAgentBuilderDraft(snapshot: SessionSnapshot): void {
 	const encoded = latestAgentBuilderDraftFromSnapshot(snapshot);
 	if (!encoded || encoded === lastAppliedBuilderDraft) return;
@@ -6009,6 +7011,7 @@ function applyAgentBuilderDraft(encoded: string): void {
 	updateAgentBuilderReadiness();
 	element("builder-title").textContent = requiredElement<HTMLInputElement>("agent-name").value || "Build a new agent";
 	void loadCapabilities().catch(() => {});
+	scheduleAgentBuildDraftPersistence();
 	setStatus(
 		warnings.length > 0
 			? `Agent Builder applied the valid draft fields. ${warnings.join(". ")}.`
@@ -6763,9 +7766,22 @@ function closeArtifactTab(artifactId: string): void {
 	renderAttachments();
 }
 
-async function openAgentBuilder(agent?: AgentSummary, showConversation = true): Promise<void> {
+async function openAgentBuilder(
+	agent?: AgentSummary,
+	showConversation = true,
+	improvement?: AgentImprovementContext,
+): Promise<void> {
 	activeSidebarAgent = agent;
+	activeAgentImprovement = improvement;
+	teamFactoryAvailable = false;
+	pendingTeamPackage = undefined;
+	teamLaunchBusy = false;
 	agentBuilderFeedback = "";
+	activeAgentBuild = undefined;
+	if (agentBuildDraftTimer !== undefined) window.clearTimeout(agentBuildDraftTimer);
+	if (agentBuildPollTimer !== undefined) window.clearTimeout(agentBuildPollTimer);
+	agentBuildDraftTimer = undefined;
+	agentBuildPollTimer = undefined;
 	agentForm.reset();
 	const catalogAgent = agent?.source === "pi-agent";
 	requiredElement<HTMLInputElement>("agent-id").value = agent?.id ?? "";
@@ -6835,11 +7851,25 @@ async function openAgentBuilder(agent?: AgentSummary, showConversation = true): 
 	renderSessionNavigation();
 	refreshRoutineEditorOptions();
 	clearRoutineEditor();
-	await Promise.all([loadCapabilities(), loadRoutines()]).catch(() => {});
+	await Promise.all([
+		loadCapabilities(),
+		loadRoutines(),
+		loadTeamFactoryStatus(),
+		agent ? loadAgentBuildForAgent(agent.id) : Promise.resolve(),
+	]).catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+	if (session?.snapshot) renderBuilderConversation(session.snapshot);
 }
 
 function closeBuilderChat(): void {
 	builderActive = false;
+	activeAgentImprovement = undefined;
+	activeAgentBuild = undefined;
+	if (agentBuildDraftTimer !== undefined) window.clearTimeout(agentBuildDraftTimer);
+	if (agentBuildPollTimer !== undefined) window.clearTimeout(agentBuildPollTimer);
+	agentBuildDraftTimer = undefined;
+	agentBuildPollTimer = undefined;
+	pendingTeamPackage = undefined;
+	teamLaunchBusy = false;
 	activeSidebarAgent = undefined;
 	activateTab("agents-workspace");
 	mobilePanelNone.checked = true;
@@ -6863,15 +7893,20 @@ function loadSelectedAgent(): Promise<void> {
 }
 
 async function loadSelectedAgentNow(agent: AgentSummary, token: string): Promise<void> {
-	const conversationsResponse = await fetch(
-		`/agent-conversations.json?agentId=${encodeURIComponent(agent.id)}&token=${encodeURIComponent(token)}`,
-	);
+	const [conversationsResponse, teamResponse] = await Promise.all([
+		fetch(`/agent-conversations.json?agentId=${encodeURIComponent(agent.id)}&token=${encodeURIComponent(token)}`),
+		fetch(`/agent-teams?coordinatorAgentId=${encodeURIComponent(agent.id)}&token=${encodeURIComponent(token)}`),
+	]);
 	if (!conversationsResponse.ok)
 		throw new Error(await responseError(conversationsResponse, "Could not load agent conversation"));
+	if (!teamResponse.ok) throw new Error(await responseError(teamResponse, "Could not load agent team state"));
+	const teamPayload: unknown = await teamResponse.json();
+	if (!isAgentTeamState(teamPayload)) throw new Error("Agent team service returned an invalid response");
+	agentTeamStates.set(agent.id, teamPayload);
 	const conversationsPayload: unknown = await conversationsResponse.json();
 	const conversationId = conversationIdFromPayload(conversationsPayload);
 	let messages: AgentMessageSummary[] = [];
-	if (conversationId) {
+	if (conversationId && !teamPayload.installed) {
 		const messagesResponse = await fetch(
 			`/agent-conversations/${encodeURIComponent(conversationId)}/messages?token=${encodeURIComponent(token)}`,
 		);
@@ -6879,28 +7914,33 @@ async function loadSelectedAgentNow(agent: AgentSummary, token: string): Promise
 		const payload: unknown = await messagesResponse.json();
 		messages = messagesFromPayload(payload);
 	}
-	if (conversationId) agentConversationIds.set(agent.id, conversationId);
+	if (conversationId && !teamPayload.installed) agentConversationIds.set(agent.id, conversationId);
 	else agentConversationIds.delete(agent.id);
 	const tasks = await loadAgentTasks(agent);
-	if (activeAgentId === agent.id) renderAgentConversation(agent, messages, tasks);
+	if (activeAgentId === agent.id) renderAgentConversation(agent, messages, tasks, teamPayload);
 }
 
 function renderAgentConversation(
 	agent: AgentSummary,
 	messages: AgentMessageSummary[],
 	tasks: AgentTaskSummary[],
+	teamState: AgentTeamState,
 ): void {
 	const activeTask = tasks.find((task) =>
 		["queued", "running", "waiting_for_approval", "waiting_for_input", "stopping"].includes(task.status),
 	);
-	const items = messages.map((message) =>
-		renderAgentMessage(
-			agent,
-			message,
-			tasks.find((task) => task.id === message.taskId),
+	const activeTeamRun = teamState.team?.runs.find((run) => run.status === "running");
+	const items = [
+		...(teamState.team?.runs ?? []).flatMap((run, index) => renderAgentTeamRun(run, index > 0)),
+		...messages.map((message) =>
+			renderAgentMessage(
+				agent,
+				message,
+				tasks.find((task) => task.id === message.taskId),
+			),
 		),
-	);
-	if (activeTask) {
+	];
+	if (activeTask && !teamState.installed) {
 		const running = document.createElement("article");
 		running.className = "message assistant agent-running";
 		const dot = document.createElement("i");
@@ -6916,9 +7956,9 @@ function renderAgentConversation(
 	}
 	transcript.replaceChildren(...items);
 	transcript.scrollTop = transcript.scrollHeight;
-	phase.textContent = activeTask ? agentTaskPhase(activeTask) : "idle";
-	send.classList.toggle("is-stopping", Boolean(activeTask));
-	send.setAttribute("aria-label", activeTask ? `Stop ${agent.name}` : `Message ${agent.name}`);
+	phase.textContent = activeTeamRun ? "team running" : activeTask ? agentTaskPhase(activeTask) : "idle";
+	send.classList.toggle("is-stopping", Boolean(activeTask || activeTeamRun));
+	send.setAttribute("aria-label", activeTask || activeTeamRun ? `Stop ${agent.name}` : `Message ${agent.name}`);
 	input.placeholder = `Message ${agent.name}…`;
 	input.disabled = false;
 	send.disabled = false;
@@ -6936,12 +7976,63 @@ function renderAgentConversation(
 	}
 	thinking.value = agent.thinking ?? session?.snapshot?.thinkingLevel ?? "off";
 	updateThinkingLevelAvailability(thinking, model.value, thinking.value as ThinkingLevel);
-	setSessionPath(agent.projectRoot, agent.source === "managed" && activeTask === undefined);
-	sessionStats.textContent = activeTask
-		? `${agent.name} · ${agentTaskPhase(activeTask)}${activeTask.lastActivityAt ? ` · ${activityAge(activeTask.lastActivityAt)}` : ""}`
-		: agent.name;
-	sessionStats.title = "Active agent conversation";
-	setStatus(activeTask ? `${agent.name} is running a task` : agent.projectRoot);
+	setSessionPath(agent.projectRoot, agent.source === "managed" && activeTask === undefined && !activeTeamRun);
+	sessionStats.textContent = activeTeamRun
+		? `${teamState.team?.workflow.name ?? agent.name} · team running`
+		: activeTask
+			? `${agent.name} · ${agentTaskPhase(activeTask)}${activeTask.lastActivityAt ? ` · ${activityAge(activeTask.lastActivityAt)}` : ""}`
+			: agent.name;
+	sessionStats.title = teamState.installed ? "Active team conversation" : "Active agent conversation";
+	setStatus(
+		activeTeamRun
+			? `${teamState.team?.workflow.name ?? agent.name} is running`
+			: activeTask
+				? `${agent.name} is running a task`
+				: agent.projectRoot,
+	);
+}
+
+function renderAgentTeamRun(run: AgentTeamRun, historical: boolean): HTMLElement[] {
+	if (historical) {
+		const article = document.createElement("article");
+		article.className = "message assistant agent-team-history";
+		const disclosure = document.createElement("details");
+		const summary = document.createElement("summary");
+		const date = new Date(run.createdAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+		summary.textContent = `${run.status} · ${date} · ${run.prompt.slice(0, 80)}${run.prompt.length > 80 ? "…" : ""}`;
+		const body = document.createElement("div");
+		body.className = "agent-message-content";
+		appendText(body, run.prompt, "muted");
+		if (run.result) appendAgentMarkdown(body, run.result);
+		else appendText(body, run.error ?? "The team run did not produce a result.", "run-error");
+		disclosure.append(summary, body);
+		article.append(disclosure);
+		return [article];
+	}
+	const request = document.createElement("article");
+	request.className = "message user";
+	appendText(request, "you", "message-label");
+	const requestBody = document.createElement("div");
+	requestBody.className = "agent-message-content";
+	appendAgentMarkdown(requestBody, run.prompt);
+	request.append(requestBody);
+
+	const response = document.createElement("article");
+	response.className = "message assistant agent-team-run";
+	appendText(response, run.status === "running" ? "team · running" : `team · ${run.status}`, "message-label");
+	const body = document.createElement("div");
+	body.className = "agent-message-content";
+	if (run.status === "running") {
+		for (const node of run.nodes) {
+			const line = document.createElement("p");
+			line.className = `agent-team-node agent-team-node-${node.status}`;
+			line.textContent = `${node.label} · ${node.progress ?? node.status}`;
+			body.append(line);
+		}
+	} else if (run.result) appendAgentMarkdown(body, run.result);
+	else appendText(body, run.error ?? "The team run did not produce a result.", "run-error");
+	response.append(body);
+	return [request, response];
 }
 
 function agentTaskPhase(task: AgentTaskSummary): string {
@@ -7237,6 +8328,16 @@ function renderAttentionEntry(item: AttentionSummary, tasks: AgentTaskSummary[])
 		retry.addEventListener("click", () => void retryAgentTask(task.id));
 		row.append(retry);
 	}
+	if ((item.kind === "failure" || item.kind === "completed") && task && agent) {
+		const improve = document.createElement("button");
+		improve.type = "button";
+		improve.className = "attention-inline-action";
+		improve.textContent = "↑";
+		improve.title = item.kind === "failure" ? "Repair agent from this run" : "Improve agent from this run";
+		improve.setAttribute("aria-label", `${improve.title}: ${item.title}`);
+		improve.addEventListener("click", () => openAgentImprovementReview(agent, task));
+		row.append(improve);
+	}
 	if (item.kind === "failure" || item.kind === "completed") {
 		const dismiss = document.createElement("button");
 		dismiss.type = "button";
@@ -7248,6 +8349,245 @@ function renderAttentionEntry(item: AttentionSummary, tasks: AgentTaskSummary[])
 		row.append(dismiss);
 	}
 	return row;
+}
+
+function improvementRoute(task: AgentTaskSummary | undefined): AgentImprovementContext["route"] {
+	if (task?.status === "completed") return "refine";
+	if (task && ["failed", "cancelled", "interrupted"].includes(task.status)) return "repair";
+	return "diagnose";
+}
+
+function improvementRouteLabel(route: AgentImprovementContext["route"]): string {
+	if (route === "repair") return "Repair";
+	if (route === "refine") return "Refine";
+	return "Assess";
+}
+
+function openAgentImprovementReview(agent: AgentSummary, task?: AgentTaskSummary): void {
+	const route = improvementRoute(task);
+	const dialog = document.createElement("dialog");
+	dialog.className = "promotion-dialog";
+	const form = document.createElement("form");
+	form.method = "dialog";
+	const heading = document.createElement("strong");
+	heading.textContent = `${improvementRouteLabel(route)} ${agent.name}`;
+	const explanation = document.createElement("p");
+	explanation.className = "muted";
+	explanation.textContent =
+		route === "repair"
+			? "Pi will use the failed run as evidence and preserve the current agent until you approve a repair."
+			: route === "refine"
+				? "Pi will compare a candidate against the successful baseline. A passing candidate is not applied automatically."
+				: "Pi will assess the current agent before deciding whether it needs repair or refinement.";
+	const objective = document.createElement("textarea");
+	objective.required = true;
+	objective.maxLength = 2_048;
+	objective.value = task
+		? `${route === "repair" ? "Fix" : "Improve"} the selected ${task.status} run: ${boundedTaskEvidence(task.prompt, 240)}`
+		: `Improve ${agent.name} while preserving its existing successful behavior.`;
+	const successCriteria = document.createElement("textarea");
+	successCriteria.required = true;
+	successCriteria.maxLength = 2_048;
+	successCriteria.placeholder = "Describe the observable result that would prove the improvement worked.";
+	const scope = document.createElement("select");
+	for (const [value, label] of [
+		["auto", "Let Pi choose agent or team"],
+		["agent", "Keep this a single agent"],
+		["team", "Evaluate an agent team"],
+	] as const) {
+		const option = document.createElement("option");
+		option.value = value;
+		option.textContent = label;
+		scope.append(option);
+	}
+	const field = (label: string, control: HTMLTextAreaElement | HTMLSelectElement): HTMLLabelElement => {
+		const wrapper = document.createElement("label");
+		wrapper.append(document.createTextNode(label), control);
+		return wrapper;
+	};
+	const actions = document.createElement("div");
+	actions.className = "promotion-actions";
+	const cancel = document.createElement("button");
+	cancel.type = "button";
+	cancel.className = "secondary-action";
+	cancel.textContent = "Cancel";
+	cancel.addEventListener("click", () => dialog.close());
+	const start = document.createElement("button");
+	start.type = "submit";
+	start.textContent = "Start improvement";
+	actions.append(cancel, start);
+	form.append(
+		heading,
+		explanation,
+		field("Improvement goal", objective),
+		field("Success criteria", successCriteria),
+		field("Execution scope", scope),
+		actions,
+	);
+	form.addEventListener("submit", (event) => {
+		event.preventDefault();
+		if (!form.reportValidity()) return;
+		const context: AgentImprovementContext = {
+			route,
+			scope: scope.value as AgentImprovementContext["scope"],
+			objective: objective.value.trim(),
+			successCriteria: successCriteria.value.trim(),
+			baselineRevision: agent.revision,
+			task: task
+				? {
+						id: task.id,
+						status: task.status,
+						prompt: task.prompt,
+						attemptIds: task.attemptIds,
+						result: task.result,
+						error: task.error,
+					}
+				: undefined,
+		};
+		dialog.close();
+		void openAgentBuilder(agent, true, context).then(() => {
+			input.value = `Propose the smallest reviewed change that meets this improvement goal: ${context.objective}`;
+			resizeComposer();
+			input.focus();
+			setStatus("Improvement brief ready. Review the request, then send it to Pi.");
+		});
+	});
+	dialog.addEventListener("close", () => dialog.remove());
+	dialog.append(form);
+	document.body.append(dialog);
+	dialog.showModal();
+	objective.focus();
+}
+
+function openSkillPromotionReview(task: AgentTaskSummary, agent: AgentSummary): void {
+	const runId = task.attemptIds.at(-1);
+	if (!runId || !capabilityToken) {
+		setStatus("The successful worker result is unavailable for promotion", true);
+		return;
+	}
+	const dialog = document.createElement("dialog");
+	dialog.className = "promotion-dialog";
+	const form = document.createElement("form");
+	form.method = "dialog";
+	const heading = document.createElement("strong");
+	heading.textContent = "Create a reusable skill";
+	const explanation = document.createElement("p");
+	explanation.className = "muted";
+	explanation.textContent = `Review what ${agent.name} should repeat before saving it to Pi's local skill catalog.`;
+	const name = document.createElement("input");
+	name.required = true;
+	name.pattern = "[a-z0-9]+(?:-[a-z0-9]+)*";
+	name.maxLength = 64;
+	name.value = skillNameFromTask(agent, task);
+	const description = document.createElement("textarea");
+	description.required = true;
+	description.maxLength = 1_024;
+	description.value = `Repeat the reviewed ${agent.name} workflow for similar requests.`;
+	const instructions = document.createElement("textarea");
+	instructions.required = true;
+	instructions.maxLength = 65_536;
+	instructions.value = [
+		"Perform this task using the same reviewed approach:",
+		"",
+		boundedTaskEvidence(task.prompt, 2_000),
+		"",
+		"Respect the active workspace and capability grants. Verify the result before reporting completion.",
+	].join("\n");
+	const result = document.createElement("details");
+	const resultSummary = document.createElement("summary");
+	resultSummary.textContent = "Successful result used as evidence";
+	const resultBody = document.createElement("pre");
+	resultBody.textContent = task.result ?? "The successful result is stored with the source run.";
+	result.append(resultSummary, resultBody);
+	const actions = document.createElement("div");
+	actions.className = "promotion-actions";
+	const field = (text: string, control: HTMLInputElement | HTMLTextAreaElement): HTMLLabelElement => {
+		const wrapper = document.createElement("label");
+		wrapper.append(document.createTextNode(text), control);
+		return wrapper;
+	};
+	const cancel = document.createElement("button");
+	cancel.type = "button";
+	cancel.className = "secondary-action";
+	cancel.textContent = "Cancel";
+	cancel.addEventListener("click", () => dialog.close());
+	const create = document.createElement("button");
+	create.type = "submit";
+	create.textContent = "Create skill";
+	actions.append(cancel, create);
+	form.append(
+		heading,
+		explanation,
+		field("Skill name", name),
+		field("When Pi should use it", description),
+		field("Reviewed instructions", instructions),
+		result,
+		actions,
+	);
+	form.addEventListener("submit", (event) => {
+		event.preventDefault();
+		if (!form.reportValidity()) return;
+		create.disabled = true;
+		void fetch(`/runs/${encodeURIComponent(runId)}/promote-skill?token=${encodeURIComponent(capabilityToken)}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ name: name.value, description: description.value, instructions: instructions.value }),
+		})
+			.then(async (response) => {
+				if (!response.ok) throw new Error(await responseError(response, "Could not create skill"));
+				dialog.close();
+				await Promise.all([loadCapabilities(), loadRoutines(), refreshActiveAgentBuild()]);
+				setStatus(`Skill ${name.value.trim()} created from the reviewed run`);
+			})
+			.catch((error: unknown) => {
+				create.disabled = false;
+				setStatus(error instanceof Error ? error.message : String(error), true);
+			});
+	});
+	dialog.addEventListener("close", () => dialog.remove());
+	dialog.append(form);
+	document.body.append(dialog);
+	dialog.showModal();
+	name.focus();
+	name.select();
+}
+
+function boundedTaskEvidence(value: string, maximumLength: number): string {
+	const withoutHandoff = value.split(/\s+Predecessor\s+[^:]+\s+result:/i, 1)[0] ?? value;
+	const compact = withoutHandoff.replace(/\s+/g, " ").trim();
+	return compact.length > maximumLength ? `${compact.slice(0, maximumLength - 1)}…` : compact;
+}
+
+function skillNameFromTask(agent: AgentSummary, task: AgentTaskSummary): string {
+	const promptFragment = task.prompt
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-|-$/g, "")
+		.slice(0, 36)
+		.replace(/-$/, "");
+	const agentFragment = agent.id
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-|-$/g, "")
+		.slice(0, 24)
+		.replace(/-$/, "");
+	return `${agentFragment || "agent"}-${promptFragment || "successful-run"}`.slice(0, 64).replace(/-$/, "");
+}
+
+async function stageRoutineFromTask(task: AgentTaskSummary, agent: AgentSummary): Promise<void> {
+	await openAgentBuilder(agent, false);
+	activateBuilderTab("builder-automation-panel");
+	clearRoutineEditor();
+	routineEditor.name.value = `${agent.name} routine`;
+	routineEditor.prompt.value = task.prompt;
+	routineEditor.targetKind.value = "agent";
+	routineEditor.agent.value = agent.id;
+	updateRoutineTargetFields();
+	if (agent.model) {
+		routineEditor.model.value = `${agent.model.provider}/${agent.model.id}`;
+		routineModelPicker.refresh();
+	}
+	setStatus("Review the schedule, then save it. It remains editable and can be run immediately.");
 }
 
 function attentionFromPayload(value: unknown): AttentionSummary[] {
@@ -7361,6 +8701,9 @@ function isAgentTaskList(value: unknown): value is { tasks: AgentTaskSummary[] }
 			].includes(String(entry.status)) &&
 			"createdAt" in entry &&
 			typeof entry.createdAt === "number" &&
+			"attemptIds" in entry &&
+			Array.isArray(entry.attemptIds) &&
+			entry.attemptIds.every((attemptId: unknown) => typeof attemptId === "string") &&
 			"artifactIds" in entry &&
 			Array.isArray(entry.artifactIds) &&
 			entry.artifactIds.every((artifactId: unknown) => typeof artifactId === "string") &&
@@ -8032,6 +9375,37 @@ interface WorkflowRunSummary {
 	error?: string;
 }
 
+interface AgentTeamState {
+	schemaVersion: "pi.agents.team-state.v1";
+	installed: boolean;
+	team?: {
+		bundleId: string;
+		packageId: string;
+		coordinatorAgentId: string;
+		agentIds: string[];
+		workflow: { id: string; name: string };
+		runs: AgentTeamRun[];
+	};
+}
+
+interface AgentTeamRun {
+	id: string;
+	status: "running" | "completed" | "failed" | "cancelled";
+	prompt: string;
+	createdAt: number;
+	finishedAt?: number;
+	result?: string;
+	error?: string;
+	nodes: Array<{
+		id: string;
+		label: string;
+		status: "queued" | "running" | "completed" | "failed" | "blocked";
+		progress?: string;
+		result?: string;
+		error?: string;
+	}>;
+}
+
 let workflows: WorkflowSummary[] = [];
 let workflowRuns: WorkflowRunSummary[] = [];
 
@@ -8131,6 +9505,46 @@ function isWorkflowPayload(value: unknown): value is { workflows: WorkflowSummar
 			typeof entry.name === "string" &&
 			"nodes" in entry &&
 			Array.isArray(entry.nodes),
+	);
+}
+
+function isAgentTeamState(value: unknown): value is AgentTeamState {
+	if (
+		typeof value !== "object" ||
+		value === null ||
+		!("schemaVersion" in value) ||
+		value.schemaVersion !== "pi.agents.team-state.v1" ||
+		!("installed" in value) ||
+		typeof value.installed !== "boolean"
+	) {
+		return false;
+	}
+	if (!value.installed) return true;
+	if (!("team" in value) || typeof value.team !== "object" || value.team === null) return false;
+	const team = value.team;
+	return (
+		"coordinatorAgentId" in team &&
+		typeof team.coordinatorAgentId === "string" &&
+		"workflow" in team &&
+		typeof team.workflow === "object" &&
+		team.workflow !== null &&
+		"id" in team.workflow &&
+		typeof team.workflow.id === "string" &&
+		"runs" in team &&
+		Array.isArray(team.runs) &&
+		team.runs.every(
+			(run) =>
+				typeof run === "object" &&
+				run !== null &&
+				"id" in run &&
+				typeof run.id === "string" &&
+				"status" in run &&
+				typeof run.status === "string" &&
+				"prompt" in run &&
+				typeof run.prompt === "string" &&
+				"nodes" in run &&
+				Array.isArray(run.nodes),
+		)
 	);
 }
 
@@ -8291,6 +9705,13 @@ async function submitBuilderComposer(): Promise<void> {
 	}
 	const prompt = input.value.trim();
 	if (!prompt) return;
+	if (!activeSidebarAgent && teamFactoryDraft) {
+		recordPromptHistory(prompt);
+		input.value = "";
+		resizeComposer();
+		await submitTeamFactory(prompt);
+		return;
+	}
 	if (/^(?:apply|save|confirm|proceed)(?:\s+(?:this|the))?\s+(?:update|change|draft)(?:\s+now)?[.!]?$/i.test(prompt)) {
 		const latestDraft = latestAgentBuilderDraftFromSnapshot(chatSession.snapshot);
 		if (latestDraft && latestDraft !== lastAppliedBuilderDraft) applyAgentBuilderDraft(latestDraft);
@@ -8308,10 +9729,37 @@ async function submitBuilderComposer(): Promise<void> {
 	input.value = "";
 	resizeComposer();
 	const editingExistingAgent = requiredElement<HTMLInputElement>("agent-id").value.length > 0;
+	const improvementContext = activeAgentImprovement
+		? [
+				`Improvement route: ${activeAgentImprovement.route}`,
+				`Improvement goal: ${activeAgentImprovement.objective}`,
+				`Success criteria: ${activeAgentImprovement.successCriteria}`,
+				`Execution scope: ${activeAgentImprovement.scope === "auto" ? "Decide whether one agent or a coordinated team is justified" : activeAgentImprovement.scope}`,
+				...(activeAgentImprovement.scope === "agent"
+					? []
+					: [
+							`Available agent roles: ${
+								agents
+									.filter((candidate) => candidate.id !== activeSidebarAgent?.id)
+									.map((candidate) => `${candidate.id} (${boundedTaskEvidence(candidate.description, 120)})`)
+									.join(", ") || "none"
+							}`,
+						]),
+				"Use a team only when distinct roles can work independently or provide a necessary review boundary. If required roles do not exist, describe them before changing delegate IDs.",
+				`Last-known-good agent revision: ${activeAgentImprovement.baselineRevision}`,
+				activeAgentImprovement.task
+					? `Retained run evidence: task ${activeAgentImprovement.task.id}; status ${activeAgentImprovement.task.status}; attempts ${activeAgentImprovement.task.attemptIds.join(", ") || "none"}; request ${boundedTaskEvidence(activeAgentImprovement.task.prompt, 2_000)}; result ${boundedTaskEvidence(activeAgentImprovement.task.result ?? "none", 2_000)}; error ${boundedTaskEvidence(activeAgentImprovement.task.error ?? "none", 1_000)}`
+					: "Retained run evidence: no specific run was selected; diagnose before proposing a change.",
+				"Preserve the current agent as the baseline. Propose a candidate only. Do not claim improvement without evidence against the stated success criteria.",
+			]
+		: [];
 	const message = [
 		agentBuilderBootstrapPrefix,
-		"Ask concise questions and recommend concrete settings. The visible configuration form remains the source of truth.",
+		"Work progressively. Start from the user's name and intended outcome, then ask at most one concise question only when it blocks the smallest useful draft.",
+		"Do not front-load persona, memory, model, tools, permissions, schedules, or team topology. Recommend each only when the concrete task requires it.",
+		"The visible configuration form remains the source of truth. The console persists the named draft independently of this conversation.",
 		"Do not call agent_deploy or modify agent files. Return a draft marker only; the user applies the reviewed form.",
+		"Never propose or create automation in this conversation. Pi unlocks that only after a one-time proof is reviewed, accepted, and promoted to a skill.",
 		editingExistingAgent
 			? "This is an edit. Include only fields the user explicitly requested to change; omit every unchanged field."
 			: "This is a new agent. Include every required field that is known and omit unknown optional fields.",
@@ -8330,6 +9778,8 @@ async function submitBuilderComposer(): Promise<void> {
 		`Current permission policy: ${requiredElement<HTMLSelectElement>("agent-permissions").value}`,
 		`Current browser access: ${requiredElement<HTMLSelectElement>("agent-browser-access").value}`,
 		`Current delegates: ${requiredElement<HTMLInputElement>("agent-delegates").value || "none"}`,
+		`Current build lifecycle: ${activeAgentBuild?.stage ?? "unnamed draft"}`,
+		...improvementContext,
 		`User request: ${prompt}`,
 	].join("\n");
 	try {
@@ -8347,6 +9797,18 @@ async function submitAgentComposer(agentId: string): Promise<void> {
 	if (!capabilityToken) return;
 	const agent = agents.find((entry) => entry.id === agentId);
 	if (!agent) throw new Error("The selected agent is unavailable");
+	const teamState = agentTeamStates.get(agentId);
+	const activeTeamRun = teamState?.team?.runs.find((run) => run.status === "running");
+	if (activeTeamRun) {
+		const response = await fetch(`/agent-teams/cancel?token=${encodeURIComponent(capabilityToken)}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ coordinatorAgentId: agentId, runId: activeTeamRun.id }),
+		});
+		if (!response.ok) throw new Error(await responseError(response, "Could not stop team run"));
+		await loadSelectedAgent();
+		return;
+	}
 	const activeTask = agentTasksByAgent
 		.get(agentId)
 		?.find((task) =>
@@ -8361,6 +9823,16 @@ async function submitAgentComposer(agentId: string): Promise<void> {
 	recordPromptHistory(prompt);
 	input.value = "";
 	resizeComposer();
+	if (teamState?.installed) {
+		const response = await fetch(`/agent-teams/run?token=${encodeURIComponent(capabilityToken)}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ coordinatorAgentId: agentId, prompt }),
+		});
+		if (!response.ok) throw new Error(await responseError(response, "Could not start team run"));
+		await loadSelectedAgent();
+		return;
+	}
 	const response = await fetch(`/agent-tasks?token=${encodeURIComponent(capabilityToken)}`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
@@ -8395,6 +9867,14 @@ attachmentInput.addEventListener("change", () => {
 	if (builderActive) return;
 	if (files.length === 0) return;
 	void uploadFiles(files).catch((error: unknown) =>
+		setStatus(error instanceof Error ? error.message : String(error), true),
+	);
+});
+teamPackageInput.addEventListener("change", () => {
+	const files = [...(teamPackageInput.files ?? [])];
+	teamPackageInput.value = "";
+	if (files.length === 0) return;
+	void prepareTeamPackageFiles(files).catch((error: unknown) =>
 		setStatus(error instanceof Error ? error.message : String(error), true),
 	);
 });
@@ -8796,13 +10276,16 @@ agentForm.addEventListener("submit", (event) => {
 				if (savedId) {
 					requiredElement<HTMLInputElement>("agent-id").value = savedId;
 					activeSidebarAgent = agents.find((entry) => entry.id === savedId) ?? activeSidebarAgent;
+					await linkActiveAgentBuild(savedId);
 				}
 				builderLabel = `Edit ${savedAgentName}`;
 				agentSubmit.textContent = "Apply and update agent";
 				agentCancel.textContent = "Cancel editing";
 				agentBuilderBaseline = agentBuilderDraftSignature();
 				agentBuilderFeedback = id ? `Agent ${savedAgentName} updated.` : `Agent ${savedAgentName} created.`;
+				activeAgentImprovement = undefined;
 				updateAgentBuilderReadiness();
+				if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
 				setStatus(agentBuilderFeedback);
 			})().catch((error: unknown) => {
 				setStatus(
@@ -8834,11 +10317,23 @@ requiredElement<HTMLSelectElement>("agent-browser-profile-kind").addEventListene
 	updateAgentBrowserProfileFields();
 	updateAgentBuilderReadiness();
 });
-agentForm.addEventListener("input", updateAgentBuilderReadiness);
-agentForm.addEventListener("change", updateAgentBuilderReadiness);
+agentForm.addEventListener("input", () => {
+	updateAgentBuilderReadiness();
+	scheduleAgentBuildDraftPersistence();
+});
+agentForm.addEventListener("change", () => {
+	updateAgentBuilderReadiness();
+	scheduleAgentBuildDraftPersistence();
+});
 for (const field of document.querySelectorAll<HTMLElement>('[form="agent-form"]')) {
-	field.addEventListener("input", updateAgentBuilderReadiness);
-	field.addEventListener("change", updateAgentBuilderReadiness);
+	field.addEventListener("input", () => {
+		updateAgentBuilderReadiness();
+		scheduleAgentBuildDraftPersistence();
+	});
+	field.addEventListener("change", () => {
+		updateAgentBuilderReadiness();
+		scheduleAgentBuildDraftPersistence();
+	});
 }
 
 pluginForm.addEventListener("submit", (event) => {
@@ -9067,13 +10562,23 @@ routineEditor.form.addEventListener("submit", (event) => {
 				? undefined
 				: routineEditor.cwd.value.trim() || undefined,
 	};
+	const automationConfirmed =
+		!definition.enabled ||
+		definition.target.kind !== "agent" ||
+		window.confirm(
+			`Enable ${definition.name} for ${activeSidebarAgent.name} using ${definition.timezone}? This will run without another prompt.`,
+		);
+	if (!automationConfirmed) {
+		setStatus("Schedule not enabled; review it and save when ready");
+		return;
+	}
 	const id = routineEditor.id.value;
 	void fetch(
 		`${id ? `/routines/${encodeURIComponent(id)}` : "/routines"}?token=${encodeURIComponent(capabilityToken)}`,
 		{
 			method: id ? "PUT" : "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify(definition),
+			body: JSON.stringify({ ...definition, automationConfirmed }),
 		},
 	)
 		.then(async (response) => {
@@ -9089,7 +10594,7 @@ routineEditor.form.addEventListener("submit", (event) => {
 				);
 			}
 			const saved: unknown = await response.json();
-			await loadRoutines();
+			await Promise.all([loadRoutines(), refreshActiveAgentBuild()]);
 			if (typeof saved === "object" && saved !== null && "id" in saved && typeof saved.id === "string") {
 				const routine = routines.find((entry) => entry.id === saved.id);
 				if (routine) editRoutine(routine);

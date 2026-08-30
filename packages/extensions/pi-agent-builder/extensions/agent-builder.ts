@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "../lib/agents.ts";
+import { scheduleAgent } from "./agent-schedule.ts";
 import { applyPersonaToAgent, fetchPersona } from "./persona.ts";
 
 const MEMORY_STRATEGIES = ["none", "notes", "mempalace"] as const;
@@ -79,7 +80,7 @@ const configureAgentTool = defineTool({
 	name: "configure_agent",
 	label: "Configure Agent",
 	description:
-		"Create or update a reusable local agent. Omitted fields remain unchanged. Use pi --serve for routines and workflows.",
+		"Create or update a reusable local agent. Omitted fields remain unchanged. Scheduling requires a user-confirmed cadence and replaces the existing schedule unless the user explicitly requests an additional one.",
 	parameters: Type.Object({
 		name: Type.String({ description: "Lowercase-kebab-case agent identifier" }),
 		description: Type.Optional(Type.String({ description: "One-line purpose" })),
@@ -88,6 +89,24 @@ const configureAgentTool = defineTool({
 		memory: Type.Optional(Type.Union(MEMORY_STRATEGIES.map((strategy) => Type.Literal(strategy)))),
 		persona: Type.Optional(Type.String({ description: "Persona catalog identifier, matched case-insensitively" })),
 		systemPrompt: Type.Optional(Type.String({ description: "Agent instructions" })),
+		scheduleTask: Type.Optional(
+			Type.String({ description: "Task for each scheduled run; requires an explicitly confirmed cadence" }),
+		),
+		scheduleCadence: Type.Optional(
+			Type.String({
+				description:
+					'User-confirmed cadence such as "daily 09:00", "weekly Mon 08:00", "hourly", or "every 30m"',
+			}),
+		),
+		scheduleConfirmed: Type.Optional(
+			Type.Boolean({ description: "Must be true only after the user explicitly selected or confirmed the cadence" }),
+		),
+		scheduleMode: Type.Optional(
+			Type.Union([Type.Literal("replace"), Type.Literal("additional")], {
+				description:
+					'"replace" keeps one schedule for the agent; use "additional" only when the user explicitly requests multiple schedules',
+			}),
+		),
 	}),
 	async execute(_toolCallId, parameters, _signal, _onUpdate, context) {
 		const name = validateAgentName(parameters.name);
@@ -119,6 +138,15 @@ const configureAgentTool = defineTool({
 			const personaBlock = body.match(/<!-- persona:start[\s\S]*<!-- persona:end -->\n?/)?.[0] ?? "";
 			body = `${parameters.systemPrompt.trim()}\n\n${personaBlock}`;
 		}
+		const hasScheduleTask = parameters.scheduleTask !== undefined;
+		const hasScheduleCadence = parameters.scheduleCadence !== undefined;
+		if (hasScheduleTask !== hasScheduleCadence) {
+			throw new Error("Scheduling requires both scheduleTask and scheduleCadence.");
+		}
+		if (hasScheduleTask && parameters.scheduleConfirmed !== true) {
+			throw new Error("Do not choose a schedule for the user. Ask them to select or confirm the cadence first.");
+		}
+
 		writeFileSync(filePath, `---\n${serializeFrontmatter(frontmatter)}\n---\n${body}`, "utf-8");
 
 		if (persona) {
@@ -129,7 +157,22 @@ const configureAgentTool = defineTool({
 
 		const action = existing ? "Updated" : "Created";
 		const personaResult = persona ? ` Applied persona "${persona.name}".` : "";
-		return { content: [{ type: "text", text: `${action} agent "${name}".${personaResult}` }], details: { filePath } };
+		let scheduleResult = "";
+		if (parameters.scheduleTask && parameters.scheduleCadence) {
+			const result = await scheduleAgent(
+				name,
+				parameters.scheduleTask,
+				parameters.scheduleCadence,
+				parameters.scheduleMode ?? "replace",
+			);
+			scheduleResult = result.unchanged
+				? ` Schedule "${result.manifest.taskName}" was already ${result.manifest.cadence}; no duplicate was created.`
+				: ` ${parameters.scheduleMode === "additional" ? "Added" : "Saved"} schedule "${result.manifest.taskName}" (${result.manifest.cadence}).${result.replaced > 0 ? ` Removed ${result.replaced} superseded schedule${result.replaced === 1 ? "" : "s"}.` : ""}`;
+		}
+		return {
+			content: [{ type: "text", text: `${action} agent "${name}".${personaResult}${scheduleResult}` }],
+			details: { filePath },
+		};
 	},
 });
 
