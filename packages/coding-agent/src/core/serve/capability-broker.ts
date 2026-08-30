@@ -427,6 +427,16 @@ const WAVE_TWO_DEFINITIONS: readonly CapabilityDefinition[] = [
 
 const WAVE_TWO_MANIFESTS: readonly CapabilityProviderManifest[] = [
 	{
+		id: "pi-public-web",
+		name: "Pi Public Web",
+		source: "builtin:pi-public-web",
+		version: "1",
+		permissions: ["bounded public network read"],
+		bindings: [
+			{ capabilityId: "web.fetch", capabilityVersion: 1, toolName: "page_read", executors: ["session", "harness"] },
+		],
+	},
+	{
 		id: "pi-everyday-data",
 		name: "Pi Everyday Data",
 		source: "builtin:pi-everyday-data",

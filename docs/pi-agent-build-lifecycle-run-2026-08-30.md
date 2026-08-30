@@ -404,3 +404,121 @@ After local execution access was restored, a broader focused run passed all
 serve-page test files. Two old UI-label assertions were updated to verify
 `Publish agent` and `Save candidate revision`. The full `npm run check`
 pipeline passed again with no formatting fixes required.
+
+## Fork-owned hardening and candidate refinement
+
+The follow-up implementation leaves inherited upstream Git-ref parsing,
+regular-expression, provider-hostname, and publishing-workflow findings deferred
+to upstream. It does not dismiss those security findings or claim they are fixed.
+
+Implemented locally:
+
+- A shared public HTTP reader enforces the 2 MB limit while streaming decoded
+  body bytes, a 30-second total deadline, caller cancellation, five redirects,
+  credential-free URLs, and public-address validation at actual socket DNS
+  resolution. Redirect, error, oversized, and interrupted bodies are cancelled.
+- Weather tools request JSON/GeoJSON explicitly. Named locations support
+  state/country constraints and reject ambiguous results; callers can provide
+  explicit coordinates. A malformed alert response is not an empty collection.
+- RSS/Atom parsing distinguishes empty feeds, malformed XML, and ordinary pages,
+  rejects document entities, uses bounded linear tag extraction for malformed
+  CDATA, and decodes one entity layer. `fast-xml-parser`
+  5.7.3 is an exact direct dependency; it was already present transitively.
+  Lockfile and distribution-lock regeneration changed only that dependency edge.
+- `page_read` retains exact URL, retrieval time, bounded static text, and a
+  truncation flag. It does not execute JavaScript or independently verify claims.
+  Its separate Pi Public Web capability starts quarantined and does not change
+  the existing Everyday Data provider's trust digest.
+- Windows `/cd` no longer passes project paths or arguments through `cmd.exe`.
+  Encoded PowerShell transports a data payload and starts the native executable
+  with Windows argument quoting. The intentionally visible interactive window is
+  retained; failure to start the launcher leaves the existing session open.
+- CI now supports manual dispatch, read-only repository permissions, no retained
+  checkout credential, the isolated `test.sh` runner, and a fork-only Windows
+  launcher regression job. Remote execution and required-check configuration
+  remain pending a committed/pushed review branch and a successful real CI run.
+
+Validation before the live proof:
+
+- Full `npm run check` passed, including browser, TypeScript and distribution locks.
+- 76 focused data, capability, lifecycle, registry, executor and serve-page tests passed.
+- All seven Windows project-launcher tests passed, including real native argument
+  round-tripping for spaces, quotes, metacharacters, Unicode, empty arguments,
+  trailing backslashes and newline characters.
+- Root `npm audit --json` reported zero known vulnerabilities across 418 dependencies.
+- Live read-only provider checks resolved Ozark, Missouri to 37.02089, -93.20602;
+  NWS returned a valid FeatureCollection; the official city home page returned text.
+
+The existing build was updated through the builder lifecycle API, not by editing
+the active agent definition. Active revision 2 remains unchanged; candidate
+revision 3 now uses Ozark city as its sole origin, explicit Missouri coordinates,
+exact page reads, honest alert semantics and qualified source evidence. Previous
+feedback and the failed proof are retained. No proof was accepted, no skill was
+promoted and no routine was created.
+
+The candidate's legacy email counters are explicitly scoped to the current
+non-email task: zero email messages and zero email actions, with a counts-context
+explanation. This avoids inventing tool or token counts. The proof also requires
+an actual successful alert receipt, so simply skipping the alert lookup cannot
+pass. Text-based counter checks are narrow regression checks, not a JSON-schema
+validator; source receipts likewise do not prove every claim in the report.
+
+The same proof prompt, `Create today's Ozark, Missouri outdoor brief`, was started
+as run `e6b168af-70c1-4b0d-8ae9-4bf44f834557`. The test server was restarted with
+the same authenticated links. Pre-proof report, index and state backups are in
+`C:\Users\bradj\AppData\Local\Temp\forkpi-fixes-20260830-a7f3`.
+
+### First repaired-provider proof: still rejected
+
+Run `e6b168af-70c1-4b0d-8ae9-4bf44f834557` succeeded at runtime. Eight machine
+checks passed: five exact-page receipts, no alert-tool errors, a successful
+official-alert receipt, three file writes, changed report, removal of the prior
+unsupported advisory label, and both zero-valued counters. The geography check
+failed: the new report still recommended Lake of the Ozarks as roughly 40 miles
+away and Springfield as south of Ozark. It also reused snippet-only facts and
+mislabelled UTC timestamps as local time. The lifecycle correctly kept it in
+`needs-refinement`; the three human-review checks remained unverified.
+
+An explicitly labelled automated review was retained as feedback, without human
+acceptance. A further candidate refinement prohibits reusing rejected factual
+content, preserves only its CSS/layout, names the known unverified destinations
+to omit, and requires a smaller report when exact evidence is unavailable. It
+also prohibits invented hourly weather and unsupported numerical safety claims.
+The identical proof task was restarted as
+`733a8e9a-5e0f-4ca1-884b-d5f1f9c5e303`; both earlier proof attempts remain archived.
+
+### Second proof: machine checks pass, outcome review still fails
+
+Run `733a8e9a-5e0f-4ca1-884b-d5f1f9c5e303` completed with all nine configured
+machine checks passing and three human checks unverified. The known distant-lake
+claim disappeared, five exact page reads succeeded, official alerts were parsed,
+the report changed, and the state counters remained numeric zero. The candidate
+therefore reached `proof-ready`, not accepted or promoted.
+
+Source review still found unsupported claims. The report's own evidence ledger
+admits that court details, fishing conditions, trail ratings and the Lions Club
+race rely on snippets or inference, yet its body and final summary describe them
+as verified. It also converts route directions starting in Springfield into an
+Ozark-origin mileage estimate. Most UTC labels improved, but some ledger entries
+still claim `21:20 CT`.
+
+Playwright review at 1440 x 900 found no horizontal overflow. At 390 x 844 the
+document width was 532 pixels: an unbroken RunSignup evidence URL overflowed.
+This is a generated-report regression, not a new Pi console layout defect.
+
+Artifacts:
+
+- `output/playwright/ozark-repaired-desktop.png`
+- `output/playwright/ozark-repaired-mobile.png`
+
+These failures were retained as explicitly labelled automated feedback, returning
+the build to `needs-refinement`. No human criteria were marked accepted. The
+remaining candidate work is claim-by-claim evidence reconciliation, truthful
+distance/time handling, and long-link wrapping with an actual mobile width test.
+No direct hand-edit of the generated report was used to make the test pass.
+
+The platform hardening has 83 focused tests passing in total (76 core and seven
+Windows tests), a passing full check pipeline, clean whitespace checks, and valid
+CI YAML with trigger/permission/runner/action-pin assertions. Remote CI and main
+branch protection are not yet established: no commit, push, PR, merge, or GitHub
+settings mutation was made in this implementation turn.

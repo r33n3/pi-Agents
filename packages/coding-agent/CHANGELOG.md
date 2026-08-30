@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added bounded static `page_read` source evidence and a separately reviewed Pi Public Web capability for sessions and isolated agents.
 - Added a progressive agent build lifecycle with durable drafts, one-time proof runs, retained result review, proof-gated skill promotion, and explicit automation confirmation.
 - Added canonical WTK agent-package validation, Pi runtime compilation, governed team launch, and retained qualification evidence integration.
 - Added web-console session directory, folder-derived session labels, and live token, cache, cost, and context usage around the composer.
@@ -29,6 +30,8 @@
 
 ### Fixed
 
+- Bounded everyday provider downloads across redirects, DNS resolution, headers, and streamed bodies; rejected private DNS answers and credential-bearing URLs.
+- Fixed weather format negotiation and ambiguous location selection, and distinguished valid empty feeds from malformed or non-feed pages with single-pass entity decoding.
 - Updated vulnerable transitive dependencies in the sandbox and Gondolin extension examples to `shell-quote` 1.10.0 and `undici` 6.28.0.
 - Fixed browser access-policy blocks appearing as unexplained generic Chromium network failures in managed-browser diagnostics.
 - Fixed slow web-console reconnects and agent saves by bounding transcript rendering, coalescing active-panel refreshes, and moving secondary agent catalog updates into the background.
