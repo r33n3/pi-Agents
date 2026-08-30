@@ -6,6 +6,8 @@
 
 - Fixed session create and attach responses broadcasting a duplicate initial transcript snapshot to the connecting client.
 
+## [0.84.4] - 2026-08-28
+
 ## [0.84.3] - 2026-08-24
 
 ## [0.84.2] - 2026-08-14
