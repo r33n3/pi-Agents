@@ -110,15 +110,18 @@ describe("AgentTaskService", () => {
 		await tasks.dispose();
 	});
 
-	test("marks an interrupted task failed during restart recovery", async () => {
+	test("marks an active task interrupted during restart recovery", async () => {
 		const { root, registry, runs, tasks } = await setup();
 		const task = await tasks.submit({ agentId: "researcher", prompt: "Long job", source: "pi" });
 		const restored = new AgentTaskService(registry, runs, join(root, "tasks"));
 		await restored.initialize();
 		expect(restored.getTask(task.id)).toMatchObject({
-			status: "failed",
-			error: "Serve host stopped before the task completed",
+			status: "interrupted",
+			error: "Serve host stopped before the local attempt completed",
 		});
+		expect(restored.listAttention("open")).toMatchObject([
+			{ taskId: task.id, kind: "failure", title: "Run interrupted" },
+		]);
 		await restored.dispose();
 		await tasks.cancel(task.id);
 		await tasks.dispose();

@@ -75,5 +75,11 @@ for name in CI GITHUB_ACTIONS; do
 	[[ -z "$value" ]] || test_env+=("$name=$value")
 done
 
+# The test browser is installed separately from the isolated user home.
+# Preserve only its explicit binary location, never browser profiles or credentials.
+if [[ -n "${PLAYWRIGHT_BROWSERS_PATH-}" ]]; then
+	test_env+=("PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH")
+fi
+
 echo "Running tests without API keys in isolated home: $test_root/home"
 env -i "${test_env[@]}" npm test

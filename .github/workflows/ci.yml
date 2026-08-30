@@ -44,7 +44,17 @@ jobs:
       - name: Check
         run: npm run check
 
+      - name: Install test browser
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pi-test-browsers
+        run: node node_modules/playwright/cli.js install --with-deps chromium
+
+      - name: Smoke test bundled CLI
+        run: node packages/coding-agent/dist/bundle/cli.js --version
+
       - name: Test
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pi-test-browsers
         run: ./test.sh
 
   windows-project-launcher:
