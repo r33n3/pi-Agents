@@ -23,10 +23,12 @@ strict. The default bind address is `127.0.0.1`; an explicit non-loopback
   stored in browser-local layout preferences.
 - The composer sends with an arrow while idle and becomes a red stop control
   during a turn. Enter sends; Shift+Enter inserts a newline.
-- The right workspace contains Browser, Agents, and Agent Builder. Selecting an
-  agent opens its persistent chat and its manual, scheduled, and workflow run
-  history. Agent Builder owns Profile, Runtime, Capabilities, Delegation, and
-  Automation for one agent.
+- Published agents appear as durable identities below Sessions. The right
+  workspace contains Browser, Workflow, and Agent Builder. Workflow collects
+  pending lifecycle decisions, active tasks, approvals, and agent activity; on
+  mobile its top-bar indicator shows the pending count without blocking chat.
+  Agent Builder owns Profile, Runtime, Capabilities, Delegation, and Automation
+  for one agent.
 - The gear beside Sessions opens deployment Settings for Models, Connections,
   Capabilities, Plugins & MCP, and Security. Provider credentials and account
   authorization are configured there rather than duplicated in Agent Builder.
@@ -39,8 +41,15 @@ strict. The default bind address is `127.0.0.1`; an explicit non-loopback
   granted agent. Active versions can also be attached to routines, larger
   workflows, generated skills, and project frontend tests. Run evidence and
   screenshots remain available after restart.
-- Agents deployed through Pi and Agent Builder share one registry and appear
-  without restarting the serve host.
+- Pi chat and Agent Builder share one draft lifecycle. `configure_agent` stages
+  a durable draft; it never deploys, runs, promotes, or schedules by itself.
+  The user reviews the complete package in Agent Builder and explicitly
+  publishes it. Edits to a published agent create an inactive candidate
+  revision; the active definition and its schedules remain unchanged until the
+  candidate passes proof review and promotion.
+- `manage_agent_build` gives chat the same explicitly confirmed Publish, Run
+  proof, Accept/Reject, Promote, and Enable schedule actions. Promotion and
+  unattended scheduling require separate confirmations.
 - Cron routines are configured in Agent Builder and their next/last task state
   and artifacts are reviewed under Agents.
 - Pi sessions discover their configured tools automatically. Installing a
@@ -59,6 +68,7 @@ Serve data is owned by `~/.pi/agent/serve`:
 
 ```text
 definitions/<agent-id>.json
+agent-builds.json
 conversations/<conversation-id>/
 tasks/<agent-id>/<task-id>/
 runs/<agent-id>/<run-id>/run.json
@@ -81,8 +91,9 @@ remain listed and readable.
 
 ## Executors
 
-- `harness` creates a fresh child-process `AgentSession` with a dedicated cwd
-  and host-mediated, path-confined `read`, `list`, and optional `write` tools.
+- `harness` creates a fresh child-process `AgentSession` with a dedicated cwd,
+  host-mediated path-confined `read`, `list`, and optional `write` tools, and
+  only the explicitly granted provider capability adapters.
   It is isolated from the active Pi transcript and other agent processes. It is
   not an OS or container security boundary.
 - `session` creates a fresh child-process Pi session with the selected standard tools.
@@ -92,6 +103,32 @@ Both executor forms use isolated run queues and deterministic process-tree
 termination. Chat, Pi delegation, routine, workflow, and A2A tasks cannot
 overlap while mutating one agent project root, and stopping one run does not
 stop unrelated agents or Pi sessions.
+
+## Agent lifecycle
+
+1. Pi chat or Agent Builder progressively stages a durable draft.
+2. The user reviews and explicitly creates or applies the agent definition.
+3. A one-time isolated proof run retains its transcript, result, tool evidence,
+   and artifacts. Relative dates are anchored to the host time and timezone.
+4. Machine-checkable criteria are evaluated as Pass, Fail, or Unverified.
+   Required empty-source, tool-error, stale-artifact, workspace-mutation, and
+   output-contract checks block acceptance. Process completion alone does not
+   prove the goal.
+5. The user accepts or rejects the proof. Rejection retains a 1-5 rating,
+   concrete feedback, and up to three focused answers for the next candidate.
+6. An accepted proof may be promoted to a reusable skill. Candidate
+   configuration becomes active only as part of this promotion.
+7. Only after skill promotion can the user review, enable, and save automation.
+
+Schedule requests made during drafting are retained as intent only. They do not
+create Windows tasks or routines. After promotion, the intent repopulates the
+routine editor for a final explicit review, or chat can enable the exact
+retained intent after confirming the action and timezone.
+
+Interrupted drafts, candidates, feedback, proof prompts, and evaluation state
+are restored from `agent-builds.json`. A proof left running by a stopped host is
+recovered as failed and returned to Needs refinement; it never activates its
+candidate revision.
 
 ## Recorded browser workflows
 

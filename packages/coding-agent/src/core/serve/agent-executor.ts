@@ -120,13 +120,7 @@ class SessionExecution implements AgentExecution {
 	}
 
 	async #run(context: AgentExecutionContext): Promise<AgentExecutionResult> {
-		const instructions = [
-			`You are the locally deployed agent "${context.definition.name}".`,
-			`Persona: ${context.definition.persona}`,
-			`Mission: ${context.definition.description}`,
-			"Operate only through the provided tools. All tool paths are confined to your assigned workspace.",
-			`Task: ${context.prompt}`,
-		].join("\n\n");
+		const instructions = agentExecutionInstructions(context);
 		try {
 			await this.#session.prompt(instructions, { source: "rpc" });
 			return agentExecutionResultFromMessages(this.#session.messages);
@@ -138,6 +132,22 @@ class SessionExecution implements AgentExecution {
 	#emit(event: AgentExecutionEvent): void {
 		for (const listener of this.#listeners) listener(event);
 	}
+}
+
+export function agentExecutionInstructions(
+	context: AgentExecutionContext,
+	now = new Date(),
+	timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone,
+): string {
+	return [
+		`You are the locally deployed agent "${context.definition.name}".`,
+		`Persona: ${context.definition.persona}`,
+		`Mission: ${context.definition.description}`,
+		`Current host date and time: ${now.toISOString()} (${timeZone}).`,
+		"Resolve relative dates such as today, yesterday, and previous calendar day from that host time and timezone.",
+		"Operate only through the provided tools. All tool paths are confined to your assigned workspace.",
+		`Task: ${context.prompt}`,
+	].join("\n\n");
 }
 
 function sessionEventPhase(type: string): AgentExecutionPhase {

@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import WebSocket from "ws";
-import { WebSocketListener } from "../src/core/serve/websocket-listener.ts";
+import { expectedSocketDisconnect, WebSocketListener } from "../src/core/serve/websocket-listener.ts";
 
 describe("WebSocketListener", () => {
 	let listener: WebSocketListener;
@@ -98,6 +98,12 @@ describe("WebSocketListener", () => {
 			await strict.close();
 			await closeHttp(blocker);
 		}
+	});
+
+	test("classifies browser refresh disconnects as expected transport closure", () => {
+		expect(expectedSocketDisconnect(Object.assign(new Error("write ECONNRESET"), { code: "ECONNRESET" }))).toBe(true);
+		expect(expectedSocketDisconnect(Object.assign(new Error("broken pipe"), { code: "EPIPE" }))).toBe(true);
+		expect(expectedSocketDisconnect(Object.assign(new Error("bad frame"), { code: "EPROTO" }))).toBe(false);
 	});
 });
 
