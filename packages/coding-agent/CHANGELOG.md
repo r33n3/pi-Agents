@@ -29,6 +29,7 @@
 
 ### Fixed
 
+- Updated vulnerable transitive dependencies in the sandbox and Gondolin extension examples to `shell-quote` 1.10.0 and `undici` 6.28.0.
 - Fixed browser access-policy blocks appearing as unexplained generic Chromium network failures in managed-browser diagnostics.
 - Fixed slow web-console reconnects and agent saves by bounding transcript rendering, coalescing active-panel refreshes, and moving secondary agent catalog updates into the background.
 - Fixed managed-browser live frames being dropped by WebSocket state checks or blocked by the console content security policy.
