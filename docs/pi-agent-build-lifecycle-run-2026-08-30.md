@@ -522,3 +522,37 @@ Windows tests), a passing full check pipeline, clean whitespace checks, and vali
 CI YAML with trigger/permission/runner/action-pin assertions. Remote CI and main
 branch protection are not yet established: no commit, push, PR, merge, or GitHub
 settings mutation was made in this implementation turn.
+
+## Review branch and remote CI validation
+
+The approved fixes were committed on `codex/fork-public-data-hardening`:
+
+- `e3c0d4c90`: public-data hardening, Windows project launch and proof documentation.
+- `dfc091be2`: Playwright packaging and CI browser prerequisites, plus the stale
+  restart-recovery test assertion. Recovery remains `interrupted`, with a visible
+  failure Attention item; production recovery behavior was not changed.
+
+The first real GitHub CI run, [33338361046](https://github.com/r33n3/pi-Agents/actions/runs/33338361046),
+passed Windows tests but failed Node bundling because esbuild followed Playwright's
+optional browser-backend imports. Playwright now remains an installed, pinned
+runtime dependency, retaining its own package-relative assets. CI explicitly
+installs Chromium and passes only its binary-cache location through the isolated
+test environment. A bundled CLI version check guards startup after packaging.
+
+The follow-up [CI run 33338502343](https://github.com/r33n3/pi-Agents/actions/runs/33338502343)
+passed both `build-check-test` and `windows-project-launcher`. This includes the
+full build, check pipeline, bundled CLI smoke test, full isolated Linux test suite,
+and seven Windows project-launch tests. Eight focused task-service/durability
+tests and the full local check pipeline also passed.
+
+Local full-suite limitations remain documented, not silently waived. Windows
+tests encountered symlink-permission and Unix-path assumptions. A clean Ubuntu
+source checkout initially lacked generated model data, compiled package entries,
+`fd` and Chromium; GitHub's build/install steps supplied those prerequisites. An
+unchanged upstream credential-cache test failed locally but did not fail the
+complete GitHub run. No upstream auth code or assertions were changed to obtain
+the CI result.
+
+The branch is for review, not automatic merge. The Ozark build and its inactive
+schedule were not changed during this commit/CI follow-up. Unrelated local
+`output/` and `simple-webpage/` files were excluded from every commit.
