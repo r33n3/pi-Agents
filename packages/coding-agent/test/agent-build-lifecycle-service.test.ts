@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -47,9 +47,11 @@ class DeferredExecution implements AgentExecution {
 
 class DeferredExecutor implements AgentExecutor {
 	readonly executions: DeferredExecution[] = [];
+	readonly contexts: AgentExecutionContext[] = [];
 
-	start(_context: AgentExecutionContext): Promise<AgentExecution> {
+	start(context: AgentExecutionContext): Promise<AgentExecution> {
 		const execution = new DeferredExecution();
+		this.contexts.push(context);
 		this.executions.push(execution);
 		return Promise.resolve(execution);
 	}
@@ -167,4 +169,242 @@ describe("AgentBuildLifecycleService", () => {
 			routineIds: ["review-daily"],
 		});
 	});
+
+	test("runs an existing-agent candidate without replacing the active revision until promotion", async () => {
+		const { root, registry, runs, executor, lifecycle } = await setup();
+		await saveReviewer(registry);
+		const build = await lifecycle.ensureForAgent("reviewer");
+		const candidate = await lifecycle.updateDraft(build.id, {
+			name: "Reviewer",
+			objective: "Review two boundaries",
+			projectRoot: join(root, "workspace"),
+			configuration: {
+				name: "Reviewer",
+				description: "Review two boundaries",
+				persona: "More careful",
+				projectRoot: join(root, "workspace"),
+				tools: ["read"],
+				memory: "none",
+				executor: "harness",
+				permissionPolicy: "read-only",
+				browserAccess: "disabled",
+				delegateAgentIds: [],
+				exposeA2a: false,
+			},
+		});
+		expect(candidate).toMatchObject({ stage: "draft", agentRevision: 1, candidateRevision: 2 });
+		expect(await registry.get("reviewer")).toMatchObject({ revision: 1, persona: "Careful" });
+
+		const proof = await lifecycle.startProof(build.id, "Review the candidate once");
+		expect(executor.contexts[0]?.definition).toMatchObject({ revision: 2, persona: "More careful" });
+		expect(await registry.get("reviewer")).toMatchObject({ revision: 1, persona: "Careful" });
+		executor.executions[0]!.resolve({ output: "Reviewed", transcript: [] });
+		await runs.waitForCompletion(proof.proof!.runId);
+		await lifecycle.get(build.id);
+		await lifecycle.reviewProof(build.id, true);
+		await lifecycle.markPromoted(proof.proof!.runId, "review-boundary", "C:/skills/review-boundary/SKILL.md");
+		expect(await registry.get("reviewer")).toMatchObject({ revision: 2, persona: "More careful" });
+	});
+
+	test("recovers a durable candidate and turns an interrupted proof into actionable refinement", async () => {
+		const { root, registry, runs, executor, lifecycle } = await setup();
+		await saveReviewer(registry);
+		const build = await lifecycle.ensureForAgent("reviewer");
+		const candidate = await lifecycle.updateDraft(build.id, {
+			name: "Reviewer",
+			objective: "Review two boundaries",
+			projectRoot: join(root, "workspace"),
+			configuration: {
+				name: "Reviewer",
+				description: "Review two boundaries",
+				persona: "Retained candidate",
+				projectRoot: join(root, "workspace"),
+				tools: ["read"],
+				memory: "none",
+				executor: "harness",
+				permissionPolicy: "read-only",
+				browserAccess: "disabled",
+				delegateAgentIds: [],
+				exposeA2a: false,
+			},
+		});
+		await lifecycle.startProof(candidate.id, "Run the retained recovery proof");
+
+		const restoredRuns = new AgentRunManager(registry, new DeferredExecutor(), join(root, "runs"));
+		await restoredRuns.initialize();
+		const restoredLifecycle = new AgentBuildLifecycleService(join(root, "lifecycle"), registry, restoredRuns);
+		await restoredLifecycle.initialize();
+		await expect(restoredLifecycle.get(candidate.id)).resolves.toMatchObject({
+			stage: "needs-refinement",
+			candidateRevision: 2,
+			proofPrompt: "Run the retained recovery proof",
+			configuration: { persona: "Retained candidate" },
+			proof: {
+				status: "failed",
+			},
+		});
+		expect(await registry.get("reviewer")).toMatchObject({ revision: 1, persona: "Careful" });
+
+		executor.executions[0]!.resolve({ output: "Original process ended", transcript: [] });
+		await runs.waitForCompletion(candidate.proof?.runId ?? (await lifecycle.get(candidate.id)).proof!.runId);
+	});
+
+	test("rejects the observed Ozark proof failures and accepts the corrected same-task rerun", async () => {
+		const { root, registry, runs, executor, lifecycle } = await setup();
+		const workspace = join(root, "ozark");
+		await mkdir(workspace, { recursive: true });
+		await writeFile(join(workspace, "report.html"), "Lake of the Ozarks — 40 miles north\nHeat Advisory Notice\n");
+		await writeFile(join(workspace, "state.json"), '{"messageCount": null, "actionCount": null}\n');
+		await registry.save({
+			id: "ozark-brief",
+			name: "Ozark brief",
+			description: "Create a grounded local outdoor brief",
+			projectRoot: workspace,
+			tools: ["read", "write", "feed_read", "weather_alerts"],
+			memory: "none",
+			persona: "Use exact sources and preserve truthful state.",
+			executor: "harness",
+			permissionPolicy: "workspace-write",
+			schedules: [],
+		});
+		const criteria = ozarkCriteria();
+		const build = await lifecycle.stageDraft({
+			name: "Ozark brief",
+			objective: "Create a grounded local outdoor brief",
+			projectRoot: workspace,
+			agentId: "ozark-brief",
+			criteria,
+		});
+		await lifecycle.linkAgent(build.id, "ozark-brief");
+
+		const failedProof = await lifecycle.startProof(build.id, "Create today's Ozark brief");
+		executor.executions[0]!.resolve({
+			output: "All events verified. Heat advisory inferred. Lake of the Ozarks is 40 miles north.",
+			transcript: [
+				toolResult("feed_read", '{"entries":[]}'),
+				toolResult("weather_alerts", "XML parse failure", true),
+			],
+		});
+		await runs.waitForCompletion(failedProof.proof!.runId);
+		const rejected = await lifecycle.get(build.id);
+		expect(rejected.stage).toBe("needs-refinement");
+		expect(rejected.evaluation?.checks).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ criterionId: "exact-source", status: "fail" }),
+				expect.objectContaining({ criterionId: "official-alert", status: "fail" }),
+				expect.objectContaining({ criterionId: "report-written", status: "fail" }),
+				expect.objectContaining({ criterionId: "report-current", status: "fail" }),
+				expect.objectContaining({ criterionId: "local-geography", status: "fail" }),
+				expect.objectContaining({ criterionId: "alert-honesty", status: "fail" }),
+				expect.objectContaining({ criterionId: "state-counts", status: "fail" }),
+			]),
+		);
+
+		await lifecycle.recordFeedback(build.id, {
+			rating: 2,
+			summary: "The result reused stale files and overstated its evidence.",
+			answers: [
+				{
+					aspect: "goal-obligation",
+					question: "What failed?",
+					answer: "Geography, alerts, sources, and state.",
+				},
+			],
+		});
+
+		const correctedProof = await lifecycle.startProof(build.id, "Create today's Ozark brief");
+		await writeFile(join(workspace, "report.html"), "Ozark, Missouri local brief\nForecast-based heat caution\n");
+		await writeFile(join(workspace, "state.json"), '{"messageCount": 0, "actionCount": 0}\n');
+		executor.executions[1]!.resolve({
+			output: "Created a smaller local brief from an exact source.",
+			transcript: [
+				toolResult("feed_read", '{"entries":[{"title":"Local event"}]}'),
+				toolResult("weather_alerts", '{"alerts":[]}'),
+				toolResult("write", "Wrote report.html"),
+				toolResult("write", "Wrote state.json"),
+			],
+		});
+		await runs.waitForCompletion(correctedProof.proof!.runId);
+		const reviewable = await lifecycle.get(build.id);
+		expect(reviewable.stage).toBe("proof-ready");
+		expect(reviewable.evaluation?.checks.every((check) => check.status === "pass")).toBe(true);
+		expect(reviewable.proofHistory).toEqual([
+			expect.objectContaining({
+				proof: expect.objectContaining({ runId: failedProof.proof!.runId, status: "succeeded" }),
+				evaluation: expect.objectContaining({
+					checks: expect.arrayContaining([
+						expect.objectContaining({ criterionId: "exact-source", status: "fail" }),
+					]),
+				}),
+			}),
+		]);
+		await expect(lifecycle.reviewProof(build.id, true)).resolves.toMatchObject({ stage: "proven" });
+	});
 });
+
+function toolResult(toolName: string, text: string, isError = false): AgentExecutionResult["transcript"][number] {
+	return {
+		role: "toolResult",
+		toolCallId: `${toolName}-${Math.random()}`,
+		toolName,
+		content: [{ type: "text", text }],
+		isError,
+		timestamp: Date.now(),
+	};
+}
+
+function ozarkCriteria(): unknown[] {
+	const criterion = (
+		id: string,
+		label: string,
+		category: string,
+		evaluator: Record<string, unknown>,
+	): Record<string, unknown> => ({
+		id,
+		label,
+		description: label,
+		category,
+		expectation: "non-regression",
+		evaluator,
+	});
+	return [
+		criterion("exact-source", "Exact source returned evidence", "grounding-integrity", {
+			type: "tool-receipt",
+			toolNames: ["feed_read"],
+			minimumSuccesses: 1,
+			requireNonEmpty: true,
+		}),
+		criterion("official-alert", "Official alert lookup did not fail", "refusal-honesty", {
+			type: "tool-errors",
+			toolNames: ["weather_alerts"],
+			maximumErrors: 0,
+		}),
+		criterion("report-written", "Report was written", "goal-obligation", {
+			type: "workspace-mutation",
+			toolNames: ["write", "edit"],
+			minimumSuccesses: 1,
+		}),
+		criterion("report-current", "Report changed during this proof", "goal-obligation", {
+			type: "artifact-change",
+			path: "report.html",
+		}),
+		criterion("local-geography", "Known out-of-radius claim is absent", "goal-obligation", {
+			type: "artifact-text",
+			path: "report.html",
+			mode: "omits",
+			text: "Lake of the Ozarks",
+		}),
+		criterion("alert-honesty", "Unconfirmed official alert label is absent", "refusal-honesty", {
+			type: "artifact-text",
+			path: "report.html",
+			mode: "omits",
+			text: "Heat Advisory Notice",
+		}),
+		criterion("state-counts", "State counters are not null", "output-contract", {
+			type: "artifact-text",
+			path: "state.json",
+			mode: "omits",
+			text: '"messageCount": null',
+		}),
+	];
+}

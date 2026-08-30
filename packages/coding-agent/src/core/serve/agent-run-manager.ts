@@ -137,6 +137,21 @@ export class AgentRunManager implements AsyncDisposable {
 		}
 	}
 
+	async readTranscript(runId: string): Promise<readonly unknown[] | undefined> {
+		const record = this.#records.get(runId);
+		if (!record || record.status !== "succeeded") return undefined;
+		try {
+			const value: unknown = JSON.parse(
+				await readFile(resolve(record.artifactDirectory, "transcript.json"), "utf8"),
+			);
+			if (!Array.isArray(value)) throw new Error(`Run ${runId} transcript must be an array`);
+			return value;
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+			throw error;
+		}
+	}
+
 	async start(
 		agentId: string,
 		prompt: string,
@@ -148,6 +163,10 @@ export class AgentRunManager implements AsyncDisposable {
 			if (!definition) throw new Error(`Agent ${agentId} was not found`);
 			return this.#startDefinition(definition, prompt, source, model);
 		});
+	}
+
+	async startCandidate(definition: AgentDefinition, prompt: string): Promise<AgentRunRecord> {
+		return this.#queue.run(async () => this.#startDefinition(definition, prompt, "manual"));
 	}
 
 	async startTemporarySpecialist(sourceAgentId: string, prompt: string, model?: ModelRef): Promise<AgentRunRecord> {

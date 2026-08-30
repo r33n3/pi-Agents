@@ -54,13 +54,20 @@ class WebSocketConnection implements ByteConnection {
 	}
 
 	send(chunk: Uint8Array): Promise<void> {
-		if (this.closedValue) return Promise.reject(new Error("WebSocket connection is closed"));
+		if (this.closedValue) return Promise.resolve();
 		if (chunk.byteLength > MAX_FRAME_BYTES) return Promise.reject(new Error("WebSocket frame exceeds 16 MiB"));
 		if (this.socket.bufferedAmount > MAX_BUFFERED_BYTES) {
 			return Promise.reject(new Error("WebSocket client is not consuming data"));
 		}
 		return new Promise((resolve, reject) =>
-			this.socket.send(chunk, { binary: true }, (error) => (error ? reject(error) : resolve())),
+			this.socket.send(chunk, { binary: true }, (error) => {
+				if (!error || expectedSocketDisconnect(error)) {
+					if (error) this.closedValue = true;
+					resolve();
+					return;
+				}
+				reject(error);
+			}),
 		);
 	}
 
@@ -192,7 +199,9 @@ export class WebSocketListener implements PiServerListener {
 			const bytes = data instanceof Buffer ? data : Buffer.concat(data as Buffer[]);
 			handler.onData(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength));
 		});
-		socket.on("error", (error) => handler.onError(error));
+		socket.on("error", (error) => {
+			if (!expectedSocketDisconnect(error)) handler.onError(error);
+		});
 		socket.once("close", () => {
 			connection.markClosed();
 			handler.onClose();
@@ -211,6 +220,11 @@ export class WebSocketListener implements PiServerListener {
 		}
 		this.options.auxiliary?.onConnection(socket);
 	}
+}
+
+export function expectedSocketDisconnect(error: Error): boolean {
+	if (!("code" in error) || typeof error.code !== "string") return false;
+	return ["ECONNRESET", "EPIPE", "WS_ERR_SOCKET_CLOSED"].includes(error.code);
 }
 
 async function listen(server: Server, host: string, requestedPort: number, autoIncrement: boolean): Promise<number> {

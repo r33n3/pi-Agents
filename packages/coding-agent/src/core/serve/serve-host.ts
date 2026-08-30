@@ -322,6 +322,17 @@ export class ServeHost implements AsyncDisposable {
 		});
 		brokeredTools.push(...googleWorkspaceTools);
 		session.registerCustomTools(googleWorkspaceTools);
+		const resolveAgentBrokeredTools = (definition: AgentDefinition): ToolDefinition[] => {
+			const names = new Set(capabilityBroker.resolveToolNames(definition.capabilities, definition.executor));
+			for (const name of definition.tools) names.add(name);
+			const allowedPlaidConnectionIds = definition.capabilities
+				.filter((grant) => grant.providerId === "plaid" && grant.connectionId)
+				.map((grant) => grant.connectionId!);
+			return [
+				...brokeredTools.filter((tool) => !plaidToolNames.has(tool.name)),
+				...createPlaidTools(plaidConnections, () => allowedPlaidConnectionIds),
+			].filter((tool) => names.has(tool.name));
+		};
 		const agentRegistry = new AgentRegistry(serveRoot, {
 			catalogDirectory: join(agentDir, "agents"),
 			personaDirectory: join(agentDir, "personas"),
@@ -336,7 +347,6 @@ export class ServeHost implements AsyncDisposable {
 			capabilityValidator: (grants, executor) => capabilityBroker.validateGrants(grants, executor),
 		});
 		await agentRegistry.initialize();
-		session.registerCustomTools(createAgentRegistryTools(agentRegistry) as ToolDefinition[]);
 		let personaCatalog: PersonaCatalog | undefined;
 		const personaProject = resolvePersonaProject(agentDir);
 		if (personaProject) {
@@ -399,19 +409,12 @@ export class ServeHost implements AsyncDisposable {
 						})
 					: [];
 			const capabilityTools = capabilityBroker.resolveToolNames(definition.capabilities, definition.executor);
-			const allowedPlaidConnectionIds = definition.capabilities
-				.filter((grant) => grant.providerId === "plaid" && grant.connectionId)
-				.map((grant) => grant.connectionId!);
-			const agentPlaidTools = createPlaidTools(plaidConnections, () => allowedPlaidConnectionIds);
-			const brokerTools = [
-				...brokeredTools.filter((tool) => !plaidToolNames.has(tool.name)),
-				...agentPlaidTools,
-			].filter((tool) => capabilityTools.includes(tool.name));
+			const agentBrokeredTools = resolveAgentBrokeredTools(definition);
 			const customTools = [
 				...scopedTools,
 				...browserTools,
 				...browserWorkflowTools,
-				...brokerTools,
+				...agentBrokeredTools,
 			] as ToolDefinition[];
 			const toolNames = isolated
 				? customTools.map((tool) => tool.name)
@@ -487,21 +490,7 @@ export class ServeHost implements AsyncDisposable {
 			},
 			capabilityToolNames: (context) =>
 				capabilityBroker.resolveToolNames(context.definition.capabilities, context.definition.executor),
-			capabilityTools: (context) => {
-				const names = new Set(
-					capabilityBroker.resolveToolNames(context.definition.capabilities, context.definition.executor),
-				);
-				if (context.definition.source === "pi-agent") {
-					for (const name of context.definition.tools) names.add(name);
-				}
-				const allowedPlaidConnectionIds = context.definition.capabilities
-					.filter((grant) => grant.providerId === "plaid" && grant.connectionId)
-					.map((grant) => grant.connectionId!);
-				return [
-					...brokeredTools.filter((tool) => !plaidToolNames.has(tool.name)),
-					...createPlaidTools(plaidConnections, () => allowedPlaidConnectionIds),
-				].filter((tool) => names.has(tool.name));
-			},
+			capabilityTools: (context) => resolveAgentBrokeredTools(context.definition),
 		});
 		this.#agentRunManager = new AgentRunManager(agentRegistry, executor, join(serveRoot, "runs"));
 		await this.#agentRunManager.initialize();
@@ -834,6 +823,13 @@ export class ServeHost implements AsyncDisposable {
 			},
 		});
 		await this.#agentRoutineScheduler.start();
+		session.registerCustomTools(
+			createAgentRegistryTools(agentRegistry, agentBuildLifecycle, {
+				promotion: runSkillPromotion,
+				routines: routineRegistry,
+				refreshRoutines: () => this.#agentRoutineScheduler!.refresh(),
+			}) as ToolDefinition[],
+		);
 
 		const currentSessionService = new CurrentSessionService(session, Date.now(), async (options) => {
 			const agentId = options.name?.startsWith("agent:") ? options.name.slice("agent:".length) : undefined;

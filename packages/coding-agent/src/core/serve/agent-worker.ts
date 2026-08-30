@@ -7,7 +7,11 @@ import type { AgentSession } from "../agent-session.ts";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../agent-session-services.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import { SessionManager } from "../session-manager.ts";
-import { type AgentExecutionPhase, agentExecutionResultFromMessages } from "./agent-executor.ts";
+import {
+	type AgentExecutionPhase,
+	agentExecutionInstructions,
+	agentExecutionResultFromMessages,
+} from "./agent-executor.ts";
 import type {
 	AgentWorkerCapabilityToolResponseMessage,
 	AgentWorkerHostAction,
@@ -235,13 +239,7 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 			activeSession = undefined;
 		});
 		if (abortRequested) throw new Error("Agent worker was aborted");
-		const instructions = [
-			`You are the locally deployed agent "${definition.name}".`,
-			`Persona: ${definition.persona}`,
-			`Mission: ${definition.description}`,
-			"Operate only through the provided tools. All tool paths are confined to your assigned workspace.",
-			`Task: ${request.context.prompt}`,
-		].join("\n\n");
+		const instructions = agentExecutionInstructions(request.context);
 		await emitProgress("waiting-for-model", "Waiting for model response");
 		await activeSession.prompt(instructions, { source: "rpc" });
 		const result = agentExecutionResultFromMessages(activeSession.messages);

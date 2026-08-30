@@ -2,9 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import type { ExtensionContext } from "../src/core/extensions/types.ts";
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
-import { createAgentRegistryTools } from "../src/core/serve/agent-registry-tools.ts";
 
 const roots: string[] = [];
 
@@ -170,41 +168,6 @@ describe("AgentRegistry", () => {
 		await expect(
 			agents.save({ ...input, browserWorkflows: [{ id: "review-page", version: 2 }] }),
 		).resolves.toMatchObject({ browserWorkflows: [{ id: "review-page", version: 2 }] });
-	});
-
-	test("keeps browser tool and access policy paired when Pi deploys an agent", async () => {
-		const { root, registry: agents } = await registry();
-		const deploy = createAgentRegistryTools(agents)[0]!;
-		const base = {
-			id: "browser-agent",
-			name: "Browser Agent",
-			description: "Reviews local pages",
-			persona: "Review pages carefully",
-			projectRoot: join(root, "browser-project"),
-		};
-		await deploy.execute(
-			"deploy-browser",
-			{ ...base, tools: ["read", "browser"] },
-			undefined,
-			undefined,
-			{} as ExtensionContext,
-		);
-		expect(await agents.get("browser-agent")).toMatchObject({
-			tools: ["read", "browser"],
-			browser: { access: "loopback" },
-		});
-
-		await deploy.execute(
-			"disable-browser",
-			{ ...base, browserAccess: "disabled" },
-			undefined,
-			undefined,
-			{} as ExtensionContext,
-		);
-		expect(await agents.get("browser-agent")).toMatchObject({
-			tools: ["read"],
-			browser: { access: "disabled" },
-		});
 	});
 
 	test("allows an explicit local project folder", async () => {

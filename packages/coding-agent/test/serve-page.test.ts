@@ -306,7 +306,8 @@ describe("createServePage", () => {
 		expect(html).toContain('class="card agent-run-history"');
 		expect(html).not.toContain('id="selected-agent-chat-form"');
 		expect(html).toContain('data-builder-tab="builder-profile-panel"');
-		expect(html).toContain("Save and deploy");
+		expect(html).toContain("Publish agent");
+		expect(html).not.toContain("Save and deploy");
 		expect(html).not.toContain('id="builder-chat-panel"');
 		expect(html).not.toContain('id="builder-chat-form"');
 		expect(html).toContain('id="external-connection-list"');
@@ -347,7 +348,8 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("agent-session-tab");
 		expect(bundleText).toContain("Active agent conversation");
 		expect(bundleText).not.toContain("builder-session-tab");
-		expect(bundleText).toContain("Apply and update agent");
+		expect(bundleText).toContain("Save candidate revision");
+		expect(bundleText).toContain("Publish agent");
 		expect(bundleText).toContain("Exit editing");
 		expect(bundleText).toContain("Do not call agent_deploy or modify agent files");
 		expect(bundleText).toContain("No changes to apply.");

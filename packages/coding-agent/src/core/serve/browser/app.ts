@@ -106,7 +106,7 @@ const settingsPluginManagement = element("settings-plugin-management");
 const externalConnectionList = element("external-connection-list");
 const delegationPanelHost = element("delegation-panel-host");
 const delegationPanel = externalConnectionList.closest("details");
-if (delegationPanel) delegationPanelHost.append(delegationPanel);
+installWorkflowWorkspaceLayout(delegationPanel);
 const claudeAuthFlow = createClaudeAuthFlow();
 const externalRunForm = requiredElement<HTMLFormElement>("external-run-form");
 const externalRunList = element("external-run-list");
@@ -162,6 +162,52 @@ const routineModelPicker = installThemedSelect(routineEditor.model);
 const thinkingPicker = installThemedSelect(thinking, "simple");
 const agentThinkingPicker = installThemedSelect(agentThinking, "simple");
 
+function installWorkflowWorkspaceLayout(delegation: HTMLDetailsElement | null): void {
+	const workspace = element("agents-workspace");
+	const workspaceTab = document.querySelector<HTMLButtonElement>('[data-tab="agents-workspace"]');
+	if (workspaceTab) workspaceTab.textContent = "Workflow";
+	const mobileToggle = document.querySelector<HTMLLabelElement>('label[for="mobile-panel-right"]');
+	if (mobileToggle) {
+		mobileToggle.title = "Workflow and browser workspace";
+		mobileToggle.setAttribute("aria-label", "Open workflow and browser workspace");
+		mobileToggle.style.position = "relative";
+		const badge = document.createElement("span");
+		badge.id = "workflow-badge";
+		badge.className = "hidden";
+		badge.style.cssText =
+			"position:absolute;right:2px;top:2px;min-width:15px;height:15px;padding:0 3px;border-radius:999px;background:var(--pi);color:#07101b;font:700 9px/15px system-ui;text-align:center";
+		mobileToggle.append(badge);
+	}
+	const activityHeading = attentionHeading.closest<HTMLElement>(".rail-heading");
+	const activityPanel = agentActivityList.closest<HTMLElement>(".agent-activity-panel");
+	if (activityHeading && activityPanel) workspace.prepend(activityHeading, activityPanel);
+	element("rail-section-resizer").classList.add("hidden");
+	const sessionsPanel = element("sessions");
+	sessionsPanel.style.flex = "1 1 auto";
+	agentList.classList.add("hidden");
+	newAgent.classList.add("hidden");
+	delegationPanelHost.classList.add("hidden");
+
+	const delegate = document.createElement("button");
+	delegate.type = "button";
+	delegate.title = "Delegate to an external agent";
+	delegate.setAttribute("aria-label", delegate.title);
+	delegate.style.width = "44px";
+	delegate.style.height = "44px";
+	delegate.style.flex = "0 0 44px";
+	delegate.innerHTML =
+		'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h10m-4-4 4 4-4 4M5 7V5h14v14H5v-2"/><text x="5" y="15" font-size="8" fill="currentColor" stroke="none">π</text></svg>';
+	delegate.addEventListener("click", () => {
+		mobilePanelRight.checked = true;
+		activateTab("agents-workspace");
+		if (delegation) {
+			delegation.open = true;
+			delegation.scrollIntoView({ behavior: "smooth", block: "start" });
+		}
+	});
+	openSettingsButton.before(delegate);
+}
+
 let session: PiSessionHandle | undefined;
 let unsubscribeSession: Unsubscribe | undefined;
 let builderActive = false;
@@ -213,6 +259,7 @@ let agentBuilderBaseline = "";
 let agentBuilderFeedback = "";
 let activeAgentImprovement: AgentImprovementContext | undefined;
 let activeAgentBuild: AgentBuildRecord | undefined;
+let draftedAgentCriteria: unknown[] | undefined;
 let agentBuildDraftTimer: number | undefined;
 let agentBuildPollTimer: number | undefined;
 let pendingTeamPackage: PendingTeamPackage | undefined;
@@ -496,6 +543,58 @@ interface AgentBuildRecord {
 	name: string;
 	objective: string;
 	projectRoot: string;
+	configuration?: {
+		name: string;
+		description: string;
+		persona: string;
+		projectRoot: string;
+		tools: string[];
+		model?: { provider: string; id: string };
+		thinking?: ThinkingLevel;
+		memory: "none" | "notes";
+		executor: "session" | "harness";
+		permissionPolicy: "read-only" | "workspace-write";
+		browserAccess: "disabled" | "loopback" | "public-web" | "private-network";
+		delegateAgentIds: string[];
+		exposeA2a: boolean;
+	};
+	candidateRevision?: number;
+	automationIntent?: {
+		task: string;
+		cadence: string;
+		timezone: string;
+		mode: "replace" | "additional";
+		confirmed: boolean;
+	};
+	criteria: Array<{
+		id: string;
+		label: string;
+		description: string;
+		category: string;
+		expectation: "required-improvement" | "non-regression" | "advisory";
+		evaluator: { type: string };
+	}>;
+	feedback: Array<{
+		id: string;
+		proofRunId: string;
+		rating: 1 | 2 | 3 | 4 | 5;
+		summary: string;
+		createdAt: number;
+	}>;
+	evaluation?: {
+		runId: string;
+		evaluatedAt: number;
+		checks: Array<{
+			criterionId: string;
+			status: "pass" | "fail" | "unverified";
+			summary: string;
+			evidence: string[];
+		}>;
+	};
+	proofHistory: Array<{
+		proof: AgentBuildRecord["proof"];
+		evaluation?: AgentBuildRecord["evaluation"];
+	}>;
 	stage: AgentBuildStage;
 	agentId?: string;
 	agentRevision?: number;
@@ -506,6 +605,7 @@ interface AgentBuildRecord {
 		status: "running" | "succeeded" | "failed" | "aborted";
 		finishedAt?: number;
 	};
+	proofPrompt?: string;
 	skill?: { name: string; path: string; sourceRunId: string };
 	routineIds: string[];
 	createdAt: number;
@@ -2191,7 +2291,7 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 	apply.type = "button";
 	apply.id = "builder-chat-apply";
 	apply.className = "primary-action";
-	apply.textContent = activeSidebarAgent ? "Apply update" : "Create agent";
+	apply.textContent = activeSidebarAgent ? "Save candidate" : "Publish agent";
 	apply.title = "Apply the reviewed agent configuration without another model call";
 	apply.addEventListener("click", () => agentForm.requestSubmit());
 	const cancel = document.createElement("button");
@@ -2238,6 +2338,7 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 					? "Describe the outcome, working folder, and access the agent needs. Pi will build the agent locally."
 					: "Continue refining the agent here, or review the generated settings.";
 	guide.append(heading, guidance);
+	if (activeAgentBuild) guide.append(renderAgentPackageSummary(activeAgentBuild));
 	if (activeAgentBuild?.stage === "testing" && agentBuildPollTimer === undefined) {
 		agentBuildPollTimer = window.setTimeout(() => {
 			agentBuildPollTimer = undefined;
@@ -2281,6 +2382,71 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 	updateAgentBuilderReadiness();
 }
 
+function renderAgentPackageSummary(build: AgentBuildRecord): HTMLElement {
+	const details = document.createElement("details");
+	details.className = "card agent-package-summary";
+	const summary = document.createElement("summary");
+	summary.textContent = `Agent package · build revision ${build.revision}${build.agentRevision ? ` · agent revision ${build.agentRevision}` : ""}`;
+	details.append(summary);
+	const configuration = build.configuration;
+	if (configuration) {
+		const changed = activeSidebarAgent
+			? agentConfigurationChanges(configuration, activeSidebarAgent)
+			: ["New package"];
+		appendText(details, `Candidate changes: ${changed.length > 0 ? changed.join(", ") : "none"}`, "muted");
+		appendText(
+			details,
+			`Model: ${configuration.model ? `${configuration.model.provider}/${configuration.model.id}` : "session default"} · Tools: ${configuration.tools.join(", ") || "none"} · Permissions: ${configuration.permissionPolicy}`,
+			"muted",
+		);
+	}
+	appendText(
+		details,
+		`Criteria: ${build.criteria.length} · Proof attempts: ${build.proofHistory.length + (build.proof ? 1 : 0)} · Evidence checks: ${build.evaluation?.checks.length ?? 0} · Feedback entries: ${build.feedback.length}`,
+		"muted",
+	);
+	const criteria = document.createElement("ul");
+	criteria.className = "muted";
+	for (const criterion of build.criteria) {
+		const item = document.createElement("li");
+		const result = build.evaluation?.checks.find((check) => check.criterionId === criterion.id);
+		item.textContent = `${result ? `${result.status.toUpperCase()} · ` : ""}${criterion.label}`;
+		criteria.append(item);
+	}
+	details.append(criteria);
+	if (build.automationIntent) {
+		appendText(
+			details,
+			`Inactive schedule intent: ${build.automationIntent.cadence} ${build.automationIntent.timezone} · ${build.automationIntent.task}`,
+			"muted",
+		);
+	}
+	return details;
+}
+
+function agentConfigurationChanges(
+	configuration: NonNullable<AgentBuildRecord["configuration"]>,
+	active: AgentSummary,
+): string[] {
+	const changes: string[] = [];
+	if (configuration.description !== active.description) changes.push("description");
+	if (configuration.persona !== active.persona) changes.push("persona instructions");
+	if (configuration.projectRoot !== active.projectRoot) changes.push("project folder");
+	if (configuration.tools.join("\0") !== active.tools.join("\0")) changes.push("tools");
+	if (
+		`${configuration.model?.provider ?? ""}/${configuration.model?.id ?? ""}` !==
+		`${active.model?.provider ?? ""}/${active.model?.id ?? ""}`
+	)
+		changes.push("model");
+	if (configuration.thinking !== active.thinking) changes.push("thinking");
+	if (configuration.executor !== active.executor) changes.push("executor");
+	if (configuration.permissionPolicy !== active.permissionPolicy) changes.push("permissions");
+	if (configuration.browserAccess !== (active.browser?.access ?? "disabled")) changes.push("browser access");
+	if (configuration.delegateAgentIds.join("\0") !== active.delegateAgentIds.join("\0")) changes.push("delegates");
+	if (configuration.exposeA2a !== active.a2a.enabled) changes.push("A2A exposure");
+	return changes;
+}
+
 function agentBuildStageLabel(record: AgentBuildRecord | undefined): string {
 	if (!record) return "Name the draft";
 	return {
@@ -2297,7 +2463,7 @@ function agentBuildStageLabel(record: AgentBuildRecord | undefined): string {
 
 function agentBuildLifecycleAction(): HTMLButtonElement | undefined {
 	const build = activeAgentBuild;
-	if (!build || build.stage === "draft" || build.stage === "automated") return undefined;
+	if (!build || build.stage === "automated" || (build.stage === "draft" && !build.agentId)) return undefined;
 	const button = document.createElement("button");
 	button.type = "button";
 	button.className = "lifecycle-action";
@@ -2321,7 +2487,8 @@ function agentBuildLifecycleAction(): HTMLButtonElement | undefined {
 		button.addEventListener("click", () => void stageRoutineFromBuild());
 		return button;
 	}
-	button.textContent = build.stage === "needs-refinement" ? "Try again" : "Try agent";
+	button.textContent =
+		build.stage === "needs-refinement" ? "Run same proof" : build.stage === "draft" ? "Try candidate" : "Try agent";
 	button.addEventListener("click", openAgentBuildProofDialog);
 	return button;
 }
@@ -2344,7 +2511,7 @@ function openAgentBuildProofDialog(): void {
 	const prompt = document.createElement("textarea");
 	prompt.required = true;
 	prompt.maxLength = 16_384;
-	prompt.value = `Prove this agent can complete its goal: ${build.objective}`;
+	prompt.value = build.proofPrompt ?? `Prove this agent can complete its goal: ${build.objective}`;
 	const label = document.createElement("label");
 	label.append(document.createTextNode("One-time proof task"), prompt);
 	const actions = document.createElement("div");
@@ -2405,9 +2572,52 @@ async function openAgentBuildProofReview(): Promise<void> {
 	heading.textContent = `Review ${build.name} proof`;
 	const explanation = document.createElement("p");
 	explanation.className = "muted";
-	explanation.textContent = "Accept only if this result proves the current agent revision can repeat the task safely.";
+	explanation.textContent =
+		"Accept only if the retained evidence and result prove this revision can repeat the task safely.";
+	const comparison = document.createElement("p");
+	comparison.className = "muted";
+	const previous = build.proofHistory.at(-1);
+	if (previous?.evaluation) {
+		const passed = previous.evaluation.checks.filter((check) => check.status === "pass").length;
+		const failed = previous.evaluation.checks.filter((check) => check.status === "fail").length;
+		comparison.textContent = `Previous proof · revision ${previous.proof?.agentRevision ?? "unknown"} · ${passed} passed · ${failed} failed. Current proof · revision ${proof.agentRevision}.`;
+	} else
+		comparison.textContent = `Current proof · revision ${proof.agentRevision} · no comparable prior evaluation retained.`;
+	const checks = document.createElement("div");
+	checks.className = "proof-evaluation";
+	for (const check of build.evaluation?.checks ?? []) {
+		const criterion = build.criteria.find((candidate) => candidate.id === check.criterionId);
+		const row = document.createElement("div");
+		row.className = `card proof-check proof-check-${check.status}`;
+		const label = document.createElement("strong");
+		label.textContent = `${check.status === "pass" ? "Pass" : check.status === "fail" ? "Fail" : "Unverified"}: ${criterion?.label ?? check.criterionId}`;
+		const summary = document.createElement("span");
+		summary.className = "muted";
+		summary.textContent = check.summary;
+		row.append(label, summary);
+		checks.append(row);
+	}
 	const output = document.createElement("pre");
 	output.textContent = result;
+	const rating = document.createElement("select");
+	for (const [value, text] of [
+		[1, "1 · Unusable"],
+		[2, "2 · Materially flawed"],
+		[3, "3 · Useful with limitations"],
+		[4, "4 · Meets goal"],
+		[5, "5 · Fully accomplished"],
+	] as const) {
+		const option = document.createElement("option");
+		option.value = String(value);
+		option.textContent = text;
+		if (value === 2) option.selected = true;
+		rating.append(option);
+	}
+	const feedback = document.createElement("textarea");
+	feedback.placeholder = "What failed, what should change, and what should be preserved?";
+	feedback.maxLength = 4_000;
+	const feedbackLabel = document.createElement("label");
+	feedbackLabel.append(document.createTextNode("Improvement feedback"), rating, feedback);
 	const actions = document.createElement("div");
 	actions.className = "promotion-actions";
 	const refine = document.createElement("button");
@@ -2417,6 +2627,12 @@ async function openAgentBuildProofReview(): Promise<void> {
 	const accept = document.createElement("button");
 	accept.type = "button";
 	accept.textContent = "Accept proof";
+	const blockingChecks = (build.evaluation?.checks ?? []).filter((check) => {
+		const criterion = build.criteria.find((candidate) => candidate.id === check.criterionId);
+		return criterion?.expectation !== "advisory" && criterion?.evaluator.type !== "human" && check.status !== "pass";
+	});
+	accept.disabled = blockingChecks.length > 0;
+	if (blockingChecks.length > 0) accept.title = "Required evidence checks must pass before this proof can be accepted";
 	const review = async (accepted: boolean): Promise<void> => {
 		const reviewResponse = await fetch(
 			`/agent-builds/${encodeURIComponent(build.id)}/proof-review?token=${encodeURIComponent(capabilityToken)}`,
@@ -2441,10 +2657,47 @@ async function openAgentBuildProofReview(): Promise<void> {
 			accepted ? "Proof accepted. Review and save it as a reusable skill." : "Proof rejected. Refine and retry.",
 		);
 	};
-	refine.addEventListener("click", () => void review(false).catch((error: unknown) => setStatus(String(error), true)));
+	refine.addEventListener("click", () => {
+		if (!feedback.value.trim()) {
+			feedback.focus();
+			setStatus("Describe what should improve before rejecting the proof", true);
+			return;
+		}
+		void fetch(
+			`/agent-builds/${encodeURIComponent(build.id)}/feedback?token=${encodeURIComponent(capabilityToken)}`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					rating: Number(rating.value),
+					summary: feedback.value.trim(),
+					answers: [
+						{
+							aspect: "goal-obligation",
+							question: "What should change while preserving successful behavior?",
+							answer: feedback.value.trim(),
+						},
+					],
+				}),
+			},
+		)
+			.then(async (feedbackResponse) => {
+				if (!feedbackResponse.ok) throw new Error(await responseError(feedbackResponse, "Could not save feedback"));
+				const payload: unknown = await feedbackResponse.json();
+				if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned invalid feedback");
+				activeAgentBuild = payload;
+				dialog.close();
+				input.value = `Improve ${build.name} using the retained failed proof, feedback, and criteria. Preserve every passing criterion.`;
+				resizeComposer();
+				input.focus();
+				if (session?.snapshot) renderBuilderConversation(session.snapshot);
+				setStatus("Feedback retained. Refine the candidate and run the same proof again.");
+			})
+			.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+	});
 	accept.addEventListener("click", () => void review(true).catch((error: unknown) => setStatus(String(error), true)));
 	actions.append(refine, accept);
-	dialog.append(heading, explanation, output, actions);
+	dialog.append(heading, explanation, comparison, checks, output, feedbackLabel, actions);
 	dialog.addEventListener("close", () => dialog.remove());
 	document.body.append(dialog);
 	dialog.showModal();
@@ -2474,19 +2727,57 @@ async function openLifecycleSkillPromotion(): Promise<void> {
 
 async function stageRoutineFromBuild(): Promise<void> {
 	if (!activeAgentBuild?.proof || !activeSidebarAgent) return;
+	const intent = activeAgentBuild.automationIntent;
 	await stageRoutineFromTask(
 		{
 			id: activeAgentBuild.proof.runId,
 			conversationId: "",
 			agentId: activeSidebarAgent.id,
 			status: "completed",
-			prompt: activeAgentBuild.proof.prompt,
+			prompt: intent?.task ?? activeAgentBuild.proof.prompt,
 			createdAt: activeAgentBuild.proof.finishedAt ?? Date.now(),
 			attemptIds: [activeAgentBuild.proof.runId],
 			artifactIds: [],
 		},
 		activeSidebarAgent,
 	);
+	if (intent) {
+		applyAutomationIntent(intent.cadence);
+		routineEditor.timezone.value = intent.timezone;
+		setStatus("Schedule intent restored. Review it and explicitly enable it before saving.");
+	}
+}
+
+function applyAutomationIntent(cadence: string): void {
+	const daily = /^daily\s+(\d{2}:\d{2})$/i.exec(cadence);
+	const weekly = /^weekly\s+(mon|tue|wed|thu|fri|sat|sun)\s+(\d{2}:\d{2})$/i.exec(cadence);
+	const every = /^every\s+(\d+)(m|h)$/i.exec(cadence);
+	if (daily?.[1]) {
+		routineEditor.preset.value = "daily";
+		routineEditor.time.value = daily[1];
+		updateRoutineCronFromPreset();
+		return;
+	}
+	if (/^hourly$/i.test(cadence)) {
+		routineEditor.preset.value = "hourly";
+		updateRoutineCronFromPreset();
+		return;
+	}
+	if (weekly?.[1] && weekly[2]) {
+		const day = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"].indexOf(weekly[1].toLowerCase());
+		const [hour, minute] = weekly[2].split(":");
+		routineEditor.preset.value = "custom";
+		routineEditor.time.value = weekly[2];
+		routineEditor.cron.value = `${Number(minute)} ${Number(hour)} * * ${day}`;
+		updateRoutineCronFromPreset();
+		return;
+	}
+	if (every?.[1] && every[2]) {
+		const interval = Number(every[1]);
+		routineEditor.preset.value = "custom";
+		routineEditor.cron.value = every[2].toLowerCase() === "m" ? `*/${interval} * * * *` : `0 */${interval} * * *`;
+		updateRoutineCronFromPreset();
+	}
 }
 
 function renderTeamPackageReview(preview: PiAgentTeamPreview): HTMLElement {
@@ -3946,7 +4237,51 @@ function renderSessionNavigation(): void {
 			}
 			return group;
 		}),
+		renderAgentNavigationGroup(),
 	);
+}
+
+function renderAgentNavigationGroup(): HTMLElement {
+	const group = document.createElement("section");
+	group.className = "connection-group agent-navigation-group";
+	const heading = document.createElement("div");
+	heading.className = "connection-heading";
+	const indicator = document.createElement("i");
+	const label = document.createElement("span");
+	label.textContent = "Agents";
+	const create = document.createElement("button");
+	create.type = "button";
+	create.textContent = "+";
+	create.title = "Build a new agent";
+	create.setAttribute("aria-label", create.title);
+	create.addEventListener("click", () => void openAgentBuilder());
+	heading.append(indicator, label, create);
+	group.append(heading);
+	if (agents.length === 0) {
+		const empty = document.createElement("p");
+		empty.className = "agent-activity-empty";
+		empty.textContent = "No published agents";
+		group.append(empty);
+		return group;
+	}
+	for (const agent of agents) {
+		const button = document.createElement("button");
+		button.type = "button";
+		button.className = "nav-item session-entry";
+		button.classList.toggle("active", activeAgentId === agent.id);
+		const name = document.createElement("strong");
+		name.textContent = agent.name;
+		const state = document.createElement("span");
+		state.className = "muted";
+		const build = agentBuilds.find((candidate) => candidate.agentId === agent.id);
+		state.textContent = build
+			? `${agentBuildStageLabel(build)} · revision ${agent.revision}`
+			: `Revision ${agent.revision}`;
+		button.append(name, state);
+		button.addEventListener("click", () => void openAgent(agent));
+		group.append(button);
+	}
+	return group;
 }
 
 async function switchSession(target: SessionTarget, preserveWorkspace = false): Promise<void> {
@@ -6245,15 +6580,45 @@ function renderAgentBuildDraftCard(build: AgentBuildRecord): HTMLElement {
 async function resumeAgentBuildDraft(build: AgentBuildRecord): Promise<void> {
 	await openAgentBuilder();
 	activeAgentBuild = build;
-	requiredElement<HTMLInputElement>("agent-name").value = build.name;
-	requiredElement<HTMLTextAreaElement>("agent-description").value = build.objective.startsWith("Refine the purpose")
-		? ""
-		: build.objective;
-	requiredElement<HTMLInputElement>("agent-project-root").value = build.projectRoot;
+	if (build.configuration) applyAgentBuildConfiguration(build.configuration);
+	else {
+		requiredElement<HTMLInputElement>("agent-name").value = build.name;
+		requiredElement<HTMLTextAreaElement>("agent-description").value = build.objective.startsWith("Refine the purpose")
+			? ""
+			: build.objective;
+		requiredElement<HTMLInputElement>("agent-project-root").value = build.projectRoot;
+	}
 	updateAgentBuilderReadiness();
 	if (session?.snapshot) renderBuilderConversation(session.snapshot);
 	input.focus();
 	setStatus(`Resumed draft ${build.name}`);
+}
+
+function applyAgentBuildConfiguration(configuration: NonNullable<AgentBuildRecord["configuration"]>): void {
+	requiredElement<HTMLInputElement>("agent-name").value = configuration.name;
+	requiredElement<HTMLTextAreaElement>("agent-description").value = configuration.description;
+	requiredElement<HTMLTextAreaElement>("agent-persona").value = configuration.persona;
+	requiredElement<HTMLInputElement>("agent-project-root").value = configuration.projectRoot;
+	requiredElement<HTMLInputElement>("agent-tools").value = configuration.tools.join(",");
+	requiredElement<HTMLSelectElement>("agent-memory").value = configuration.memory;
+	requiredElement<HTMLSelectElement>("agent-executor").value = configuration.executor;
+	requiredElement<HTMLSelectElement>("agent-permissions").value = configuration.permissionPolicy;
+	requiredElement<HTMLSelectElement>("agent-browser-access").value = configuration.browserAccess;
+	requiredElement<HTMLInputElement>("agent-delegates").value = configuration.delegateAgentIds.join(",");
+	requiredElement<HTMLInputElement>("agent-a2a").checked = configuration.exposeA2a;
+	if (configuration.model) {
+		requiredElement<HTMLSelectElement>("agent-model").value =
+			`${configuration.model.provider}/${configuration.model.id}`;
+		agentModelPicker.refresh();
+	}
+	if (configuration.thinking) requiredElement<HTMLSelectElement>("agent-thinking").value = configuration.thinking;
+	updateThinkingLevelAvailability(
+		requiredElement<HTMLSelectElement>("agent-thinking"),
+		requiredElement<HTMLSelectElement>("agent-model").value,
+		configuration.thinking,
+	);
+	updateAgentBrowserProfileFields();
+	updateBuilderCapabilitySummary();
 }
 
 function closeAgentMenus(except?: HTMLDetailsElement): void {
@@ -6848,7 +7213,15 @@ function validateAgentBuilder(): boolean {
 	return false;
 }
 
-function agentBuildDraftInput(): { name: string; objective: string; projectRoot: string } | undefined {
+function agentBuildDraftInput():
+	| {
+			name: string;
+			objective: string;
+			projectRoot: string;
+			configuration?: AgentBuildRecord["configuration"];
+			criteria?: unknown[];
+	  }
+	| undefined {
 	const name = requiredElement<HTMLInputElement>("agent-name").value.trim();
 	const projectRoot = requiredElement<HTMLInputElement>("agent-project-root").value.trim();
 	if (!name || !projectRoot) return undefined;
@@ -6857,6 +7230,44 @@ function agentBuildDraftInput(): { name: string; objective: string; projectRoot:
 		name,
 		objective: description || `Refine the purpose and expected outcome of ${name}.`,
 		projectRoot,
+		configuration: agentBuildConfigurationInput(),
+		criteria: draftedAgentCriteria ?? activeAgentBuild?.criteria,
+	};
+}
+
+function agentBuildConfigurationInput(): AgentBuildRecord["configuration"] | undefined {
+	const value = (id: string) =>
+		requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(id).value.trim();
+	const name = value("agent-name");
+	const description = value("agent-description");
+	const persona = value("agent-persona");
+	const projectRoot = value("agent-project-root");
+	if (!name || !description || !persona || !projectRoot) return undefined;
+	const modelReference = value("agent-model");
+	const separator = modelReference.indexOf("/");
+	return {
+		name,
+		description,
+		persona,
+		projectRoot,
+		tools: value("agent-tools")
+			.split(",")
+			.map((tool) => tool.trim())
+			.filter(Boolean),
+		model:
+			separator > 0
+				? { provider: modelReference.slice(0, separator), id: modelReference.slice(separator + 1) }
+				: undefined,
+		thinking: value("agent-thinking") as ThinkingLevel,
+		memory: value("agent-memory") as "none" | "notes",
+		executor: value("agent-executor") as "session" | "harness",
+		permissionPolicy: value("agent-permissions") as "read-only" | "workspace-write",
+		browserAccess: value("agent-browser-access") as "disabled" | "loopback" | "public-web" | "private-network",
+		delegateAgentIds: value("agent-delegates")
+			.split(",")
+			.map((id) => id.trim())
+			.filter(Boolean),
+		exposeA2a: requiredElement<HTMLInputElement>("agent-a2a").checked,
 	};
 }
 
@@ -6872,7 +7283,7 @@ function scheduleAgentBuildDraftPersistence(): void {
 }
 
 async function persistAgentBuildDraft(): Promise<void> {
-	if (!capabilityToken || activeAgentBuild?.agentId) return;
+	if (!capabilityToken) return;
 	const draft = agentBuildDraftInput();
 	if (!draft) return;
 	const path = activeAgentBuild ? `/agent-builds/${encodeURIComponent(activeAgentBuild.id)}` : "/agent-builds/draft";
@@ -6885,11 +7296,12 @@ async function persistAgentBuildDraft(): Promise<void> {
 	const payload: unknown = await response.json();
 	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid draft");
 	activeAgentBuild = payload;
+	draftedAgentCriteria = payload.criteria;
 	if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
 }
 
-async function loadAgentBuildForAgent(agentId: string): Promise<void> {
-	if (!capabilityToken) return;
+async function loadAgentBuildForAgent(agentId: string): Promise<AgentBuildRecord | undefined> {
+	if (!capabilityToken) return undefined;
 	const response = await fetch(`/agent-builds/for-agent?token=${encodeURIComponent(capabilityToken)}`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
@@ -6899,6 +7311,8 @@ async function loadAgentBuildForAgent(agentId: string): Promise<void> {
 	const payload: unknown = await response.json();
 	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid record");
 	activeAgentBuild = payload;
+	draftedAgentCriteria = payload.criteria;
+	return payload;
 }
 
 async function linkActiveAgentBuild(agentId: string): Promise<void> {
@@ -6919,10 +7333,13 @@ async function linkActiveAgentBuild(agentId: string): Promise<void> {
 	const payload: unknown = await response.json();
 	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid record");
 	activeAgentBuild = payload;
+	draftedAgentCriteria = payload.criteria;
+	await loadAgents();
 }
 
 async function refreshActiveAgentBuild(): Promise<void> {
 	if (!capabilityToken || !activeAgentBuild) return;
+	const previousRevision = activeAgentBuild.revision;
 	const response = await fetch(
 		`/agent-builds/${encodeURIComponent(activeAgentBuild.id)}?token=${encodeURIComponent(capabilityToken)}`,
 	);
@@ -6930,6 +7347,12 @@ async function refreshActiveAgentBuild(): Promise<void> {
 	const payload: unknown = await response.json();
 	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid record");
 	activeAgentBuild = payload;
+	draftedAgentCriteria = payload.criteria;
+	if (payload.revision !== previousRevision && payload.stage === "draft" && payload.configuration) {
+		applyAgentBuildConfiguration(payload.configuration);
+		agentBuilderFeedback = `Staged revision ${payload.revision} is ready to review and apply.`;
+		updateAgentBuilderReadiness();
+	}
 	if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
 }
 
@@ -6964,14 +7387,44 @@ function applyAgentBuilderDraft(encoded: string): void {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(encoded);
-	} catch {
+	} catch (error) {
+		const message = `Agent draft JSON is invalid: ${error instanceof Error ? error.message : String(error)}`;
+		agentBuilderFeedback = message;
+		agentValidation.className = "run-error";
+		agentValidation.textContent = message;
+		setStatus(message, true);
 		return;
 	}
 	const draft = objectRecord(parsed);
-	if (!draft) return;
+	if (!draft) {
+		const message = "Agent draft marker must contain one JSON object";
+		agentBuilderFeedback = message;
+		agentValidation.className = "run-error";
+		agentValidation.textContent = message;
+		setStatus(message, true);
+		return;
+	}
 	lastAppliedBuilderDraft = encoded;
 	agentBuilderFeedback = "";
 	const warnings: string[] = [];
+	const supportedFields = new Set([
+		"name",
+		"description",
+		"projectRoot",
+		"personaId",
+		"persona",
+		"systemPrompt",
+		"model",
+		"thinking",
+		"executor",
+		"permissionPolicy",
+		"browserAccess",
+		"tools",
+		"delegateAgentIds",
+		"criteria",
+	]);
+	const unsupported = Object.keys(draft).filter((field) => !supportedFields.has(field));
+	if (unsupported.length > 0) warnings.push(`Unsupported fields: ${unsupported.join(", ")}`);
 	setBuilderDraftText("agent-name", draft.name);
 	setBuilderDraftText("agent-description", draft.description);
 	setBuilderDraftText("agent-project-root", draft.projectRoot);
@@ -6980,12 +7433,13 @@ function applyAgentBuilderDraft(encoded: string): void {
 			personaSelect.value = draft.personaId;
 			updatePersonaPreview(true);
 		}
-	} else if (typeof draft.persona === "string") {
-		const persona = personas.find((entry) => entry.id === draft.persona);
+	} else if (typeof draft.persona === "string" || typeof draft.systemPrompt === "string") {
+		const instructions = typeof draft.persona === "string" ? draft.persona : String(draft.systemPrompt);
+		const persona = personas.find((entry) => entry.id === instructions);
 		if (persona && personaSelect.value !== persona.id) {
 			personaSelect.value = persona.id;
 			updatePersonaPreview(true);
-		} else if (!persona) setBuilderDraftText("agent-persona", draft.persona);
+		} else if (!persona) setBuilderDraftText("agent-persona", instructions);
 	}
 	if (!setBuilderDraftSelect("agent-model", draft.model)) warnings.push(`Unavailable model ${String(draft.model)}`);
 	setBuilderDraftSelect("agent-thinking", draft.thinking);
@@ -7000,6 +7454,10 @@ function applyAgentBuilderDraft(encoded: string): void {
 	}
 	if (Array.isArray(draft.delegateAgentIds) && draft.delegateAgentIds.every((entry) => typeof entry === "string"))
 		requiredElement<HTMLInputElement>("agent-delegates").value = draft.delegateAgentIds.join(", ");
+	if (draft.criteria !== undefined) {
+		if (Array.isArray(draft.criteria)) draftedAgentCriteria = draft.criteria;
+		else warnings.push("Improvement criteria must be an array");
+	}
 	updateAgentBrowserProfileFields();
 	agentModelPicker.refresh();
 	updateThinkingLevelAvailability(
@@ -7778,6 +8236,7 @@ async function openAgentBuilder(
 	teamLaunchBusy = false;
 	agentBuilderFeedback = "";
 	activeAgentBuild = undefined;
+	draftedAgentCriteria = undefined;
 	if (agentBuildDraftTimer !== undefined) window.clearTimeout(agentBuildDraftTimer);
 	if (agentBuildPollTimer !== undefined) window.clearTimeout(agentBuildPollTimer);
 	agentBuildDraftTimer = undefined;
@@ -7833,7 +8292,7 @@ async function openAgentBuilder(
 			: agent.name
 		: "Build a new agent";
 	builderLabel = agent ? `Edit ${agent.name}` : "Agent Builder";
-	agentSubmit.textContent = agent ? "Apply and update agent" : "Create agent";
+	agentSubmit.textContent = agent ? "Save candidate revision" : "Publish agent";
 	agentCancel.textContent = agent ? "Cancel editing" : "Cancel agent";
 	activateTab(showConversation ? "agents-workspace" : "agent-builder");
 	activateBuilderTab("builder-profile-panel");
@@ -7851,12 +8310,22 @@ async function openAgentBuilder(
 	renderSessionNavigation();
 	refreshRoutineEditorOptions();
 	clearRoutineEditor();
-	await Promise.all([
-		loadCapabilities(),
-		loadRoutines(),
-		loadTeamFactoryStatus(),
-		agent ? loadAgentBuildForAgent(agent.id) : Promise.resolve(),
-	]).catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+	let loadedBuild: AgentBuildRecord | undefined;
+	try {
+		[, , , loadedBuild] = await Promise.all([
+			loadCapabilities(),
+			loadRoutines(),
+			loadTeamFactoryStatus(),
+			agent ? loadAgentBuildForAgent(agent.id) : Promise.resolve(undefined),
+		]);
+	} catch (error) {
+		setStatus(error instanceof Error ? error.message : String(error), true);
+	}
+	if (loadedBuild?.stage === "draft" && loadedBuild.configuration) {
+		applyAgentBuildConfiguration(loadedBuild.configuration);
+		updateAgentBuilderReadiness();
+		setStatus(`Loaded staged changes for ${loadedBuild.name}`);
+	}
 	if (session?.snapshot) renderBuilderConversation(session.snapshot);
 }
 
@@ -7864,6 +8333,7 @@ function closeBuilderChat(): void {
 	builderActive = false;
 	activeAgentImprovement = undefined;
 	activeAgentBuild = undefined;
+	draftedAgentCriteria = undefined;
 	if (agentBuildDraftTimer !== undefined) window.clearTimeout(agentBuildDraftTimer);
 	if (agentBuildPollTimer !== undefined) window.clearTimeout(agentBuildPollTimer);
 	agentBuildDraftTimer = undefined;
@@ -8251,9 +8721,20 @@ function renderAgentActivity(tasks: AgentTaskSummary[], attention: AttentionSumm
 	const openAttention = attention
 		.filter((item) => item.status === "open")
 		.sort((left, right) => priority[left.kind] - priority[right.kind] || right.createdAt - left.createdAt);
-	attentionHeading.textContent = openAttention.length > 0 ? `Attention · ${openAttention.length}` : "Attention";
+	const workflowBuilds = agentBuilds
+		.filter((build) => build.stage !== "automated")
+		.sort((left, right) => right.updatedAt - left.updatedAt);
+	const attentionCount = openAttention.length + workflowBuilds.length;
+	attentionHeading.textContent = attentionCount > 0 ? `Workflow · ${attentionCount}` : "Workflow";
+	const workflowTab = document.querySelector<HTMLButtonElement>('[data-tab="agents-workspace"]');
+	if (workflowTab) workflowTab.textContent = attentionCount > 0 ? `Workflow · ${attentionCount}` : "Workflow";
+	const workflowBadge = document.getElementById("workflow-badge");
+	if (workflowBadge) {
+		workflowBadge.textContent = String(attentionCount);
+		workflowBadge.classList.toggle("hidden", attentionCount === 0);
+	}
 	openArtifactsButton.disabled = artifacts.length === 0;
-	if (active.length === 0 && openAttention.length === 0) {
+	if (active.length === 0 && openAttention.length === 0 && workflowBuilds.length === 0) {
 		const empty = document.createElement("p");
 		empty.className = "agent-activity-empty";
 		empty.textContent = "Nothing needs attention";
@@ -8261,9 +8742,54 @@ function renderAgentActivity(tasks: AgentTaskSummary[], attention: AttentionSumm
 		return;
 	}
 	agentActivityList.replaceChildren(
+		...workflowBuilds.slice(0, 5).map(renderBuildWorkflowEntry),
 		...active.slice(0, 5).map((task) => renderTaskActivityEntry(task)),
 		...openAttention.slice(0, 5).map((item) => renderAttentionEntry(item, tasks)),
 	);
+}
+
+function renderBuildWorkflowEntry(build: AgentBuildRecord): HTMLButtonElement {
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "agent-activity-entry";
+	button.dataset.status =
+		build.stage === "needs-refinement" ? "failed" : build.stage === "testing" ? "running" : "waiting_for_input";
+	button.title = `${build.name}: ${agentBuildStageLabel(build)}`;
+	const indicator = document.createElement("i");
+	indicator.className = "agent-activity-status";
+	const copy = document.createElement("span");
+	const name = document.createElement("strong");
+	name.textContent = build.name;
+	const next = document.createElement("small");
+	next.textContent = buildWorkflowNextAction(build);
+	copy.append(name, next);
+	const state = document.createElement("time");
+	state.dateTime = new Date(build.updatedAt).toISOString();
+	state.textContent = agentBuildStageLabel(build);
+	button.append(indicator, copy, state);
+	button.addEventListener("click", () => {
+		activeAgentBuild = build;
+		const agent = agents.find((candidate) => candidate.id === build.agentId);
+		void openAgentBuilder(agent).then(() => {
+			if (
+				build.stage === "proof-ready" ||
+				(build.stage === "needs-refinement" && build.proof?.status === "succeeded")
+			) {
+				void openAgentBuildProofReview();
+			}
+		});
+	});
+	return button;
+}
+
+function buildWorkflowNextAction(build: AgentBuildRecord): string {
+	if (build.stage === "draft") return build.agentId ? "Review candidate changes" : "Review and publish draft";
+	if (build.stage === "ready-to-test") return "Run one proof";
+	if (build.stage === "testing") return "Proof is running";
+	if (build.stage === "proof-ready") return "Review evidence and decide";
+	if (build.stage === "needs-refinement") return "Review failed criteria and improve";
+	if (build.stage === "proven") return "Promote accepted revision";
+	return "Review and enable schedule";
 }
 
 function renderTaskActivityEntry(task: AgentTaskSummary): HTMLButtonElement {
@@ -9763,6 +10289,7 @@ async function submitBuilderComposer(): Promise<void> {
 		editingExistingAgent
 			? "This is an edit. Include only fields the user explicitly requested to change; omit every unchanged field."
 			: "This is a new agent. Include every required field that is known and omit unknown optional fields.",
+		"When feedback identifies an observable regression, include a criteria array in the draft marker. Each item needs id, label, description, category, expectation, and evaluator. Use human for judgment; tool-receipt/tool-errors/workspace-mutation for retained tool evidence; result-text/artifact-text/artifact-change for deterministic output checks. Preserve existing passing criteria.",
 		'End with exactly one one-line JSON marker. For a model-only edit, use: [AGENT_DRAFT]{"model":"provider/model"}[/AGENT_DRAFT]',
 		"Never invent a model ID. Use an exact candidate below. If there is one clear match, use it without asking; otherwise ask the user to choose in Advanced configuration.",
 		`Exact model candidates for this request: ${agentBuilderModelCandidates(prompt)}`,
@@ -9784,6 +10311,7 @@ async function submitBuilderComposer(): Promise<void> {
 	].join("\n");
 	try {
 		await chatSession.prompt(message);
+		if (builderActive && session === chatSession) await refreshActiveAgentBuild();
 	} catch (error) {
 		if (!input.value.trim()) {
 			input.value = prompt;
@@ -10245,11 +10773,35 @@ agentForm.addEventListener("submit", (event) => {
 				: undefined,
 		schedules: activeSidebarAgent?.schedules ?? [],
 	};
-	const path = id ? `/agents/${encodeURIComponent(id)}` : "/agents";
+	if (id) {
+		if (activeAgentBuild?.agentId !== id) {
+			setStatus("The durable build record is unavailable. Reopen this agent before saving a candidate.", true);
+			return;
+		}
+		setStatus("Saving candidate revision…");
+		void persistAgentBuildDraft()
+			.then(async () => {
+				agentBuilderBaseline = agentBuilderDraftSignature();
+				agentBuilderFeedback = `Candidate revision ${activeAgentBuild?.candidateRevision ?? ""} saved. The active agent remains unchanged until proof acceptance and promotion.`;
+				activeAgentImprovement = undefined;
+				updateAgentBuilderReadiness();
+				await loadAgents();
+				if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
+				setStatus(agentBuilderFeedback);
+			})
+			.catch((error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				agentValidation.className = "run-error";
+				agentValidation.textContent = message;
+				setStatus(message, true);
+			});
+		return;
+	}
+	const path = "/agents";
 	const savedAgentName = definition.name;
-	setStatus(id ? "Updating agent…" : "Creating agent…");
+	setStatus("Publishing agent…");
 	void fetch(`${path}?token=${encodeURIComponent(capabilityToken)}`, {
-		method: id ? "PUT" : "POST",
+		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(definition),
 	})
@@ -10279,10 +10831,10 @@ agentForm.addEventListener("submit", (event) => {
 					await linkActiveAgentBuild(savedId);
 				}
 				builderLabel = `Edit ${savedAgentName}`;
-				agentSubmit.textContent = "Apply and update agent";
+				agentSubmit.textContent = "Save candidate revision";
 				agentCancel.textContent = "Cancel editing";
 				agentBuilderBaseline = agentBuilderDraftSignature();
-				agentBuilderFeedback = id ? `Agent ${savedAgentName} updated.` : `Agent ${savedAgentName} created.`;
+				agentBuilderFeedback = `Agent ${savedAgentName} published.`;
 				activeAgentImprovement = undefined;
 				updateAgentBuilderReadiness();
 				if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
