@@ -15,9 +15,10 @@ packages/ai/src/providers/.model-generation-*/
 
 # Environment
 .env
-.env.local
-.pi/vault/
-.env.*.local
+.env.*
+!.env.example
+!.env.sample
+!.env.template
 
 # Editor files
 .vscode/
@@ -37,6 +38,7 @@ tui-debug.log
 compaction-results/
 .opencode/
 .playwright-cli/
+.playwright/
 .codex-remote-attachments/
 syntax.jsonl
 out.jsonl
@@ -45,23 +47,42 @@ out.html
 packages/coding-agent/binaries/
 todo.md
 plans/
-.pi/hf-sessions/
-.pi/hf-sessions-backup/
 
-# Local Pi agents and runtime state. Keep shared extensions, prompts, and skills tracked.
-.pi/agents/
-.pi/agents-runs/
-.pi/agents-schedules/
-.pi/memory/
-.pi/personas/
-.pi/serve/
-.pi/sessions/
-.pi/auth.json
-.pi/models.json
-.pi/models-store.json
-.pi/settings.json
-.pi/trust.json
-.pi/mantle-token.py
+# Private user work and generated evidence. Use .local/ for personal projects.
+.local/
+/output/
+/playwright-report/
+/test-results/
+
+# Pi data is private by default, including nested projects and future stores.
+# New agents, skills, prompts, extensions, credentials, and state stay local.
+# See docs/pi-user-data-privacy.md before adding a shared-source exception.
+**/.pi/*
+
+# Reviewed source shipped with this repository, not user-generated packages.
+!/.pi/extensions/
+/.pi/extensions/*
+!/.pi/extensions/api-tools.ts
+!/.pi/extensions/import-repro.ts
+!/.pi/extensions/prompt-url-widget.ts
+!/.pi/extensions/redraws.ts
+!/.pi/extensions/tps.ts
+!/.pi/prompts/
+/.pi/prompts/*
+!/.pi/prompts/cl.md
+!/.pi/prompts/is.md
+!/.pi/prompts/pr.md
+!/.pi/prompts/sa.md
+!/.pi/prompts/wr.md
+!/.pi/skills/
+/.pi/skills/*
+!/.pi/skills/add-llm-provider.md
+!/.pi/git/
+/.pi/git/*
+!/.pi/git/.gitignore
+!/.pi/npm/
+/.pi/npm/*
+!/.pi/npm/.gitignore
 
 # Local task scratch files
 .tmp_*

@@ -143,9 +143,9 @@ keys from that child environment.
 
 ### Alternative A: one passphrase vault per workspace
 
-This closely follows WTK-dev. It is portable and keeps a checkout
-self-contained, but duplicates shared accounts, complicates rotation, and
-requires repeated unlocks when Pi serves several workspaces.
+This approach is portable and keeps a checkout self-contained, but duplicates
+shared accounts, complicates rotation, and requires repeated unlocks when Pi
+serves several workspaces.
 
 ### Alternative B: operating-system storage only
 

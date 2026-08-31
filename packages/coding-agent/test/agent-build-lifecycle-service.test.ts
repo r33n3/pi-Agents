@@ -249,15 +249,16 @@ describe("AgentBuildLifecycleService", () => {
 		await runs.waitForCompletion(candidate.proof?.runId ?? (await lifecycle.get(candidate.id)).proof!.runId);
 	});
 
-	test("rejects the observed Ozark proof failures and accepts the corrected same-task rerun", async () => {
+	// Synthetic identities reproduce failure categories without publishing a user's package.
+	test("rejects source, geography, and stale-artifact failures and accepts the corrected same-task rerun", async () => {
 		const { root, registry, runs, executor, lifecycle } = await setup();
-		const workspace = join(root, "ozark");
+		const workspace = join(root, "exampletown");
 		await mkdir(workspace, { recursive: true });
-		await writeFile(join(workspace, "report.html"), "Lake of the Ozarks — 40 miles north\nHeat Advisory Notice\n");
+		await writeFile(join(workspace, "report.html"), "Distant Lake — 40 miles north\nHeat Advisory Notice\n");
 		await writeFile(join(workspace, "state.json"), '{"messageCount": null, "actionCount": null}\n');
 		await registry.save({
-			id: "ozark-brief",
-			name: "Ozark brief",
+			id: "exampletown-brief",
+			name: "Exampletown brief",
 			description: "Create a grounded local outdoor brief",
 			projectRoot: workspace,
 			tools: ["read", "write", "feed_read", "weather_alerts"],
@@ -267,19 +268,19 @@ describe("AgentBuildLifecycleService", () => {
 			permissionPolicy: "workspace-write",
 			schedules: [],
 		});
-		const criteria = ozarkCriteria();
+		const criteria = exampletownCriteria();
 		const build = await lifecycle.stageDraft({
-			name: "Ozark brief",
+			name: "Exampletown brief",
 			objective: "Create a grounded local outdoor brief",
 			projectRoot: workspace,
-			agentId: "ozark-brief",
+			agentId: "exampletown-brief",
 			criteria,
 		});
-		await lifecycle.linkAgent(build.id, "ozark-brief");
+		await lifecycle.linkAgent(build.id, "exampletown-brief");
 
-		const failedProof = await lifecycle.startProof(build.id, "Create today's Ozark brief");
+		const failedProof = await lifecycle.startProof(build.id, "Create today's Exampletown brief");
 		executor.executions[0]!.resolve({
-			output: "All events verified. Heat advisory inferred. Lake of the Ozarks is 40 miles north.",
+			output: "All events verified. Heat advisory inferred. Distant Lake is 40 miles north.",
 			transcript: [
 				toolResult("feed_read", '{"entries":[]}'),
 				toolResult("weather_alerts", "XML parse failure", true),
@@ -312,8 +313,11 @@ describe("AgentBuildLifecycleService", () => {
 			],
 		});
 
-		const correctedProof = await lifecycle.startProof(build.id, "Create today's Ozark brief");
-		await writeFile(join(workspace, "report.html"), "Ozark, Missouri local brief\nForecast-based heat caution\n");
+		const correctedProof = await lifecycle.startProof(build.id, "Create today's Exampletown brief");
+		await writeFile(
+			join(workspace, "report.html"),
+			"Exampletown, Example State local brief\nForecast-based heat caution\n",
+		);
 		await writeFile(join(workspace, "state.json"), '{"messageCount": 0, "actionCount": 0}\n');
 		executor.executions[1]!.resolve({
 			output: "Created a smaller local brief from an exact source.",
@@ -353,7 +357,7 @@ function toolResult(toolName: string, text: string, isError = false): AgentExecu
 	};
 }
 
-function ozarkCriteria(): unknown[] {
+function exampletownCriteria(): unknown[] {
 	const criterion = (
 		id: string,
 		label: string,
@@ -392,7 +396,7 @@ function ozarkCriteria(): unknown[] {
 			type: "artifact-text",
 			path: "report.html",
 			mode: "omits",
-			text: "Lake of the Ozarks",
+			text: "Distant Lake",
 		}),
 		criterion("alert-honesty", "Unconfirmed official alert label is absent", "refusal-honesty", {
 			type: "artifact-text",

@@ -7,7 +7,7 @@ Implemented for the local process profile: slices 0 through 8 and 10. Slice 9 re
 Reference baseline:
 
 - Repository: `https://github.com/CopilotKit/openbot`
-- Local review checkout: `C:\Users\bradj\Development\openbot`
+- Local review checkout: a separate sibling checkout of the reference project.
 - Branch: `main`
 - Commit: `d293f2331bd5ff9ba4ad17af6ac94570a157d26d`
 - License at the reviewed commit: MIT

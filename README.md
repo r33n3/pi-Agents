@@ -8,8 +8,6 @@
 
 Pi Agents is a developer-focused fork of [earendil-works/pi](https://github.com/earendil-works/pi). It preserves Pi's CLI, agent runtime, multi-provider model support, and extension system while adding an authenticated local web workspace for running Pi sessions, deployed agents, browser automation, and coordinated workflows together.
 
-![Pi Agents desktop workspace](docs/images/pi-agents-desktop.png)
-
 ## What this fork adds
 
 | Area | Added behavior |
@@ -28,19 +26,6 @@ Pi Agents is a developer-focused fork of [earendil-works/pi](https://github.com/
 | Interoperability | Expose selected agents through an authenticated A2A 1.0 HTTP+JSON boundary using the same persistent task service as local chat and workflows. |
 | Responsive access | Phone and unfolded Pixel Fold layouts keep chat primary and open Sessions or Browser/Agents/Agent Builder as dismissible side panels. |
 
-<table>
-  <tr>
-    <td><img alt="Pi Agents mobile chat" src="docs/images/pi-agents-mobile-chat.png"></td>
-    <td><img alt="Pi Agents mobile agent workspace" src="docs/images/pi-agents-mobile-agents.png"></td>
-    <td><img alt="Pi Agents unfolded foldable workspace" src="docs/images/pi-agents-fold.png"></td>
-  </tr>
-  <tr>
-    <td align="center">Mobile chat</td>
-    <td align="center">Mobile agents</td>
-    <td align="center">Unfolded Pixel Fold</td>
-  </tr>
-</table>
-
 ## Start the web workspace
 
 Run Pi from the project it should operate on:
@@ -55,6 +40,18 @@ Pi starts at port `4173` and selects the next available port when needed. It pri
 To run several projects, start one Pi process in each directory. Then use **Connect Pi** in any console and enter the complete capability URL printed by another process. The console can switch among those sessions while every Pi process and deployed agent continues independently.
 
 See [pi-Agents local console](docs/pi-agents-serve.md) for storage, executors, companion extensions, and focused verification commands.
+
+## Keep user data private
+
+Agents, drafts, sessions, credentials, and generated evidence are local user data,
+not contributions to this repository. The root `.gitignore` keeps `.pi/` private
+by default, with explicit exceptions only for reviewed source shipped here.
+Put personal build workspaces under `.local/` or outside the checkout. Store
+screenshots and reports under `output/`; public examples must use synthetic data.
+
+See [user-data privacy and reusable ignore rules](docs/pi-user-data-privacy.md)
+before testing, contributing, or sharing an agent. Ignore rules do not protect
+already tracked files or remove data from Git history.
 
 ## Local network access
 
@@ -188,6 +185,10 @@ We treat npm dependency changes as reviewed code changes.
 ## Share your OSS coding agent sessions
 
 If you use Pi or other coding agents for open source work, please share your sessions.
+
+Sharing is optional and requires a separate review and explicit publication.
+Never include private agent packages, credentials, capability URLs, personal
+conversations, or user data. The ignore rules do not sanitize session exports.
 
 Public OSS session data helps improve coding agents with real-world tasks, tool use, failures, and fixes instead of toy benchmarks.
 

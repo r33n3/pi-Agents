@@ -1,15 +1,20 @@
 # Agent build lifecycle validation — 2026-08-30
 
+This is an anonymized case study of a local validation run, not a distributable
+user agent package. Agent names, run labels, locations, prompts, schedules, and
+host paths are generalized placeholders. Findings, lifecycle transitions, and
+test results are retained; original packages and evidence remain private.
+
 ## Scope
 
 Validate the full draft, create, proof, review, refine, promote, and schedule
-lifecycle with `ozark-outdoor-daily-brief` before turning the findings into an
+lifecycle with `reference-local-brief` before turning the findings into an
 implementation goal.
 
-- Build: `build-716ed6c7-de57-4fa4-ac87-2bc771fecc33`
-- Agent: `ozark-outdoor-daily-brief`
-- Project: `C:\Users\bradj\Development\daily-mail-agent-feed`
-- Intended schedule: daily at 10:00 America/Chicago
+- Build: `<private-build-id>`
+- Agent: `reference-local-brief`
+- Project: `<private-workspace>`
+- Intended schedule: daily, with a user-selected time and timezone
 - Schedule status: inactive
 
 ## Lifecycle result
@@ -18,13 +23,13 @@ implementation goal.
 | --- | --- | --- |
 | Draft | Passed | Existing staged build was recoverable from the current builder chat. |
 | Create | Passed with UX issue | `Create agent` produced managed agent revision 1 and build revision 4. No routine was created. |
-| Isolated proof | Runtime passed | Run `ffb2b938-5d84-4d25-9275-598bed1f55ed` completed and retained `run.json`, `transcript.json`, and `result.md`. |
+| Isolated proof | Runtime passed | Run `proof-initial` completed and retained `run.json`, `transcript.json`, and `result.md`. |
 | Proof quality review | Failed | The report rendered correctly but contained unsupported and geographically incorrect claims. The proof was rejected. |
 | Rejection feedback | Passed | `Needs refinement` returned control to builder chat, where the user supplied concrete proof findings for the next revision. |
 | Refine after rejection | Passed after recovery | The original builder turn stalled and the serve process exited. Restarting with the same capability token preserved the build, agent, proof, and feedback. The `Improve` flow then staged and applied agent revision 2. |
-| Second isolated proof | Runtime passed, quality failed | Run `8a9ecbb5-bfe7-4877-886d-1df89ea4cdee` completed on agent revision 2, but reused the rejected report unchanged and repeated unsupported claims. The proof was rejected. |
+| Second isolated proof | Runtime passed, quality failed | Run `proof-revision-2` completed on agent revision 2, but reused the rejected report unchanged and repeated unsupported claims. The proof was rejected. |
 | Promote | Not attempted | A rejected proof must not be promoted. |
-| Schedule | Not attempted | No accepted proof or promotion exists, and the original 10:00 intent is no longer present in the build record. |
+| Schedule | Not attempted | No accepted proof or promotion exists, and the original daily schedule intent is no longer present in the build record. |
 
 Current safe state: agent revision 2 exists, both proofs are rejected, and no
 schedule is active.
@@ -51,7 +56,7 @@ Revision 2 showed one process improvement: it called `feed_read` three times.
 All three reads returned empty entry sets, so they did not verify any factual
 claim. The agent nevertheless asserted that all events and sources were
 verified. It made no `write` or `edit` call, left the prior report and state
-unchanged, repeated the incorrect Lake of the Ozarks radius and direction
+unchanged, repeated the incorrect Distant Lake radius and direction
 claims, retained inferred official alert wording, and left `messageCount` and
 `actionCount` as `null`.
 
@@ -77,15 +82,14 @@ Required fix:
 
 ### Geographic scope was not enforced
 
-The proof called Lake Ozark/Lake of the Ozarks about 40 miles north and inside
-the requested 45-mile driving radius. Independent route results place the trip
-at roughly 102–108 driving miles. It also described Springfield destinations
-as south of Ozark and Glade Top Trail as west, despite their actual directions.
+The proof placed a distant lake inside the requested driving radius, although
+independent route results placed it well outside that boundary. It also gave
+incorrect directions to nearby destinations and a regional trail.
 
 Required fix:
 
-- Store the anchor as Ozark, Missouri 65721 with resolved coordinates.
-- Distinguish Ozark city, the Ozarks region, and Lake Ozark before research.
+- Store the intended city, state, postal code, and resolved coordinates.
+- Distinguish the reference city from similarly named regions and towns before research.
 - Require route evidence for a claim stated as driving distance.
 - Reject or omit candidates not proven within the requested radius.
 - Prefer a smaller local result over regional filler.
@@ -131,7 +135,7 @@ Required fix:
 ## Pi Agents user-experience improvement backlog
 
 These are product and interaction improvements exposed by the lifecycle test.
-They are separate from defects in the generated Ozarks report.
+They are separate from defects in the generated local-brief report.
 
 ### Keep approvals visible without blocking chat
 
@@ -284,7 +288,7 @@ Required fix:
 
 ### Schedule intent was lost
 
-The original 10:00 America/Chicago request was described by the builder but is
+The original daily schedule request was described by the builder but is
 absent from the current build record. Creation and proof correctly left the
 routine list empty, but there is nothing to repopulate after promotion.
 
@@ -318,12 +322,7 @@ The generated report itself passed layout checks:
   found.
 - The only browser console error was a missing `favicon.ico`.
 
-Artifacts:
-
-- `output/playwright/ozark-proof-desktop-viewport.png`
-- `output/playwright/ozark-proof-mobile-viewport.png`
-- `output/playwright/ozark-proof-desktop.png`
-- `output/playwright/ozark-proof-mobile.png`
+Desktop and mobile screenshots are retained privately under ignored `output/`.
 
 ## Next resume point
 
@@ -335,19 +334,19 @@ official alert labels without a confirmed alert, and null state regressions.
 
 ## Implementation outcome
 
-The lifecycle goal was implemented and validated against the same Ozark daily
+The lifecycle goal was implemented and validated against the same reference daily
 brief case. Drafts now retain their full package, candidate revisions remain
 inactive, feedback and criteria are durable, proof checks distinguish Pass,
 Fail, and Unverified, and promotion and scheduling require separate explicit
 human actions. The same controls are available through chat tools and through
 the persistent Workflow drawer on desktop and mobile.
 
-The validation used build `build-716ed6c7-de57-4fa4-ac87-2bc771fecc33` with published revision 2 retained
+The validation used build `<private-build-id>` with published revision 2 retained
 as the active agent and revision 3 staged as the candidate. Its requested
-schedule remained an inactive intent for daily 10:00 America/Chicago. No
+schedule remained an inactive intent for a user-selected daily time and timezone. No
 routine was created.
 
-Proof run `22b15998-4f8f-4428-8aa9-25141be65736` completed at the runtime level,
+Proof run `proof-candidate-3` completed at the runtime level,
 but the lifecycle correctly moved the build to `needs-refinement` instead of
 accepting the model's success claim. The resulting checks were:
 
@@ -360,7 +359,7 @@ accepting the model's success claim. The resulting checks were:
 | Official-alert validation | Fail | The alert lookup produced a tool error |
 | Report written | Pass | Two workspace mutations were observed |
 | Report current | Pass | The report artifact changed during the proof |
-| Local geography | Fail | The report still contained `Lake of the Ozarks` |
+| Local geography | Fail | The report still contained `Distant Lake` |
 | Alert honesty | Fail | The report still contained `Heat Advisory Notice` |
 | Message count persisted | Fail | `messageCount` remained `null` |
 | Action count persisted | Fail | `actionCount` remained `null` |
@@ -375,15 +374,12 @@ regression test verifies a failed attempt is retained before a corrected rerun.
 
 The workflow presentation was verified at desktop and 390 x 844 mobile sizes.
 Durable agents appear under Sessions on the left, while the right Workflow
-drawer presents pending actions without blocking chat. Selecting the Ozark
+drawer presents pending actions without blocking chat. Selecting the reference
 workflow item opens the candidate package and evidence review directly. The
 external-delegation action is a Pi-themed accessible icon beside Settings.
 
-Artifacts:
-
-- `output/playwright/pi-agents-workflow-desktop.png`
-- `output/playwright/pi-agents-workflow-mobile.png`
-- `output/playwright/pi-agents-ozark-evidence-mobile.png`
+Workflow and evidence-review screenshots are retained privately under ignored
+`output/`; they are not reusable public demo assets.
 
 Validation completed with 11 focused lifecycle and registry-tool tests passing.
 The full `npm run check` pipeline also passed, including formatting, TypeScript,
@@ -392,7 +388,7 @@ tests.
 
 ## Goal disposition
 
-The product lifecycle goal is complete. The Ozark candidate itself is
+The product lifecycle goal is complete. The reference candidate itself is
 intentionally rejected, not promoted or scheduled. This is the expected result:
 the improvement loop found real regressions, preserved the safe active revision,
 and gave the user actionable evidence for the next refinement.
@@ -446,12 +442,12 @@ Validation before the live proof:
   round-tripping for spaces, quotes, metacharacters, Unicode, empty arguments,
   trailing backslashes and newline characters.
 - Root `npm audit --json` reported zero known vulnerabilities across 418 dependencies.
-- Live read-only provider checks resolved Ozark, Missouri to 37.02089, -93.20602;
+- Live read-only provider checks resolved the intended city to explicit coordinates;
   NWS returned a valid FeatureCollection; the official city home page returned text.
 
 The existing build was updated through the builder lifecycle API, not by editing
 the active agent definition. Active revision 2 remains unchanged; candidate
-revision 3 now uses Ozark city as its sole origin, explicit Missouri coordinates,
+revision 3 now uses the reference city as its sole origin, explicit anchor coordinates,
 exact page reads, honest alert semantics and qualified source evidence. Previous
 feedback and the failed proof are retained. No proof was accepted, no skill was
 promoted and no routine was created.
@@ -463,19 +459,19 @@ an actual successful alert receipt, so simply skipping the alert lookup cannot
 pass. Text-based counter checks are narrow regression checks, not a JSON-schema
 validator; source receipts likewise do not prove every claim in the report.
 
-The same proof prompt, `Create today's Ozark, Missouri outdoor brief`, was started
-as run `e6b168af-70c1-4b0d-8ae9-4bf44f834557`. The test server was restarted with
+The same local-brief proof task was started as run `proof-repaired-1`.
+The test server was restarted with
 the same authenticated links. Pre-proof report, index and state backups are in
-`C:\Users\bradj\AppData\Local\Temp\forkpi-fixes-20260830-a7f3`.
+`<private-backup-directory>`.
 
 ### First repaired-provider proof: still rejected
 
-Run `e6b168af-70c1-4b0d-8ae9-4bf44f834557` succeeded at runtime. Eight machine
+Run `proof-repaired-1` succeeded at runtime. Eight machine
 checks passed: five exact-page receipts, no alert-tool errors, a successful
 official-alert receipt, three file writes, changed report, removal of the prior
 unsupported advisory label, and both zero-valued counters. The geography check
-failed: the new report still recommended Lake of the Ozarks as roughly 40 miles
-away and Springfield as south of Ozark. It also reused snippet-only facts and
+failed: the new report still placed Distant Lake inside the requested radius
+and gave an incorrect direction to a nearby city. It also reused snippet-only facts and
 mislabelled UTC timestamps as local time. The lifecycle correctly kept it in
 `needs-refinement`; the three human-review checks remained unverified.
 
@@ -485,31 +481,29 @@ content, preserves only its CSS/layout, names the known unverified destinations
 to omit, and requires a smaller report when exact evidence is unavailable. It
 also prohibits invented hourly weather and unsupported numerical safety claims.
 The identical proof task was restarted as
-`733a8e9a-5e0f-4ca1-884b-d5f1f9c5e303`; both earlier proof attempts remain archived.
+`proof-repaired-2`; both earlier proof attempts remain archived.
 
 ### Second proof: machine checks pass, outcome review still fails
 
-Run `733a8e9a-5e0f-4ca1-884b-d5f1f9c5e303` completed with all nine configured
+Run `proof-repaired-2` completed with all nine configured
 machine checks passing and three human checks unverified. The known distant-lake
 claim disappeared, five exact page reads succeeded, official alerts were parsed,
 the report changed, and the state counters remained numeric zero. The candidate
 therefore reached `proof-ready`, not accepted or promoted.
 
 Source review still found unsupported claims. The report's own evidence ledger
-admits that court details, fishing conditions, trail ratings and the Lions Club
+admits that court details, fishing conditions, trail ratings and the local charity
 race rely on snippets or inference, yet its body and final summary describe them
-as verified. It also converts route directions starting in Springfield into an
-Ozark-origin mileage estimate. Most UTC labels improved, but some ledger entries
-still claim `21:20 CT`.
+as verified. It also converts route directions starting in a nearby city into a
+reference-origin mileage estimate. Most UTC labels improved, but some ledger
+entries still mislabel UTC retrieval times as local time.
 
 Playwright review at 1440 x 900 found no horizontal overflow. At 390 x 844 the
-document width was 532 pixels: an unbroken RunSignup evidence URL overflowed.
+document width was 532 pixels: an unbroken event-registration evidence URL overflowed.
 This is a generated-report regression, not a new Pi console layout defect.
 
-Artifacts:
-
-- `output/playwright/ozark-repaired-desktop.png`
-- `output/playwright/ozark-repaired-mobile.png`
+Desktop and mobile repaired-proof screenshots are retained privately under
+ignored `output/`.
 
 These failures were retained as explicitly labelled automated feedback, returning
 the build to `needs-refinement`. No human criteria were marked accepted. The
@@ -553,6 +547,19 @@ unchanged upstream credential-cache test failed locally but did not fail the
 complete GitHub run. No upstream auth code or assertions were changed to obtain
 the CI result.
 
-The branch is for review, not automatic merge. The Ozark build and its inactive
+The branch is for review, not automatic merge. The reference build and its inactive
 schedule were not changed during this commit/CI follow-up. Unrelated local
-`output/` and `simple-webpage/` files were excluded from every commit.
+`output/` and personal project files were excluded from every commit.
+
+## Public-data privacy follow-up
+
+The public case study and regression fixtures now use generalized identities
+instead of a user's agent names, locations, build/run IDs, or host paths. Live
+workspace screenshots were removed from tracked documentation while retaining
+their local copies. No active agent, candidate, report, credential, or schedule
+was changed by this cleanup.
+
+The [user-data privacy guide](pi-user-data-privacy.md) documents private workspace
+locations, explicit shared-source exceptions, and staging checks. `.pi/` content
+is ignored by default, including future stores and nested projects. This change
+does not remove personal details from already published Git history.

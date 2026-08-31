@@ -24,61 +24,60 @@ async function run(name: string, parameters: Record<string, unknown>): Promise<R
 }
 
 describe("everyday source tools", () => {
+	// Locations and coordinates below are synthetic; all provider responses are mocked.
 	test("requests GeoJSON for official alerts using explicit coordinates", async () => {
 		respond('{"type":"FeatureCollection","features":[]}', "application/geo+json");
 		const result = await run("weather_alerts", {
-			location: "Ozark, Missouri",
-			latitude: 37.0209,
-			longitude: -93.206,
+			location: "Exampletown, Region Two",
+			latitude: 10.25,
+			longitude: 20.5,
 		});
-		expect(fetchPublicText).toHaveBeenCalledExactlyOnceWith(
-			expect.stringContaining("point=37.0209,-93.206"),
-			undefined,
-			{ accept: "application/geo+json" },
-		);
+		expect(fetchPublicText).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("point=10.25,20.5"), undefined, {
+			accept: "application/geo+json",
+		});
 		expect(result.alerts).toEqual({ type: "FeatureCollection", features: [] });
-		expect(result.location).toMatchObject({ name: "Ozark, Missouri", latitude: 37.0209 });
+		expect(result.location).toMatchObject({ name: "Exampletown, Region Two", latitude: 10.25 });
 	});
 
 	test("does not mistake XML or malformed JSON for a verified empty alert collection", async () => {
 		respond("<feed/>", "application/atom+xml");
-		await expect(run("weather_alerts", { location: "Ozark", latitude: 37, longitude: -93 })).rejects.toThrow(
+		await expect(run("weather_alerts", { location: "Exampletown", latitude: 10, longitude: 20 })).rejects.toThrow(
 			"instead of JSON",
 		);
 		respond('{"features":[]}');
-		await expect(run("weather_alerts", { location: "Ozark", latitude: 37, longitude: -93 })).rejects.toThrow(
+		await expect(run("weather_alerts", { location: "Exampletown", latitude: 10, longitude: 20 })).rejects.toThrow(
 			"valid alert collection",
 		);
 		respond("{");
-		await expect(run("weather_alerts", { location: "Ozark", latitude: 37, longitude: -93 })).rejects.toThrow(
+		await expect(run("weather_alerts", { location: "Exampletown", latitude: 10, longitude: 20 })).rejects.toThrow(
 			"invalid JSON",
 		);
 	});
 
-	test("rejects ambiguous places instead of selecting the first Ozark", async () => {
+	test("rejects ambiguous places instead of selecting the first Exampletown", async () => {
 		respond(
 			JSON.stringify({
 				results: [
 					{
-						name: "Ozark",
-						admin1: "Arkansas",
+						name: "Exampletown",
+						admin1: "Region One",
 						country: "United States",
 						country_code: "US",
-						latitude: 35.49,
-						longitude: -93.83,
+						latitude: 30,
+						longitude: 40,
 					},
 					{
-						name: "Ozark",
-						admin1: "Missouri",
+						name: "Exampletown",
+						admin1: "Region Two",
 						country: "United States",
 						country_code: "US",
-						latitude: 37.02,
-						longitude: -93.2,
+						latitude: 10,
+						longitude: 20,
 					},
 				],
 			}),
 		);
-		await expect(run("weather_lookup", { location: "Ozark" })).rejects.toThrow("Ambiguous");
+		await expect(run("weather_lookup", { location: "Exampletown" })).rejects.toThrow("Ambiguous");
 		expect(fetchPublicText).toHaveBeenCalledOnce();
 	});
 
@@ -86,19 +85,19 @@ describe("everyday source tools", () => {
 		respond(
 			JSON.stringify({
 				results: [
-					{ name: "Ozark", admin1: "Arkansas", country_code: "US", latitude: 35.49, longitude: -93.83 },
-					{ name: "Ozark", admin1: "Missouri", country_code: "US", latitude: 37.02, longitude: -93.2 },
+					{ name: "Exampletown", admin1: "Region One", country_code: "US", latitude: 30, longitude: 40 },
+					{ name: "Exampletown", admin1: "Region Two", country_code: "US", latitude: 10, longitude: 20 },
 				],
 			}),
 		);
 		respond('{"current":{"temperature_2m":80}}');
-		const result = await run("weather_lookup", { location: "Ozark", region: "Missouri", countryCode: "US" });
-		expect(result.location).toMatchObject({ admin1: "Missouri", latitude: 37.02 });
-		expect(vi.mocked(fetchPublicText).mock.calls[1]?.[0]).toContain("latitude=37.02&longitude=-93.2");
+		const result = await run("weather_lookup", { location: "Exampletown", region: "Region Two", countryCode: "US" });
+		expect(result.location).toMatchObject({ admin1: "Region Two", latitude: 10 });
+		expect(vi.mocked(fetchPublicText).mock.calls[1]?.[0]).toContain("latitude=10&longitude=20");
 	});
 
 	test("requires both coordinates", async () => {
-		await expect(run("weather_lookup", { location: "Ozark", latitude: 37 })).rejects.toThrow("both valid");
+		await expect(run("weather_lookup", { location: "Exampletown", latitude: 10 })).rejects.toThrow("both valid");
 		expect(fetchPublicText).not.toHaveBeenCalled();
 	});
 
@@ -133,13 +132,13 @@ describe("everyday source tools", () => {
 
 	test("retains source evidence from ordinary pages without script/style content", async () => {
 		respond(
-			"<html><style>secret-style</style><body><script>secret-script</script><h1>Ozark &amp; Trails</h1><p>Open today</p></body></html>",
+			"<html><style>secret-style</style><body><script>secret-script</script><h1>Exampletown &amp; Trails</h1><p>Open today</p></body></html>",
 			"text/html; charset=utf-8",
 		);
 		await expect(run("page_read", { url: "https://example.com/source" })).resolves.toMatchObject({
 			url: "https://example.com/source",
 			fetchedAt: "2026-08-30T12:00:00Z",
-			text: "Ozark & Trails Open today",
+			text: "Exampletown & Trails Open today",
 			truncated: false,
 		});
 	});
