@@ -1,21 +1,75 @@
 <p align="center">
-  <a href="https://pi.dev">
-    <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
+  <a href="https://github.com/r33n3/pi-Agents">
+    <img alt="Pi Agents logo" src="assets/pi-agents.svg" width="128">
   </a>
 </p>
 
 # Pi Agents
 
-Pi Agents is a developer-focused fork of [earendil-works/pi](https://github.com/earendil-works/pi). It preserves Pi's CLI, agent runtime, multi-provider model support, and extension system while adding an authenticated local web workspace for running Pi sessions, deployed agents, browser automation, and coordinated workflows together.
+Pi Agents (ForkPI) is a developer-focused fork of [earendil-works/pi](https://github.com/earendil-works/pi). It builds on Pi's CLI, agent runtime, multi-provider model support, and extension system with an authenticated local web workspace for persistent agents, browser automation, and coordinated workflows.
+
+Use it to manage coding sessions, configure reusable agents, review their work,
+and run approved automation from one workspace. This is an independently maintained
+fork; upstream package and release links do not distribute this fork's additions.
+
+## Screenshots
+
+The development interface below uses synthetic sessions, agents, and conversation
+content. “Demo model” is a fixture, not a connected provider. No personal data or
+live execution results are shown.
+
+**Workspace:** session navigation, chat, model controls, and agent proof-review
+items in one view.
+
+![Pi Agents workspace with demo sessions, a release-review conversation, and agents awaiting proof runs](docs/screenshots/workspace.jpg)
+
+<details>
+<summary>Agent Builder: review a draft before publishing</summary>
+
+Set the agent's purpose, project folder, and instructions in the Profile panel.
+The example is a saved draft; it has not been published or run.
+
+![Pi Agents Agent Builder showing a synthetic Documentation reviewer draft and its Profile settings](docs/screenshots/agent-builder.jpg)
+
+</details>
+
+See [screenshot capture notes](docs/screenshots/README.md) for provenance and privacy checks.
+
+## How this fork differs from upstream
+
+| Area | Upstream Pi | Pi Agents |
+|---|---|---|
+| Foundation | Extensible coding CLI, agent runtime, and multi-provider APIs | Builds on those packages and retains the CLI and extension system |
+| Workspace | Terminal-first coding workflow with SDK and extension integration | Adds the `pi --serve` browser console and deployment settings |
+| Persistent agents | Building blocks for custom agent applications | Adds Agent Builder, saved definitions, task history, and proof review |
+| Automation | Extensible through tools and extensions | Adds integrated workflows, routines, managed browsing, and recorded browser workflows |
+| Controls | Runs with the launching account's permissions; supports external sandbox patterns | Adds capability grants, approval records, and scoped harness tools, subject to the limits below |
+
+The fork's focus is workflow and operational control. More features do not by
+themselves establish better coding accuracy; results still depend on the model,
+tools, context, and task.
+
+## Current scope and limits
+
+The workspace is under active development and intended for trusted local use.
+Review agent output before enabling unattended work. Current limits include:
+
+- **Shared serve storage:** processes using the same agent directory share definitions, routines, and run records, but execution locks are local to each process. Starting another host can treat a live run as interrupted. Use one serve host per agent directory for deployed agents and routines.
+- **Overlapping workspaces:** writer exclusion checks exact workspace paths. Do not run writers concurrently against a parent directory and its subdirectory, or different paths to the same directory.
+- **Read-only session tools:** the `session` executor can still enable `bash` or `edit` with a read-only policy. For bounded file inspection, use the `harness` executor with only `read` and `list`; use OS isolation when a stronger boundary is required.
+- **Run budgets:** cumulative token and cost limits are checked after execution. They are not hard spending caps across a multi-turn run.
+
+See [Security boundary](#security-boundary) before granting tools or exposing a listener.
 
 ## What this fork adds
 
 | Area | Added behavior |
 |---|---|
 | Web console | `pi --serve` launches a token-protected, responsive workspace with session tabs, model controls, usage telemetry, attachments, prompt history, and resizable panels. |
-| Multiple Pi sessions | Connect independent Pi processes and project directories in one console. Each process keeps its own model, transcript, tools, working directory, and stop state. |
+| Multiple Pi sessions | Connect Pi processes and project directories in one console. Each live session keeps its own model, transcript, tools, working directory, and stop state; deployed-agent storage has the sharing limits above. |
 | Persistent agents | Create persona-backed agents with a project root, model, thinking level, executor, filesystem policy, browser policy, and explicit tool grants. Chat and run history survive restarts. |
 | Agent Builder | Build or edit an agent through a temporary chat tab while structured Profile, Runtime, Capabilities, Delegation, and Automation settings remain available in the side workspace. |
+| Proof review | Stage a draft or candidate revision, explicitly publish it, run a proof task, and review retained evidence before promotion and schedule activation. |
 | Deployment Settings | A gear beside Sessions opens project-scoped Models, Connections, Capabilities, Plugins & MCP, and Security settings without replacing the active chat. |
 | Orchestration | Run sequential, parallel, and supervisor workflows. `pi-coordinator` executes dependency-aware work packages and exposes inspectable subagent progress without flooding the main chat. |
 | Routines | Define cron-backed agent or workflow runs with persisted schedules, results, artifacts, retries, and restart recovery. |
@@ -28,16 +82,49 @@ Pi Agents is a developer-focused fork of [earendil-works/pi](https://github.com/
 
 ## Start the web workspace
 
-Run Pi from the project it should operate on:
+Build this repository to use the fork. Installing the upstream
+`@earendil-works/pi-coding-agent` package does not install the web workspace described here.
+
+Requires Git, Node.js 22.19.0 or later, and npm. From a terminal:
+
+```sh
+git clone https://github.com/r33n3/pi-Agents.git
+cd pi-Agents
+npm ci --ignore-scripts
+npm run build
+```
+
+Start from the checkout on Linux or macOS:
+
+```sh
+./pi-test.sh --serve
+```
+
+Or in Windows PowerShell:
+
+```powershell
+.\pi-test.ps1 --serve
+```
+
+Configure a model provider before submitting a task. See the
+[coding-agent guide](packages/coding-agent/README.md) for provider authentication.
+For managed browser automation, install Chromium with
+`./pi-test.sh browser install chromium` or `.\pi-test.ps1 browser install chromium`.
+
+If your `pi` command already points to a build of this fork, run it from the
+project it should operate on:
 
 ```sh
 cd path/to/project
 pi --serve
 ```
 
-Pi starts at port `4173` and selects the next available port when needed. It prints a process-scoped capability URL containing the authentication token. Open that exact URL in a browser.
+Pi binds to `127.0.0.1`, starts at port `4173`, and selects the next available port when needed. It prints a capability URL containing the authentication token. Open that exact URL in a browser. The token is generated for the process unless you explicitly configure `PI_SERVE_TOKEN`.
 
-To run several projects, start one Pi process in each directory. Then use **Connect Pi** in any console and enter the complete capability URL printed by another process. The console can switch among those sessions while every Pi process and deployed agent continues independently.
+Use **Connect Pi** to attach another running Pi process by its complete capability
+URL. Switching the visible session does not stop the other process. This does not
+isolate shared agent storage: follow the single-host guidance above when using
+deployed agents or routines.
 
 See [pi-Agents local console](docs/pi-agents-serve.md) for storage, executors, companion extensions, and focused verification commands.
 
@@ -101,11 +188,27 @@ scraping and bounded crawling.
 
 ## Security boundary
 
-The web token authenticates the console; it is not an operating-system sandbox. Deployed agents run in separate child processes with isolated queues and working directories. Child environments exclude provider, OAuth, and API-key secrets; harness filesystem actions are path-confined and mediated by the host. The launching operating-system account remains the ultimate local authority, so use the documented container or sandbox patterns when stronger isolation is required.
+The web token grants control of the Pi process to its holder. It does not provide
+per-user roles or an operating-system sandbox. Keep the listener local unless you
+have configured the network protections described above.
+
+Deployed task runs use separate child processes. Worker environments filter
+inherited credentials; the selected model credential can still be supplied over
+private process messaging. Harness filesystem tools are path-confined and
+mediated by the host. Standard session tools and installed extensions run with
+the launching account's authority. Neither a child process nor a tool grant
+provides an OS boundary against untrusted code.
+
+Use the [container and sandbox patterns](packages/coding-agent/docs/containerization.md)
+when stronger isolation is required. The concurrency, read-only, and budget
+limits above also apply to unattended work.
 
 ## Upstream Pi
 
-This fork tracks the upstream Pi project and retains its package structure and MIT license.
+This fork follows the upstream Pi project and retains its package structure and
+MIT license. The links and npm badge below describe upstream Pi, not a Pi Agents
+release. Fork-specific support and changes belong in
+[r33n3/pi-Agents](https://github.com/r33n3/pi-Agents).
 
 <p>
   <a href="https://discord.com/invite/3cU7Bz4UPx"><img alt="Pi Discord" src="https://img.shields.io/badge/discord-upstream%20community-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
@@ -132,7 +235,9 @@ For Slack/chat automation and workflows see [earendil-works/pi-chat](https://git
 
 ## Permissions & Containerization
 
-Pi does not include a built-in permission system for restricting filesystem, process, network, or credential access. By default, it runs with the permissions of the user and process that launched it.
+Pi Agents adds application-level tool policies and capability approvals, but it
+does not include an OS sandbox for restricting process, network, or credential
+access. It runs with the permissions of the user and process that launched it.
 
 If you need stronger boundaries, containerize or sandbox Pi. See [packages/coding-agent/docs/containerization.md](packages/coding-agent/docs/containerization.md) for three patterns:
 
@@ -142,7 +247,12 @@ If you need stronger boundaries, containerize or sandbox Pi. See [packages/codin
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [AGENTS.md](AGENTS.md) for project-specific rules (for both humans and agents).  Longer term plans for Pi can also be found in [RFCs](https://rfc.earendil.com/keyword/pi/).
+Propose fork-specific changes against [r33n3/pi-Agents](https://github.com/r33n3/pi-Agents).
+Follow [AGENTS.md](AGENTS.md) for development rules and
+[user-data privacy guidance](docs/pi-user-data-privacy.md) before sharing files.
+[CONTRIBUTING.md](CONTRIBUTING.md) documents the upstream contribution gate;
+read it before submitting work upstream. Upstream plans are discussed in
+[Pi RFCs](https://rfc.earendil.com/keyword/pi/).
 
 ## Development
 
@@ -157,7 +267,9 @@ npm run check         # Lint, format, and type check
 
 ## Building standalone binaries from release source
 
-GitHub releases include a versioned source archive covered by the release's `SHA256SUMS` file. Extract it and run the same build script used for the official standalone binaries:
+Upstream GitHub releases include a versioned source archive covered by the
+release's `SHA256SUMS` file. Those archives build upstream Pi, not this fork.
+For an upstream release, extract the archive and run its binary build script:
 
 ```bash
 VERSION="<release-version>"
@@ -196,9 +308,10 @@ For the full explanation, see [this post on X](https://x.com/badlogicgames/statu
 
 To publish sessions, use [`badlogic/pi-share-hf`](https://github.com/badlogic/pi-share-hf). Read its README.md for setup instructions. All you need is a Hugging Face account, the Hugging Face CLI, and `pi-share-hf`.
 
-You can also watch [this video](https://x.com/badlogicgames/status/2041151967695634619), where I show how I publish my `pi-mono` sessions.
+The upstream maintainer demonstrates session publication in
+[this video](https://x.com/badlogicgames/status/2041151967695634619).
 
-I regularly publish my own `pi-mono` work sessions here:
+The upstream maintainer's published `pi-mono` sessions are available here:
 
 - [badlogicgames/pi-mono on Hugging Face](https://huggingface.co/datasets/badlogicgames/pi-mono)
 
@@ -207,7 +320,7 @@ I regularly publish my own `pi-mono` work sessions here:
 MIT
 
 <p align="center">
-  <a href="https://pi.dev">pi.dev</a> domain graciously donated by
+  Upstream <a href="https://pi.dev">pi.dev</a> domain donated by
   <br /><br />
   <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
 </p>
