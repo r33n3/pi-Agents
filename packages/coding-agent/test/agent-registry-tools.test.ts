@@ -273,6 +273,7 @@ describe("configure_agent lifecycle tool", () => {
 	});
 
 	test("lets chat promote a proven build and enable only its retained confirmed schedule", async () => {
+		// This synthetic package has no connection to a user's stored agent or schedule.
 		const root = await mkdtemp(join(tmpdir(), "pi-agent-tool-complete-"));
 		roots.push(root);
 		const registry = new AgentRegistry(join(root, "registry"), { defaultWorkspace: join(root, "workspace") });
@@ -296,10 +297,10 @@ describe("configure_agent lifecycle tool", () => {
 		const configured = await configure.execute(
 			"configure-full-chat",
 			{
-				name: "ozark-chat-agent",
-				description: "Create a grounded Ozark, Missouri brief",
-				projectRoot: join(root, "ozark"),
-				scheduleTask: "Create today's Ozark, Missouri brief",
+				name: "exampletown-chat-agent",
+				description: "Create a grounded Exampletown, Example State brief",
+				projectRoot: join(root, "exampletown"),
+				scheduleTask: "Create today's Exampletown, Example State brief",
 				scheduleCadence: "daily 07:00",
 				scheduleConfirmed: true,
 			},
@@ -317,7 +318,7 @@ describe("configure_agent lifecycle tool", () => {
 		);
 		await manage.execute(
 			"proof",
-			{ buildId, action: "run-proof", confirmed: true, prompt: "Create today's Ozark, Missouri brief" },
+			{ buildId, action: "run-proof", confirmed: true, prompt: "Create today's Exampletown, Example State brief" },
 			undefined,
 			undefined,
 			{} as ExtensionContext,
@@ -354,7 +355,7 @@ describe("configure_agent lifecycle tool", () => {
 				enabled: true,
 				cron: "0 7 * * *",
 				timezone: "America/Chicago",
-				target: { kind: "agent", agentId: "ozark-chat-agent" },
+				target: { kind: "agent", agentId: "exampletown-chat-agent" },
 			}),
 		]);
 	});

@@ -1,10 +1,14 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -16,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -38,5 +44,34 @@ jobs:
       - name: Check
         run: npm run check
 
+      - name: Install test browser
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pi-test-browsers
+        run: node node_modules/playwright/cli.js install --with-deps chromium
+
+      - name: Smoke test bundled CLI
+        run: node packages/coding-agent/dist/bundle/cli.js --version
+
       - name: Test
-        run: npm test
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/pi-test-browsers
+        run: ./test.sh
+
+  windows-project-launcher:
+    if: github.repository == 'r33n3/pi-Agents'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Test Windows project arguments
+        working-directory: packages/extensions/pi-switch-project
+        run: node ../../../node_modules/vitest/dist/cli.js --run test/switch-project.test.ts

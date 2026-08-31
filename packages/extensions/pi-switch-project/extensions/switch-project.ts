@@ -12,8 +12,8 @@
  * already handles (see handleResumeSession's MissingSessionCwdError recovery).
  */
 
-import { existsSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -24,6 +24,7 @@ export function stripSessionArgs(args: string[]): string[] {
 	const out: string[] = [];
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
+		if ([...SESSION_FLAGS_WITH_VALUE].some((flag) => arg.startsWith(`${flag}=`))) continue;
 		if (SESSION_FLAGS_WITH_VALUE.has(arg)) {
 			i++; // also skip its value
 			continue;
@@ -47,6 +48,28 @@ export function unquote(raw: string): string {
 		}
 	}
 	return trimmed;
+}
+
+/** Data never becomes PowerShell syntax; native arguments use Windows argv quoting, not cmd escaping. */
+export function windowsProjectScript(executable: string, args: string[], cwd: string): string {
+	for (const value of [executable, cwd, ...args]) {
+		if (value.includes("\0")) throw new Error("Project launch values must not contain NUL characters");
+	}
+	const argumentsText = args.map((arg) => `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, "$1$1")}"`).join(" ");
+	const payload = Buffer.from(JSON.stringify({ executable, argumentsText, cwd }), "utf8").toString("base64");
+	return [
+		"$ErrorActionPreference = 'Stop'",
+		`$launch = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | ConvertFrom-Json`,
+		"Set-Location -LiteralPath $launch.cwd",
+		"$start = New-Object System.Diagnostics.ProcessStartInfo",
+		"$start.FileName = $launch.executable",
+		"$start.Arguments = $launch.argumentsText",
+		"$start.WorkingDirectory = $launch.cwd",
+		"$start.UseShellExecute = $false",
+		"$child = [System.Diagnostics.Process]::Start($start)",
+		"$child.WaitForExit()",
+		"if ($child.ExitCode -ne 0) { Write-Warning ('Pi exited with code ' + $child.ExitCode) }",
+	].join("\n");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -85,25 +108,35 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (process.platform === "win32") {
-				// On Windows, `detached: true` does NOT give the child its own console — it only
-				// affects process-group/signal behavior. With stdio "inherit" the child shares the
-				// parent's console, so once this process exits, the owning shell (PowerShell) just
-				// regains its prompt — even if the child is technically still alive, it has no
-				// visible/attached console left to run its TUI in. `cmd /c start` explicitly opens
-				// a new, independent console window, which is the standard fix for this on Windows.
 				ctx.ui.notify(`Switching to ${resolved} in a new window...`, "info");
-				// "cmd /k" instead of running node directly: keeps the new window open after the
-				// launched process exits (whether that's a normal interactive exit or a startup
-				// crash) instead of the window flashing shut the instant node exits — needed both
-				// so a crash is actually visible and so exiting the session normally drops you into
-				// a plain prompt in the new directory instead of just closing.
-				spawn("cmd.exe", ["/c", "start", "", "/D", resolved, "cmd", "/k", process.argv[0], ...relaunchArgs], {
-					cwd: resolved,
-					env: process.env,
-					detached: true,
-					stdio: "ignore",
-					windowsHide: false,
-				}).unref();
+				// A hidden launcher opens the requested interactive window. NoExit preserves a
+				// usable prompt and startup diagnostics after Pi exits, without a cmd /k layer.
+				const encoded = Buffer.from(
+					windowsProjectScript(process.execPath, relaunchArgs, resolved),
+					"utf16le",
+				).toString("base64");
+				const launcher =
+					"$ErrorActionPreference = 'Stop'\n" +
+					`Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoLogo -NoProfile -NoExit -EncodedCommand ${encoded}' -WindowStyle Normal`;
+				try {
+					await new Promise<void>((resolve, reject) => {
+						const child = spawn(
+							"powershell.exe",
+							["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(launcher, "utf16le").toString("base64")],
+							{ cwd: resolved, env: process.env, stdio: "ignore", windowsHide: true },
+						);
+						child.once("error", reject);
+						child.once("exit", (code) =>
+							code === 0 ? resolve() : reject(new Error(`Project launcher exited with code ${code}`)),
+						);
+					});
+				} catch (error) {
+					ctx.ui.notify(
+						`Could not open the new project: ${error instanceof Error ? error.message : String(error)}`,
+						"error",
+					);
+					return;
+				}
 			} else {
 				ctx.ui.notify(`Switching to ${resolved}...`, "info");
 				const child = spawn(process.argv[0], relaunchArgs, {

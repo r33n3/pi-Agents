@@ -297,6 +297,30 @@ describe("CapabilityBroker", () => {
 		});
 	});
 
+	test("makes public page reads reviewable without changing existing everyday provider trust", async () => {
+		const tools = ["weather_lookup", "weather_alerts", "feed_read", "site_monitor_check", "finance_watchlist_list"];
+		const defaults = new CapabilityBroker(root, { activeToolNames: () => tools });
+		await defaults.initialize();
+		await defaults.reviewProvider("pi-everyday-data", true);
+		await defaults.enableProvider("pi-everyday-data", true);
+		const restored = new CapabilityBroker(root, { activeToolNames: () => [...tools, "page_read"] });
+		await restored.initialize();
+		expect(restored.snapshot().providers.find((provider) => provider.id === "pi-everyday-data")).toMatchObject({
+			trust: "enabled",
+		});
+		expect(restored.snapshot().providers.find((provider) => provider.id === "pi-public-web")).toMatchObject({
+			trust: "quarantined",
+			health: "ready",
+			enabled: false,
+		});
+		const grants = [{ capabilityId: "web.fetch", capabilityVersion: 1, providerId: "pi-public-web" }];
+		expect(() => restored.resolveToolNames(grants, "harness")).toThrow("not enabled");
+		await restored.reviewProvider("pi-public-web", true);
+		await restored.enableProvider("pi-public-web", true);
+		expect(restored.resolveToolNames(grants, "harness")).toEqual(["page_read"]);
+		expect(restored.resolveToolNames(grants, "session")).toEqual(["page_read"]);
+	});
+
 	test("rejects authentication groups that expose unbound capabilities", async () => {
 		const invalid: CapabilityProviderManifest = {
 			...manifests[0]!,
