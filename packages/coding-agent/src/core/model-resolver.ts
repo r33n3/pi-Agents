@@ -184,6 +184,8 @@ function buildFallbackModel(provider: string, modelId: string, availableModels: 
 		...baseModel,
 		id: modelId,
 		name: modelId,
+		// A custom ID may reuse the transport, but not another model's verified native options.
+		controls: {},
 	};
 }
 

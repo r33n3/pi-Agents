@@ -1,4 +1,4 @@
-import type { StopReason, Usage } from "@earendil-works/pi-ai";
+import type { ModelControls, StopReason, Usage } from "@earendil-works/pi-ai";
 import "../messages.ts";
 import type { AgentMessage } from "../../types.ts";
 import type { Session } from "./session.ts";
@@ -36,6 +36,12 @@ export interface ThinkingLevelEntry extends EntryBase {
 	thinkingLevel: string;
 }
 
+/** Native selections are separate from legacy thinking. Only null exits native mode. */
+export interface ModelControlsEntry extends EntryBase {
+	type: "model_controls_change";
+	modelControls: ModelControls | null;
+}
+
 export interface ActiveToolsEntry extends EntryBase {
 	type: "active_tools_change";
 	activeToolNames: string[];
@@ -68,6 +74,7 @@ export type Entry =
 	| MessageEntry
 	| ModelChangeEntry
 	| ThinkingLevelEntry
+	| ModelControlsEntry
 	| ActiveToolsEntry
 	| CompactionEntry
 	| BranchSummaryEntry

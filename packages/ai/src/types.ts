@@ -9,9 +9,12 @@ import type { OpenAICodexResponsesOptions } from "./api/openai-codex-responses.t
 import type { OpenAICompletionsOptions } from "./api/openai-completions.ts";
 import type { OpenAIResponsesOptions } from "./api/openai-responses.ts";
 import type { PiMessagesOptions } from "./api/pi-messages.ts";
+import type { ModelControlCapabilities, ModelControls } from "./model-controls.ts";
+import type { ModelCost, UsageCost } from "./model-pricing.ts";
 import type { AssistantMessageDiagnostic } from "./utils/diagnostics.ts";
 import type { AssistantMessageEventStream } from "./utils/event-stream.ts";
 
+export type { ModelCost, ModelCostRates, ModelCostTier, UsageCost } from "./model-pricing.ts";
 export type { AssistantMessageEventStream } from "./utils/event-stream.ts";
 
 export type KnownApi =
@@ -177,6 +180,8 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 }
 
 export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
+	/** Independent, native model controls. Unsupported selections fail before dispatch. */
+	controls?: ModelControls;
 	/**
 	 * Optional callback invoked after an HTTP response is received and before
 	 * its body stream is consumed.
@@ -393,13 +398,7 @@ export interface Usage {
 	 */
 	reasoning?: number;
 	totalTokens: number;
-	cost: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		total: number;
-	};
+	cost: UsageCost;
 }
 
 export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred";
@@ -432,6 +431,12 @@ export interface AssistantMessage {
 	model: string;
 	responseModel?: string; // Concrete `chunk.model` when different from the requested `model` (e.g. OpenRouter `auto` -> `anthropic/...`)
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
+	/** Requested/sent settings are not evidence that the provider used them; reported values are separate. */
+	execution?: {
+		requested: ModelControls;
+		sent: ModelControls;
+		reported?: ModelControls;
+	};
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
 	usage: Usage;
 	stopReason: StopReason;
@@ -800,23 +805,6 @@ export interface VercelGatewayRouting {
 	order?: string[];
 }
 
-export interface ModelCostRates {
-	input: number; // $/million tokens
-	output: number; // $/million tokens
-	cacheRead: number; // $/million tokens
-	cacheWrite: number; // $/million tokens
-}
-
-export interface ModelCostTier extends ModelCostRates {
-	/** Use this tier for requests whose total input usage exceeds this token count. */
-	inputTokensAbove: number;
-}
-
-export interface ModelCost extends ModelCostRates {
-	/** Request-wide pricing tiers. The highest matching input threshold applies to the full request. */
-	tiers?: ModelCostTier[];
-}
-
 // Model interface for the unified model system
 export interface Model<TApi extends Api> {
 	id: string;
@@ -830,6 +818,8 @@ export interface Model<TApi extends Api> {
 	 * Missing keys use provider defaults. null marks a level as unsupported.
 	 */
 	thinkingLevelMap?: ThinkingLevelMap;
+	/** Explicit, source-dated native controls; absent metadata does not imply support. */
+	controls?: ModelControlCapabilities;
 	input: ("text" | "image")[];
 	cost: ModelCost;
 	contextWindow: number;

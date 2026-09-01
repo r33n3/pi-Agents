@@ -71,6 +71,7 @@ export class RunSkillPromotionService {
 		}
 		const candidateDirectory = resolve(this.#skillsRoot, `.candidate-${randomUUID()}`);
 		const candidatePath = resolve(candidateDirectory, "SKILL.md");
+		let installed = false;
 		try {
 			if (await pathExists(skillDirectory)) throw new Error(`Skill ${name} already exists`);
 			await mkdir(candidateDirectory);
@@ -95,9 +96,13 @@ export class RunSkillPromotionService {
 			}
 			if (validation.skills[0]?.name !== name) throw new Error("Generated skill identity does not match its path");
 			await rename(candidateDirectory, skillDirectory);
+			installed = true;
 			const result = { runId: input.runId, name, path: resolve(skillDirectory, "SKILL.md") };
 			await this.#lifecycle?.markPromoted(input.runId, result.name, result.path);
 			return result;
+		} catch (error) {
+			if (installed) await rm(skillDirectory, { recursive: true, force: true });
+			throw error;
 		} finally {
 			await rm(candidateDirectory, { recursive: true, force: true });
 			await lock.close();

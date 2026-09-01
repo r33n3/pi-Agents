@@ -1,5 +1,6 @@
 import { PiClient, type PiSessionHandle, type Unsubscribe } from "@earendil-works/pi-client";
 import type {
+	ModelControls,
 	ModelMetadata,
 	SessionMetadata,
 	SessionSnapshot,
@@ -8,12 +9,15 @@ import type {
 } from "@earendil-works/pi-protocol";
 import { createBrowserId } from "./browser-id.ts";
 import { splitInlineThinking } from "./inline-thinking.ts";
+import { catalogSourceLabels, describeCatalogRefresh } from "./model-catalog-status.ts";
 import {
 	getModelSelectionCostPresentations,
 	getSessionCostPresentation,
 	type ModelSelectionCostPresentation,
 	modelSelectionCostKey,
 } from "./model-pricing.ts";
+import { describeModelControls, mergeModelSettingsDraft, modelSettingsError } from "./model-settings.ts";
+import { openModelSettings } from "./model-settings-dialog.ts";
 import { filterPresentedModels } from "./model-visibility.ts";
 import { installThemedSelect } from "./themed-select.ts";
 import { selectTranscriptWindow } from "./transcript-window.ts";
@@ -161,6 +165,64 @@ const externalModelPicker = installThemedSelect(externalModel);
 const routineModelPicker = installThemedSelect(routineEditor.model);
 const thinkingPicker = installThemedSelect(thinking, "simple");
 const agentThinkingPicker = installThemedSelect(agentThinking, "simple");
+const chatModelSettings = installModelSettingsButton(thinking, "Chat model settings");
+const agentModelSettings = installModelSettingsButton(agentThinking, "Agent model settings");
+let agentModelControls: ModelControls | undefined;
+
+function installModelSettingsButton(select: HTMLSelectElement, label: string): HTMLButtonElement {
+	const button = document.createElement("button");
+	button.type = "button";
+	button.textContent = "Model options";
+	button.setAttribute("aria-label", label);
+	button.style.cssText = "min-height:40px;max-width:100%;white-space:normal";
+	select.closest("label")?.after(button);
+	return button;
+}
+
+function editableChatModelSession(): PiSessionHandle | undefined {
+	if (activeAgentId || activeSubagentKey || activeExternalRunId || activeExternalConnectionId || activeArtifactId)
+		return undefined;
+	return session;
+}
+
+function syncModelSettingsPresentation(): void {
+	const target = editableChatModelSession();
+	chatModelSettings.hidden = !target;
+	chatModelSettings.style.display = target ? "" : "none";
+	chatModelSettings.disabled =
+		!target ||
+		target.snapshot?.phase !== "idle" ||
+		pendingSessionConfigurationUpdates.has(target.id) ||
+		(builderActive && teamFactoryBusy);
+	if (target) {
+		model.disabled = chatModelSettings.disabled;
+		thinking.disabled = chatModelSettings.disabled || target.snapshot?.modelControls !== undefined;
+		modelPicker.refresh();
+		thinkingPicker.refresh();
+	}
+	const controls = activeAgentId
+		? agents.find((entry) => entry.id === activeAgentId)?.modelControls
+		: target?.snapshot?.modelControls;
+	const native = controls !== undefined;
+	const thinkingLabel = thinking.closest("label");
+	if (thinkingLabel) thinkingLabel.style.display = native ? "none" : "";
+	chatModelSettings.textContent = native ? describeModelControls(controls) : "Model options";
+	chatModelSettings.title = `${describeModelControls(controls)} · Edit reasoning and processing separately`;
+	const agentThinkingLabel = agentThinking.closest("label");
+	if (agentThinkingLabel) agentThinkingLabel.style.display = agentModelControls !== undefined ? "none" : "";
+	agentModelSettings.textContent =
+		agentModelControls === undefined ? "Model options" : describeModelControls(agentModelControls);
+	agentModelSettings.title = "Edit agent runtime settings; this does not change the Builder chat model";
+	agentModelSettings.disabled = activeSidebarAgent?.source === "pi-agent";
+}
+
+/** Retain missing catalog references so an unrelated edit cannot turn them into inheritance. */
+function selectAgentModel(value: string): void {
+	if (value && ![...agentModel.options].some((option) => option.value === value))
+		agentModel.add(new Option(`${value} (unavailable — review)`, value));
+	agentModel.value = value;
+	agentModelPicker.refresh();
+}
 
 function installWorkflowWorkspaceLayout(delegation: HTMLDetailsElement | null): void {
 	const workspace = element("agents-workspace");
@@ -551,6 +613,7 @@ interface AgentBuildRecord {
 		tools: string[];
 		model?: { provider: string; id: string };
 		thinking?: ThinkingLevel;
+		modelControls?: ModelControls;
 		memory: "none" | "notes";
 		executor: "session" | "harness";
 		permissionPolicy: "read-only" | "workspace-write";
@@ -1381,17 +1444,33 @@ function renderSettingsModels(): void {
 		byProvider.set(entry.provider, group);
 	}
 	settingsModelList.replaceChildren(
-		...[...byProvider.entries()].map(([provider, models]) =>
-			settingsCard(
+		...[...byProvider.entries()].map(([provider, models]) => {
+			const warning = models.some(
+				(model) => model.catalogRefresh?.failed || model.catalogRefresh?.warning || model.catalog?.timestampWarning,
+			);
+			const stale = models.some((model) => model.catalog?.freshness === "refresh-due");
+			const card = settingsCard(
 				provider,
-				`${models.length} usable model${models.length === 1 ? "" : "s"}`,
-				"Ready",
+				`${models.length} configured model${models.length === 1 ? "" : "s"} · account access not verified`,
+				warning ? "Catalog warning" : stale ? "Catalog refresh due" : "Configured",
 				"Deployment",
 				provider,
-			),
-		),
+			);
+			appendText(card, describeCatalogRefresh(models[0]?.catalogRefresh), "capability-meta");
+			const sources = new Map<string, number>();
+			for (const model of models) {
+				const label = model.catalog ? catalogSourceLabels[model.catalog.source] : "unknown source";
+				sources.set(label, (sources.get(label) ?? 0) + 1);
+			}
+			appendText(
+				card,
+				`Catalog sources: ${[...sources].map(([source, count]) => `${count} ${source}`).join(" · ")}. Review each model's source and overrides in model settings.`,
+				"capability-meta",
+			);
+			return card;
+		}),
 	);
-	if (byProvider.size === 0) appendText(settingsModelList, "No usable models reported", "settings-empty");
+	if (byProvider.size === 0) appendText(settingsModelList, "No configured models reported", "settings-empty");
 }
 
 function renderSettingsConnections(): void {
@@ -2175,6 +2254,7 @@ async function saveTargetPath(path: string): Promise<void> {
 				permissionPolicy: agent.permissionPolicy,
 				model: agent.model,
 				thinking: agent.thinking,
+				modelControls: agent.modelControls,
 				delegateAgentIds: agent.delegateAgentIds,
 				a2a: agent.a2a,
 				browser: agent.browser,
@@ -2399,6 +2479,11 @@ function renderAgentPackageSummary(build: AgentBuildRecord): HTMLElement {
 			`Model: ${configuration.model ? `${configuration.model.provider}/${configuration.model.id}` : "session default"} · Tools: ${configuration.tools.join(", ") || "none"} · Permissions: ${configuration.permissionPolicy}`,
 			"muted",
 		);
+		appendText(
+			details,
+			`Model options: ${configuration.modelControls === undefined ? `legacy thinking ${configuration.thinking ?? "inherited"}` : describeModelControls(configuration.modelControls)}`,
+			"muted",
+		);
 	}
 	appendText(
 		details,
@@ -2439,6 +2524,8 @@ function agentConfigurationChanges(
 	)
 		changes.push("model");
 	if (configuration.thinking !== active.thinking) changes.push("thinking");
+	if (describeModelControls(configuration.modelControls) !== describeModelControls(active.modelControls))
+		changes.push("model controls");
 	if (configuration.executor !== active.executor) changes.push("executor");
 	if (configuration.permissionPolicy !== active.permissionPolicy) changes.push("permissions");
 	if (configuration.browserAccess !== (active.browser?.access ?? "disabled")) changes.push("browser access");
@@ -3483,6 +3570,7 @@ function renderEarlierMessages(
 
 function renderSessionStats(snapshot: SessionSnapshot): void {
 	const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+	let hasUnknownCost = false;
 	let latestAssistantUsage: Extract<TranscriptItem, { role: "assistant" }>["usage"];
 	for (const item of snapshot.transcript) {
 		if ((item.role !== "assistant" && item.role !== "tool") || !item.usage) continue;
@@ -3490,7 +3578,9 @@ function renderSessionStats(snapshot: SessionSnapshot): void {
 		totals.output += item.usage.output;
 		totals.cacheRead += item.usage.cacheRead;
 		totals.cacheWrite += item.usage.cacheWrite;
-		totals.cost += item.usage.cost.total;
+		if (item.usage.cost.status === "unknown" || !Number.isFinite(item.usage.cost.total) || item.usage.cost.total < 0)
+			hasUnknownCost = true;
+		else totals.cost += item.usage.cost.total;
 		if (item.role === "assistant" && item.status !== "error" && item.status !== "aborted") {
 			latestAssistantUsage = item.usage;
 		}
@@ -3530,6 +3620,7 @@ function renderSessionStats(snapshot: SessionSnapshot): void {
 		currentModel?.cost,
 		totals.cost,
 		totals.input + totals.output + totals.cacheRead + totals.cacheWrite > 0,
+		hasUnknownCost,
 	);
 	if (costPresentation) {
 		appendStat("$", costPresentation.value, costPresentation.title, "session-stat-cost");
@@ -3607,6 +3698,23 @@ function renderItem(item: TranscriptItem): HTMLElement {
 	}
 	if (item.role === "assistant" && (item.status === "error" || item.status === "aborted") && item.errorMessage) {
 		appendText(article, friendlyAssistantError(item.errorMessage), "run-error");
+	}
+	if (item.role === "assistant" && item.execution) {
+		const details = document.createElement("details");
+		details.className = "muted";
+		const summary = document.createElement("summary");
+		summary.textContent = "Model execution settings";
+		details.append(summary);
+		for (const [label, controls] of [
+			["Requested", item.execution.requested],
+			["Sent", item.execution.sent],
+			["Provider reported", item.execution.reported],
+		] as const) {
+			const row = document.createElement("p");
+			row.textContent = `${label}: ${controls === undefined ? "Not reported" : Object.keys(controls).length === 0 ? "No explicit fields" : describeModelControls(controls)}`;
+			details.append(row);
+		}
+		article.append(details);
 	}
 	return article;
 }
@@ -3871,6 +3979,7 @@ function populateModels(models: readonly ModelMetadata[], includeAgentModels = f
 	modelCostPresentations = getModelSelectionCostPresentations(presentedModels);
 	replacePrimaryModelOptions(presentedModels);
 	if (!includeAgentModels) return;
+	const previousAgentModel = agentModel.value;
 	const inherit = document.createElement("option");
 	inherit.value = "";
 	inherit.textContent = "Inherit current session";
@@ -3893,7 +4002,7 @@ function populateModels(models: readonly ModelMetadata[], includeAgentModels = f
 			? recommendedModelValue
 			: "";
 		agentModelsInitialized = true;
-	}
+	} else selectAgentModel(previousAgentModel);
 	agentModelPicker.refresh();
 	refreshRoutineEditorOptions();
 }
@@ -3928,6 +4037,18 @@ function updateThinkingLevelAvailability(
 	modelValue: string,
 	preferredLevel?: ThinkingLevel,
 ): void {
+	syncModelSettingsPresentation();
+	if (
+		(select === agentThinking && agentModelControls !== undefined) ||
+		(select === thinking &&
+			(editableChatModelSession()?.snapshot?.modelControls !== undefined ||
+				(activeAgentId && agents.find((entry) => entry.id === activeAgentId)?.modelControls !== undefined)))
+	) {
+		select.disabled = true;
+		refreshThinkingPicker(select);
+		return;
+	}
+	if (select === agentThinking) select.disabled = activeSidebarAgent?.source === "pi-agent";
 	const modelRef = modelRefFromValue(modelValue);
 	const metadata = modelRef
 		? availableModels.find((entry) => entry.provider === modelRef.provider && entry.id === modelRef.id)
@@ -4039,6 +4160,7 @@ async function refreshSessionTargets(): Promise<void> {
 }
 
 function renderSessionNavigation(): void {
+	syncModelSettingsPresentation();
 	const targets = sessionTargets();
 	sessionTabs.replaceChildren(
 		...targets.map((target) => {
@@ -6438,6 +6560,7 @@ interface AgentSummary {
 	permissionPolicy: "read-only" | "workspace-write";
 	model?: { provider: string; id: string };
 	thinking?: ThinkingLevel;
+	modelControls?: ModelControls;
 	projectRoot: string;
 	delegateAgentIds: string[];
 	a2a: { enabled: boolean };
@@ -6606,12 +6729,9 @@ function applyAgentBuildConfiguration(configuration: NonNullable<AgentBuildRecor
 	requiredElement<HTMLSelectElement>("agent-browser-access").value = configuration.browserAccess;
 	requiredElement<HTMLInputElement>("agent-delegates").value = configuration.delegateAgentIds.join(",");
 	requiredElement<HTMLInputElement>("agent-a2a").checked = configuration.exposeA2a;
-	if (configuration.model) {
-		requiredElement<HTMLSelectElement>("agent-model").value =
-			`${configuration.model.provider}/${configuration.model.id}`;
-		agentModelPicker.refresh();
-	}
-	if (configuration.thinking) requiredElement<HTMLSelectElement>("agent-thinking").value = configuration.thinking;
+	agentModelControls = configuration.modelControls === undefined ? undefined : { ...configuration.modelControls };
+	selectAgentModel(configuration.model ? `${configuration.model.provider}/${configuration.model.id}` : "");
+	agentThinking.value = configuration.thinking ?? "high";
 	updateThinkingLevelAvailability(
 		requiredElement<HTMLSelectElement>("agent-thinking"),
 		requiredElement<HTMLSelectElement>("agent-model").value,
@@ -6619,6 +6739,9 @@ function applyAgentBuildConfiguration(configuration: NonNullable<AgentBuildRecor
 	);
 	updateAgentBrowserProfileFields();
 	updateBuilderCapabilitySummary();
+	// A restored candidate is already saved, even when it differs from the active agent.
+	// Unpublished drafts still need the Publish action, so keep their initial baseline.
+	if (activeAgentBuild?.agentId) agentBuilderBaseline = agentBuilderDraftSignature();
 }
 
 function closeAgentMenus(except?: HTMLDetailsElement): void {
@@ -7080,15 +7203,27 @@ const agentBuilderTrackedFieldIds = [
 ] as const;
 
 function agentBuilderDraftSignature(): string {
-	return JSON.stringify(
-		agentBuilderTrackedFieldIds.map((fieldId) => {
+	return JSON.stringify([
+		...agentBuilderTrackedFieldIds.map((fieldId) => {
 			const field = requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(fieldId);
 			return [fieldId, field instanceof HTMLInputElement && field.type === "checkbox" ? field.checked : field.value];
 		}),
-	);
+		["modelControls", agentModelControls],
+	]);
 }
 
 function agentBuilderConfigurationError(): string | undefined {
+	if (agentModelControls !== undefined) {
+		const error = modelSettingsError(
+			{
+				model: modelRefFromValue(agentModel.value),
+				thinkingLevel: agentThinking.value as ThinkingLevel,
+				modelControls: agentModelControls,
+			},
+			availableModels,
+		);
+		if (error) return error;
+	}
 	const permissions = requiredElement<HTMLSelectElement>("agent-permissions").value;
 	if (permissions === "read-only" && selectedAgentTools().has("write"))
 		return "Read-only agents cannot enable the write tool.";
@@ -7258,7 +7393,8 @@ function agentBuildConfigurationInput(): AgentBuildRecord["configuration"] | und
 			separator > 0
 				? { provider: modelReference.slice(0, separator), id: modelReference.slice(separator + 1) }
 				: undefined,
-		thinking: value("agent-thinking") as ThinkingLevel,
+		thinking: agentModelControls === undefined ? (value("agent-thinking") as ThinkingLevel) : undefined,
+		modelControls: agentModelControls === undefined ? undefined : { ...agentModelControls },
 		memory: value("agent-memory") as "none" | "notes",
 		executor: value("agent-executor") as "session" | "harness",
 		permissionPolicy: value("agent-permissions") as "read-only" | "workspace-write",
@@ -7284,6 +7420,8 @@ function scheduleAgentBuildDraftPersistence(): void {
 
 async function persistAgentBuildDraft(): Promise<void> {
 	if (!capabilityToken) return;
+	const configurationError = agentBuilderConfigurationError();
+	if (configurationError) throw new Error(configurationError);
 	const draft = agentBuildDraftInput();
 	if (!draft) return;
 	const path = activeAgentBuild ? `/agent-builds/${encodeURIComponent(activeAgentBuild.id)}` : "/agent-builds/draft";
@@ -7416,6 +7554,7 @@ function applyAgentBuilderDraft(encoded: string): void {
 		"systemPrompt",
 		"model",
 		"thinking",
+		"modelControls",
 		"executor",
 		"permissionPolicy",
 		"browserAccess",
@@ -7441,8 +7580,22 @@ function applyAgentBuilderDraft(encoded: string): void {
 			updatePersonaPreview(true);
 		} else if (!persona) setBuilderDraftText("agent-persona", instructions);
 	}
-	if (!setBuilderDraftSelect("agent-model", draft.model)) warnings.push(`Unavailable model ${String(draft.model)}`);
-	setBuilderDraftSelect("agent-thinking", draft.thinking);
+	try {
+		const next = mergeModelSettingsDraft(
+			{
+				model: modelRefFromValue(agentModel.value),
+				thinkingLevel: agentThinking.value as ThinkingLevel,
+				modelControls: agentModelControls,
+			},
+			draft,
+			availableModels,
+		);
+		selectAgentModel(next.model ? `${next.model.provider}/${next.model.id}` : "");
+		agentModelControls = next.modelControls;
+		agentThinking.value = next.thinkingLevel;
+	} catch (error) {
+		warnings.push(`Model settings were not changed: ${error instanceof Error ? error.message : String(error)}`);
+	}
 	setBuilderDraftSelect("agent-executor", draft.executor);
 	setBuilderDraftSelect("agent-permissions", draft.permissionPolicy);
 	setBuilderDraftSelect("agent-browser-access", draft.browserAccess);
@@ -7682,7 +7835,7 @@ async function openAgent(agent?: AgentSummary): Promise<void> {
 	persistExternalConnectionTabs();
 	if (!openAgentIds.includes(agent.id)) openAgentIds.push(agent.id);
 	selectedAgentTitle.textContent = agent.name;
-	selectedAgentMeta.textContent = `${agent.model ? `${agent.model.provider}/${agent.model.id}` : "Current Pi model"} · ${formatWorkingDirectory(agent.projectRoot)}`;
+	selectedAgentMeta.textContent = `${agent.model ? `${agent.model.provider}/${agent.model.id}` : "Current Pi model"} · ${agent.modelControls === undefined ? `Legacy thinking: ${agent.thinking ?? "inherited"}` : describeModelControls(agent.modelControls)} · ${formatWorkingDirectory(agent.projectRoot)}`;
 	selectedAgentMeta.title = agent.projectRoot;
 	selectedAgentPanel.classList.remove("hidden");
 	activateTab("agents-workspace");
@@ -8242,6 +8395,7 @@ async function openAgentBuilder(
 	agentBuildDraftTimer = undefined;
 	agentBuildPollTimer = undefined;
 	agentForm.reset();
+	agentModelControls = agent?.modelControls === undefined ? undefined : { ...agent.modelControls };
 	const catalogAgent = agent?.source === "pi-agent";
 	requiredElement<HTMLInputElement>("agent-id").value = agent?.id ?? "";
 	requiredElement<HTMLInputElement>("agent-name").value = agent?.name ?? "";
@@ -8268,15 +8422,17 @@ async function openAgentBuilder(
 	requiredElement<HTMLInputElement>("agent-delegates").value = agent?.delegateAgentIds.join(", ") ?? "";
 	requiredElement<HTMLInputElement>("agent-a2a").checked = agent?.a2a.enabled ?? false;
 	const recommendedModelValue = `${recommendedAgentModel.provider}/${recommendedAgentModel.id}`;
-	agentModel.value = agent
-		? agent.model
-			? `${agent.model.provider}/${agent.model.id}`
-			: ""
-		: availableModels.some(
-					(entry) => entry.provider === recommendedAgentModel.provider && entry.id === recommendedAgentModel.id,
-				)
-			? recommendedModelValue
-			: "";
+	selectAgentModel(
+		agent
+			? agent.model
+				? `${agent.model.provider}/${agent.model.id}`
+				: ""
+			: availableModels.some(
+						(entry) => entry.provider === recommendedAgentModel.provider && entry.id === recommendedAgentModel.id,
+					)
+				? recommendedModelValue
+				: "",
+	);
 	agentModelPicker.refresh();
 	updateThinkingLevelAvailability(
 		requiredElement<HTMLSelectElement>("agent-thinking"),
@@ -8310,23 +8466,25 @@ async function openAgentBuilder(
 	renderSessionNavigation();
 	refreshRoutineEditorOptions();
 	clearRoutineEditor();
-	let loadedBuild: AgentBuildRecord | undefined;
-	try {
-		[, , , loadedBuild] = await Promise.all([
-			loadCapabilities(),
-			loadRoutines(),
-			loadTeamFactoryStatus(),
-			agent ? loadAgentBuildForAgent(agent.id) : Promise.resolve(undefined),
-		]);
-	} catch (error) {
-		setStatus(error instanceof Error ? error.message : String(error), true);
-	}
+	const loaded = await Promise.allSettled([
+		loadCapabilities(),
+		loadRoutines(),
+		loadTeamFactoryStatus(),
+		agent ? loadAgentBuildForAgent(agent.id) : Promise.resolve(undefined),
+	]);
+	const loadedBuild = loaded[3].status === "fulfilled" ? loaded[3].value : undefined;
 	if (loadedBuild?.stage === "draft" && loadedBuild.configuration) {
 		applyAgentBuildConfiguration(loadedBuild.configuration);
 		updateAgentBuilderReadiness();
 		setStatus(`Loaded staged changes for ${loadedBuild.name}`);
 	}
 	if (session?.snapshot) renderBuilderConversation(session.snapshot);
+	const failure = loaded.find((result) => result.status === "rejected");
+	if (failure?.status === "rejected")
+		setStatus(
+			`Builder service unavailable: ${failure.reason instanceof Error ? failure.reason.message : String(failure.reason)}`,
+			true,
+		);
 }
 
 function closeBuilderChat(): void {
@@ -10128,7 +10286,7 @@ sessionPathForm.addEventListener("submit", (event) => {
 });
 
 async function submitComposer(): Promise<void> {
-	if (activeSubagentKey || activeExternalRunId) return;
+	if (activeSubagentKey || activeExternalRunId || activeArtifactId) return;
 	if (activeExternalConnectionId) {
 		await submitExternalComposer(activeExternalConnectionId);
 		return;
@@ -10142,6 +10300,9 @@ async function submitComposer(): Promise<void> {
 		return;
 	}
 	if (!session) return;
+	const targetSession = session;
+	await pendingSessionConfigurationUpdates.get(targetSession.id);
+	if (editableChatModelSession() !== targetSession) return;
 	if (session.snapshot?.phase !== "idle") {
 		await session.abort();
 		return;
@@ -10300,7 +10461,9 @@ async function submitBuilderComposer(): Promise<void> {
 		`Current persona profile: ${personaSelect.value || "custom"}. Omit persona fields unless the user requested a persona change.`,
 		`Current tools: ${requiredElement<HTMLInputElement>("agent-tools").value || "none"}`,
 		`Current model: ${agentModel.value || "inherit current session"}`,
-		`Current thinking: ${agentThinking.value}`,
+		`Current model controls: ${agentModelControls === undefined ? `legacy thinking ${agentThinking.value}` : JSON.stringify(agentModelControls)}`,
+		"For native settings use modelControls with reasoningMode, reasoningEffort, reasoningBudget, and/or processingTier. Omit it to preserve settings; {} means provider defaults; null explicitly returns to legacy thinking. Never combine native controls and thinking. Never choose a premium processing tier unless the user requests it.",
+		`Selected model control capabilities (account access is not verified): ${JSON.stringify(availableModels.find((entry) => `${entry.provider}/${entry.id}` === agentModel.value)?.controls ?? {})}`,
 		`Current executor: ${requiredElement<HTMLSelectElement>("agent-executor").value}`,
 		`Current permission policy: ${requiredElement<HTMLSelectElement>("agent-permissions").value}`,
 		`Current browser access: ${requiredElement<HTMLSelectElement>("agent-browser-access").value}`,
@@ -10568,10 +10731,14 @@ model.addEventListener("change", () => {
 		}
 		return;
 	}
-	updateThinkingLevelAvailability(thinking, model.value, thinking.value as ThinkingLevel);
-	const targetSession = session;
-	if (!targetSession || activeAgentId || activeSubagentKey || activeExternalRunId || activeExternalConnectionId)
+	const targetSession = editableChatModelSession();
+	if (
+		!targetSession ||
+		targetSession.snapshot?.phase !== "idle" ||
+		pendingSessionConfigurationUpdates.has(targetSession.id)
+	)
 		return;
+	updateThinkingLevelAvailability(thinking, model.value, thinking.value as ThinkingLevel);
 	trackSessionConfigurationUpdate(
 		targetSession,
 		targetSession.setModel({ provider: model.value.slice(0, separator), id: model.value.slice(separator + 1) }),
@@ -10590,13 +10757,70 @@ agentModel.addEventListener("change", () => {
 });
 
 thinking.addEventListener("change", () => {
-	const targetSession = session;
-	if (targetSession && !activeAgentId && !activeSubagentKey && !activeExternalRunId && !activeExternalConnectionId)
+	const targetSession = editableChatModelSession();
+	if (targetSession?.snapshot?.phase === "idle" && !pendingSessionConfigurationUpdates.has(targetSession.id))
 		trackSessionConfigurationUpdate(
 			targetSession,
 			targetSession.setThinking(thinking.value as ThinkingLevel),
 			`Switching thinking to ${thinking.value}…`,
 		);
+});
+
+chatModelSettings.addEventListener("click", () => {
+	const target = editableChatModelSession();
+	if (!target?.snapshot || chatModelSettings.disabled) return;
+	openModelSettings({
+		title: builderActive ? "Builder chat model settings" : "Chat model settings",
+		models: availableModels,
+		current: {
+			model: target.snapshot.model,
+			thinkingLevel: target.snapshot.thinkingLevel,
+			modelControls: target.snapshot.modelControls,
+		},
+		onApply: async (selection) => {
+			if (
+				editableChatModelSession() !== target ||
+				target.snapshot?.phase !== "idle" ||
+				pendingSessionConfigurationUpdates.has(target.id)
+			)
+				throw new Error("The chat changed or is busy. Reopen model settings.");
+			if (!selection.model) throw new Error("Choose a model.");
+			const update = target
+				.setModel(selection.model, selection.modelControls ?? null)
+				.then(async (snapshot) =>
+					selection.modelControls === undefined && snapshot.thinkingLevel !== selection.thinkingLevel
+						? target.setThinking(selection.thinkingLevel)
+						: snapshot,
+				);
+			trackSessionConfigurationUpdate(target, update, "Applying model settings…");
+			await update;
+		},
+	});
+});
+
+agentModelSettings.addEventListener("click", () => {
+	if (!builderActive || agentModelSettings.disabled) return;
+	const editingId = requiredElement<HTMLInputElement>("agent-id").value;
+	openModelSettings({
+		title: "Agent runtime model settings",
+		models: availableModels,
+		allowInherit: true,
+		current: {
+			model: modelRefFromValue(agentModel.value),
+			thinkingLevel: agentThinking.value as ThinkingLevel,
+			modelControls: agentModelControls,
+		},
+		onApply: async (selection) => {
+			if (!builderActive || requiredElement<HTMLInputElement>("agent-id").value !== editingId)
+				throw new Error("The agent being edited changed. Reopen model settings.");
+			selectAgentModel(selection.model ? `${selection.model.provider}/${selection.model.id}` : "");
+			agentModelControls = selection.modelControls === undefined ? undefined : { ...selection.modelControls };
+			agentThinking.value = selection.thinkingLevel;
+			updateThinkingLevelAvailability(agentThinking, agentModel.value, selection.thinkingLevel);
+			updateAgentBuilderReadiness();
+			scheduleAgentBuildDraftPersistence();
+		},
+	});
 });
 
 function trackSessionConfigurationUpdate(
@@ -10606,22 +10830,27 @@ function trackSessionConfigurationUpdate(
 ): void {
 	pendingSessionConfigurationUpdates.set(targetSession.id, update);
 	setStatus(pendingMessage);
+	syncModelSettingsPresentation();
 	void update.then(
 		() => {
 			if (pendingSessionConfigurationUpdates.get(targetSession.id) === update)
 				pendingSessionConfigurationUpdates.delete(targetSession.id);
-			setStatus(builderActive ? `${builderLabel} ready` : "Ready");
+			if (editableChatModelSession() === targetSession) {
+				syncModelSettingsPresentation();
+				setStatus(builderActive ? `${builderLabel} ready` : "Ready");
+			}
 		},
 		(error: unknown) => {
 			if (pendingSessionConfigurationUpdates.get(targetSession.id) === update)
 				pendingSessionConfigurationUpdates.delete(targetSession.id);
-			if (targetSession.snapshot) {
+			if (targetSession.snapshot && editableChatModelSession() === targetSession) {
 				model.value = `${targetSession.snapshot.model.provider}/${targetSession.snapshot.model.id}`;
 				modelPicker.refresh();
 				thinking.value = targetSession.snapshot.thinkingLevel;
 				updateThinkingLevelAvailability(thinking, model.value, targetSession.snapshot.thinkingLevel);
 			}
-			setStatus(error instanceof Error ? error.message : String(error), true);
+			if (editableChatModelSession() === targetSession)
+				setStatus(error instanceof Error ? error.message : String(error), true);
 		},
 	);
 }
@@ -10742,7 +10971,8 @@ agentForm.addEventListener("submit", (event) => {
 		persona: value("agent-persona"),
 		executor,
 		permissionPolicy: value("agent-permissions"),
-		thinking: value("agent-thinking"),
+		thinking: agentModelControls === undefined ? value("agent-thinking") : undefined,
+		modelControls: agentModelControls === undefined ? undefined : { ...agentModelControls },
 		delegateAgentIds: value("agent-delegates")
 			.split(",")
 			.map((entry) => entry.trim())

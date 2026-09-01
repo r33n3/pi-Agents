@@ -26,7 +26,7 @@ describe("getModelSelectionCostPresentations", () => {
 		});
 		expect(presentations.get(modelSelectionCostKey("anthropic", "premium"))).toMatchObject({ band: "highest" });
 		expect(presentations.get(modelSelectionCostKey("anthropic", "balanced"))?.title).toBe(
-			"Moderate cost · Input $3.00 / 1M · Output $15.00 / 1M · Cache read $0.30 / 1M · Cache write $3.75 / 1M",
+			"Moderate cost · Estimated base rates · Input $3.00 / 1M · Output $15.00 / 1M · Cache read $0.30 / 1M · Cache write $3.75 / 1M",
 		);
 	});
 
@@ -45,7 +45,7 @@ describe("getSessionCostPresentation", () => {
 	it("marks used Bedrock models without verified rates as unpriced", () => {
 		expect(
 			getSessionCostPresentation("bedrock-mantle", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, 0, true),
-		).toEqual({ value: "—", title: "No verified Bedrock token price is configured for this model" });
+		).toEqual({ value: "—", title: "Session cost is unknown; token pricing is unavailable" });
 	});
 
 	it("shows a sub-cent precision value when a verified rate rounds to zero", () => {
@@ -63,5 +63,41 @@ describe("getSessionCostPresentation", () => {
 		expect(
 			getSessionCostPresentation("ollama", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, 0, true),
 		).toBeUndefined();
+	});
+	it("marks mixed-session totals as a known subtotal when some requests are unpriced", () => {
+		expect(getSessionCostPresentation("custom", cost(1, 2), 1.5, true, true)).toEqual({
+			value: "1.500+",
+			title: "Known session subtotal; some request costs are unknown",
+		});
+		expect(getSessionCostPresentation("openrouter", cost(-1, -1), -10, true)).toEqual({
+			value: "—",
+			title: "Session cost is unknown",
+		});
+	});
+});
+
+describe("unknown and context-tier price presentation", () => {
+	it("excludes unknown sentinels even when another rate is positive", () => {
+		const presentations = getModelSelectionCostPresentations([
+			{ provider: "router", id: "mixed", cost: cost(-1, 5) },
+			{ provider: "custom", id: "zero", cost: { ...cost(0, 0), status: "estimated" } },
+		]);
+		expect(presentations.get(modelSelectionCostKey("router", "mixed"))?.band).toBe("unknown");
+		expect(presentations.get(modelSelectionCostKey("custom", "zero"))?.band).not.toBe("unknown");
+	});
+	it("discloses context-dependent tiers in the price tooltip", () => {
+		const presentations = getModelSelectionCostPresentations([
+			{
+				provider: "fixture",
+				id: "tiered",
+				cost: {
+					...cost(1, 2),
+					tiers: [{ inputTokensAbove: 200000, ...cost(2, 4) }],
+				},
+			},
+		]);
+		expect(presentations.get(modelSelectionCostKey("fixture", "tiered"))?.title).toContain(
+			"Above 200,000 input tokens: input $2.00 / 1M, output $4.00 / 1M",
+		);
 	});
 });

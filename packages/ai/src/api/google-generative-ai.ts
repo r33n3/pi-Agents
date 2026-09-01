@@ -3,7 +3,9 @@ import {
 	type GenerateContentParameters,
 	GoogleGenAI,
 	type ThinkingConfig,
+	ThinkingLevel,
 } from "@google/genai";
+import { type ModelControls, validateModelControls } from "../model-controls.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
@@ -36,6 +38,7 @@ import {
 	retryGoogleRequest,
 	supportsGoogleStrictToolSampling,
 } from "./google-shared.ts";
+import { lazyStream } from "./lazy.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 export interface GoogleOptions extends StreamOptions {
@@ -49,6 +52,13 @@ export interface GoogleOptions extends StreamOptions {
 
 // Counter for generating unique tool call IDs
 let toolCallCounter = 0;
+
+const NATIVE_THINKING_LEVELS: Readonly<Record<string, ThinkingLevel>> = {
+	minimal: ThinkingLevel.MINIMAL,
+	low: ThinkingLevel.LOW,
+	medium: ThinkingLevel.MEDIUM,
+	high: ThinkingLevel.HIGH,
+};
 
 export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 	model: Model<"google-generative-ai">,
@@ -77,6 +87,12 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 		};
 
 		try {
+			const requested = options?.controls === undefined ? undefined : { ...options.controls };
+			if (requested !== undefined) {
+				validateModelControls(model, requested);
+				if (options?.thinking !== undefined)
+					throw new Error("Choose native model controls or legacy thinking, not both");
+			}
 			if (options?.fetch && options.fetch !== globalThis.fetch) {
 				throw new Error("Custom fetch is not supported by the Google Generative AI adapter");
 			}
@@ -86,10 +102,25 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 			}
 			const client = createClient(model, apiKey, options?.headers);
 			let params = buildParams(model, context, options);
+			const expectedThinking = { ...params.config?.thinkingConfig };
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as GenerateContentParameters;
 			}
+			const thinking = params.config?.thinkingConfig;
+			if (
+				requested !== undefined &&
+				(params.model !== model.id ||
+					thinking?.thinkingLevel !== expectedThinking.thinkingLevel ||
+					thinking?.thinkingBudget !== expectedThinking.thinkingBudget)
+			)
+				throw new Error("Payload changes conflict with native model controls");
+			const sent: ModelControls = {
+				...(thinking?.thinkingLevel !== undefined ? { reasoningEffort: thinking.thinkingLevel } : {}),
+				...(thinking?.thinkingBudget !== undefined ? { reasoningBudget: thinking.thinkingBudget } : {}),
+			};
+			// Google does not report an effective thinking setting; usage counts are not such evidence.
+			output.execution = { requested: requested ?? {}, sent };
 			const googleStream = await retryGoogleRequest(() => client.models.generateContentStream(params), options);
 
 			stream.push({ type: "start", partial: output });
@@ -299,6 +330,17 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
+	if (options?.controls !== undefined) {
+		return lazyStream(model, async () => {
+			validateModelControls(model, options.controls);
+			if (options.reasoning !== undefined || options.thinkingBudgets !== undefined)
+				throw new Error("Choose native model controls or legacy reasoning, not both");
+			return stream(model, context, {
+				...buildBaseOptions(model, context, options, options.apiKey),
+				toolChoice: options.toolChoice,
+			});
+		});
+	}
 	const apiKey = options?.apiKey;
 	if (!apiKey) {
 		throw new Error(`No API key for provider: ${model.provider}`);
@@ -387,7 +429,20 @@ function buildParams(
 		}),
 	};
 
-	if (options.thinking?.enabled && model.reasoning) {
+	if (options.controls !== undefined) {
+		const controls = options.controls;
+		if (controls.reasoningEffort !== undefined) {
+			config.thinkingConfig = {
+				includeThoughts: true,
+				thinkingLevel: NATIVE_THINKING_LEVELS[controls.reasoningEffort],
+			};
+		} else if (controls.reasoningBudget !== undefined) {
+			config.thinkingConfig = {
+				thinkingBudget: controls.reasoningBudget,
+				...(controls.reasoningBudget !== 0 ? { includeThoughts: true } : {}),
+			};
+		}
+	} else if (options.thinking?.enabled && model.reasoning) {
 		const thinkingConfig: ThinkingConfig = { includeThoughts: true };
 		if (options.thinking.level !== undefined) {
 			// Cast to any since our GoogleApiThinkingLevel mirrors Google's ThinkingLevel enum values

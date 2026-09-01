@@ -1,4 +1,10 @@
-import type { ModelRef, SessionPhase, SessionSnapshot, ThinkingLevel } from "@earendil-works/pi-protocol";
+import type {
+	ModelControls,
+	ModelRef,
+	SessionPhase,
+	SessionSnapshot,
+	ThinkingLevel,
+} from "@earendil-works/pi-protocol";
 import type { PiSessionRuntime, PiSessionRuntimeEvent, PromptInput, SteerInput } from "@earendil-works/pi-server";
 
 /**
@@ -11,8 +17,9 @@ export interface LiveSessionDelegate {
 	prompt(input: PromptInput): Promise<void>;
 	steer(input: SteerInput): Promise<void>;
 	abort(): Promise<void>;
-	setModel(model: ModelRef): Promise<void>;
+	setModel(model: ModelRef, modelControls?: ModelControls | null): Promise<void>;
 	setThinking(thinkingLevel: ThinkingLevel): Promise<void>;
+	setModelControls(modelControls: ModelControls | null): Promise<void>;
 	subscribe(listener: (event: PiSessionRuntimeEvent) => void): () => void;
 	dispose(): Promise<void>;
 }
@@ -45,12 +52,16 @@ export class LiveSessionRuntime implements PiSessionRuntime {
 		return this.delegate.abort();
 	}
 
-	setModel(model: ModelRef): Promise<void> {
-		return this.delegate.setModel(model);
+	setModel(model: ModelRef, modelControls?: ModelControls | null): Promise<void> {
+		return this.delegate.setModel(model, modelControls);
 	}
 
 	setThinking(thinkingLevel: ThinkingLevel): Promise<void> {
 		return this.delegate.setThinking(thinkingLevel);
+	}
+
+	setModelControls(modelControls: ModelControls | null): Promise<void> {
+		return this.delegate.setModelControls(modelControls);
 	}
 
 	subscribe(listener: (event: PiSessionRuntimeEvent) => void): () => void {

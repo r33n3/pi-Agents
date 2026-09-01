@@ -1,11 +1,12 @@
 import { readFile } from "node:fs/promises";
-import type { ImageContent } from "@earendil-works/pi-ai";
+import { type ImageContent, ModelControlsError } from "@earendil-works/pi-ai";
 import type { ModelMetadata, SessionMetadata } from "@earendil-works/pi-protocol";
 import {
 	type CreateSessionOptions,
 	PiServerError,
 	type PiServerService,
 	type PiSessionRuntime,
+	toProtocolModelMetadata,
 } from "@earendil-works/pi-server";
 import type { AgentSession } from "../agent-session.ts";
 import { AgentSessionServeDelegate, runSupervisedSessionPrompt } from "./agent-session-serve-delegate.ts";
@@ -44,44 +45,46 @@ export class CurrentSessionService implements PiServerService {
 
 	async listModels(): Promise<ModelMetadata[]> {
 		return this.#session.modelRuntime.getAvailableSnapshot().map((model) => ({
-			provider: model.provider,
-			id: model.id,
-			name: model.name,
-			api: model.api,
-			reasoning: model.reasoning,
-			input: model.input,
-			contextWindow: model.contextWindow,
-			maxTokens: model.maxTokens,
-			cost: {
-				input: model.cost.input,
-				output: model.cost.output,
-				cacheRead: model.cost.cacheRead,
-				cacheWrite: model.cost.cacheWrite,
-			},
-			supportedThinkingLevels: model.reasoning ? ["off", "low", "medium", "high"] : ["off"],
-			authenticated: true,
+			...toProtocolModelMetadata(model, true),
+			controls: this.#session.modelRuntime.getModelControlCapabilities(model),
+			catalogRefresh: this.#session.modelRuntime.getCatalogRefreshStatus(model.provider),
+			catalog: this.#session.modelRuntime.getModelProvenance(model.provider, model.id),
 		}));
 	}
 
 	async createSession(options: CreateSessionOptions): Promise<PiSessionRuntime> {
+		if (options.modelControls != null && options.thinkingLevel !== undefined)
+			throw new PiServerError("invalid_request", "Choose native model controls or legacy thinkingLevel, not both");
 		if (!this.#createHostedSession)
 			throw new PiServerError("not_implemented", "Browser helper sessions are disabled");
 		if (this.#hosted.has(options.id) || options.id === this.#session.sessionId) {
 			throw new PiServerError("session_locked", `Session already exists: ${options.id}`);
 		}
-		const session = await this.#createHostedSession(options);
-		if (session.sessionId !== options.id) {
-			session.dispose();
-			throw new Error(`Hosted session factory returned ${session.sessionId}, expected ${options.id}`);
+		let session: AgentSession | undefined;
+		try {
+			session = await this.#createHostedSession(options);
+			if (session.sessionId !== options.id) {
+				throw new Error(`Hosted session factory returned ${session.sessionId}, expected ${options.id}`);
+			}
+			const controls = session.modelControls;
+			if (controls !== undefined) {
+				if (!session.model) throw new PiServerError("invalid_request", "No model is selected");
+				session.modelRuntime.validateModelControls(session.model, controls);
+			}
+		} catch (error) {
+			session?.dispose();
+			if (error instanceof ModelControlsError) throw new PiServerError("invalid_request", error.message);
+			throw error;
 		}
 		const createdAt = Date.now();
+		const hostedSession = session;
 		let disposed = false;
 		const runtime = new LiveSessionRuntime(
 			new AgentSessionServeDelegate(session, createdAt, () => {
 				if (disposed) return;
 				disposed = true;
 				this.#hosted.delete(options.id);
-				session.dispose();
+				hostedSession.dispose();
 			}),
 		);
 		this.#hosted.set(options.id, { session, createdAt, runtime });

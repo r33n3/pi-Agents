@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, parse, relative, resolve } from "node:path";
-import type { ModelRef, ThinkingLevel } from "@earendil-works/pi-protocol";
+import type { ModelControls, ModelRef, ThinkingLevel } from "@earendil-works/pi-protocol";
 import { parseFrontmatter } from "../../utils/frontmatter.ts";
+import { parseAgentModelControls } from "./agent-model-settings.ts";
 import type { BrowserAccess } from "./browser-policy.ts";
 import type { BrowserProfile } from "./browser-profile-store.ts";
 import type { BrowserRuntimeKind } from "./browser-session-manager.ts";
@@ -42,6 +43,8 @@ export interface AgentDefinition {
 	model?: ModelRef;
 	budget?: { maxTokens?: number; maxCostUsd?: number };
 	thinking?: ThinkingLevel;
+	/** Omitted uses legacy thinking; {} explicitly selects provider defaults. */
+	modelControls?: ModelControls;
 	tools: string[];
 	capabilities: AgentCapabilityGrant[];
 	memory: AgentMemoryKind;
@@ -87,6 +90,7 @@ export interface AgentRegistryOptions {
 	personaDirectory?: string;
 	defaultWorkspace?: string;
 	modelCatalog?: () => readonly AgentModelCatalogEntry[];
+	modelControlsValidator?: (model: ModelRef, controls: ModelControls) => void;
 	browserWorkflowCatalog?: (id: string, version: number) => boolean;
 	capabilityValidator?: (grants: readonly AgentCapabilityGrant[], executor: AgentExecutorKind) => void;
 }
@@ -109,6 +113,7 @@ export class AgentRegistry {
 	readonly #personaDirectory: string | undefined;
 	readonly #defaultWorkspace: string;
 	readonly #modelCatalog: (() => readonly AgentModelCatalogEntry[]) | undefined;
+	readonly #modelControlsValidator: AgentRegistryOptions["modelControlsValidator"];
 	readonly #browserWorkflowCatalog: ((id: string, version: number) => boolean) | undefined;
 	readonly #capabilityValidator:
 		| ((grants: readonly AgentCapabilityGrant[], executor: AgentExecutorKind) => void)
@@ -124,6 +129,7 @@ export class AgentRegistry {
 		this.#personaDirectory = options.personaDirectory ? resolve(options.personaDirectory) : undefined;
 		this.#defaultWorkspace = resolve(options.defaultWorkspace ?? process.cwd());
 		this.#modelCatalog = options.modelCatalog;
+		this.#modelControlsValidator = options.modelControlsValidator;
 		this.#browserWorkflowCatalog = options.browserWorkflowCatalog;
 		this.#capabilityValidator = options.capabilityValidator;
 	}
@@ -159,7 +165,7 @@ export class AgentRegistry {
 		return this.#queue.run(async () => {
 			await this.initialize();
 			const normalized = normalizeDefinition(input, this.#defaultWorkspace);
-			this.#validateModel(normalized.model);
+			this.validateModelSettings(normalized);
 			this.#capabilityValidator?.(normalized.capabilities, normalized.executor);
 			for (const workflow of normalized.browserWorkflows) {
 				if (this.#browserWorkflowCatalog && !this.#browserWorkflowCatalog(workflow.id, workflow.version)) {
@@ -189,6 +195,13 @@ export class AgentRegistry {
 			});
 			return definition;
 		});
+	}
+
+	/** Check the current catalog before saving or starting work, never rewriting stored selections. */
+	validateModelSettings(settings: Pick<AgentDefinition, "model" | "thinking" | "modelControls">): void {
+		const controls = parseAgentModelControls(settings);
+		this.#validateModel(settings.model);
+		if (controls !== undefined && settings.model) this.#modelControlsValidator?.(settings.model, controls);
 	}
 
 	#validateModel(model: ModelRef | undefined): void {
@@ -353,6 +366,7 @@ function normalizeDefinition(value: unknown, defaultWorkspace: string): AgentDef
 		model: normalizeModel(input.model),
 		budget: normalizeBudget(input.budget),
 		thinking: normalizeThinking(input.thinking),
+		modelControls: parseAgentModelControls(input),
 		tools: [...new Set(tools)],
 		capabilities,
 		memory: oneOf(input.memory, ["none", "notes"], "memory"),

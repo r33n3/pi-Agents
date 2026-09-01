@@ -1,12 +1,18 @@
 import {
 	type ImageContent as AiImageContent,
+	type ModelCatalogSnapshot as AiModelCatalogSnapshot,
+	type ModelControlCapabilities as AiModelControlCapabilities,
+	type ModelControls as AiModelControls,
 	type TextContent as AiTextContent,
 	type Usage as AiUsage,
 	type Api,
 	type AssistantMessage,
+	getModelControlCapabilities,
 	getSupportedThinkingLevels,
+	getUsageCostStatus,
 	type Model,
 	type ModelThinkingLevel,
+	normalizeModelCost,
 	type ToolCall,
 	type ToolResultMessage,
 	type UserMessage,
@@ -14,6 +20,9 @@ import {
 import type {
 	AssistantTranscriptItem,
 	JsonValue,
+	ModelCatalogSnapshot,
+	ModelControlCapabilities,
+	ModelControls,
 	ModelMetadata,
 	ThinkingLevel,
 	ToolTranscriptItem,
@@ -25,6 +34,12 @@ type Assert<T extends true> = T;
 type ExactKeys<T, Keys extends keyof T> = keyof T extends Keys ? true : false;
 type _AiThinkingLevelsFitProtocol = Assert<ModelThinkingLevel extends ThinkingLevel ? true : false>;
 type _ProtocolThinkingLevelsFitAi = Assert<ThinkingLevel extends ModelThinkingLevel ? true : false>;
+type _AiControlsFitProtocol = Assert<AiModelControls extends ModelControls ? true : false>;
+type _ProtocolControlsFitAi = Assert<ModelControls extends AiModelControls ? true : false>;
+type _AiCapabilitiesFitProtocol = Assert<AiModelControlCapabilities extends ModelControlCapabilities ? true : false>;
+type _ProtocolCapabilitiesFitAi = Assert<ModelControlCapabilities extends AiModelControlCapabilities ? true : false>;
+type _AiCatalogSnapshotFitsProtocol = Assert<AiModelCatalogSnapshot extends ModelCatalogSnapshot ? true : false>;
+type _ProtocolCatalogSnapshotFitsAi = Assert<ModelCatalogSnapshot extends AiModelCatalogSnapshot ? true : false>;
 type AiModelInput = Model<Api>["input"][number];
 type ProtocolModelInput = ModelMetadata["input"][number];
 type _AiModelInputsFitProtocol = Assert<AiModelInput extends ProtocolModelInput ? true : false>;
@@ -32,7 +47,7 @@ type _ProtocolModelInputsFitAi = Assert<ProtocolModelInput extends AiModelInput 
 /**
  * Enumerate mapped and intentionally omitted pi-ai fields so additions fail compilation here.
  * Provider replay metadata, diagnostics, cache-write retention splits, model transport settings,
- * model sampling defaults, pricing tiers, and deferred-tool availability remain intentionally
+ * model sampling defaults and deferred-tool availability remain intentionally
  * server-side.
  */
 type _AiTextContentFieldsAccountedFor = Assert<ExactKeys<AiTextContent, "type" | "text" | "textSignature">>;
@@ -53,7 +68,7 @@ type _AiUsageFieldsAccountedFor = Assert<
 	>
 >;
 type _AiUsageCostFieldsAccountedFor = Assert<
-	ExactKeys<AiUsage["cost"], "input" | "output" | "cacheRead" | "cacheWrite" | "total">
+	ExactKeys<AiUsage["cost"], "input" | "output" | "cacheRead" | "cacheWrite" | "total" | "status">
 >;
 type _AiModelFieldsAccountedFor = Assert<
 	ExactKeys<
@@ -65,6 +80,7 @@ type _AiModelFieldsAccountedFor = Assert<
 		| "baseUrl"
 		| "reasoning"
 		| "thinkingLevelMap"
+		| "controls"
 		| "input"
 		| "cost"
 		| "contextWindow"
@@ -75,7 +91,7 @@ type _AiModelFieldsAccountedFor = Assert<
 	>
 >;
 type _AiModelCostFieldsAccountedFor = Assert<
-	ExactKeys<Model<Api>["cost"], "input" | "output" | "cacheRead" | "cacheWrite" | "tiers">
+	ExactKeys<Model<Api>["cost"], "input" | "output" | "cacheRead" | "cacheWrite" | "tiers" | "status">
 >;
 type _AiUserMessageFieldsAccountedFor = Assert<ExactKeys<UserMessage, "role" | "content" | "timestamp">>;
 type _AiAssistantMessageFieldsAccountedFor = Assert<
@@ -88,6 +104,7 @@ type _AiAssistantMessageFieldsAccountedFor = Assert<
 		| "model"
 		| "responseModel"
 		| "responseId"
+		| "execution"
 		| "diagnostics"
 		| "usage"
 		| "stopReason"
@@ -201,6 +218,7 @@ export function toProtocolUsage(usage: AiUsage | undefined): Usage | undefined {
 			cacheRead: nonNegativeNumber(usage.cost.cacheRead),
 			cacheWrite: nonNegativeNumber(usage.cost.cacheWrite),
 			total: nonNegativeNumber(usage.cost.total),
+			status: getUsageCostStatus(usage.cost),
 		},
 	} satisfies Usage;
 	return result;
@@ -216,13 +234,9 @@ export function toProtocolModelMetadata(model: Model<Api>, authenticated: boolea
 		input: [...model.input],
 		contextWindow: Math.max(1, Math.floor(model.contextWindow)),
 		maxTokens: Math.max(1, Math.floor(model.maxTokens)),
-		cost: {
-			input: nonNegativeNumber(model.cost.input),
-			output: nonNegativeNumber(model.cost.output),
-			cacheRead: nonNegativeNumber(model.cost.cacheRead),
-			cacheWrite: nonNegativeNumber(model.cost.cacheWrite),
-		},
+		cost: normalizeModelCost(model.cost),
 		supportedThinkingLevels: getSupportedThinkingLevels(model),
+		controls: getModelControlCapabilities(model),
 		authenticated,
 	} satisfies ModelMetadata;
 	return result;
@@ -297,6 +311,7 @@ export function toProtocolAssistantMessage(
 			? {}
 			: { responseModel: identifier(message.responseModel, "Assistant response model") }),
 		...(usage ? { usage } : {}),
+		...(message.execution ? { execution: structuredClone(message.execution) } : {}),
 		timestamp: timestamp(message.timestamp),
 	} as const;
 	switch (message.stopReason) {

@@ -1,15 +1,17 @@
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vitest/config";
+import { defineConfig, mergeConfig } from "vitest/config";
+import baseConfig from "../../vitest.base.ts";
 
-export default defineConfig({
+export default mergeConfig(baseConfig, defineConfig({
 	test: {
 		globals: true,
 		environment: "node",
 		reporters: process.env.GITHUB_ACTIONS ? ["dot", "github-actions"] : ["dot"],
 	},
 	resolve: {
-		alias: {
-			"@earendil-works/pi-protocol": fileURLToPath(new URL("../protocol/src/index.ts", import.meta.url)),
-		},
+		alias: [{
+			find: /^@earendil-works\/pi-protocol$/,
+			replacement: fileURLToPath(new URL("../protocol/src/index.ts", import.meta.url)),
+		}],
 	},
-});
+}));

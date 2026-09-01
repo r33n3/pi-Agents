@@ -50,12 +50,93 @@ export const ModelRefSchema = StrictObject({
 });
 export type ModelRef = Static<typeof ModelRefSchema>;
 
-export const ModelCostSchema = StrictObject({
+// This transport contract is checked against pi-ai by pi-server without coupling
+// the standalone protocol/browser package to provider SDK dependencies.
+export const ModelControlsSchema = StrictObject({
+	reasoningMode: Type.Optional(Type.String({ minLength: 1 })),
+	reasoningEffort: Type.Optional(Type.String({ minLength: 1 })),
+	reasoningBudget: Type.Optional(Type.Integer({ minimum: -1 })),
+	processingTier: Type.Optional(Type.String({ minLength: 1 })),
+});
+export type ModelControls = Static<typeof ModelControlsSchema>;
+const ControlEvidenceSchema = StrictObject({
+	kind: Type.Union([Type.Literal("provider-docs"), Type.Literal("provider-discovery"), Type.Literal("user-override")]),
+	reference: Type.String({ minLength: 1 }),
+	checkedAt: Type.String({ minLength: 1 }),
+});
+const ChoiceControlSchema = StrictObject({
+	values: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, uniqueItems: true }),
+	default: Type.Optional(Type.String({ minLength: 1 })),
+	guidance: Type.Optional(Type.String({ minLength: 1, maxLength: 2000 })),
+	evidence: ControlEvidenceSchema,
+});
+export const ModelControlCapabilitiesSchema = StrictObject({
+	reasoningMode: Type.Optional(ChoiceControlSchema),
+	reasoningEffort: Type.Optional(ChoiceControlSchema),
+	reasoningBudget: Type.Optional(
+		StrictObject({
+			minimum: Type.Integer({ minimum: 0 }),
+			maximum: Type.Optional(Type.Integer({ minimum: 0 })),
+			automaticValue: Type.Optional(Type.Literal(-1)),
+			disabledValue: Type.Optional(Type.Literal(0)),
+			default: Type.Optional(Type.Integer({ minimum: -1 })),
+			evidence: ControlEvidenceSchema,
+		}),
+	),
+	processingTier: Type.Optional(ChoiceControlSchema),
+});
+export type ModelControlCapabilities = Static<typeof ModelControlCapabilitiesSchema>;
+export const ModelExecutionSchema = StrictObject({
+	requested: ModelControlsSchema,
+	sent: ModelControlsSchema,
+	reported: Type.Optional(ModelControlsSchema),
+});
+
+const ModelCostRateProperties = {
 	input: Type.Number({ minimum: 0 }),
 	output: Type.Number({ minimum: 0 }),
 	cacheRead: Type.Number({ minimum: 0 }),
 	cacheWrite: Type.Number({ minimum: 0 }),
+	status: Type.Optional(Type.Union([Type.Literal("estimated"), Type.Literal("unknown")])),
+};
+export const ModelCostSchema = StrictObject({
+	...ModelCostRateProperties,
+	tiers: Type.Optional(
+		Type.Array(
+			StrictObject({
+				inputTokensAbove: Type.Integer({ minimum: 0 }),
+				...ModelCostRateProperties,
+			}),
+		),
+	),
 });
+
+/** A catalog pass is neither model-level freshness nor verified account access. */
+export const ModelCatalogRefreshStatusSchema = StrictObject({
+	mode: Type.Union([Type.Literal("cache-only"), Type.Literal("network-allowed")]),
+	completedAt: TimestampSchema,
+	failed: Type.Boolean(),
+	warning: Type.Boolean(),
+});
+export type ModelCatalogRefreshStatus = Static<typeof ModelCatalogRefreshStatusSchema>;
+
+export const ModelCatalogSnapshotSchema = StrictObject({
+	timestampWarning: Type.Optional(Type.Literal("future")),
+	source: Type.Union([
+		Type.Literal("bundled"),
+		Type.Literal("remote-catalog"),
+		Type.Literal("provider"),
+		Type.Literal("user-config"),
+		Type.Literal("extension"),
+	]),
+	loadedFrom: Type.Optional(Type.Union([Type.Literal("cache"), Type.Literal("refresh")])),
+	generatedAt: Type.Optional(TimestampSchema),
+	checkedAt: Type.Optional(TimestampSchema),
+	refreshIntervalMs: Type.Optional(Type.Integer({ minimum: 1 })),
+	overrides: Type.Optional(Type.Array(Type.Union([Type.Literal("user-config"), Type.Literal("extension")]))),
+	freshness: Type.Union([Type.Literal("unknown"), Type.Literal("within-refresh-window"), Type.Literal("refresh-due")]),
+});
+export type ModelCatalogSnapshot = Static<typeof ModelCatalogSnapshotSchema>;
 
 export const ModelMetadataSchema = StrictObject({
 	provider: IdSchema,
@@ -68,6 +149,9 @@ export const ModelMetadataSchema = StrictObject({
 	maxTokens: Type.Integer({ minimum: 1 }),
 	cost: ModelCostSchema,
 	supportedThinkingLevels: Type.Array(ThinkingLevelSchema, { minItems: 1 }),
+	controls: Type.Optional(ModelControlCapabilitiesSchema),
+	catalogRefresh: Type.Optional(ModelCatalogRefreshStatusSchema),
+	catalog: Type.Optional(ModelCatalogSnapshotSchema),
 	authenticated: Type.Boolean(),
 });
 export type ModelMetadata = Static<typeof ModelMetadataSchema>;
@@ -113,6 +197,7 @@ export const UsageSchema = StrictObject({
 		cacheRead: Type.Number({ minimum: 0 }),
 		cacheWrite: Type.Number({ minimum: 0 }),
 		total: Type.Number({ minimum: 0 }),
+		status: Type.Optional(Type.Union([Type.Literal("estimated"), Type.Literal("unknown"), Type.Literal("reported")])),
 	}),
 });
 export type Usage = Static<typeof UsageSchema>;
@@ -129,6 +214,7 @@ const AssistantTranscriptItemProperties = {
 	content: Type.Array(AssistantContentSchema),
 	model: ModelRefSchema,
 	responseModel: Type.Optional(Type.String({ minLength: 1 })),
+	execution: Type.Optional(ModelExecutionSchema),
 	usage: Type.Optional(UsageSchema),
 	timestamp: TimestampSchema,
 } as const;
@@ -247,6 +333,7 @@ export const SessionSnapshotSchema = StrictObject({
 	phase: SessionPhaseSchema,
 	model: ModelRefSchema,
 	thinkingLevel: ThinkingLevelSchema,
+	modelControls: Type.Optional(ModelControlsSchema),
 	attached: Type.Boolean(),
 	locked: Type.Boolean(),
 	revision: Type.Integer({ minimum: 0 }),
@@ -295,6 +382,7 @@ export const CreateCommandSchema = StrictObject({
 	name: Type.Optional(Type.String()),
 	model: Type.Optional(ModelRefSchema),
 	thinkingLevel: Type.Optional(ThinkingLevelSchema),
+	modelControls: Type.Optional(Type.Union([ModelControlsSchema, Type.Null()])),
 });
 export const AttachCommandSchema = StrictObject({ command: Type.Literal("attach"), sessionId: IdSchema });
 export const DetachCommandSchema = StrictObject({ command: Type.Literal("detach"), sessionId: IdSchema });
@@ -305,11 +393,17 @@ export const SetModelCommandSchema = StrictObject({
 	command: Type.Literal("set_model"),
 	sessionId: IdSchema,
 	model: ModelRefSchema,
+	modelControls: Type.Optional(Type.Union([ModelControlsSchema, Type.Null()])),
 });
 export const SetThinkingCommandSchema = StrictObject({
 	command: Type.Literal("set_thinking"),
 	sessionId: IdSchema,
 	thinkingLevel: ThinkingLevelSchema,
+});
+export const SetModelControlsCommandSchema = StrictObject({
+	command: Type.Literal("set_model_controls"),
+	sessionId: IdSchema,
+	modelControls: Type.Union([ModelControlsSchema, Type.Null()]),
 });
 export const CommandSchema = Type.Union([
 	ListCommandSchema,
@@ -321,6 +415,7 @@ export const CommandSchema = Type.Union([
 	AbortCommandSchema,
 	SetModelCommandSchema,
 	SetThinkingCommandSchema,
+	SetModelControlsCommandSchema,
 ]);
 export type Command = Static<typeof CommandSchema>;
 export type CommandName = Command["command"];
@@ -353,6 +448,10 @@ export const SetThinkingResultSchema = StrictObject({
 	command: Type.Literal("set_thinking"),
 	session: SessionSnapshotSchema,
 });
+export const SetModelControlsResultSchema = StrictObject({
+	command: Type.Literal("set_model_controls"),
+	session: SessionSnapshotSchema,
+});
 
 export const ListResultSchema = StrictObject({
 	command: Type.Literal("list"),
@@ -372,6 +471,7 @@ export const CommandResultSchema = Type.Union([
 	AbortResultSchema,
 	SetModelResultSchema,
 	SetThinkingResultSchema,
+	SetModelControlsResultSchema,
 ]);
 export type CommandResult = Static<typeof CommandResultSchema>;
 

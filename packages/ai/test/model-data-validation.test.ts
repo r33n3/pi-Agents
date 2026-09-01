@@ -78,6 +78,18 @@ function writeFixtureData(
 }
 
 describe("generated model data validation", () => {
+	it.each([
+		["thinkingLevelMap", { high: false }, "thinkingLevelMap"],
+		["maxTokens", 1.5, "maxTokens"],
+		["cost", { input: "1", output: 0, cacheRead: 0, cacheWrite: 0 }, "cost.input"],
+	] as const)("uses shared metadata validation for malformed %s", (field, value, expectedMessage) => {
+		const fixture = createFixture();
+		const model = fixture.values["model-a"] as Record<string, unknown>;
+		model[field] = value;
+		writeFixtureData(fixture.dataDir, fixture.structure, fixture.values);
+		expect(() => validateModelDataDirectory(fixture.structure, fixture.dataDir)).toThrow(expectedMessage);
+	});
+
 	it("rejects a missing upstream model from an exact generated allowlist", () => {
 		expect(() => assertExactModelIds("qwen-token-plan-individual", ["model-a", "model-b"], ["model-a"])).toThrow(
 			"qwen-token-plan-individual model IDs do not match (missing: model-b)",

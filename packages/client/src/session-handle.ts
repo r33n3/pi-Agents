@@ -1,5 +1,6 @@
 import type {
 	Command,
+	ModelControls,
 	ModelRef,
 	ResultForCommand,
 	ServerEvent,
@@ -28,8 +29,11 @@ export interface SessionLease extends AsyncDisposable {
 	prompt(text: string): Promise<SessionSnapshot>;
 	steer(text: string): Promise<SessionSnapshot>;
 	abort(): Promise<SessionSnapshot>;
-	setModel(model: ModelRef): Promise<SessionSnapshot>;
+	/** Omitted controls retain the current selection; null explicitly restores legacy thinking. */
+	setModel(model: ModelRef, modelControls?: ModelControls | null): Promise<SessionSnapshot>;
 	setThinking(thinkingLevel: ThinkingLevel): Promise<SessionSnapshot>;
+	/** Replace the native selection. An empty object uses provider defaults; null restores legacy thinking. */
+	setModelControls(modelControls: ModelControls | null): Promise<SessionSnapshot>;
 }
 
 export type PiSessionHandle = SessionLease;
@@ -97,12 +101,16 @@ export class SessionHandle implements SessionLease {
 		return (await this.#request({ command: "abort", sessionId: this.id })).session;
 	}
 
-	async setModel(model: ModelRef): Promise<SessionSnapshot> {
-		return (await this.#request({ command: "set_model", sessionId: this.id, model })).session;
+	async setModel(model: ModelRef, modelControls?: ModelControls | null): Promise<SessionSnapshot> {
+		return (await this.#request({ command: "set_model", sessionId: this.id, model, modelControls })).session;
 	}
 
 	async setThinking(thinkingLevel: ThinkingLevel): Promise<SessionSnapshot> {
 		return (await this.#request({ command: "set_thinking", sessionId: this.id, thinkingLevel })).session;
+	}
+
+	async setModelControls(modelControls: ModelControls | null): Promise<SessionSnapshot> {
+		return (await this.#request({ command: "set_model_controls", sessionId: this.id, modelControls })).session;
 	}
 
 	#request<const TCommand extends SessionCommand>(command: TCommand): Promise<ResultForCommand<TCommand>> {

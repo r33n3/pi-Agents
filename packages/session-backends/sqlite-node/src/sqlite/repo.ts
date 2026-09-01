@@ -16,8 +16,9 @@ import {
 	type SessionRepo as SessionRepository,
 	type SessionStats,
 	type SessionStorage,
+	validateSessionModelControls,
 } from "@earendil-works/pi-agent-core";
-import { uuidv7 } from "@earendil-works/pi-ai";
+import { assertModelControls, uuidv7 } from "@earendil-works/pi-ai";
 import { appendEntryToBranchCache, buildCachedBranch, deleteBranchCache, rebuildBranchCache } from "./branch-cache.ts";
 import { applyMigrations } from "./migrations.ts";
 import { sql } from "./sql.ts";
@@ -208,6 +209,9 @@ function decodeEntry(row: EntryRow): Entry {
 			case "thinking_level_change":
 				if (typeof payload.thinkingLevel !== "string") throw new Error("Invalid thinking_level_change payload");
 				return { ...base, type: "thinking_level_change", thinkingLevel: payload.thinkingLevel };
+			case "model_controls_change":
+				if (payload.modelControls !== null) assertModelControls(payload.modelControls);
+				return { ...base, type: "model_controls_change", modelControls: payload.modelControls };
 			case "active_tools_change":
 				if (!Array.isArray(payload.activeToolNames)) throw new Error("Invalid active_tools_change payload");
 				if (payload.activeToolNames.some((value) => typeof value !== "string")) {
@@ -275,11 +279,13 @@ function recordOpKind(record: NewRecord): string | undefined {
 
 function decodeRecord(row: { seq: number; timestamp: number; payload: string }): LaneRecord {
 	try {
-		return {
+		const record = {
 			...(JSON.parse(row.payload) as object),
 			seq: row.seq,
 			timestamp: row.timestamp,
 		} as LaneRecord;
+		validateSessionModelControls(record);
+		return record;
 	} catch (error) {
 		throw new SessionError(
 			"storage",
@@ -455,6 +461,7 @@ class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadata> {
 
 	async appendEntry<TEntry extends Entry>(entry: ProvisionedEntry<TEntry>, lane: string): Promise<TEntry> {
 		return this.enqueueWrite(() => {
+			validateSessionModelControls(entry);
 			const parentId = readLaneHead(this.db, this.metadata.id, lane).leafId;
 			assertUnusedId(this.db, this.metadata.id, entry.id);
 			const seq = getNextSequence(this.db, this.metadata.id);
@@ -486,6 +493,7 @@ class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadata> {
 	async appendRecord<TRecord extends LaneRecord>(record: NewRecord<TRecord>): Promise<TRecord>;
 	async appendRecord(record: NewRecord): Promise<LaneRecord> {
 		return this.enqueueWrite(() => {
+			validateSessionModelControls(record);
 			if (!readLane(this.db, this.metadata.id, record.lane)) {
 				throw new SessionError("invalid_lane", `Lane not found: ${record.lane}`);
 			}
@@ -844,6 +852,10 @@ export class SqliteSessionRepository
 				}
 			}
 
+			// Validate native settings before copying raw payloads into a new session.
+			for (const entry of entries) {
+				if (entry.type === "model_controls_change") decodeEntry(entry);
+			}
 			const copiedIds = new Set(entries.map((entry) => entry.id));
 			const latestName = readLatestFact(db, source.id, "name", null);
 			const latestLabels = readLatestLabelFacts(db, source.id);

@@ -6,7 +6,7 @@
  */
 
 import { createInterface } from "node:readline";
-import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
+import { type ImageContent, ModelControlsError, modelsAreEqual, validateModelControls } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { type Args, type Mode, normalizeSessionName, parseArgs, printHelp } from "./cli/args.ts";
@@ -444,7 +444,8 @@ export async function createSessionManager(
 	return SessionManager.create(cwd, sessionDir, { id: parsed.sessionId });
 }
 
-function buildSessionOptions(
+/** @internal Resolves CLI selections without auth, requests, or session writes. */
+export function buildSessionOptions(
 	parsed: Args,
 	scopedModels: ScopedModel[],
 	hasExistingSession: boolean,
@@ -496,13 +497,13 @@ function buildSessionOptions(
 		if (savedInScope) {
 			options.model = savedInScope.model;
 			// Use thinking level from scoped model config if explicitly set
-			if (!parsed.thinking && savedInScope.thinkingLevel) {
+			if (!parsed.thinking && parsed.modelControls === undefined && savedInScope.thinkingLevel) {
 				options.thinkingLevel = savedInScope.thinkingLevel;
 			}
 		} else {
 			options.model = scopedModels[0].model;
 			// Use thinking level from first scoped model if explicitly set
-			if (!parsed.thinking && scopedModels[0].thinkingLevel) {
+			if (!parsed.thinking && parsed.modelControls === undefined && scopedModels[0].thinkingLevel) {
 				options.thinkingLevel = scopedModels[0].thinkingLevel;
 			}
 		}
@@ -511,6 +512,16 @@ function buildSessionOptions(
 	// Thinking level from CLI (takes precedence over scoped model thinking levels set above)
 	if (parsed.thinking) {
 		options.thinkingLevel = parsed.thinking;
+	}
+	if (parsed.modelControls !== undefined) {
+		if (parsed.thinking !== undefined || cliThinkingFromModel) {
+			throw new ModelControlsError("Choose native model controls or legacy --thinking / :thinking, not both");
+		}
+		if (options.model) validateModelControls(options.model, parsed.modelControls);
+		options.modelControls = { ...parsed.modelControls };
+	} else if (parsed.thinking !== undefined || cliThinkingFromModel) {
+		// Clear restored native settings before SDK construction, not after startup.
+		options.modelControls = null;
 	}
 
 	// Scoped models for Ctrl+P cycling
@@ -824,6 +835,7 @@ export async function main(args: string[], options?: MainOptions) {
 			sessionStartEvent,
 			model: sessionOptions.model,
 			thinkingLevel: sessionOptions.thinkingLevel,
+			modelControls: sessionOptions.modelControls,
 			scopedModels: sessionOptions.scopedModels,
 			tools: sessionOptions.tools,
 			excludeTools: sessionOptions.excludeTools,

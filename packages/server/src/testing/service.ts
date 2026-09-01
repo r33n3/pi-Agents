@@ -1,4 +1,5 @@
 import type {
+	ModelControls,
 	ModelMetadata,
 	ModelRef,
 	SessionMetadata,
@@ -137,14 +138,19 @@ export class TestSessionRuntime implements PiSessionRuntime {
 		this.pendingPrompt.done.resolve("aborted");
 	}
 
-	async setModel(model: ModelRef): Promise<void> {
+	async setModel(model: ModelRef, modelControls?: ModelControls | null): Promise<void> {
 		if (this.getPhase() !== "idle") throw new PiServerError("busy", "Session is busy");
-		this.update({ model });
+		this.update({ model, ...(modelControls === undefined ? {} : { modelControls: modelControls ?? undefined }) });
 	}
 
 	async setThinking(thinkingLevel: ThinkingLevel): Promise<void> {
 		if (this.getPhase() !== "idle") throw new PiServerError("busy", "Session is busy");
-		this.update({ thinkingLevel });
+		this.update({ thinkingLevel, modelControls: undefined });
+	}
+
+	async setModelControls(modelControls: ModelControls | null): Promise<void> {
+		if (this.getPhase() !== "idle") throw new PiServerError("busy", "Session is busy");
+		this.update({ modelControls: modelControls === null ? undefined : { ...modelControls } });
 	}
 
 	subscribe(listener: (event: PiSessionRuntimeEvent) => void): () => void {
@@ -225,7 +231,7 @@ export class TestServerService implements PiServerService {
 	async createSession(options: CreateSessionOptions): Promise<PiSessionRuntime> {
 		this.lastCreatedId = options.id;
 		if (this.sessions.has(options.id)) throw new PiServerError("session_locked", "Session already exists");
-		this.seed(options.id, options.name, options.cwd, options.model, options.thinkingLevel);
+		this.seed(options.id, options.name, options.cwd, options.model, options.thinkingLevel, options.modelControls);
 		return this.acquire(options.id);
 	}
 
@@ -241,6 +247,7 @@ export class TestServerService implements PiServerService {
 		cwd = "/tmp/pi-server-conformance",
 		model: ModelRef = { provider: TEST_MODEL.provider, id: TEST_MODEL.id },
 		thinkingLevel: ThinkingLevel = "off",
+		modelControls?: ModelControls | null,
 	): void {
 		this.sessions.set(id, {
 			snapshot: {
@@ -252,6 +259,7 @@ export class TestServerService implements PiServerService {
 				phase: "idle",
 				model,
 				thinkingLevel,
+				...(modelControls == null ? {} : { modelControls: { ...modelControls } }),
 				attached: false,
 				locked: false,
 				revision: 0,

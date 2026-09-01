@@ -1,5 +1,6 @@
 import type {
 	Command,
+	ModelControls,
 	ModelMetadata,
 	ModelRef,
 	SessionMetadata,
@@ -31,6 +32,7 @@ export interface CreateSessionOptions {
 	name?: string;
 	model?: ModelRef;
 	thinkingLevel?: ThinkingLevel;
+	modelControls?: ModelControls | null;
 }
 
 export type PiSessionRuntimeEvent =
@@ -45,8 +47,11 @@ export interface PiSessionRuntime {
 	prompt(input: PromptInput): Promise<void>;
 	steer(input: SteerInput): Promise<void>;
 	abort(): Promise<void>;
-	setModel(model: ModelRef): Promise<void>;
+	/** Omitted controls retain the current selection; null explicitly restores legacy thinking. */
+	setModel(model: ModelRef, modelControls?: ModelControls | null): Promise<void>;
 	setThinking(thinkingLevel: ThinkingLevel): Promise<void>;
+	/** Replace the native selection. An empty object uses provider defaults; null restores legacy thinking. */
+	setModelControls(modelControls: ModelControls | null): Promise<void>;
 	subscribe(listener: (event: PiSessionRuntimeEvent) => void): () => void;
 	dispose(): Promise<void>;
 }

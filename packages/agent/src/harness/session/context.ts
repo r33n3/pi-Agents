@@ -1,10 +1,13 @@
+import type { ModelControls } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "../../types.ts";
 import { createBranchSummaryMessage, createCompactionSummaryMessage } from "../messages.ts";
+import { readSessionModelControls } from "./model-controls.ts";
 import type { CompactionEntry, CustomEntry, Entry } from "./types.ts";
 
 export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
+	modelControls?: ModelControls;
 	model: { provider: string; modelId: string } | null;
 	activeToolNames: string[] | null;
 }
@@ -39,7 +42,8 @@ function deriveSessionContextState(pathEntries: readonly Entry[]): Omit<SessionC
 		}
 	}
 
-	return { thinkingLevel, model, activeToolNames };
+	const modelControls = readSessionModelControls(pathEntries);
+	return { thinkingLevel, model, activeToolNames, ...(modelControls === undefined ? {} : { modelControls }) };
 }
 
 export function defaultContextEntryTransform(pathEntries: readonly Entry[]): Entry[] {

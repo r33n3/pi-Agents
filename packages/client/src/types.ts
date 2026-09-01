@@ -1,4 +1,4 @@
-import type { ModelRef, ThinkingLevel } from "@earendil-works/pi-protocol";
+import type { ModelControls, ModelRef, ThinkingLevel } from "@earendil-works/pi-protocol";
 import type { ByteTransportFactory } from "./transport.ts";
 
 export type ConnectionState = "disconnected" | "connecting" | "connected";
@@ -23,4 +23,5 @@ export interface CreateSessionOptions {
 	name?: string;
 	model?: ModelRef;
 	thinkingLevel?: ThinkingLevel;
+	modelControls?: ModelControls | null;
 }

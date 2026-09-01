@@ -21,6 +21,10 @@ describe("strict model generation", () => {
 		for (const entry of ["package.json", "scripts", "src"]) {
 			cpSync(join(packageRoot, entry), join(isolatedPackageRoot, entry), { recursive: true });
 		}
+		// The shared capability validator uses the package's pinned schema runtime.
+		cpSync(join(packageRoot, "../../node_modules/typebox"), join(isolatedPackageRoot, "node_modules/typebox"), {
+			recursive: true,
+		});
 		const preloadPath = join(fixtureRoot, "mock-models-dev.mjs");
 		const modelIds = [
 			"deepseek-v4-flash-0731",

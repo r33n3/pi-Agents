@@ -1,5 +1,10 @@
 import { join } from "node:path";
-import type { ModelsStore, ModelsStoreEntry, ModelsStoreOperationOptions } from "@earendil-works/pi-ai";
+import {
+	type ModelsStore,
+	type ModelsStoreEntry,
+	type ModelsStoreOperationOptions,
+	validateModelsStoreEntry,
+} from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
 import { getFileRevision, normalizePath } from "../utils/paths.ts";
@@ -60,7 +65,18 @@ export class FileModelsStore implements ModelsStore {
 	}
 
 	private parse(content: string | undefined): StoredModels {
-		return content ? (JSON.parse(stripBom(content)) as StoredModels) : {};
+		if (!content) return {};
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(stripBom(content));
+		} catch {
+			throw new Error("Invalid models-store.json JSON; original file was preserved");
+		}
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+			throw new Error("Invalid models-store.json root; expected a provider object; original file was preserved");
+		// Individual provider entries are validated on read so one bad provider cannot
+		// prevent another provider's catalog from loading or refreshing.
+		return parsed as StoredModels;
 	}
 
 	private updateReadState(readState: ModelsFileReadState, data: StoredModels, revision?: string): void {
@@ -118,16 +134,25 @@ export class FileModelsStore implements ModelsStore {
 	}
 
 	async read(providerId: string, options?: ModelsStoreOperationOptions): Promise<ModelsStoreEntry | undefined> {
-		const entry = (await this.readLatest(this.readState, options))[providerId];
+		const entries = await this.readLatest(this.readState, options);
 		options?.signal?.throwIfAborted();
-		return entry ? structuredClone(entry) : undefined;
+		if (!Object.hasOwn(entries, providerId)) return undefined;
+		const entry = entries[providerId];
+		validateModelsStoreEntry(providerId, entry);
+		return structuredClone(entry);
 	}
 
 	async write(providerId: string, entry: ModelsStoreEntry, options?: ModelsStoreOperationOptions): Promise<void> {
+		validateModelsStoreEntry(providerId, entry);
 		let latest: StoredModels | undefined;
 		await this.storage.withLockAsync(async (content) => {
 			const current = this.parse(content);
-			current[providerId] = structuredClone(entry);
+			Object.defineProperty(current, providerId, {
+				value: structuredClone(entry),
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			});
 			latest = current;
 			return { result: undefined, next: JSON.stringify(current, null, 2) };
 		}, options);

@@ -6,6 +6,7 @@ import type {
 	Unsubscribe,
 } from "@earendil-works/pi-client";
 import type {
+	ModelControls,
 	ModelMetadata,
 	ModelRef,
 	ServerEvent,
@@ -23,7 +24,15 @@ import {
 	type TranscriptState,
 } from "./transcript.ts";
 
-export type RemoteSessionOperation = "open" | "create" | "submit" | "abort" | "setModel" | "setThinking" | "reconnect";
+export type RemoteSessionOperation =
+	| "open"
+	| "create"
+	| "submit"
+	| "abort"
+	| "setModel"
+	| "setThinking"
+	| "setModelControls"
+	| "reconnect";
 
 export type RemoteSessionLifecycle =
 	| { readonly status: "unbound" }
@@ -41,6 +50,7 @@ export interface CreateRemoteSessionOptions {
 	cwd: string;
 	model?: ModelRef;
 	thinkingLevel?: ThinkingLevel;
+	modelControls?: ModelControls | null;
 }
 
 export interface RemoteSessionOptions {
@@ -194,10 +204,10 @@ export class RemoteSession {
 		await this.#runOperation("abort", () => handle.abort().then(() => undefined), preemptingSubmit);
 	}
 
-	async setModel(model: ModelRef): Promise<void> {
+	async setModel(model: ModelRef, modelControls?: ModelControls | null): Promise<void> {
 		await this.#runIdleOperation("setModel", "change model", () =>
 			this.#requireHandle()
-				.setModel(model)
+				.setModel(model, modelControls)
 				.then(() => undefined),
 		);
 	}
@@ -206,6 +216,14 @@ export class RemoteSession {
 		await this.#runIdleOperation("setThinking", "change thinking level", () =>
 			this.#requireHandle()
 				.setThinking(thinkingLevel)
+				.then(() => undefined),
+		);
+	}
+
+	async setModelControls(modelControls: ModelControls | null): Promise<void> {
+		await this.#runIdleOperation("setModelControls", "change model controls", () =>
+			this.#requireHandle()
+				.setModelControls(modelControls)
 				.then(() => undefined),
 		);
 	}
@@ -293,7 +311,7 @@ export class RemoteSession {
 	}
 
 	async #runIdleOperation(
-		operation: "setModel" | "setThinking",
+		operation: "setModel" | "setThinking" | "setModelControls",
 		description: string,
 		run: () => Promise<void>,
 	): Promise<void> {

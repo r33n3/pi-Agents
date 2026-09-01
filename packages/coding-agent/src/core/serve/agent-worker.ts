@@ -226,6 +226,7 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 			sessionManager: SessionManager.inMemory(workspace),
 			model,
 			thinkingLevel: definition.thinking,
+			modelControls: definition.modelControls,
 			tools: toolNames,
 			customTools: customTools.length > 0 ? customTools : undefined,
 		});

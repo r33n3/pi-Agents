@@ -1,3 +1,4 @@
+import { validateSessionModelControls } from "../model-controls.ts";
 import { type SessionMutation, SessionState } from "../state.ts";
 import {
 	type BranchBounds,
@@ -265,6 +266,9 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	}
 
 	private async appendMutation(mutation: SessionMutation): Promise<void> {
+		if (mutation.kind === "entry" || mutation.kind === "record") {
+			validateSessionModelControls(mutation.kind === "entry" ? mutation.entry : mutation.record);
+		}
 		fileResult(
 			await this.fs.appendFile(this.metadata.path, encodeMutation(mutation)),
 			`Failed to append session ${this.metadata.path}`,

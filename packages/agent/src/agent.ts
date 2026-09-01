@@ -2,11 +2,13 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ModelControls,
 	SimpleStreamOptions,
 	TextContent,
 	ThinkingBudgets,
 	Transport,
 } from "@earendil-works/pi-ai";
+import { assertModelControls } from "@earendil-works/pi-ai";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
@@ -70,11 +72,20 @@ function createMutableAgentState(
 ): MutableAgentState {
 	let tools = initialState?.tools?.slice() ?? [];
 	let messages = initialState?.messages?.slice() ?? [];
+	if (initialState?.modelControls !== undefined) assertModelControls(initialState.modelControls);
+	let modelControls = initialState?.modelControls === undefined ? undefined : { ...initialState.modelControls };
 
 	return {
 		systemPrompt: initialState?.systemPrompt ?? "",
 		model: initialState?.model ?? DEFAULT_MODEL,
 		thinkingLevel: initialState?.thinkingLevel ?? "off",
+		get modelControls() {
+			return modelControls === undefined ? undefined : { ...modelControls };
+		},
+		set modelControls(nextControls: ModelControls | undefined) {
+			if (nextControls !== undefined) assertModelControls(nextControls);
+			modelControls = nextControls === undefined ? undefined : { ...nextControls };
+		},
 		get tools() {
 			return tools;
 		},
@@ -445,14 +456,17 @@ export class Agent {
 	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
 		const shouldStopAfterTurn = this.shouldStopAfterTurn;
+		const controls = this._state.modelControls;
 		return {
 			model: this._state.model,
-			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
+			controls,
+			reasoning:
+				controls !== undefined || this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
 			sessionId: this.sessionId,
 			onPayload: this.onPayload,
 			onResponse: this.onResponse,
 			transport: this.transport,
-			thinkingBudgets: this.thinkingBudgets,
+			thinkingBudgets: controls === undefined ? this.thinkingBudgets : undefined,
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,

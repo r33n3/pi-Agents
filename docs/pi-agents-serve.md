@@ -8,8 +8,9 @@ pi --serve --serve-port 4174
 pi --serve --serve-host 127.0.0.1
 ```
 
-Pi prints a process-scoped capability URL. HTTP resources and the binary
-WebSocket protocol require its token. Without `--serve-port`, Pi starts at 4173
+Pi prints a capability URL. Its token is generated for the process unless
+`PI_SERVE_TOKEN` is explicitly configured. HTTP resources and the binary
+WebSocket protocol require that token. Without `--serve-port`, Pi starts at 4173
 and selects the next available port if necessary. An explicit port remains
 strict. The default bind address is `127.0.0.1`; an explicit non-loopback
 `--serve-host` is allowed with a warning.
@@ -64,7 +65,10 @@ and advertises the compatible `1.0` wire-protocol version.
 
 ## Storage
 
-Serve data is owned by `~/.pi/agent/serve`:
+Serve data is stored under `~/.pi/agent/serve` by default. Processes using the same
+agent directory share this storage, but execution locks are local to each process.
+Use one serve host per agent directory for deployed agents and routines.
+Starting another host can mark a live run as failed during restart recovery.
 
 ```text
 definitions/<agent-id>.json
@@ -99,10 +103,16 @@ remain listed and readable.
 - `session` creates a fresh child-process Pi session with the selected standard tools.
   Use it for trusted interactive local work that needs normal Pi path behavior.
 
-Both executor forms use isolated run queues and deterministic process-tree
-termination. Chat, Pi delegation, routine, workflow, and A2A tasks cannot
-overlap while mutating one agent project root, and stopping one run does not
-stop unrelated agents or Pi sessions.
+Within one host, the run manager excludes concurrent writers for an exact project
+path, and stopping one run does not stop unrelated agents or Pi sessions. This
+exclusion does not cover other hosts, nested project roots, or alternate paths to
+the same directory. Avoid concurrent writers in those configurations.
+
+The `session` executor can still enable `bash` or `edit` under a read-only policy.
+Use `harness` with only `read` and `list` for bounded file inspection. Cumulative
+run budgets are checked after execution and are not hard spending caps. See the
+[README limits](../README.md#current-scope-and-limits) and
+[security boundary](../README.md#security-boundary) before enabling automation.
 
 ## Agent lifecycle
 

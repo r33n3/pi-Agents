@@ -1,23 +1,26 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { bashExecutionToText } from "@earendil-works/pi-agent-core";
+import { ModelControlsError } from "@earendil-works/pi-ai";
 import type {
 	AssistantTranscriptItem,
+	ModelControls,
 	ModelRef,
 	SessionPhase,
 	SessionSnapshot,
 	ThinkingLevel,
 	ToolTranscriptItem,
 	TranscriptItem,
-	Usage,
 	UserTranscriptItem,
 } from "@earendil-works/pi-protocol";
 import {
+	PiServerError,
 	type PiSessionRuntimeEvent,
 	type PromptInput,
 	type SteerInput,
 	sanitizeProtocolDetails,
 	toProtocolJsonValue,
+	toProtocolUsage,
 } from "@earendil-works/pi-server";
 import type { AgentSession } from "../agent-session.ts";
 import type { LiveSessionDelegate } from "./live-session-runtime.ts";
@@ -48,6 +51,7 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 			phase: this.getPhase(),
 			model,
 			thinkingLevel: this.session.thinkingLevel,
+			modelControls: this.session.modelControls,
 			attached: true,
 			locked: !this.session.isIdle,
 			revision: this.revision,
@@ -83,15 +87,27 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 		return this.session.abort();
 	}
 
-	async setModel(model: ModelRef): Promise<void> {
+	async setModel(model: ModelRef, modelControls?: ModelControls | null): Promise<void> {
 		const resolved = this.session.modelRuntime.getModel(model.provider, model.id);
-		if (!resolved) throw new Error(`Unknown model: ${model.provider}/${model.id}`);
-		await this.session.setModel(resolved);
+		if (!resolved) throw new PiServerError("invalid_request", `Unknown model: ${model.provider}/${model.id}`);
+		await this.changeModelSettings(() => this.session.setModel(resolved, { modelControls }));
 	}
 
-	setThinking(thinkingLevel: ThinkingLevel): Promise<void> {
-		this.session.setThinkingLevel(thinkingLevel);
-		return Promise.resolve();
+	async setThinking(thinkingLevel: ThinkingLevel): Promise<void> {
+		await this.changeModelSettings(() => this.session.setThinkingLevel(thinkingLevel));
+	}
+
+	async setModelControls(modelControls: ModelControls | null): Promise<void> {
+		await this.changeModelSettings(() => this.session.setModelControls(modelControls));
+	}
+
+	private async changeModelSettings(change: () => void | Promise<void>): Promise<void> {
+		try {
+			await change();
+		} catch (error) {
+			if (error instanceof ModelControlsError) throw new PiServerError("invalid_request", error.message);
+			throw error;
+		}
 	}
 
 	subscribe(listener: (event: PiSessionRuntimeEvent) => void): () => void {
@@ -157,7 +173,7 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 				return [this.assistantItem(message)];
 			case "toolResult": {
 				const details = sanitizeProtocolDetails(message.details);
-				const usage = this.protocolUsage(message.usage);
+				const usage = toProtocolUsage(message.usage);
 				const common = {
 					id: this.idFor(message),
 					role: "tool" as const,
@@ -253,13 +269,14 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 			if (part.type === "thinking") return { type: "thinking" as const, thinking: part.thinking };
 			return { type: "toolCall" as const, toolCallId: part.id, toolName: part.name, input: part.arguments };
 		});
-		const usage = this.protocolUsage(message.usage);
+		const usage = toProtocolUsage(message.usage);
 		const common = {
 			id: this.idFor(message),
 			role: "assistant" as const,
 			content,
 			model: { provider: message.provider, id: message.model },
 			responseModel: message.responseModel,
+			...(message.execution ? { execution: structuredClone(message.execution) } : {}),
 			...(usage === undefined ? {} : { usage }),
 			timestamp: message.timestamp,
 		};
@@ -269,25 +286,6 @@ export class AgentSessionServeDelegate implements LiveSessionDelegate {
 			return { ...common, status: "aborted", stopReason: "aborted", errorMessage: message.errorMessage };
 		if (message.stopReason === "length") return { ...common, status: "complete", stopReason: "length" };
 		return { ...common, status: "complete", stopReason: message.stopReason === "toolUse" ? "toolUse" : "stop" };
-	}
-
-	private protocolUsage(usage: Extract<AgentMessage, { role: "assistant" }>["usage"] | undefined): Usage | undefined {
-		if (usage === undefined) return undefined;
-		return {
-			input: usage.input,
-			output: usage.output,
-			cacheRead: usage.cacheRead,
-			cacheWrite: usage.cacheWrite,
-			...(usage.reasoning === undefined ? {} : { reasoning: usage.reasoning }),
-			totalTokens: usage.totalTokens,
-			cost: {
-				input: usage.cost.input,
-				output: usage.cost.output,
-				cacheRead: usage.cost.cacheRead,
-				cacheWrite: usage.cost.cacheWrite,
-				total: usage.cost.total,
-			},
-		};
 	}
 
 	private userContent(

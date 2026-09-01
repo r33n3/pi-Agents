@@ -29,6 +29,28 @@ afterEach(() => {
 });
 
 describe("streamProxy", () => {
+	it.each(["done", "error"] as const)("preserves native selections and execution metadata on %s", async (type) => {
+		const execution: AssistantMessage["execution"] = {
+			requested: { processingTier: "fast", reasoningEffort: "low" },
+			sent: { processingTier: "fast", reasoningEffort: "low" },
+			reported: { processingTier: "default" },
+		};
+		const event: ProxyAssistantMessageEvent =
+			type === "done"
+				? { type, reason: "stop", usage, execution }
+				: { type, reason: "error", usage, execution, errorMessage: "Synthetic failure" };
+		const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response(`data: ${JSON.stringify(event)}\n\n`));
+		vi.stubGlobal("fetch", fetch);
+		const result = await streamProxy(
+			model,
+			{ messages: [] },
+			{ authToken: "synthetic", proxyUrl: "https://example.invalid", controls: execution.requested },
+		).result();
+		expect(JSON.parse(String(fetch.mock.calls[0][1]?.body)).options).toEqual({ controls: execution.requested });
+		expect(result.execution).toEqual(execution);
+		expect(result.stopReason).toBe(type === "done" ? "stop" : "error");
+	});
+
 	it("preserves tool-call metadata received only on toolcall_end", async () => {
 		const proxyEvents: ProxyAssistantMessageEvent[] = [
 			{ type: "start" },

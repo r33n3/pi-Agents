@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
+import type { ModelControls } from "@earendil-works/pi-ai";
+import { parseAgentModelControls } from "./agent-model-settings.ts";
 import type {
 	AgentDefinition,
 	AgentDefinitionInput,
@@ -148,6 +150,7 @@ export interface AgentBuildConfiguration {
 	tools: string[];
 	model?: { provider: string; id: string };
 	thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	modelControls?: ModelControls;
 	memory: AgentMemoryKind;
 	executor: AgentExecutorKind;
 	permissionPolicy: AgentPermissionPolicy;
@@ -217,6 +220,8 @@ export class AgentBuildLifecycleService {
 		return this.#queue.run(async () => {
 			await this.initialize();
 			const draft = normalizeDraft(input);
+			if (draft.configuration?.modelControls !== undefined)
+				this.#registry.validateModelSettings(draft.configuration);
 			if (draft.agentId) return this.#stageAgentDraft(draft);
 			const existingAgent = (await this.#registry.list()).find(
 				(agent) => agent.name.toLowerCase() === draft.name.toLowerCase(),
@@ -256,6 +261,8 @@ export class AgentBuildLifecycleService {
 			await this.initialize();
 			const record = this.#required(id);
 			const draft = normalizeDraft(input);
+			if (draft.configuration?.modelControls !== undefined)
+				this.#registry.validateModelSettings(draft.configuration);
 			if (record.agentId && draft.name !== record.name) {
 				throw new Error("A deployed agent name cannot be changed through its build draft");
 			}
@@ -282,6 +289,8 @@ export class AgentBuildLifecycleService {
 		return this.#queue.run(async () => {
 			await this.initialize();
 			const draft = normalizeDraft(input);
+			if (draft.configuration?.modelControls !== undefined)
+				this.#registry.validateModelSettings(draft.configuration);
 			if (draft.agentId) return this.#stageAgentDraft(draft);
 			const existingAgent = (await this.#registry.list()).find(
 				(agent) => agent.name.toLowerCase() === draft.name.toLowerCase(),
@@ -411,16 +420,18 @@ export class AgentBuildLifecycleService {
 			if (record.stage === "testing") throw new Error("This build already has an active proof run");
 			const request = prompt.trim();
 			if (!request) throw new Error("A concrete one-time proof task is required");
+			const activeDefinition = await this.#requiredAgent(record.agentId);
+			const candidate =
+				record.candidateRevision && record.configuration
+					? candidateDefinition(activeDefinition, record.configuration, record.candidateRevision)
+					: undefined;
+			if ((candidate ?? activeDefinition).modelControls !== undefined)
+				this.#registry.validateModelSettings(candidate ?? activeDefinition);
 			this.#archiveProof(record);
 			const artifactBaselines = await captureArtifactBaselines(record);
-			const activeDefinition = await this.#requiredAgent(record.agentId);
-			const run =
-				record.candidateRevision && record.configuration
-					? await this.#runs.startCandidate(
-							candidateDefinition(activeDefinition, record.configuration, record.candidateRevision),
-							request,
-						)
-					: await this.#runs.start(record.agentId, request, "manual");
+			const run = candidate
+				? await this.#runs.startCandidate(candidate, request)
+				: await this.#runs.start(record.agentId, request, "manual");
 			record.proof = {
 				runId: run.id,
 				agentRevision: run.agentRevision,
@@ -515,6 +526,15 @@ export class AgentBuildLifecycleService {
 			await this.initialize();
 			const record = [...this.#records.values()].find((candidate) => candidate.proof?.runId === runId);
 			if (!record) throw new Error("The promoted proof is not attached to an agent build");
+			await this.#refresh(record);
+			if (
+				!record.proof ||
+				record.proof.runId !== runId ||
+				record.stage !== "proven" ||
+				(record.candidateRevision !== undefined && record.proof.agentRevision !== record.candidateRevision)
+			) {
+				throw new Error("The accepted proof is no longer current; restage and rerun the proof");
+			}
 			if (record.candidateRevision && record.configuration && record.agentId) {
 				const active = await this.#requiredAgent(record.agentId);
 				if (active.revision !== record.agentRevision) {
@@ -780,6 +800,7 @@ function configurationFromAgent(definition: AgentDefinition): AgentBuildConfigur
 		tools: [...definition.tools],
 		model: definition.model ? { ...definition.model } : undefined,
 		thinking: definition.thinking,
+		modelControls: definition.modelControls === undefined ? undefined : { ...definition.modelControls },
 		memory: definition.memory,
 		executor: definition.executor,
 		permissionPolicy: definition.permissionPolicy,
@@ -818,6 +839,7 @@ function candidateInput(active: AgentDefinition, configuration: AgentBuildConfig
 		model: configuration.model,
 		budget: active.budget,
 		thinking: configuration.thinking,
+		modelControls: configuration.modelControls === undefined ? undefined : { ...configuration.modelControls },
 		tools: [...configuration.tools],
 		capabilities: structuredClone(active.capabilities),
 		memory: configuration.memory,
@@ -843,6 +865,7 @@ function newAgentInput(configuration: AgentBuildConfiguration): AgentDefinitionI
 		description: configuration.description,
 		model: configuration.model,
 		thinking: configuration.thinking,
+		modelControls: configuration.modelControls === undefined ? undefined : { ...configuration.modelControls },
 		tools: [...configuration.tools],
 		capabilities: [],
 		memory: configuration.memory,
@@ -887,6 +910,7 @@ function parseConfiguration(value: unknown): AgentBuildConfiguration | undefined
 		projectRoot: resolve(requiredString(configuration.projectRoot, "configuration project root")),
 		tools: parseStringArray(configuration.tools, "configuration tools"),
 		model: parsedModel,
+		modelControls: parseAgentModelControls(configuration),
 		thinking:
 			configuration.thinking === undefined
 				? undefined

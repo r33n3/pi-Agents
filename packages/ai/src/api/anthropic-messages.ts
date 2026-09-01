@@ -1,5 +1,9 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type {
+	MessageCreateParamsStreaming as BetaMessageCreateParamsStreaming,
+	BetaUsage,
+} from "@anthropic-ai/sdk/resources/beta/messages/messages.js";
+import type {
 	CacheControlEphemeral,
 	ContentBlockParam,
 	MessageCreateParamsStreaming,
@@ -7,6 +11,8 @@ import type {
 	RawMessageStreamEvent,
 	RefusalStopDetails,
 } from "@anthropic-ai/sdk/resources/messages.js";
+import { getAnthropicProcessingCost } from "../anthropic-processing.ts";
+import { getModelControlCapabilities, type ModelControls, validateModelControls } from "../model-controls.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	AnthropicMessagesCompat,
@@ -40,6 +46,7 @@ import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 
 import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
+import { lazyStream } from "./lazy.ts";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampMaxTokensToContext } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -168,13 +175,15 @@ export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 export type AnthropicThinkingDisplay = "summarized" | "omitted";
 
-type MessageCreateParamsStreamingWithFallbacks = MessageCreateParamsStreaming & {
-	fallbacks?: readonly { model: string }[];
-};
+type MessageCreateParamsStreamingWithFallbacks = MessageCreateParamsStreaming &
+	Pick<BetaMessageCreateParamsStreaming, "speed"> & {
+		fallbacks?: readonly { model: string }[];
+	};
 
 const FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14";
 const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14";
 const SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01";
+const FAST_MODE_BETA = "fast-mode-2026-02-01";
 
 function shouldUseServerSideFallbackBeta(model: Model<"anthropic-messages">): boolean {
 	return (model.compat?.allowedFallbackModels?.length ?? 0) > 0;
@@ -525,6 +534,30 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 		};
 
 		try {
+			const requested = options?.controls === undefined ? undefined : { ...options.controls };
+			if (requested !== undefined) {
+				validateModelControls(model, requested);
+				if (
+					options?.thinkingEnabled !== undefined ||
+					options?.thinkingBudgetTokens !== undefined ||
+					options?.effort !== undefined
+				)
+					throw new Error("Choose native model controls or legacy thinking/effort, not both");
+			}
+			// Manual interleaving is model-specific, not implied by an accepted beta header.
+			const nativeManualInterleaving =
+				requested?.reasoningMode === "enabled" &&
+				!options?.client &&
+				options?.interleavedThinking !== false &&
+				model.provider === "anthropic" &&
+				model.baseUrl.replace(/\/$/, "") === "https://api.anthropic.com" &&
+				[
+					"claude-opus-4-5",
+					"claude-opus-4-5-20251101",
+					"claude-sonnet-4-5",
+					"claude-sonnet-4-5-20250929",
+					"claude-sonnet-4-6",
+				].includes(model.id);
 			let client: Anthropic;
 			let isOAuth: boolean;
 			let usageModel = model;
@@ -551,23 +584,100 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				const created = createClient(
 					model,
 					apiKey,
-					options?.interleavedThinking ?? true,
+					requested !== undefined ? nativeManualInterleaving : (options?.interleavedThinking ?? true),
 					shouldUseFineGrainedToolStreamingBeta(model, context),
 					shouldUseServerSideFallbackBeta(model),
 					options?.headers,
 					options?.fetch,
 					copilotDynamicHeaders,
 					cacheSessionId,
+					requested?.reasoningMode,
 				);
 				client = created.client;
 				isOAuth = created.isOAuthToken;
 			}
+			// API-key documentation is not evidence for an OAuth or injected alternate connection.
+			const usesBearerAuth =
+				isOAuth ||
+				!!client.authToken ||
+				hasHeader(model.headers, "authorization") ||
+				hasHeader(options?.headers, "authorization");
+			if (requested !== undefined) {
+				validateModelControls(
+					{ ...model, baseUrl: client.baseURL, ...(!model.controls && usesBearerAuth ? { controls: {} } : {}) },
+					requested,
+				);
+			}
 			let params = buildParams(model, context, isOAuth, options);
+			const expectedControls = serializedAnthropicControls(params);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
-				params = nextParams as MessageCreateParamsStreaming;
+				params = nextParams as MessageCreateParamsStreamingWithFallbacks;
 			}
+			const sent = serializedAnthropicControls(params);
+			if (requested !== undefined) {
+				if (
+					params.model !== model.id ||
+					params.service_tier !== undefined ||
+					(params.thinking !== undefined &&
+						params.thinking.type !== "enabled" &&
+						"budget_tokens" in params.thinking) ||
+					Object.keys({ ...expectedControls, ...sent }).some(
+						(key) => expectedControls[key as keyof ModelControls] !== sent[key as keyof ModelControls],
+					)
+				)
+					throw new Error("Payload changes conflict with native model controls");
+				validateModelControls(model, sent);
+				const mode = sent.reasoningMode ?? getModelControlCapabilities(model).reasoningMode?.default;
+				if (
+					mode === "enabled" &&
+					params.thinking?.type === "enabled" &&
+					!(nativeManualInterleaving && (params.tools?.length ?? 0) > 0) &&
+					params.thinking.budget_tokens >= params.max_tokens
+				)
+					throw new Error(
+						"Anthropic reasoningBudget must be less than maxTokens unless supported manual interleaving with tools is enabled",
+					);
+				if (
+					params.temperature !== undefined &&
+					(!getAnthropicCompat(model).supportsTemperature || (mode !== "disabled" && params.temperature !== 1))
+				)
+					throw new Error("Temperature conflicts with the selected Anthropic thinking mode or model");
+				if (
+					mode !== "disabled" &&
+					mode !== undefined &&
+					(params.tool_choice?.type === "any" || params.tool_choice?.type === "tool")
+				)
+					throw new Error("Forced tool choice is not supported with Anthropic thinking; choose auto or none");
+			}
+			output.execution = { requested: requested ?? {}, sent };
+			// Request-level headers retain explicit caller betas and the betas selected by
+			// this adapter. A custom header must not silently disable required interleaving.
+			const nativeBetas =
+				nativeManualInterleaving || requested?.processingTier !== undefined
+					? [
+							...new Set([
+								...(nativeManualInterleaving ? [INTERLEAVED_THINKING_BETA] : []),
+								...(requested?.processingTier !== undefined ? [FAST_MODE_BETA] : []),
+								...(shouldUseFineGrainedToolStreamingBeta(model, context)
+									? [FINE_GRAINED_TOOL_STREAMING_BETA]
+									: []),
+								...(shouldUseServerSideFallbackBeta(model) ? [SERVER_SIDE_FALLBACK_BETA] : []),
+								...[model.headers, options?.headers].flatMap((headers) =>
+									Object.entries(headers ?? {}).flatMap(([key, value]) =>
+										key.toLowerCase() === "anthropic-beta" && value
+											? value
+													.split(",")
+													.map((beta) => beta.trim())
+													.filter(Boolean)
+											: [],
+									),
+								),
+							]),
+						].join(",")
+					: undefined;
 			const requestOptions = {
+				...(nativeBetas ? { headers: { "anthropic-beta": nativeBetas } } : {}),
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
@@ -585,6 +695,30 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
+			let reportedSpeed: unknown;
+			let inferenceGeo: unknown = params.inference_geo;
+			const publicApi =
+				!usesBearerAuth &&
+				model.provider === "anthropic" &&
+				client.baseURL?.replace(/\/$/, "") === "https://api.anthropic.com";
+			const updateProcessingCost = (
+				usage: Partial<Pick<BetaUsage, "speed" | "inference_geo" | "output_tokens">> = {},
+			) => {
+				if (usage.speed != null) {
+					reportedSpeed = usage.speed;
+					if (usage.speed === "fast" || usage.speed === "standard")
+						output.execution!.reported = { processingTier: usage.speed };
+					else delete output.execution!.reported;
+				}
+				if (usage.inference_geo != null) inferenceGeo = usage.inference_geo;
+				calculateCost(
+					{
+						...usageModel,
+						cost: getAnthropicProcessingCost(usageModel, reportedSpeed ?? params.speed, inferenceGeo, publicApi),
+					},
+					output.usage,
+				);
+			};
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
 				if (event.type === "message_start") {
@@ -596,7 +730,14 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 							: model.compat?.allowedFallbackModels?.find(
 									(fallback) => fallback.provider === model.provider && fallback.model === output.model,
 								)?.cost;
-					usageModel = fallbackCost ? { ...model, id: output.model, cost: fallbackCost } : model;
+					usageModel =
+						output.model && output.model !== model.id
+							? {
+									...model,
+									id: output.model,
+									cost: fallbackCost ?? { ...model.cost, tiers: undefined, status: "unknown" },
+								}
+							: model;
 					// Capture initial token usage from message_start event
 					// This ensures we have input token counts even if the stream is aborted early
 					output.usage.input = event.message.usage.input_tokens || 0;
@@ -607,7 +748,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					// Anthropic doesn't provide total_tokens, compute from components
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-					calculateCost(usageModel, output.usage);
+					updateProcessingCost(event.message.usage);
 				} else if (event.type === "content_block_start") {
 					if (event.content_block.type === "text") {
 						const block: Block = {
@@ -752,6 +893,9 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						if (event.usage.cache_creation_input_tokens != null) {
 							output.usage.cacheWrite = event.usage.cache_creation_input_tokens;
 						}
+						const cacheCreation = (event.usage as Partial<BetaUsage>).cache_creation;
+						if (cacheCreation?.ephemeral_1h_input_tokens != null)
+							output.usage.cacheWrite1h = cacheCreation.ephemeral_1h_input_tokens;
 						// Anthropic reports reasoning tokens in `output_tokens_details.thinking_tokens` on the
 						// final message_delta usage (a subset of output_tokens). SDK 0.91.1 omits the field from
 						// its Usage type, so read it through a narrow cast. Verified against the live API.
@@ -764,7 +908,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					// Anthropic doesn't provide total_tokens, compute from components
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-					calculateCost(usageModel, output.usage);
+					updateProcessingCost(event.usage);
 				}
 			}
 
@@ -827,6 +971,17 @@ export const streamSimple: StreamFunction<"anthropic-messages", SimpleStreamOpti
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
+	if (options?.controls !== undefined) {
+		return lazyStream(model, async () => {
+			validateModelControls(model, options.controls);
+			if (options.reasoning !== undefined || options.thinkingBudgets !== undefined)
+				throw new Error("Choose native model controls or legacy reasoning, not both");
+			return stream(model, context, {
+				...buildBaseOptions(model, context, options, options.apiKey),
+				toolChoice: options.toolChoice,
+			});
+		});
+	}
 	assertRequestAuth(model.provider, options?.apiKey, options?.headers);
 
 	const base = {
@@ -884,9 +1039,11 @@ function createClient(
 	fetch?: typeof globalThis.fetch,
 	dynamicHeaders?: Record<string, string>,
 	sessionId?: string,
+	nativeThinkingMode?: string,
 ): { client: Anthropic; isOAuthToken: boolean } {
 	// Adaptive thinking models have interleaved thinking built in, so skip the beta header.
-	const needsInterleavedBeta = interleavedThinking && model.compat?.forceAdaptiveThinking !== true;
+	const needsInterleavedBeta =
+		interleavedThinking && (nativeThinkingMode === "enabled" || model.compat?.forceAdaptiveThinking !== true);
 	const betaFeatures: string[] = [];
 	if (useFineGrainedToolStreamingBeta) {
 		betaFeatures.push(FINE_GRAINED_TOOL_STREAMING_BETA);
@@ -1034,7 +1191,10 @@ function buildParams(
 	}
 
 	// Temperature is incompatible with extended thinking and unsupported on Claude Opus 4.7+.
-	if (options?.temperature !== undefined && !options?.thinkingEnabled && compat.supportsTemperature) {
+	if (
+		options?.temperature !== undefined &&
+		(options.controls !== undefined || (!options.thinkingEnabled && compat.supportsTemperature))
+	) {
 		params.temperature = options.temperature;
 	}
 
@@ -1059,7 +1219,25 @@ function buildParams(
 	}
 
 	// Configure thinking mode: adaptive, budget-based, or explicitly disabled.
-	if (model.reasoning) {
+	if (options?.controls !== undefined) {
+		const controls = options.controls;
+		const display = options.thinkingDisplay;
+		if (controls.reasoningMode === "enabled" && controls.reasoningBudget !== undefined)
+			params.thinking = {
+				type: "enabled",
+				budget_tokens: controls.reasoningBudget,
+				...(display ? { display } : {}),
+			};
+		else if (controls.reasoningMode === "adaptive")
+			params.thinking = { type: "adaptive", ...(display ? { display } : {}) };
+		else if (controls.reasoningMode === "disabled") params.thinking = { type: "disabled" };
+		if (controls.reasoningEffort !== undefined)
+			params.output_config = { effort: controls.reasoningEffort as AnthropicEffort };
+		if (controls.processingTier === "standard" || controls.processingTier === "fast")
+			params.speed = controls.processingTier;
+		if (display !== undefined && (controls.reasoningMode === undefined || controls.reasoningMode === "disabled"))
+			throw new Error("thinkingDisplay requires an explicit adaptive or enabled thinking mode");
+	} else if (model.reasoning) {
 		if (options?.thinkingEnabled) {
 			// Default to "summarized" so Opus 4.7 and Mythos Preview behave like
 			// older Claude 4 models (whose API default is also "summarized").
@@ -1068,13 +1246,7 @@ function buildParams(
 				// Adaptive thinking: Claude decides when and how much to think.
 				params.thinking = { type: "adaptive", display };
 				if (options.effort) {
-					// The Anthropic SDK types can lag newly supported effort values such as "xhigh".
-					params.output_config =
-						options.effort === "xhigh"
-							? ({ effort: options.effort } as unknown as NonNullable<
-									MessageCreateParamsStreaming["output_config"]
-								>)
-							: { effort: options.effort };
+					params.output_config = { effort: options.effort };
 				}
 			} else {
 				// Budget-based thinking for older models
@@ -1110,6 +1282,15 @@ function buildParams(
 	}
 
 	return params;
+}
+
+function serializedAnthropicControls(params: MessageCreateParamsStreamingWithFallbacks): ModelControls {
+	return {
+		...(params.thinking ? { reasoningMode: params.thinking.type } : {}),
+		...(params.thinking?.type === "enabled" ? { reasoningBudget: params.thinking.budget_tokens } : {}),
+		...(params.output_config?.effort != null ? { reasoningEffort: params.output_config.effort } : {}),
+		...(params.speed !== undefined ? { processingTier: params.speed as string } : {}),
+	};
 }
 
 // Normalize tool call IDs to match Anthropic's required pattern and length

@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { assertModelControls, type ModelControls } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
@@ -49,6 +50,8 @@ export interface CreateAgentSessionOptions {
 	model?: Model<any>;
 	/** Thinking level. Default: from settings, else 'medium' (clamped to model capabilities) */
 	thinkingLevel?: ThinkingLevel;
+	/** Native model controls. Omit to restore; {} preserves provider defaults; null selects legacy thinking. */
+	modelControls?: ModelControls | null;
 	/** Models available for cycling (Ctrl+P in interactive mode) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -171,6 +174,11 @@ function getDefaultAgentDir(): string {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	if (options.modelControls !== undefined && options.modelControls !== null) {
+		assertModelControls(options.modelControls);
+		if (options.thinkingLevel !== undefined)
+			throw new Error("Choose native model controls or legacy thinking, not both");
+	}
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
@@ -192,6 +200,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+	const modelControls =
+		options.modelControls !== undefined ? (options.modelControls ?? undefined) : existingSession.modelControls;
 
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
@@ -224,6 +234,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} else if (modelFallbackMessage) {
 			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
 		}
+	}
+
+	// Explicit selections must be valid before they become persisted preferences.
+	// Restored selections remain editable and are revalidated before each request.
+	if (model && options.modelControls !== undefined && options.modelControls !== null) {
+		modelRuntime.validateModelControls(model, options.modelControls);
 	}
 
 	let thinkingLevel = options.thinkingLevel;
@@ -308,6 +324,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			systemPrompt: "",
 			model,
 			thinkingLevel,
+			modelControls,
 			tools: [],
 		},
 		convertToLlm: convertToLlmWithBlockImages,
@@ -384,6 +401,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
+	// A resolved legacy default must not erase restored native controls. Only null clears them.
+	if (options.modelControls !== undefined) sessionManager.appendModelControlsChange(modelControls ?? null);
 
 	const session = new AgentSession({
 		agent,

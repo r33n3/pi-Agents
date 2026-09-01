@@ -2,6 +2,50 @@ import { describe, expect, test } from "vitest";
 import { collectRequests, connectClient, MemoryServer, openRemoteSession, sessionSnapshot } from "./support.ts";
 
 describe("RemoteSession operations", () => {
+	test("keeps the previous native selection on rejection and accepts authoritative replacements", async () => {
+		const server = new MemoryServer();
+		const client = await connectClient(server);
+		const selection = { processingTier: "default" };
+		const remote = await openRemoteSession(
+			client,
+			server,
+			sessionSnapshot("session-1", { modelControls: selection }),
+		);
+		const requests = collectRequests(server);
+		const rejected = remote.setModelControls({ processingTier: "unsupported" });
+		const pending = requests.at(-1)!;
+		expect(pending.request).toEqual({
+			command: "set_model_controls",
+			sessionId: "session-1",
+			modelControls: { processingTier: "unsupported" },
+		});
+		expect(remote.operation).toBe("setModelControls");
+		server.send({
+			type: "response",
+			id: pending.id,
+			ok: false,
+			error: { code: "invalid_request", message: "Unsupported tier" },
+		});
+		await expect(rejected).rejects.toThrow("Unsupported tier");
+		expect(remote.snapshot?.modelControls).toEqual(selection);
+		expect(remote.state.lifecycle.status).toBe("ready");
+		const model = { provider: "fixture", id: "replacement" };
+		const replacing = remote.setModel(model, {});
+		const replacement = requests.at(-1)!;
+		expect(replacement.request).toEqual({ command: "set_model", sessionId: "session-1", model, modelControls: {} });
+		server.send({
+			type: "response",
+			id: replacement.id,
+			ok: true,
+			result: {
+				command: "set_model",
+				session: sessionSnapshot("session-1", { revision: 2, model, modelControls: {} }),
+			},
+		});
+		await replacing;
+		expect(remote.snapshot?.modelControls).toEqual({});
+		client.disconnect();
+	});
 	test("projects progress for subscribers without changing the authoritative snapshot", async () => {
 		const server = new MemoryServer();
 		const remoteSession = await openRemoteSession(
@@ -164,6 +208,7 @@ describe("RemoteSession operations", () => {
 		const requests = collectRequests(server);
 		const prompting = remoteSession.submit("hello");
 		await expect(remoteSession.setThinking("high")).rejects.toThrow("Remote session is busy with submit");
+		await expect(remoteSession.setModelControls({})).rejects.toThrow("Remote session is busy with submit");
 		await expect(remoteSession.open("session-2")).rejects.toThrow("Remote session is busy with submit");
 		const request = requests.at(-1);
 		if (!request) throw new Error("Missing prompt request");

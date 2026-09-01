@@ -1,6 +1,5 @@
-import type { ModelCost } from "@earendil-works/pi-ai";
+import { getModelCostStatus, type ModelCost } from "@earendil-works/pi-ai/model-pricing";
 
-const BEDROCK_PROVIDER_IDS = new Set(["amazon-bedrock", "bedrock-mantle"]);
 const LOCAL_PROVIDER_IDS = new Set(["ollama"]);
 const COST_BANDS = [
 	{ id: "lowest", label: "Lowest cost", color: "#2dd4bf" },
@@ -31,14 +30,16 @@ export function modelSelectionCostKey(provider: string, id: string): string {
 	return `${provider}\u0000${id}`;
 }
 
-/** Ranks configured remote models by a 75% input / 25% output token blend. */
+/** Ranks base catalog estimates by a 75% input / 25% output token blend, not verified billed cost. */
 export function getModelSelectionCostPresentations(
 	models: readonly PricedModel[],
 ): ReadonlyMap<string, ModelSelectionCostPresentation> {
 	const scores = [
 		...new Set(
 			models
-				.filter((model) => !LOCAL_PROVIDER_IDS.has(model.provider) && hasVerifiedPrice(model.cost))
+				.filter(
+					(model) => !LOCAL_PROVIDER_IDS.has(model.provider) && getModelCostStatus(model.cost) === "estimated",
+				)
 				.map((model) => blendedTokenPrice(model.cost)),
 		),
 	].sort((left, right) => left - right);
@@ -61,7 +62,7 @@ export function getModelSelectionCostPresentations(
 			});
 			continue;
 		}
-		if (!hasVerifiedPrice(model.cost)) {
+		if (getModelCostStatus(model.cost) === "unknown") {
 			presentations.set(key, {
 				band: "unknown",
 				color: "#6b7280",
@@ -79,17 +80,18 @@ export function getModelSelectionCostPresentations(
 			color: band.color,
 			title: [
 				band.label,
+				"Estimated base rates",
 				`Input ${formatRate(model.cost.input)}`,
 				`Output ${formatRate(model.cost.output)}`,
 				...cacheRates,
+				...(model.cost.tiers ?? []).map(
+					(tier) =>
+						`Above ${tier.inputTokensAbove.toLocaleString("en-US")} input tokens: ${getModelCostStatus(tier) === "unknown" ? "pricing unavailable" : `input ${formatRate(tier.input)}, output ${formatRate(tier.output)}`}`,
+				),
 			].join(" · "),
 		});
 	}
 	return presentations;
-}
-
-function hasVerifiedPrice(cost: ModelCost): boolean {
-	return cost.input > 0 || cost.output > 0 || cost.cacheRead > 0 || cost.cacheWrite > 0;
 }
 
 function blendedTokenPrice(cost: ModelCost): number {
@@ -105,13 +107,19 @@ export function getSessionCostPresentation(
 	modelCost: ModelCost | undefined,
 	totalCost: number,
 	hasUsage: boolean,
+	hasUnknownCost = false,
 ): SessionCostPresentation | undefined {
+	if (hasUnknownCost || !Number.isFinite(totalCost) || totalCost < 0) {
+		return totalCost > 0 && Number.isFinite(totalCost)
+			? { value: `${totalCost.toFixed(3)}+`, title: "Known session subtotal; some request costs are unknown" }
+			: { value: "—", title: "Session cost is unknown" };
+	}
 	if (totalCost > 0) {
 		return { value: totalCost.toFixed(3), title: "Estimated session cost in US dollars" };
 	}
-	if (!hasUsage || !BEDROCK_PROVIDER_IDS.has(provider)) return undefined;
-	if (modelCost && Object.values(modelCost).some((rate) => rate > 0)) {
+	if (!hasUsage || LOCAL_PROVIDER_IDS.has(provider)) return undefined;
+	if (modelCost && getModelCostStatus(modelCost) === "estimated") {
 		return { value: totalCost.toFixed(3), title: "Estimated session cost is below the displayed precision" };
 	}
-	return { value: "—", title: "No verified Bedrock token price is configured for this model" };
+	return { value: "—", title: "Session cost is unknown; token pricing is unavailable" };
 }

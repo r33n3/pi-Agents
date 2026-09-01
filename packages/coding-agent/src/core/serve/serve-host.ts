@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore, type ModelControls, ModelControlsError } from "@earendil-works/pi-ai";
 import { PiServer } from "@earendil-works/pi-server";
 import type { AgentSession } from "../agent-session.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
@@ -343,6 +343,12 @@ export class ServeHost implements AsyncDisposable {
 					id: model.id,
 					name: model.name,
 				})),
+			modelControlsValidator: (reference, controls) => {
+				const model = session.modelRuntime.getModel(reference.provider, reference.id);
+				if (!model)
+					throw new ModelControlsError(`Agent model ${reference.provider}/${reference.id} is unavailable`);
+				session.modelRuntime.validateModelControls(model, controls);
+			},
 			browserWorkflowCatalog: (id, version) => browserWorkflowRunner.isActiveVersion(id, version),
 			capabilityValidator: (grants, executor) => capabilityBroker.validateGrants(grants, executor),
 		});
@@ -364,7 +370,9 @@ export class ServeHost implements AsyncDisposable {
 			agentSessionManager = SessionManager.inMemory(workspace),
 			browserOwner?: BrowserOwner,
 			executionModelRuntime = modelRuntime,
+			modelControls?: ModelControls | null,
 		) => {
+			const selectedControls = modelControls === undefined ? definition.modelControls : modelControls;
 			const requestedModel = definition.model;
 			const resolvedAgentModel = requestedModel
 				? executionModelRuntime.getModel(requestedModel.provider, requestedModel.id)
@@ -446,7 +454,8 @@ export class ServeHost implements AsyncDisposable {
 				agentDir,
 				modelRuntime: executionModelRuntime,
 				model: agentModel,
-				thinkingLevel: definition.thinking,
+				thinkingLevel: selectedControls == null ? definition.thinking : undefined,
+				modelControls: selectedControls,
 				tools: toolNames,
 				customTools: customTools.length > 0 ? customTools : undefined,
 				resourceLoader,
@@ -841,10 +850,20 @@ export class ServeHost implements AsyncDisposable {
 					id: options.id,
 				});
 				agentSessionManager.appendSessionInfo(`agent:${definition.id}`);
-				return createConfiguredAgentSession(definition, workspace, agentSessionManager, {
-					kind: "pi-session",
-					id: options.id,
-				});
+				return createConfiguredAgentSession(
+					{
+						...definition,
+						...(options.model ? { model: options.model } : {}),
+						...(options.thinkingLevel !== undefined
+							? { thinking: options.thinkingLevel, modelControls: undefined }
+							: {}),
+					},
+					workspace,
+					agentSessionManager,
+					{ kind: "pi-session", id: options.id },
+					modelRuntime,
+					options.modelControls,
+				);
 			}
 			const requestedModel = options.model;
 			const hostedModel = requestedModel
@@ -879,6 +898,7 @@ export class ServeHost implements AsyncDisposable {
 					modelRuntime,
 					model: hostedModel,
 					thinkingLevel: options.thinkingLevel,
+					modelControls: options.modelControls,
 					customTools: [...browserTools, ...browserWorkflowTools],
 					sessionManager: hostedSessionManager,
 				})
