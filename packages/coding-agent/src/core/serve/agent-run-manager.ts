@@ -224,6 +224,8 @@ export class AgentRunManager implements AsyncDisposable {
 	): Promise<AgentRunRecord> {
 		if (this.#disposed) throw new Error("Agent run manager is disposed");
 		if (prompt.trim() === "") throw new Error("Agent run prompt is required");
+		const executionDefinition = model ? { ...definition, model } : definition;
+		if (executionDefinition.modelControls !== undefined) this.#registry.validateModelSettings(executionDefinition);
 		if (this.#activeByRun.size >= this.#maxConcurrentRuns) throw new Error("Agent run capacity is reached");
 		if (this.#activeByAgent.has(definition.id)) throw new Error(`Agent ${definition.id} already has an active run`);
 		const workspace = this.#registry.workspacePath(definition);
@@ -253,7 +255,7 @@ export class AgentRunManager implements AsyncDisposable {
 		try {
 			const execution = await this.#executor.start({
 				runId,
-				definition: model ? { ...definition, model } : definition,
+				definition: executionDefinition,
 				workspace,
 				prompt: record.prompt,
 			});

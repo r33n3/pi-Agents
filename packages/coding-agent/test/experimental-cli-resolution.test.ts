@@ -5,6 +5,42 @@ const UNSUPPORTED_SERVER_OPTIONS = "The experimental server command does not sup
 const UNSUPPORTED_CLIENT_OPTIONS = "The experimental client command does not support existing CLI options yet";
 
 describe("experimental CLI command composition", () => {
+	test.each([
+		[
+			["--reasoning-mode", "pro", "--reasoning-effort=high", "--processing-tier", "priority"],
+			{ reasoningMode: "pro", reasoningEffort: "high", processingTier: "priority" },
+		],
+		[["--reasoning-budget", "0"], { reasoningBudget: 0 }],
+		[["--reasoning-budget=-1"], { reasoningBudget: -1 }],
+		[["--model-defaults"], {}],
+	] as const)(
+		"forwards native selections to Pi without a separate capability mapping: %j",
+		async (argv, modelControls) => {
+			const context = { runPi: vi.fn(), runServer: vi.fn(), runClient: vi.fn() };
+			const result = await experimentalCli.execute([...argv], context);
+			expect(result).toMatchObject({ ok: true, command: { command: "pi", options: { modelControls } } });
+			expect(context.runPi).toHaveBeenCalledWith(
+				expect.objectContaining({ options: expect.objectContaining({ modelControls }) }),
+			);
+			expect(context.runServer).not.toHaveBeenCalled();
+			expect(context.runClient).not.toHaveBeenCalled();
+		},
+	);
+
+	test.each([
+		["--reasoning-effort", "high", "--thinking", "low"],
+		["--reasoning-budget", "1.5"],
+		["--reasoning-effort"],
+		["server", "--processing-tier", "priority"],
+		["client", "--model-defaults"],
+	])("rejects invalid or unsupported native CLI input before execution: %j", async (...argv) => {
+		const context = { runPi: vi.fn(), runServer: vi.fn(), runClient: vi.fn() };
+		expect(await experimentalCli.execute(argv, context)).toMatchObject({ ok: false });
+		expect(context.runPi).not.toHaveBeenCalled();
+		expect(context.runServer).not.toHaveBeenCalled();
+		expect(context.runClient).not.toHaveBeenCalled();
+	});
+
 	test("composes pi command options with the existing parser", () => {
 		const result = experimentalCli.parse([
 			"--listen",

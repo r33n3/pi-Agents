@@ -1,5 +1,6 @@
 import { uuidv7 } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "../../types.ts";
+import { validateSessionModelControls } from "./model-controls.ts";
 import type {
 	BranchBounds,
 	Entry,
@@ -285,6 +286,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> implem
 
 	private async commitEntry<TEntry extends Entry>(entry: ProvisionedEntry<TEntry>, lane: string): Promise<TEntry> {
 		assertJsonSerializable(entry);
+		validateSessionModelControls(entry);
 		return this.storage.appendEntry(entry, lane);
 	}
 
@@ -292,6 +294,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> implem
 		record: TNewRecord,
 	): Promise<TNewRecord & Pick<RecordBase, "seq" | "timestamp">> {
 		assertJsonSerializable(record);
+		validateSessionModelControls(record);
 		return this.storage.appendRecord<LaneRecord>(record) as unknown as Promise<
 			TNewRecord & Pick<RecordBase, "seq" | "timestamp">
 		>;

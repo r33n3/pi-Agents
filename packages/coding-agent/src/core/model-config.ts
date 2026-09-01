@@ -1,6 +1,7 @@
 /** Immutable, credential-blind models.json snapshot. */
 
 import { readFile } from "node:fs/promises";
+import { getModelControlCapabilityErrors, ModelControlCapabilitiesSchema } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { Compile } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
@@ -146,6 +147,7 @@ const ModelCostRatesSchema = {
 	output: Type.Number(),
 	cacheRead: Type.Number(),
 	cacheWrite: Type.Number(),
+	status: Type.Optional(Type.Union([Type.Literal("estimated"), Type.Literal("unknown")])),
 };
 const ModelCostTierSchema = Type.Object({
 	inputTokensAbove: Type.Number(),
@@ -163,6 +165,7 @@ const ModelDefinitionSchema = Type.Object({
 	baseUrl: Type.Optional(Type.String({ minLength: 1 })),
 	reasoning: Type.Optional(Type.Boolean()),
 	thinkingLevelMap: Type.Optional(ThinkingLevelMapSchema),
+	controls: Type.Optional(ModelControlCapabilitiesSchema),
 	input: Type.Optional(Type.Array(Type.Union([Type.Literal("text"), Type.Literal("image")]))),
 	cost: Type.Optional(ModelCostSchema),
 	contextWindow: Type.Optional(Type.Number()),
@@ -176,6 +179,7 @@ const ModelOverrideSchema = Type.Object({
 	name: Type.Optional(Type.String({ minLength: 1 })),
 	reasoning: Type.Optional(Type.Boolean()),
 	thinkingLevelMap: Type.Optional(ThinkingLevelMapSchema),
+	controls: Type.Optional(ModelControlCapabilitiesSchema),
 	input: Type.Optional(Type.Array(Type.Union([Type.Literal("text"), Type.Literal("image")]))),
 	cost: Type.Optional(
 		Type.Object({
@@ -183,6 +187,7 @@ const ModelOverrideSchema = Type.Object({
 			output: Type.Optional(Type.Number()),
 			cacheRead: Type.Optional(Type.Number()),
 			cacheWrite: Type.Optional(Type.Number()),
+			status: Type.Optional(Type.Union([Type.Literal("estimated"), Type.Literal("unknown")])),
 			tiers: Type.Optional(Type.Array(ModelCostTierSchema)),
 		}),
 	),
@@ -281,6 +286,12 @@ export class ModelConfig {
 		const config = parsed as ModelsJson;
 		const providers = new Map<string, ModelsJsonProvider>();
 		for (const [providerId, provider] of Object.entries(config.providers)) {
+			for (const definition of [...(provider.models ?? []), ...Object.values(provider.modelOverrides ?? {})]) {
+				if (definition.controls === undefined) continue;
+				const errors = getModelControlCapabilityErrors(definition.controls);
+				if (errors.length > 0)
+					return new ModelConfig(new Map(), `Invalid model controls for ${providerId}: ${errors.join("; ")}`);
+			}
 			providers.set(providerId, deepFreeze(structuredClone(provider)));
 		}
 		return new ModelConfig(providers);

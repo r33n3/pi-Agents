@@ -7,8 +7,10 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ModelControls,
 	SimpleStreamOptions,
 	TextContent,
+	ThinkingBudgets,
 	Tool,
 	ToolResultMessage,
 	Usage,
@@ -142,6 +144,10 @@ export interface AgentLoopTurnUpdate {
 	model?: Model<any>;
 	/** Thinking level for the next provider request. */
 	thinkingLevel?: ThinkingLevel;
+	/** Native controls for the next request. Omit to keep; null explicitly returns to legacy thinking. */
+	modelControls?: ModelControls | null;
+	/** Legacy budget overrides when returning to legacy thinking. Omit to keep; null clears. */
+	thinkingBudgets?: ThinkingBudgets | null;
 }
 
 export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
@@ -336,8 +342,10 @@ export interface AgentState {
 	systemPrompt: string;
 	/** Active model used for future turns. */
 	model: Model<any>;
-	/** Requested reasoning level for future turns. */
+	/** Legacy reasoning level, used only when modelControls is undefined. */
 	thinkingLevel: ThinkingLevel;
+	/** Native selections for future turns. An empty object preserves provider defaults, not legacy thinking. */
+	modelControls?: ModelControls;
 	/** Available tools. Assigning a new array copies the top-level array. */
 	set tools(tools: AgentTool<any>[]);
 	get tools(): AgentTool<any>[];

@@ -3,6 +3,7 @@
  */
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ModelControls } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../config.ts";
 import type { ExtensionFlag } from "../core/extensions/types.ts";
@@ -17,6 +18,8 @@ export interface Args {
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
 	thinking?: ThinkingLevel;
+	/** Explicit native selection; omitted fields use provider defaults, not saved controls. */
+	modelControls?: ModelControls;
 	continue?: boolean;
 	resume?: boolean;
 	help?: boolean;
@@ -64,6 +67,12 @@ export interface Args {
 }
 
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const MODEL_CONTROL_FLAGS = {
+	"--reasoning-mode": "reasoningMode",
+	"--reasoning-effort": "reasoningEffort",
+	"--reasoning-budget": "reasoningBudget",
+	"--processing-tier": "processingTier",
+} as const;
 
 export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 	return VALID_THINKING_LEVELS.includes(level as ThinkingLevel);
@@ -84,6 +93,7 @@ export function parseArgs(args: string[]): Args {
 
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
+		const optionName = arg.split("=", 1)[0];
 
 		if (arg === "--") {
 			for (const positionalArg of args.slice(i + 1)) {
@@ -150,8 +160,47 @@ export function parseArgs(args: string[]): Args {
 				.split(",")
 				.map((s) => s.trim())
 				.filter((name) => name.length > 0);
-		} else if (arg === "--thinking" && i + 1 < args.length) {
-			const level = args[++i];
+		} else if (arg === "--model-defaults") {
+			result.modelControls ??= {};
+		} else if (Object.hasOwn(MODEL_CONTROL_FLAGS, optionName)) {
+			const key = MODEL_CONTROL_FLAGS[optionName as keyof typeof MODEL_CONTROL_FLAGS];
+			const inline = arg.includes("=");
+			const value = inline ? arg.slice(arg.indexOf("=") + 1) : args[i + 1];
+			if (
+				value === undefined ||
+				(!inline && (value.startsWith("@") || (value.startsWith("-") && !/^-\d+$/.test(value))))
+			) {
+				result.diagnostics.push({ type: "error", message: `${optionName} requires a value` });
+				continue;
+			}
+			if (!inline) i++;
+			if (key === "reasoningBudget") {
+				const budget = Number(value);
+				if (!/^-?\d+$/.test(value) || !Number.isSafeInteger(budget) || budget < -1) {
+					result.diagnostics.push({
+						type: "error",
+						message: `${optionName} requires an integer of -1 or greater; supported values depend on the model`,
+					});
+				} else {
+					result.modelControls ??= {};
+					result.modelControls[key] = budget;
+				}
+			} else if (!value.trim() || value !== value.trim()) {
+				result.diagnostics.push({
+					type: "error",
+					message: `${optionName} requires a non-empty native value without surrounding whitespace`,
+				});
+			} else {
+				result.modelControls ??= {};
+				result.modelControls[key] = value;
+			}
+		} else if (arg === "--thinking") {
+			const level = args[i + 1];
+			if (level === undefined || level.startsWith("-") || level.startsWith("@")) {
+				result.diagnostics.push({ type: "error", message: "--thinking requires a level" });
+				continue;
+			}
+			i++;
 			if (isValidThinkingLevel(level)) {
 				result.thinking = level;
 			} else {
@@ -277,6 +326,10 @@ export function parseArgs(args: string[]): Args {
 		}
 	}
 
+	if (result.modelControls !== undefined && result.thinking !== undefined) {
+		result.diagnostics.push({ type: "error", message: "Choose native model controls or --thinking, not both" });
+	}
+
 	return result;
 }
 
@@ -331,6 +384,11 @@ ${chalk.bold("Options:")}
   --exclude-tools, -xt <tools>   Comma-separated denylist of tool names to disable
                                  Applies to built-in, extension, and custom tools
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
+  --reasoning-mode <value>       Native reasoning mode supported by the selected model
+  --reasoning-effort <value>     Native reasoning effort (independent of processing speed)
+  --reasoning-budget <tokens>    Native reasoning token budget; sentinels are model-specific
+  --processing-tier <value>      Native processing tier; availability and cost vary by provider
+  --model-defaults               Use native provider defaults instead of saved/legacy controls
   --extension, -e <path>         Load an extension file (can be used multiple times)
   --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
   --skill <path>                 Load a skill file or directory (can be used multiple times)
@@ -356,6 +414,10 @@ ${chalk.bold("Options:")}
   --version, -v                  Show version number
 
 Extensions can register additional flags (e.g., --plan from plan-mode extension).${extensionFlagsText}
+
+Native flags replace the saved native selection; omitted controls use provider defaults.
+Do not combine native flags with --thinking or a model's :thinking suffix.
+With no control flags, resumed sessions retain their saved settings.
 
 ${chalk.bold("Examples:")}
   # Print a provider API key for an external client

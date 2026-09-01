@@ -9,6 +9,7 @@ import type {
 	SessionErrorCode,
 	SessionRepo,
 } from "../types.ts";
+import { createModelControlsConformance } from "./model-controls.ts";
 import type { SessionBackendConformanceCase, SessionBackendFixtureFactory } from "./types.ts";
 
 function createUserMessage(text: string): AgentMessage {
@@ -93,6 +94,7 @@ export function createSessionBackendConformance(
 	factory: SessionBackendFixtureFactory,
 ): readonly SessionBackendConformanceCase[] {
 	return [
+		...createModelControlsConformance(factory),
 		createCase(
 			factory,
 			"entries and lanes",

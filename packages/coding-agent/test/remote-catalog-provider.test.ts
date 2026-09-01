@@ -4,6 +4,7 @@ import {
 	InMemoryModelsStore,
 	type Model,
 	type ModelsPublication,
+	type ModelsStoreEntry,
 	type Provider,
 	type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
@@ -51,7 +52,7 @@ function testProvider(localGeneratedAt?: number) {
 async function refreshProvider(
 	provider: Provider,
 	store: InMemoryModelsStore,
-	overrides: Partial<Pick<RefreshModelsContext, "allowNetwork" | "force" | "signal">> = {},
+	overrides: Partial<Pick<RefreshModelsContext, "allowNetwork" | "force" | "signal" | "reportWarning">> = {},
 ): Promise<void> {
 	const publish = async (publication: ModelsPublication): Promise<boolean> => {
 		if (publication.persist === null) await store.delete(provider.id);
@@ -66,12 +67,184 @@ async function refreshProvider(
 		allowNetwork: overrides.allowNetwork ?? true,
 		force: overrides.force,
 		signal: overrides.signal ?? neverAbortedSignal,
+		reportWarning: overrides.reportWarning,
 	});
 }
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("remote catalog provider", () => {
+	it.each([404, 501])("keeps last-good body age across unavailable status %s and offline restart", async (status) => {
+		const generatedAt = Date.parse("2026-08-01T00:00:00Z");
+		const modifiedAt = generatedAt + 1000;
+		const fetch = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify([model("cached")]), {
+					headers: { "last-modified": new Date(modifiedAt).toUTCString(), etag: '"good"' },
+				}),
+			)
+			.mockResolvedValue(new Response(null, { status }));
+		vi.spyOn(Date, "now").mockReturnValue(generatedAt + 5000);
+		const provider = testProvider(generatedAt);
+		const store = new InMemoryModelsStore();
+		await refreshProvider(provider, store);
+		const original = await store.read(provider.id);
+		expect(provider.getModelProvenance?.("cached")).toMatchObject({
+			source: "remote-catalog",
+			loadedFrom: "refresh",
+			generatedAt: modifiedAt,
+			checkedAt: generatedAt + 5000,
+		});
+		expect(provider.getModelProvenance?.("static")).toEqual({ source: "bundled", generatedAt });
+		vi.mocked(Date.now).mockReturnValue(generatedAt + 10000);
+		const reportWarning = vi.fn();
+		await refreshProvider(provider, store, { force: true, reportWarning });
+		expect(reportWarning).toHaveBeenCalledOnce();
+		expect(await store.read(provider.id)).toMatchObject({
+			models: original?.models,
+			lastModified: modifiedAt,
+			validatedAt: generatedAt + 5000,
+			checkedAt: generatedAt + 10000,
+		});
+		const offline = testProvider(generatedAt);
+		await refreshProvider(offline, store, { allowNetwork: false });
+		expect(offline.getModels().map((entry) => entry.id)).toEqual(["static", "cached"]);
+		expect(offline.getModelProvenance?.("cached")).toMatchObject({
+			source: "remote-catalog",
+			loadedFrom: "cache",
+			generatedAt: modifiedAt,
+			checkedAt: generatedAt + 5000,
+		});
+		await refreshProvider(offline, store);
+		expect(fetch).toHaveBeenCalledTimes(2); // An unavailable-endpoint check still suppresses immediate retries.
+	});
+	it("retains last-good in-memory models when an invalid cache cannot be repaired from the endpoint", async () => {
+		const generatedAt = Date.parse("2026-08-01T00:00:00Z");
+		vi.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify([model("cached")]), {
+					headers: { "last-modified": new Date(generatedAt + 1000).toUTCString() },
+				}),
+			)
+			.mockResolvedValue(new Response(null, { status: 404 }));
+		const provider = testProvider(generatedAt);
+		const store = new InMemoryModelsStore();
+		await refreshProvider(provider, store);
+		const original = provider.getModelProvenance?.("cached");
+		await store.write(provider.id, { models: null } as unknown as ModelsStoreEntry);
+		await refreshProvider(provider, store, { force: true });
+		const offline = testProvider(generatedAt);
+		await refreshProvider(offline, store, { allowNetwork: false });
+		expect(offline.getModels().map((entry) => entry.id)).toEqual(["static", "cached"]);
+		expect(offline.getModelProvenance?.("cached")?.checkedAt).toBe(original?.checkedAt);
+	});
+	it("does not infer a successful body check from a legacy cache check timestamp", async () => {
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+		await store.write(provider.id, { models: [model("old")], checkedAt: Date.now(), lastModified: 1 });
+		await refreshProvider(provider, store, { allowNetwork: false });
+		expect(provider.getModelProvenance?.("old")?.checkedAt).toBeUndefined();
+	});
+	it("ignores invalid cached bodies and validators, retains prior models, and repairs on refresh", async () => {
+		const responses = [
+			new Response(JSON.stringify([model("last-good")])),
+			new Response(JSON.stringify([model("repaired")]), { headers: { etag: '"repaired"' } }),
+		];
+		const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => responses.shift() as Response);
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+		await refreshProvider(provider, store);
+		const invalid = {
+			models: [{ ...model("bad"), contextWindow: 0 }],
+			checkedAt: Date.now(),
+			lastModified: 1,
+			etag: '"bad"',
+		};
+		await store.write(provider.id, invalid);
+		const reportWarning = vi.fn();
+		await refreshProvider(provider, store, { allowNetwork: false, reportWarning });
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "last-good"]);
+		expect(await store.read(provider.id)).toEqual(invalid);
+		expect(reportWarning).toHaveBeenCalledTimes(1);
+		await refreshProvider(provider, store, { reportWarning });
+		expect(fetch.mock.calls[1]?.[1]?.headers).not.toHaveProperty("if-none-match");
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "repaired"]);
+		expect((await store.read(provider.id))?.etag).toBe('"repaired"');
+	});
+	it("allows the Models offline phase to report corrupt cache and continue to online repair", async () => {
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+		await store.write(provider.id, { models: null } as unknown as ModelsStoreEntry);
+		const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([model("repaired")])));
+		const models = createModels({ modelsStore: store });
+		models.setProvider(provider);
+		const result = await models.refresh();
+		expect(result.errors.size).toBe(0);
+		expect(result.warnings?.size).toBe(1);
+		expect(fetch).toHaveBeenCalledTimes(1);
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "repaired"]);
+	});
+	it("does not accept 304 without a valid cached body and sent validator", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 304 }));
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+		await expect(refreshProvider(provider, store)).rejects.toThrow("304 without a valid cached body");
+		expect(await store.read(provider.id)).toBeUndefined();
+	});
+	it("does not postpone refresh because a cached check timestamp is in the future", async () => {
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+		await store.write(provider.id, { models: [model("cached")], checkedAt: Date.now() + 60000, lastModified: 1 });
+		const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([model("fresh")])));
+		await refreshProvider(provider, store);
+		expect(fetch).toHaveBeenCalledTimes(1);
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "fresh"]);
+	});
+	it("does not advance freshness metadata after a failed network check", async () => {
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+		const stored = { models: [model("cached")], checkedAt: 1, lastModified: 1, etag: '"last-good"' };
+		await store.write(provider.id, stored);
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("forbidden", { status: 403 }));
+		await expect(refreshProvider(provider, store)).rejects.toThrow("403");
+		expect(await store.read(provider.id)).toEqual(stored);
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "cached"]);
+	});
+	it.each([
+		["missing fields", [{ id: "incomplete" }]],
+		["mixed valid and invalid entries", [model("new-valid"), { ...model("invalid"), maxTokens: 0 }]],
+		["invalid pricing", [{ ...model("invalid"), cost: { input: "1", output: 0, cacheRead: 0, cacheWrite: 0 } }]],
+		["unknown thinking level", [{ ...model("invalid"), thinkingLevelMap: { ultra: "ultra" } }]],
+		["provider mismatch", [{ ...model("invalid"), provider: "another-provider" }]],
+		["duplicate IDs", [model("duplicate"), model("duplicate")]],
+		["malformed wrapper", { models: "not-an-array" }],
+	] as const)("rejects %s atomically without replacing the last-known-good catalog", async (_label, invalid) => {
+		const responses = [
+			new Response(JSON.stringify([model("cached")]), { headers: { etag: '"valid"' } }),
+			new Response(JSON.stringify(invalid), { headers: { etag: '"invalid"' } }),
+		];
+		vi.spyOn(globalThis, "fetch").mockImplementation(async () => responses.shift() as Response);
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+		await refreshProvider(provider, store);
+		const saved = await store.read(provider.id);
+		await expect(refreshProvider(provider, store, { force: true })).rejects.toThrow();
+		expect(await store.read(provider.id)).toEqual(saved);
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "cached"]);
+		const offline = testProvider();
+		await refreshProvider(offline, store, { allowNetwork: false });
+		expect(offline.getModels()).toEqual(provider.getModels());
+	});
+
+	it("accepts the supported array wrapper and preserves model-specific options", async () => {
+		const source = { ...model("wrapped"), reasoning: true, thinkingLevelMap: { off: null, high: "max" } };
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ models: [source] })));
+		const provider = testProvider();
+		await refreshProvider(provider, new InMemoryModelsStore());
+		expect(provider.getModels()[1]).toEqual(source);
+	});
+
 	it("parses keyed catalogs, sends version headers, observes the refresh TTL, and supports forced refreshes", async () => {
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
 			async () =>
@@ -141,6 +314,12 @@ describe("remote catalog provider", () => {
 		expect(stored?.models.map((entry) => entry.id)).toEqual(["dynamic"]);
 		expect(stored?.etag).toBe('"catalog-1"');
 		expect(stored?.checkedAt).toBeGreaterThanOrEqual(checkedAt ?? 0);
+		expect(stored?.validatedAt).toBe(stored?.checkedAt);
+		expect(provider.getModelProvenance?.("dynamic")).toMatchObject({
+			source: "remote-catalog",
+			loadedFrom: "refresh",
+			checkedAt: stored?.validatedAt,
+		});
 	});
 
 	it("drops a stale etag when the overlay becomes unavailable", async () => {
@@ -217,6 +396,7 @@ describe("remote catalog provider", () => {
 		await second;
 		await first;
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "newer"]);
+		const latestProvenance = provider.getModelProvenance?.("newer");
 
 		finishFirst?.(
 			new Response(JSON.stringify({ older: model("older") }), {
@@ -227,6 +407,8 @@ describe("remote catalog provider", () => {
 
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "newer"]);
 		expect((await store.read(provider.id))?.models.map((entry) => entry.id)).toEqual(["newer"]);
+		expect(provider.getModelProvenance?.("newer")).toEqual(latestProvenance);
+		expect(provider.getModelProvenance?.("older")).toBeUndefined();
 	});
 
 	it("treats unimplemented pi.dev catalog routes as an unavailable overlay", async () => {

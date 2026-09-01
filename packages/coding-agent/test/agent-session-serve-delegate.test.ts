@@ -132,7 +132,7 @@ describe("AgentSessionServeDelegate", () => {
 			cacheRead: 100,
 			cacheWrite: 50,
 			totalTokens: 164,
-			cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 },
+			cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1, status: "estimated" },
 		});
 		expect(() => encodeServerMessage({ type: "event", event: { type: "session_snapshot", snapshot } })).not.toThrow();
 	});

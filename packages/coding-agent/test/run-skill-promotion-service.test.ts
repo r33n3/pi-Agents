@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import type { AgentBuildLifecycleService } from "../src/core/serve/agent-build-lifecycle-service.ts";
 import type {
 	AgentExecution,
 	AgentExecutionContext,
@@ -112,5 +113,42 @@ describe("RunSkillPromotionService", () => {
 		expect(await readFile(join(root, "skills", "concurrent-review", "SKILL.md"), "utf8")).toContain(
 			"name: concurrent-review",
 		);
+	});
+
+	test("removes the installed skill when lifecycle promotion is rejected", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-run-skill-rejected-"));
+		roots.push(root);
+		const registry = new AgentRegistry(join(root, "registry"));
+		await registry.save({
+			id: "reviewer",
+			name: "Reviewer",
+			description: "Reviews code",
+			tools: ["read"],
+			memory: "none",
+			persona: "Careful",
+			executor: "harness",
+			permissionPolicy: "read-only",
+			schedules: [],
+		});
+		const runs = new AgentRunManager(registry, new CompletedExecutor(), join(root, "runs"));
+		const run = await runs.start("reviewer", "Review this boundary");
+		await runs.waitForCompletion(run.id);
+		const lifecycle = {
+			assertPromotionAllowed: () => Promise.resolve({}),
+			markPromoted: () => Promise.reject(new Error("The accepted proof is no longer current")),
+		} as unknown as AgentBuildLifecycleService;
+		const service = new RunSkillPromotionService(runs, join(root, "skills"), lifecycle);
+
+		await expect(
+			service.promote({
+				runId: run.id,
+				name: "rejected-review",
+				description: "Review one boundary only after lifecycle acceptance.",
+				instructions: "Inspect the boundary and retain evidence.",
+			}),
+		).rejects.toThrow("no longer current");
+		await expect(readFile(join(root, "skills", "rejected-review", "SKILL.md"), "utf8")).rejects.toMatchObject({
+			code: "ENOENT",
+		});
 	});
 });

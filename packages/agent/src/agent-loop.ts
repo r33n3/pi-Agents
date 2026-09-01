@@ -7,7 +7,9 @@ import {
 	type AssistantMessage,
 	type Context,
 	EventStream,
+	lazyStream,
 	type ToolResultMessage,
+	validateModelControls,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
 import { getDefaultStreamFn } from "./stream-fn.ts";
@@ -177,15 +179,28 @@ async function runLoop(
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
 				if (nextTurnSnapshot) {
 					currentContext = nextTurnSnapshot.context ?? currentContext;
+					const controls =
+						nextTurnSnapshot.modelControls === undefined
+							? config.controls
+							: (nextTurnSnapshot.modelControls ?? undefined);
 					config = {
 						...config,
 						model: nextTurnSnapshot.model ?? config.model,
+						controls: controls === undefined ? undefined : { ...controls },
+						thinkingBudgets:
+							controls !== undefined
+								? undefined
+								: nextTurnSnapshot.thinkingBudgets === undefined
+									? config.thinkingBudgets
+									: (nextTurnSnapshot.thinkingBudgets ?? undefined),
 						reasoning:
-							nextTurnSnapshot.thinkingLevel === undefined
-								? config.reasoning
-								: nextTurnSnapshot.thinkingLevel === "off"
-									? undefined
-									: nextTurnSnapshot.thinkingLevel,
+							controls !== undefined
+								? undefined
+								: nextTurnSnapshot.thinkingLevel === undefined
+									? config.reasoning
+									: nextTurnSnapshot.thinkingLevel === "off"
+										? undefined
+										: nextTurnSnapshot.thinkingLevel,
 					};
 				}
 				// Preparation can be long-running (for example, compaction). Pick up steering
@@ -299,14 +314,22 @@ async function streamAssistantResponse(
 		tools: context.tools,
 	};
 
-	// Resolve API key (important for expiring tokens)
-	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
-
-	const response = await streamFunction(config.model, llmContext, {
-		...config,
-		apiKey: resolvedApiKey,
-		signal,
+	const response = lazyStream(config.model, async () => {
+		// Validate every turn, including model changes, before resolving credentials.
+		if (config.controls !== undefined) {
+			validateModelControls(config.model, config.controls);
+			if (config.reasoning !== undefined || config.thinkingBudgets !== undefined)
+				throw new Error("Choose native model controls or legacy reasoning, not both");
+		}
+		const controls = config.controls === undefined ? undefined : { ...config.controls };
+		const resolvedApiKey =
+			(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+		return streamFunction(config.model, llmContext, {
+			...config,
+			controls,
+			apiKey: resolvedApiKey,
+			signal,
+		});
 	});
 
 	let partialMessage: AssistantMessage | null = null;

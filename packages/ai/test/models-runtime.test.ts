@@ -829,9 +829,17 @@ describe("Models runtime", () => {
 			expires: 0,
 		}));
 
-		expect(await models.checkAuth("ambient")).toEqual({ source: "env", type: "api_key" });
+		expect(await models.checkAuth("ambient")).toEqual({
+			source: "env",
+			type: "api_key",
+			connection: { type: "api_key" },
+		});
 		expect(await models.checkAuth("missing")).toBeUndefined();
-		expect(await models.checkAuth("oauth")).toEqual({ source: "OAuth", type: "oauth" });
+		expect(await models.checkAuth("oauth")).toEqual({
+			source: "OAuth",
+			type: "oauth",
+			connection: { type: "oauth" },
+		});
 		expect(refreshes).toBe(0);
 		expect((await models.getAvailable()).map((model) => model.provider)).toEqual(["ambient", "oauth"]);
 		expect((await models.getAvailable("ambient")).map((model) => model.provider)).toEqual(["ambient"]);

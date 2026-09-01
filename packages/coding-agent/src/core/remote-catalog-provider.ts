@@ -1,4 +1,12 @@
-import type { Api, Model, ModelsStoreEntry, Provider } from "@earendil-works/pi-ai";
+import {
+	type Api,
+	type Model,
+	type ModelCatalogProvenance,
+	type ModelsStoreEntry,
+	type Provider,
+	validateModelCatalog,
+	validateModelsStoreEntry,
+} from "@earendil-works/pi-ai";
 import { VERSION } from "../config.ts";
 import { fetchWithRetry } from "../utils/management-http.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
@@ -26,9 +34,8 @@ function parseCatalog(providerId: string, value: unknown): Model<Api>[] {
 				? Object.values(value)
 				: undefined;
 	if (!entries) throw new Error(`Invalid model catalog for provider "${providerId}"`);
-	return entries
-		.filter((entry): entry is Model<Api> => typeof entry === "object" && entry !== null && "id" in entry)
-		.map((model) => ({ ...model, provider: providerId }));
+	validateModelCatalog(providerId, entries);
+	return [...entries];
 }
 
 function remoteModels(
@@ -49,17 +56,43 @@ export function withRemoteCatalog(
 	localGeneratedAt?: number,
 ): Provider {
 	let dynamicModels: readonly Model<Api>[] = [];
+	let provenance: ModelCatalogProvenance | undefined;
 
 	return {
 		...provider,
 		getModels: () => mergeModels(provider.getModels(), dynamicModels),
+		getModelProvenance: (modelId) => {
+			if (dynamicModels.some((model) => model.id === modelId)) return provenance && { ...provenance };
+			if (!provider.getModels().some((model) => model.id === modelId)) return undefined;
+			return localGeneratedAt !== undefined
+				? { source: "bundled", generatedAt: localGeneratedAt }
+				: provider.getModelProvenance?.(modelId);
+		},
 		refreshModels: async (context) => {
-			const stored = context.stored;
-			const restored = remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id);
+			let stored = context.stored;
+			if (stored !== undefined) {
+				try {
+					validateModelsStoreEntry(provider.id, stored);
+				} catch (cause) {
+					context.reportWarning?.(
+						new Error("Ignoring invalid cached catalog; retaining last valid models", { cause }),
+					);
+					stored = undefined;
+				}
+			}
+			const restored = stored ? remoteModels(stored, localGeneratedAt) : dynamicModels;
 			if (
 				!(await context.publish({
 					update: () => {
 						dynamicModels = restored;
+						if (stored)
+							provenance = {
+								source: "remote-catalog",
+								loadedFrom: "cache",
+								generatedAt: stored.lastModified || undefined,
+								checkedAt: stored.validatedAt,
+								refreshIntervalMs: REMOTE_CATALOG_REFRESH_INTERVAL_MS,
+							};
 					},
 				}))
 			) {
@@ -70,6 +103,7 @@ export function withRemoteCatalog(
 				!context.force &&
 				stored?.checkedAt !== undefined &&
 				stored.lastModified !== undefined &&
+				stored.checkedAt <= Date.now() &&
 				Date.now() - stored.checkedAt < REMOTE_CATALOG_REFRESH_INTERVAL_MS
 			) {
 				return;
@@ -95,25 +129,40 @@ export function withRemoteCatalog(
 			const checkedAt = Date.now();
 			// Unchanged: dynamicModels already holds the stored overlay, so only the
 			// freshness window moves.
-			if (response.status === 304 && stored) {
-				await context.publish({ persist: { ...stored, checkedAt } });
+			if (response.status === 304) {
+				if (!validator || !stored) throw new Error("Model catalog returned 304 without a valid cached body");
+				await context.publish({
+					persist: { ...stored, checkedAt, validatedAt: checkedAt },
+					update: () => {
+						provenance = {
+							...provenance,
+							source: "remote-catalog",
+							loadedFrom: "refresh",
+							checkedAt,
+							refreshIntervalMs: REMOTE_CATALOG_REFRESH_INTERVAL_MS,
+						};
+					},
+				});
 				return;
 			}
 			if (response.status === 404 || response.status === 501) {
 				await context.publish({
 					persist: {
-						...(stored ?? { models: [] }),
+						...(stored ?? {
+							models: dynamicModels,
+							lastModified: provenance?.generatedAt ?? 0,
+							validatedAt: provenance?.checkedAt,
+						}),
 						checkedAt,
-						lastModified: 0,
 						etag: undefined,
 					},
 				});
+				context.reportWarning?.(new Error("Remote model catalog is unavailable; retaining last valid models"));
 				return;
 			}
 			if (!response.ok) {
-				// Transient failure: the cached body and its validator stay valid, so keep the
-				// etag and let the next refresh revalidate instead of downloading the catalog.
-				await context.publish({ persist: { ...(stored ?? { models: [] }), checkedAt } });
+				// Failed checks must not make stale data appear fresh or suppress a retry.
+				// Preserve the body and validator for the next revalidation.
 				throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
 			}
 			const refreshed = parseCatalog(provider.id, await response.json());
@@ -122,6 +171,7 @@ export function withRemoteCatalog(
 			const entry = {
 				models: refreshed,
 				checkedAt,
+				validatedAt: checkedAt,
 				lastModified: Number.isNaN(lastModified) ? 0 : lastModified,
 				etag: response.headers.get("etag") ?? undefined,
 			};
@@ -130,6 +180,13 @@ export function withRemoteCatalog(
 				persist: entry,
 				update: () => {
 					dynamicModels = published;
+					provenance = {
+						source: "remote-catalog",
+						loadedFrom: "refresh",
+						generatedAt: entry.lastModified || undefined,
+						checkedAt,
+						refreshIntervalMs: REMOTE_CATALOG_REFRESH_INTERVAL_MS,
+					};
 				},
 			});
 		},

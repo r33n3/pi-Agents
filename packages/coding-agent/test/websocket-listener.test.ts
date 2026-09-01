@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, get, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import WebSocket from "ws";
 import { expectedSocketDisconnect, WebSocketListener } from "../src/core/serve/websocket-listener.ts";
@@ -98,6 +98,31 @@ describe("WebSocketListener", () => {
 			await strict.close();
 			await closeHttp(blocker);
 		}
+	});
+
+	test("closes active HTTP streams when the listener stops", async () => {
+		await listener.close();
+		listener = new WebSocketListener({
+			host: "127.0.0.1",
+			port: 0,
+			token: "secret-token",
+			onHttpRequest: (_request, response) => {
+				response.writeHead(200, { "content-type": "text/event-stream" });
+				response.write("event: ready\ndata: {}\n\n");
+			},
+		});
+		await listener.start(() => ({ onData: () => {}, onClose: () => {}, onError: () => {} }));
+
+		const address = new URL(listener.address!);
+		address.protocol = "http:";
+		const request = get(address, (response) => response.resume());
+		await new Promise<void>((resolve, reject) => {
+			request.once("response", () => resolve());
+			request.once("error", reject);
+		});
+
+		await listener.close();
+		request.destroy();
 	});
 
 	test("classifies browser refresh disconnects as expected transport closure", () => {

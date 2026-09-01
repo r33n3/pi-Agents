@@ -103,6 +103,8 @@ export interface AuthContext {
 /** Result of resolving auth for a model. */
 export interface AuthResult {
 	auth: ModelAuth;
+	/** Transport facts for this resolution; does not establish model access. */
+	connection?: ModelAuthConnection;
 	/** Provider-scoped environment/config values resolved from credentials and ambient context. */
 	env?: ProviderEnv;
 	/** Human-readable label for status UI: "ANTHROPIC_API_KEY", "OAuth", "~/.aws/credentials". */
@@ -112,6 +114,15 @@ export interface AuthResult {
 export interface AuthCheck {
 	source?: string;
 	type: "api_key" | "oauth";
+	/** Internal routing facts from a side-effect-free check, not model access or entitlement. */
+	connection?: ModelAuthConnection;
+}
+
+/** Unknown means the check cannot establish the request transport (for example, a key command). */
+export interface ModelAuthConnection {
+	type: "api_key" | "oauth" | "bearer" | "unknown";
+	/** Internal only: a configured endpoint may contain private routing or credential data. */
+	baseUrl?: string;
 }
 
 export type AuthType = "api_key" | "oauth";

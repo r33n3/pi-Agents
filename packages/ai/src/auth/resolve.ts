@@ -1,6 +1,7 @@
 import type { ProviderEnv } from "../types.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { formatThrownValue } from "../utils/diagnostics.ts";
+import { getModelAuthConnection } from "./connection.ts";
 import type {
 	ApiKeyAuth,
 	ApiKeyCredential,
@@ -172,7 +173,8 @@ async function resolveStoredOAuth(
 	}
 
 	try {
-		return { auth: await oauth.toAuth(credential), source: "OAuth" };
+		const auth = await oauth.toAuth(credential);
+		return { auth, source: "OAuth", connection: getModelAuthConnection(providerId, auth, "oauth") };
 	} catch (error) {
 		throw new ModelsError("oauth", `OAuth auth derivation failed for ${providerId}`, { cause: error });
 	}
@@ -186,7 +188,8 @@ async function resolveApiKey(
 	signal: AbortSignal,
 ): Promise<AuthResult | undefined> {
 	try {
-		return await apiKey.resolve({ ctx: authContext, credential, signal });
+		const result = await apiKey.resolve({ ctx: authContext, credential, signal });
+		return result && { ...result, connection: getModelAuthConnection(providerId, result.auth) };
 	} catch (error) {
 		throw new ModelsError("auth", `API key auth failed for provider ${providerId}`, { cause: error });
 	}

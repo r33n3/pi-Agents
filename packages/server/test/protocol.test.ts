@@ -1,5 +1,11 @@
 import type { Api, AssistantMessage, Model, ToolCall, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
-import { encodeServerMessage, PROTOCOL_VERSION } from "@earendil-works/pi-protocol";
+import {
+	encodeServerMessage,
+	ModelControlsSchema,
+	ModelMetadataSchema,
+	PROTOCOL_VERSION,
+} from "@earendil-works/pi-protocol";
+import { Compile } from "typebox/compile";
 import { describe, expect, test } from "vitest";
 import {
 	sanitizeProtocolDetails,
@@ -7,6 +13,7 @@ import {
 	toProtocolJsonValue,
 	toProtocolModelMetadata,
 	toProtocolToolResultMessage,
+	toProtocolUsage,
 	toProtocolUserMessage,
 } from "../src/protocol.ts";
 
@@ -78,6 +85,49 @@ function assertValidServerPayload(item: ProtocolTranscriptItem): void {
 }
 
 describe("pi-ai protocol bridge", () => {
+	test("preserves native budget sentinel metadata without treating dynamic as a negative token count", () => {
+		const metadata = toProtocolModelMetadata(
+			{
+				...model,
+				api: "google-generative-ai",
+				controls: {
+					reasoningBudget: {
+						minimum: 512,
+						maximum: 24576,
+						automaticValue: -1,
+						disabledValue: 0,
+						default: -1,
+						evidence: { kind: "user-override", reference: "synthetic fixture", checkedAt: "2026-08-31" },
+					},
+				},
+			},
+			false,
+		);
+		expect(Compile(ModelMetadataSchema).Check(JSON.parse(JSON.stringify(metadata)))).toBe(true);
+		expect(metadata.controls?.reasoningBudget?.automaticValue).toBe(-1);
+		expect(metadata.controls?.reasoningBudget?.disabledValue).toBe(0);
+		expect(Compile(ModelControlsSchema).Check({ reasoningBudget: -1 })).toBe(true);
+		expect(Compile(ModelControlsSchema).Check({ reasoningBudget: -2 })).toBe(false);
+	});
+	test("preserves unknown price status instead of presenting normalized sentinels as free", () => {
+		const metadata = toProtocolModelMetadata(
+			{ ...model, cost: { input: -1, output: -1, cacheRead: 0, cacheWrite: 0 } },
+			false,
+		);
+		expect(metadata.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, status: "unknown" });
+		expect(Compile(ModelMetadataSchema).Check(metadata)).toBe(true);
+	});
+	test.each(["estimated", "unknown", "reported"] as const)("preserves explicit usage cost status %s", (status) => {
+		const usage = toProtocolUsage({
+			input: 10,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 15,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, status },
+		});
+		expect(usage?.cost.status).toBe(status);
+	});
 	test("maps model metadata and produces protocol-valid output", () => {
 		const result = toProtocolModelMetadata(model, true);
 
@@ -90,6 +140,63 @@ describe("pi-ai protocol bridge", () => {
 		});
 		expect(result.supportedThinkingLevels).toContain("off");
 	});
+	test("transports control capabilities and dated evidence without endpoint or credential fields", () => {
+		const controls = {
+			reasoningEffort: {
+				values: ["high"],
+				evidence: { kind: "user-override" as const, reference: "synthetic fixture", checkedAt: "2026-08-31" },
+			},
+		};
+		const result = toProtocolModelMetadata(
+			{
+				...model,
+				api: "openai-responses",
+				controls,
+				headers: { Authorization: "Bearer synthetic-secret" },
+			},
+			false,
+		);
+		expect(result.controls).toEqual(controls);
+		expect(Compile(ModelMetadataSchema).Check(JSON.parse(JSON.stringify(result)))).toBe(true);
+		expect(result).not.toHaveProperty("baseUrl");
+		expect(result).not.toHaveProperty("headers");
+		expect(JSON.stringify(result)).not.toContain("synthetic-secret");
+		result.controls!.reasoningEffort!.values.push("low");
+		expect(controls.reasoningEffort.values).toEqual(["high"]);
+	});
+	test.each([undefined, { processingTier: "default" }])(
+		"keeps requested, sent, and provider-reported controls distinct: %j",
+		(reported) => {
+			const message: AssistantMessage = {
+				role: "assistant",
+				content: [],
+				api: "openai-responses",
+				provider: "fixture",
+				model: "fixture",
+				execution: {
+					requested: { reasoningMode: "pro", processingTier: "fast" },
+					sent: { reasoningMode: "pro", processingTier: "fast" },
+					reported,
+				},
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 1,
+			};
+			const result = toProtocolAssistantMessage(message, { id: "fixture" });
+			expect(result.execution).toEqual(message.execution);
+			expect(JSON.parse(JSON.stringify(result)).execution.reported).toEqual(reported);
+			assertValidServerPayload(result);
+			expect(result.execution).not.toBe(message.execution);
+			expect(result.execution!.sent).not.toBe(message.execution!.sent);
+		},
+	);
 
 	test("exhaustively maps assistant content and stop reasons", () => {
 		const message = {

@@ -556,6 +556,12 @@ export async function processResponsesStream<TApi extends Api>(
 		if (response?.id) {
 			output.responseId = response.id;
 		}
+		if (output.execution)
+			output.execution.reported = {
+				reasoningMode: response.reasoning?.mode,
+				reasoningEffort: response.reasoning?.effort ?? undefined,
+				processingTier: response.service_tier ?? undefined,
+			};
 		if (response?.usage) {
 			const inputDetails = response.usage.input_tokens_details as
 				| { cached_tokens?: number; cache_write_tokens?: number }

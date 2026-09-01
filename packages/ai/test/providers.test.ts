@@ -102,6 +102,7 @@ describe("builtin providers", () => {
 
 		expect(await models.getAuth("anthropic")).toEqual({
 			auth: { headers: { Authorization: "Bearer auth-token" } },
+			connection: { type: "bearer" },
 			source: "ANTHROPIC_AUTH_TOKEN",
 		});
 	});
@@ -531,7 +532,7 @@ describe("createProvider", () => {
 					markFirstStarted?.();
 					await firstBlocked;
 				}
-				return [testModel("api-a", `listed-${current}`)];
+				return [{ ...testModel("api-a", `listed-${current}`), provider: "dynamic" }];
 			},
 			api: recordingStreams("a", []),
 		});

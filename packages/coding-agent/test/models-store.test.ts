@@ -8,9 +8,11 @@ import { FileModelsStore } from "../src/core/models-store.ts";
 
 const sharedTempDir = join(tmpdir(), `pi-models-store-shared-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 const sharedModelsPath = join(sharedTempDir, "models-store.json");
+let sharedStore: FileModelsStore;
 
 beforeAll(() => {
 	mkdirSync(sharedTempDir, { recursive: true });
+	sharedStore = new FileModelsStore(sharedModelsPath);
 });
 
 afterAll(() => {
@@ -37,8 +39,43 @@ function model(provider: string, id: string): Model<"openai-completions"> {
 }
 
 describe("FileModelsStore", () => {
+	it.each(["null", "[]", "42", '{"private":"synthetic-sensitive-value"'])(
+		"rejects malformed cache files without overwriting them: %s",
+		async (content) => {
+			const path = join(sharedTempDir, "invalid-root.json");
+			writeFileSync(path, content);
+			const store = new FileModelsStore(path);
+			await expect(store.read("one")).rejects.toThrow("original file was preserved");
+			await expect(store.write("one", { models: [model("one", "valid")] })).rejects.toThrow(
+				"original file was preserved",
+			);
+			expect(readFileSync(path, "utf8")).toBe(content);
+		},
+	);
+	it("isolates invalid provider entries and repairs only the refreshed provider", async () => {
+		const path = join(sharedTempDir, "invalid-provider.json");
+		const invalid = { models: [{ ...model("bad", "invalid"), maxTokens: 0 }] };
+		writeFileSync(path, JSON.stringify({ good: { models: [model("good", "valid")] }, bad: invalid }));
+		const store = new FileModelsStore(path);
+		await expect(store.read("bad")).rejects.toThrow("maxTokens");
+		expect((await store.read("good"))?.models[0].id).toBe("valid");
+		await store.write("good", { models: [model("good", "updated")] });
+		expect(JSON.parse(readFileSync(path, "utf8")).bad).toEqual(invalid);
+		await store.write("bad", { models: [model("bad", "repaired")] });
+		expect((await store.read("bad"))?.models[0].id).toBe("repaired");
+	});
+	it("handles prototype-like provider IDs as data, never inherited properties", async () => {
+		const path = join(sharedTempDir, "provider-keys.json");
+		writeFileSync(path, "{}");
+		const store = new FileModelsStore(path);
+		expect(await store.read("constructor")).toBeUndefined();
+		expect(await store.read("__proto__")).toBeUndefined();
+		await store.write("__proto__", { models: [model("__proto__", "valid")] });
+		expect((await store.read("__proto__"))?.models[0].id).toBe("valid");
+		expect(Object.hasOwn(JSON.parse(readFileSync(path, "utf8")), "__proto__")).toBe(true);
+	});
 	it("persists provider catalogs without replacing unrelated providers", async () => {
-		const store = new FileModelsStore(sharedModelsPath);
+		const store = sharedStore;
 
 		await store.write("one", { models: [model("one", "m1")], checkedAt: 100 });
 		await store.write("two", { models: [model("two", "m2")], checkedAt: 200 });

@@ -1,3 +1,4 @@
+import { validateSessionModelControls } from "./model-controls.ts";
 import {
 	type BranchBounds,
 	type Entry,
@@ -95,6 +96,14 @@ export class SessionState {
 	}
 
 	applyMutation(mutation: SessionMutation, invalid: InvalidMutation = invalidMutation): void {
+		if (mutation.kind === "entry" || mutation.kind === "record") {
+			try {
+				validateSessionModelControls(mutation.kind === "entry" ? mutation.entry : mutation.record);
+			} catch (error) {
+				if (error instanceof SessionError && error.code === "invalid_payload") invalid(error.message);
+				throw error;
+			}
+		}
 		const seq =
 			mutation.kind === "entry"
 				? mutation.entry.seq

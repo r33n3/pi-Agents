@@ -27,6 +27,7 @@
 			"@earendil-works/pi-client": ["./packages/client/src/index.ts"],
 			"@earendil-works/pi-client/*": ["./packages/client/src/*"],
 			"@earendil-works/pi-server": ["./packages/server/src/index.ts"],
+			"@earendil-works/pi-server/testing": ["./packages/server/src/testing/index.ts"],
 			"@earendil-works/pi-server/*": ["./packages/server/src/*"],
 			"typebox": ["./node_modules/typebox"],
 			"@earendil-works/pi-tui": ["./packages/tui/src/index.ts"],

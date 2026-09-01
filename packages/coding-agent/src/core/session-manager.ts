@@ -1,5 +1,13 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { type ImageContent, type Message, type TextContent, type Usage, uuidv7 } from "@earendil-works/pi-ai";
+import {
+	assertModelControls,
+	type ImageContent,
+	type Message,
+	type ModelControls,
+	type TextContent,
+	type Usage,
+	uuidv7,
+} from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
@@ -64,6 +72,12 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
 	provider: string;
 	modelId: string;
+}
+
+export interface ModelControlsChangeEntry extends SessionEntryBase {
+	type: "model_controls_change";
+	/** Empty object preserves provider defaults; null explicitly returns to legacy thinking. */
+	modelControls: ModelControls | null;
 }
 
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
@@ -145,6 +159,7 @@ export type SessionEntry =
 	| SessionMessageEntry
 	| ThinkingLevelChangeEntry
 	| ModelChangeEntry
+	| ModelControlsChangeEntry
 	| CompactionEntry
 	| BranchSummaryEntry
 	| CustomEntry
@@ -168,6 +183,7 @@ export interface SessionTreeNode {
 export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
+	modelControls?: ModelControls;
 	model: { provider: string; modelId: string } | null;
 }
 
@@ -359,20 +375,30 @@ function buildSessionPath(
 	return path;
 }
 
-function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "thinkingLevel" | "model"> {
+function getSessionContextSettings(
+	path: SessionEntry[],
+): Pick<SessionContext, "thinkingLevel" | "model" | "modelControls"> {
 	let thinkingLevel = "off";
 	let model: { provider: string; modelId: string } | null = null;
+	let controlsEntry: ModelControlsChangeEntry | undefined;
 
 	for (const entry of path) {
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel;
 		} else if (entry.type === "model_change") {
 			model = { provider: entry.provider, modelId: entry.modelId };
+		} else if (entry.type === "model_controls_change") {
+			controlsEntry = entry;
 		} else if (entry.type === "message" && entry.message.role === "assistant") {
 			model = { provider: entry.message.provider, modelId: entry.message.model };
 		}
 	}
 
+	// Never silently turn malformed stored native controls into legacy/default settings.
+	if (controlsEntry && controlsEntry.modelControls !== null) {
+		assertModelControls(controlsEntry.modelControls);
+		return { thinkingLevel, model, modelControls: { ...controlsEntry.modelControls } };
+	}
 	return { thinkingLevel, model };
 }
 
@@ -464,9 +490,9 @@ export function buildSessionContext(
 	byId?: Map<string, SessionEntry>,
 ): SessionContext {
 	const path = buildSessionPath(entries, leafId, byId);
-	const { thinkingLevel, model } = getSessionContextSettings(path);
+	const settings = getSessionContextSettings(path);
 	const messages = buildContextEntries(entries, leafId, byId).flatMap(sessionEntryToContextMessages);
-	return { messages, thinkingLevel, model };
+	return { messages, ...settings };
 }
 
 /**
@@ -1075,6 +1101,20 @@ export class SessionManager {
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append native selections, or null to explicitly return to legacy thinking. */
+	appendModelControlsChange(modelControls: ModelControls | null): string {
+		if (modelControls !== null) assertModelControls(modelControls);
+		const entry: ModelControlsChangeEntry = {
+			type: "model_controls_change",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			modelControls: modelControls === null ? null : { ...modelControls },
 		};
 		this._appendEntry(entry);
 		return entry.id;

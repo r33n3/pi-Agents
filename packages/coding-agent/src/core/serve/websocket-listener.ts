@@ -167,7 +167,10 @@ export class WebSocketListener implements PiServerListener {
 		for (const socket of this.auxiliarySockets?.clients ?? []) socket.terminate();
 		await new Promise<void>((resolve) => this.sockets?.close(() => resolve()) ?? resolve());
 		await new Promise<void>((resolve) => this.auxiliarySockets?.close(() => resolve()) ?? resolve());
-		await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve());
+		const server = this.server;
+		const serverClosed = new Promise<void>((resolve) => server?.close(() => resolve()) ?? resolve());
+		server?.closeAllConnections();
+		await serverClosed;
 		this.sockets = undefined;
 		this.auxiliarySockets = undefined;
 		this.server = undefined;

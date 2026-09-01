@@ -48,12 +48,14 @@ export type ProxyAssistantMessageEvent =
 			type: "done";
 			reason: Extract<StopReason, "stop" | "length" | "toolUse">;
 			usage: AssistantMessage["usage"];
+			execution?: AssistantMessage["execution"];
 	  }
 	| {
 			type: "error";
 			reason: Extract<StopReason, "aborted" | "error">;
 			errorMessage?: string;
 			usage: AssistantMessage["usage"];
+			execution?: AssistantMessage["execution"];
 	  };
 
 type ProxySerializableStreamOptions = Pick<
@@ -62,6 +64,7 @@ type ProxySerializableStreamOptions = Pick<
 	| "samplingParams"
 	| "maxTokens"
 	| "reasoning"
+	| "controls"
 	| "cacheRetention"
 	| "sessionId"
 	| "headers"
@@ -105,6 +108,7 @@ function buildProxyRequestOptions(options: ProxyStreamOptions): ProxySerializabl
 		samplingParams: options.samplingParams,
 		maxTokens: options.maxTokens,
 		reasoning: options.reasoning,
+		controls: options.controls,
 		cacheRetention: options.cacheRetention,
 		sessionId: options.sessionId,
 		headers: options.headers,
@@ -353,12 +357,14 @@ function processProxyEvent(
 		case "done":
 			partial.stopReason = proxyEvent.reason;
 			partial.usage = proxyEvent.usage;
+			partial.execution = proxyEvent.execution;
 			return { type: "done", reason: proxyEvent.reason, message: partial };
 
 		case "error":
 			partial.stopReason = proxyEvent.reason;
 			partial.errorMessage = proxyEvent.errorMessage;
 			partial.usage = proxyEvent.usage;
+			partial.execution = proxyEvent.execution;
 			return { type: "error", reason: proxyEvent.reason, error: partial };
 
 		default: {

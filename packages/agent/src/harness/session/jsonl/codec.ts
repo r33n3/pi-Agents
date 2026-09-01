@@ -1,6 +1,7 @@
 import { err, ok, type Result } from "../../types.ts";
+import { validateSessionModelControls } from "../model-controls.ts";
 import type { SessionMutation } from "../state.ts";
-import type { Entry, LaneRecord } from "../types.ts";
+import { type Entry, type LaneRecord, SessionError } from "../types.ts";
 import { JsonlDecodeError } from "./errors.ts";
 import type { JsonlSessionMetadata, JsonlV4Header } from "./types.ts";
 
@@ -8,6 +9,7 @@ const ENTRY_TYPES = new Set<Entry["type"]>([
 	"message",
 	"model_change",
 	"thinking_level_change",
+	"model_controls_change",
 	"active_tools_change",
 	"compaction",
 	"branch_summary",
@@ -219,9 +221,16 @@ function decodeMutation(line: string): SessionMutation {
 
 export function parseMutation(line: string): Result<SessionMutation, JsonlDecodeError> {
 	try {
-		return ok<SessionMutation, JsonlDecodeError>(decodeMutation(line));
+		const mutation = decodeMutation(line);
+		if (mutation.kind === "entry" || mutation.kind === "record") {
+			validateSessionModelControls(mutation.kind === "entry" ? mutation.entry : mutation.record);
+		}
+		return ok<SessionMutation, JsonlDecodeError>(mutation);
 	} catch (error) {
 		if (error instanceof JsonlDecodeError) return err<SessionMutation, JsonlDecodeError>(error);
+		if (error instanceof SessionError && error.code === "invalid_payload") {
+			return err<SessionMutation, JsonlDecodeError>(new JsonlDecodeError("schema", error.message, error));
+		}
 		throw error;
 	}
 }

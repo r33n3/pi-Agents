@@ -23,9 +23,10 @@ import type {
 	AgentState,
 	AgentTool,
 	PrepareNextTurnContext,
+	StreamFn,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText } from "@earendil-works/pi-ai";
+import { contentText, type ModelControls, ModelControlsError } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -158,6 +159,7 @@ export type AgentSessionEvent =
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| { type: "model_controls_changed"; modelControls: ModelControls | null }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -257,6 +259,11 @@ export interface PromptOptions {
 export interface ModelMutationOptions {
 	/** Persist the new value to global defaults. Defaults to session-only. */
 	persist?: boolean;
+}
+
+export interface SetModelOptions extends ModelMutationOptions {
+	/** Replace native settings atomically with the model; null explicitly returns to legacy thinking. */
+	modelControls?: ModelControls | null;
 }
 
 /** Result from cycleModel() */
@@ -457,6 +464,7 @@ export class AgentSession {
 		headers?: Record<string, string>;
 		env?: Record<string, string>;
 	}> {
+		if (this.modelControls !== undefined) this._modelRuntime.validateModelControls(model, this.modelControls);
 		if (this.agent.streamFunction === streamSimple) {
 			return this._getRequiredRequestAuth(model);
 		}
@@ -579,6 +587,8 @@ export class AgentSession {
 				},
 				model: this.agent.state.model,
 				thinkingLevel: this.agent.state.thinkingLevel,
+				modelControls: this.modelControls ?? null,
+				thinkingBudgets: this.agent.thinkingBudgets ?? null,
 			};
 		};
 	}
@@ -917,6 +927,10 @@ export class AgentSession {
 		return this.agent.state.thinkingLevel;
 	}
 
+	get modelControls(): ModelControls | undefined {
+		return this.agent.state.modelControls;
+	}
+
 	/** Whether the session is currently processing an agent run or post-run continuation. */
 	get isStreaming(): boolean {
 		return this._isAgentRunActive;
@@ -1247,6 +1261,7 @@ export class AgentSession {
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
+			if (this.modelControls !== undefined) this._modelRuntime.validateModelControls(this.model, this.modelControls);
 
 			const hasConfiguredAuth =
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
@@ -1670,15 +1685,27 @@ export class AgentSession {
 	 * Persists to global defaults only when options.persist is true.
 	 * @throws Error if no auth is configured for the model
 	 */
-	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
-		if (!(await this._modelRuntime.checkAuth(model.provider))) {
+	async setModel(model: Model<any>, options: SetModelOptions = {}): Promise<void> {
+		const controls =
+			options.modelControls === undefined
+				? this.modelControls
+				: options.modelControls === null
+					? undefined
+					: { ...options.modelControls };
+		if (controls !== undefined) this._modelRuntime.validateModelControls(model, controls);
+		const auth = await this._modelRuntime.checkAuth(model.provider);
+		if (!auth) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
+		// Recheck after asynchronous auth in case another settings action changed the selection.
+		const latestControls = options.modelControls === undefined ? this.modelControls : controls;
+		if (latestControls !== undefined) this._modelRuntime.validateModelControls(model, latestControls, auth);
 		this.agent.state.model = model;
 		this.sessionManager.appendModelChange(model.provider, model.id);
+		if (options.modelControls !== undefined) this.setModelControls(controls ?? null);
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 			this._addPersistedDefaultToNonEmptyScope(model);
@@ -1687,7 +1714,7 @@ export class AgentSession {
 		// Apply thinking level for the new model.
 		// Per-model thinking level overrides take priority over the global default.
 		// Model persistence does not implicitly rewrite the global thinking default.
-		this.setThinkingLevel(thinkingLevel);
+		if (this.modelControls === undefined) this.setThinkingLevel(thinkingLevel);
 
 		await this._emitModelSelect(model, previousModel, "set");
 	}
@@ -1742,6 +1769,7 @@ export class AgentSession {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const next = scopedModels[nextIndex];
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.model, next.thinkingLevel);
+		if (this.modelControls !== undefined) this._modelRuntime.validateModelControls(next.model, this.modelControls);
 
 		// Apply model
 		this.agent.state.model = next.model;
@@ -1756,7 +1784,7 @@ export class AgentSession {
 		// - Per-model thinking level overrides take priority over the global default
 		// setThinkingLevel clamps to model capabilities.
 		// Model persistence does not implicitly rewrite the global thinking default.
-		this.setThinkingLevel(thinkingLevel);
+		if (this.modelControls === undefined) this.setThinkingLevel(thinkingLevel);
 
 		await this._emitModelSelect(next.model, currentModel, "cycle");
 
@@ -1779,6 +1807,7 @@ export class AgentSession {
 		const nextModel = availableModels[nextIndex];
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(nextModel);
+		if (this.modelControls !== undefined) this._modelRuntime.validateModelControls(nextModel, this.modelControls);
 		this.agent.state.model = nextModel;
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		if (options.persist) {
@@ -1788,7 +1817,7 @@ export class AgentSession {
 
 		// Apply thinking level for the new model.
 		// Model persistence does not implicitly rewrite the global thinking default.
-		this.setThinkingLevel(thinkingLevel);
+		if (this.modelControls === undefined) this.setThinkingLevel(thinkingLevel);
 
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
 
@@ -1799,6 +1828,30 @@ export class AgentSession {
 	// Thinking Level Management
 	// =========================================================================
 
+	/** Validate and persist native selections. No defaults, effort, or premium tiers are injected. */
+	setModelControls(controls: ModelControls | null): void {
+		if (controls !== null) {
+			if (!this.model) throw new Error(formatNoModelSelectedMessage());
+			this._modelRuntime.validateModelControls(this.model, controls);
+		}
+		const next = controls ?? undefined;
+		const previous = this.modelControls;
+		if (previous === undefined && next === undefined) return;
+		if (
+			previous !== undefined &&
+			next !== undefined &&
+			["reasoningMode", "reasoningEffort", "reasoningBudget", "processingTier"].every(
+				(key) => previous[key as keyof ModelControls] === next[key as keyof ModelControls],
+			)
+		)
+			return;
+		const entryId = this.sessionManager.appendModelControlsChange(controls);
+		this.agent.state.modelControls = next;
+		const entry = this.sessionManager.getEntry(entryId);
+		if (entry) this._emit({ type: "entry_appended", entry });
+		this._emit({ type: "model_controls_changed", modelControls: this.modelControls ?? null });
+	}
+
 	/**
 	 * Set thinking level.
 	 * Clamps to model capabilities based on available thinking levels.
@@ -1807,6 +1860,11 @@ export class AgentSession {
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
 		const availableLevels = this.getAvailableThinkingLevels();
+		if (this.modelControls !== undefined) {
+			if (!availableLevels.includes(level))
+				throw new ModelControlsError("Unsupported legacy thinking level; choose a supported replacement");
+			this.setModelControls(null);
+		}
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
 		// Only persist if actually changing
@@ -1911,6 +1969,19 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private _getSummarizationStreamFunction(): StreamFn {
+		const controls = this.modelControls;
+		const stream = this.agent.streamFunction;
+		if (controls === undefined) return stream;
+		return (model, context, options) =>
+			stream(model, context, {
+				...options,
+				reasoning: undefined,
+				thinkingBudgets: undefined,
+				controls: { ...controls },
+			});
+	}
+
 	/** Generate Pi's built-in compaction summary for manual and automatic compaction. */
 	private async _runDefaultCompaction(
 		preparation: CompactionPreparation,
@@ -1930,7 +2001,7 @@ export class AgentSession {
 			customInstructions,
 			signal,
 			this.thinkingLevel,
-			this.agent.streamFunction,
+			this._getSummarizationStreamFunction(),
 			env,
 			this.settingsManager.getRetrySettings(),
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
@@ -3220,7 +3291,7 @@ export class AgentSession {
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
-					streamFn: this.agent.streamFunction,
+					streamFn: this._getSummarizationStreamFunction(),
 					retry: this.settingsManager.getRetrySettings(),
 					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
 				});
@@ -3291,6 +3362,15 @@ export class AgentSession {
 			}
 
 			// Update agent state
+			// Tree navigation keeps the user's current model preferences. Record them on
+			// the new branch so a later reopen cannot reactivate historical premium settings.
+			if (
+				this.modelControls !== undefined ||
+				this.sessionManager.getBranch().some((entry) => entry.type === "model_controls_change")
+			) {
+				if (this.model) this.sessionManager.appendModelChange(this.model.provider, this.model.id);
+				this.sessionManager.appendModelControlsChange(this.modelControls ?? null);
+			}
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 

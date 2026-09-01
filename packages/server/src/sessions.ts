@@ -49,6 +49,11 @@ export class LiveSessionManager {
 			case "list":
 				return { command: "list" as const, sessions: await this.listMetadata() };
 			case "create": {
+				if (command.modelControls != null && command.thinkingLevel !== undefined)
+					throw new PiServerError(
+						"invalid_request",
+						"Choose native model controls or legacy thinkingLevel, not both",
+					);
 				const id = randomUUID();
 				const options: CreateSessionOptions = {
 					id,
@@ -56,6 +61,7 @@ export class LiveSessionManager {
 					name: command.name,
 					model: command.model,
 					thinkingLevel: command.thinkingLevel,
+					modelControls: command.modelControls,
 				};
 				const live = await this.acquire(id, () => this.options.service.createSession(options));
 				await this.attach(connection, live);
@@ -106,7 +112,9 @@ export class LiveSessionManager {
 			}
 			case "set_model": {
 				const live = this.requireAttached(connection, command.sessionId);
-				const session = await this.runOperation(connection, live, () => live.runtime.setModel(command.model));
+				const session = await this.runOperation(connection, live, () =>
+					live.runtime.setModel(command.model, command.modelControls),
+				);
 				return { command: "set_model" as const, session };
 			}
 			case "set_thinking": {
@@ -115,6 +123,13 @@ export class LiveSessionManager {
 					live.runtime.setThinking(command.thinkingLevel),
 				);
 				return { command: "set_thinking" as const, session };
+			}
+			case "set_model_controls": {
+				const live = this.requireAttached(connection, command.sessionId);
+				const session = await this.runOperation(connection, live, () =>
+					live.runtime.setModelControls(command.modelControls),
+				);
+				return { command: "set_model_controls" as const, session };
 			}
 		}
 	}

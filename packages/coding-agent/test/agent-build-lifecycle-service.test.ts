@@ -206,6 +206,46 @@ describe("AgentBuildLifecycleService", () => {
 		expect(await registry.get("reviewer")).toMatchObject({ revision: 2, persona: "More careful" });
 	});
 
+	test("rejects promotion when the proof decision changes after the eligibility check", async () => {
+		const { root, registry, runs, executor, lifecycle } = await setup();
+		await saveReviewer(registry);
+		const build = await lifecycle.ensureForAgent("reviewer");
+		await lifecycle.updateDraft(build.id, {
+			name: "Reviewer",
+			objective: "Review two boundaries",
+			projectRoot: join(root, "workspace"),
+			configuration: {
+				name: "Reviewer",
+				description: "Review two boundaries",
+				persona: "Accepted candidate",
+				projectRoot: join(root, "workspace"),
+				tools: ["read"],
+				memory: "none",
+				executor: "harness",
+				permissionPolicy: "read-only",
+				browserAccess: "disabled",
+				delegateAgentIds: [],
+				exposeA2a: false,
+			},
+		});
+		const proof = await lifecycle.startProof(build.id, "Review the candidate once");
+		executor.executions[0]!.resolve({ output: "Reviewed", transcript: [] });
+		await runs.waitForCompletion(proof.proof!.runId);
+		await lifecycle.get(build.id);
+		await lifecycle.reviewProof(build.id, true);
+		await expect(lifecycle.assertPromotionAllowed(proof.proof!.runId)).resolves.toMatchObject({ stage: "proven" });
+
+		await lifecycle.recordFeedback(build.id, {
+			rating: 2,
+			summary: "The accepted proof needs another refinement pass.",
+			answers: [],
+		});
+		await expect(
+			lifecycle.markPromoted(proof.proof!.runId, "review-boundary", "C:/skills/review-boundary/SKILL.md"),
+		).rejects.toThrow("no longer current");
+		expect(await registry.get("reviewer")).toMatchObject({ revision: 1, persona: "Careful" });
+	});
+
 	test("recovers a durable candidate and turns an interrupted proof into actionable refinement", async () => {
 		const { root, registry, runs, executor, lifecycle } = await setup();
 		await saveReviewer(registry);

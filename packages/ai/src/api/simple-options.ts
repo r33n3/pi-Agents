@@ -29,6 +29,7 @@ export function buildBaseOptions(
 			? { ...model.samplingParams, ...options?.samplingParams }
 			: undefined;
 	return {
+		controls: options?.controls,
 		temperature: options?.temperature,
 		samplingParams,
 		maxTokens: clampMaxTokensToContext(model, context, options?.maxTokens ?? model.maxTokens),

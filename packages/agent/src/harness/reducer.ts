@@ -1,6 +1,7 @@
-import type { AssistantMessage, DeferredHandle, StopReason } from "@earendil-works/pi-ai";
+import type { AssistantMessage, DeferredHandle, ModelControls, StopReason } from "@earendil-works/pi-ai";
 import { Guard } from "typebox/guard";
 import type { AgentMessage, AgentToolCall, ThinkingLevel } from "../types.ts";
+import { readSessionModelControls, validateSessionModelControls } from "./session/model-controls.ts";
 import type {
 	Entry,
 	LaneRecord,
@@ -54,6 +55,7 @@ export interface RecordLogSlice {
 export interface EffectiveLaneConfiguration {
 	model: { provider: string; modelId: string };
 	thinkingLevel: ThinkingLevel;
+	modelControls?: ModelControls;
 	activeToolNames: string[];
 }
 
@@ -324,7 +326,10 @@ export function validateRecordLog(input: RecordLogSlice): void {
 	const toolInvocations = new Set<string>();
 	const records = [...input.records].sort((left, right) => left.seq - right.seq);
 
+	for (const entry of input.entries) validateSessionModelControls(entry);
+	for (const operation of input.openOperations) validateSessionModelControls(operation);
 	for (const record of records) {
+		validateSessionModelControls(record);
 		if (record.type === "operation_started") {
 			starts.set(record.id, record);
 			validateOperationResult(entriesById, record);
@@ -402,7 +407,8 @@ function deriveEffectiveConfiguration(input: LaneReductionInput): EffectiveLaneC
 	const entriesById = new Map<string, Entry>();
 	for (const entry of [...input.configurationEntries, ...input.ownEntries]) entriesById.set(entry.id, entry);
 
-	for (const entry of bySequence([...entriesById.values()])) {
+	const entries = bySequence([...entriesById.values()]);
+	for (const entry of entries) {
 		switch (entry.type) {
 			case "model_change":
 				configuration = { ...configuration, model: { provider: entry.provider, modelId: entry.modelId } };
@@ -423,6 +429,9 @@ function deriveEffectiveConfiguration(input: LaneReductionInput): EffectiveLaneC
 				break;
 		}
 	}
+	const modelControls = readSessionModelControls(entries, input.defaults.modelControls);
+	if (modelControls === undefined) delete configuration.modelControls;
+	else configuration.modelControls = modelControls;
 	return configuration;
 }
 
@@ -505,6 +514,7 @@ function deriveToolBatch(
 /** Purely reconstructs one lane's orchestration state from its bounded recovery inputs. */
 export function reduceLaneState(input: LaneReductionInput): LaneReductionResult {
 	validateRecordLog(input);
+	for (const entry of [...input.configurationEntries, ...input.ownEntries]) validateSessionModelControls(entry);
 
 	const records = bySequence(input.records);
 	const ownEntries = bySequence(input.ownEntries);

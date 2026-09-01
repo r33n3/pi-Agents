@@ -7,9 +7,13 @@ import {
 	type AuthResult,
 	type Context,
 	type Credential,
+	getModelAuthConnection,
+	getModelCatalogSnapshot,
 	lazyStream,
 	type Model,
 	type ModelAuth,
+	type ModelAuthConnection,
+	type ModelCatalogProvenance,
 	type OAuthAuth,
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
@@ -18,6 +22,8 @@ import {
 	type RefreshModelsContext,
 	type SimpleStreamOptions,
 	type StreamOptions,
+	validateModelCatalog,
+	validateModelControls,
 } from "@earendil-works/pi-ai";
 import { getApiProvider } from "@earendil-works/pi-ai/compat";
 import type { ModelConfig, ModelsJsonModel, ModelsJsonModelOverride, ModelsJsonProvider } from "./model-config.ts";
@@ -59,6 +65,7 @@ export interface ProviderConfigInput {
 		baseUrl?: string;
 		reasoning: boolean;
 		thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
+		controls?: Model<Api>["controls"];
 		input: ("text" | "image")[];
 		cost: Model<Api>["cost"];
 		contextWindow: number;
@@ -77,6 +84,18 @@ export type AuthStatus = {
 };
 
 export const clearApiKeyCache = clearConfigValueCache;
+
+interface ComposedCatalogState {
+	base: Provider | undefined;
+	extension: ProviderConfigInput | undefined;
+	extensionModels?: ProviderConfigInput["models"];
+	extensionCheckedAt?: number;
+	oauthCredential?: OAuthCredentials;
+}
+
+// Transfer accepted dynamic inputs only when recomposing the same provider/extension connection.
+// This state stays private to composition and is never persisted or included in provenance.
+const composedCatalogStates = new WeakMap<Provider, ComposedCatalogState>();
 
 function mergeCompat(
 	base: Model<Api>["compat"],
@@ -108,6 +127,7 @@ function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride
 		thinkingLevelMap: override.thinkingLevelMap
 			? { ...model.thinkingLevelMap, ...override.thinkingLevelMap }
 			: model.thinkingLevelMap,
+		controls: override.controls ?? model.controls,
 		input: (override.input as ("text" | "image")[] | undefined) ?? model.input,
 		cost: override.cost
 			? {
@@ -115,6 +135,7 @@ function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride
 					output: override.cost.output ?? model.cost.output,
 					cacheRead: override.cost.cacheRead ?? model.cost.cacheRead,
 					cacheWrite: override.cost.cacheWrite ?? model.cost.cacheWrite,
+					status: override.cost.status ?? model.cost.status,
 					tiers: override.cost.tiers ?? model.cost.tiers,
 				}
 			: model.cost,
@@ -155,6 +176,7 @@ function modelFromJson(
 		baseUrl,
 		reasoning: definition.reasoning ?? false,
 		thinkingLevelMap: definition.thinkingLevelMap,
+		controls: definition.controls,
 		input: (definition.input ?? ["text"]) as ("text" | "image")[],
 		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: definition.contextWindow ?? 128000,
@@ -322,21 +344,48 @@ function composeApiKeyAuth(
 		check: async (input) => {
 			if (input.credential) {
 				if (inherited?.check) return inherited.check(input);
-				if (input.credential.key) return { type: "api_key", source: "stored credential" };
+				if (input.credential.key)
+					return {
+						type: "api_key",
+						source: "stored credential",
+						connection: getModelAuthConnection(providerId, { apiKey: input.credential.key }),
+					};
 				const resolved = await inherited?.resolve(input);
-				return resolved ? { type: "api_key", source: resolved.source } : undefined;
+				return resolved
+					? {
+							type: "api_key",
+							source: resolved.source,
+							connection: getModelAuthConnection(providerId, resolved.auth),
+						}
+					: undefined;
 			}
 			if (rawKey !== undefined) {
-				if (isCommandConfigValue(rawKey)) return { type: "api_key", source: "configured API key" };
+				if (isCommandConfigValue(rawKey))
+					return { type: "api_key", source: "configured API key", connection: { type: "unknown" } };
 				const envNames = getConfigValueEnvVarNames(rawKey);
+				const env: Record<string, string> = {};
 				for (const name of envNames) {
-					if ((await input.ctx.env(name)) === undefined) return undefined;
+					const value = await input.ctx.env(name);
+					if (value === undefined) return undefined;
+					env[name] = value;
 				}
-				return { type: "api_key", source: "configured API key" };
+				// The command case returned above; checking a literal/template must never execute a key command.
+				const key = resolveConfigValueOrThrow(rawKey, `API key for provider "${providerId}"`, env);
+				return {
+					type: "api_key",
+					source: "configured API key",
+					connection: getModelAuthConnection(providerId, { apiKey: key }),
+				};
 			}
 			if (inherited?.check) return inherited.check(input);
 			const resolved = await inherited?.resolve(input);
-			return resolved ? { type: "api_key", source: resolved.source } : undefined;
+			return resolved
+				? {
+						type: "api_key",
+						source: resolved.source,
+						connection: getModelAuthConnection(providerId, resolved.auth),
+					}
+				: undefined;
 		},
 		resolve: async (input) => {
 			let result: AuthResult | undefined;
@@ -413,7 +462,68 @@ export function validateExtensionProvider(
 	if (extension.streamSimple && !extension.api) {
 		throw new Error(`Provider ${providerId}: "api" is required when registering streamSimple.`);
 	}
-	applyExtension(providerId, applyModelsJson(providerId, base?.getModels() ?? [], modelsConfig), extension);
+	composeCatalog(providerId, base, modelsConfig, extension);
+}
+
+/** Build a detached, fully validated snapshot in the same order for registration and refresh. */
+function composeCatalog(
+	providerId: string,
+	base: Provider | undefined,
+	config: ModelsJsonProvider | undefined,
+	extension: ProviderConfigInput | undefined,
+	oauthCredential?: OAuthCredentials,
+	refreshedExtensionAt?: number,
+): { models: Model<Api>[]; provenance: Map<string, ModelCatalogProvenance> } {
+	// models.json modelOverrides are the topmost user-config layer: they apply once,
+	// after custom-model upserts, extension model replacement, and legacy OAuth projection.
+	const baseline = structuredClone(base?.getModels() ?? []);
+	const sources = new Map<string, ModelCatalogProvenance>();
+	for (const model of baseline) {
+		let provenance: ModelCatalogProvenance | undefined;
+		try {
+			const snapshot = getModelCatalogSnapshot(base?.getModelProvenance?.(model.id));
+			if (snapshot) {
+				const { freshness: _freshness, timestampWarning: _timestampWarning, ...source } = snapshot;
+				provenance = source;
+			}
+		} catch {
+			/* Optional metadata cannot disable a model. */
+		}
+		sources.set(model.id, provenance ?? { source: "provider" });
+	}
+	const overlay = (modelId: string, source: "user-config" | "extension") => {
+		const previous = sources.get(modelId);
+		sources.set(modelId, previous ? { ...previous, overrides: [...(previous.overrides ?? []), source] } : { source });
+	};
+	let models = applyModelsJson(providerId, baseline, config);
+	if (config?.baseUrl || config?.headers || config?.compat)
+		for (const model of baseline) overlay(model.id, "user-config");
+	for (const definition of config?.models ?? []) sources.set(definition.id, { source: "user-config" });
+	models = applyExtension(providerId, models, extension);
+	if (extension?.models) {
+		for (const model of models)
+			sources.set(model.id, {
+				source: "extension",
+				...(refreshedExtensionAt === undefined ? {} : { loadedFrom: "refresh", checkedAt: refreshedExtensionAt }),
+			});
+	} else if (extension?.baseUrl || extension?.headers || extension?.streamSimple) {
+		for (const model of models) overlay(model.id, "extension");
+	}
+	if (oauthCredential && extension?.oauth?.modifyModels) {
+		// Callbacks may mutate their inputs or retain references. Neither can alter the source layers.
+		models = extension.oauth.modifyModels(structuredClone(models), structuredClone(oauthCredential));
+		for (const model of models) overlay(model.id, "extension");
+	}
+	models = models.map((model) => {
+		const override = config?.modelOverrides?.[model.id];
+		if (override) overlay(model.id, "user-config");
+		return override ? applyModelOverride(model, override) : model;
+	});
+	validateModelCatalog(providerId, models);
+	return {
+		models: structuredClone(models),
+		provenance: new Map(models.map((model) => [model.id, sources.get(model.id) ?? { source: "provider" }])),
+	};
 }
 
 /** Compose built-in, models.json, and extension layers without reading credentials. */
@@ -422,30 +532,27 @@ export function composeModelProvider(
 	base: Provider | undefined,
 	modelConfig: ModelConfig,
 	extension: ProviderConfigInput | undefined,
+	previous?: Provider,
 ): Provider {
 	const config = modelConfig.getProvider(providerId);
-	let extensionOAuthCredential: OAuthCredentials | undefined;
-	let refreshedExtensionModels: ProviderConfigInput["models"];
-	const currentExtension = (): ProviderConfigInput | undefined =>
-		extension && refreshedExtensionModels ? { ...extension, models: refreshedExtensionModels } : extension;
-	// models.json modelOverrides are the topmost user-config layer: they apply once,
-	// after custom-model upserts, extension model replacement, and legacy OAuth projection.
-	const getModels = () => {
-		let models = applyExtension(
-			providerId,
-			applyModelsJson(providerId, base?.getModels() ?? [], config),
-			currentExtension(),
-		);
-		if (extensionOAuthCredential && extension?.oauth?.modifyModels) {
-			models = extension.oauth.modifyModels(models, extensionOAuthCredential);
-		}
-		return models.map((model) => {
-			const override = config?.modelOverrides?.[model.id];
-			return override ? applyModelOverride(model, override) : model;
-		});
+	const previousState = previous && composedCatalogStates.get(previous);
+	const inherited = previousState?.base === base && previousState?.extension === extension ? previousState : undefined;
+	const state: ComposedCatalogState = {
+		base,
+		extension,
+		extensionModels: inherited?.extensionModels && structuredClone(inherited.extensionModels),
+		extensionCheckedAt: inherited?.extensionCheckedAt,
+		oauthCredential: inherited?.oauthCredential && structuredClone(inherited.oauthCredential),
 	};
 	// Validate eagerly so registration/reload reports structural errors immediately.
-	getModels();
+	let catalog = composeCatalog(
+		providerId,
+		base,
+		config,
+		extension && state.extensionModels ? { ...extension, models: state.extensionModels } : extension,
+		state.oauthCredential,
+		state.extensionCheckedAt,
+	);
 	const apiKey = composeApiKeyAuth(providerId, base, config, extension);
 	const oauth = composeOAuthAuth(providerId, base, config, extension);
 	if (!apiKey && !oauth) throw new Error(`Provider ${providerId}: no authentication method configured.`);
@@ -458,6 +565,7 @@ export function composeModelProvider(
 		simple: boolean,
 	): AssistantMessageEventStream =>
 		lazyStream(model, async () => {
+			if (options?.controls !== undefined) validateModelControls(model, options.controls);
 			if (extension?.streamSimple && model.api === extension.api) {
 				return extension.streamSimple(model, context, options as SimpleStreamOptions);
 			}
@@ -479,7 +587,13 @@ export function composeModelProvider(
 		baseUrl: extension?.baseUrl ?? config?.baseUrl ?? base?.baseUrl,
 		headers: base?.headers,
 		auth: { ...(apiKey ? { apiKey } : {}), ...(oauth ? { oauth } : {}) },
-		getModels,
+		getModels: () => structuredClone(catalog.models),
+		getModelProvenance: (modelId) => {
+			const provenance = catalog.provenance.get(modelId);
+			return (
+				provenance && { ...provenance, ...(provenance.overrides ? { overrides: [...provenance.overrides] } : {}) }
+			);
+		},
 		refreshModels:
 			base?.refreshModels || extension?.refreshModels || extension?.oauth?.modifyModels
 				? async (context) => {
@@ -490,15 +604,23 @@ export function composeModelProvider(
 						const oauthCredential = context.credential?.type === "oauth" ? context.credential : undefined;
 						await context.publish({
 							update: () => {
-								if (refreshed) {
-									// Validate before publishing the new synchronous list.
-									applyExtension(providerId, applyModelsJson(providerId, base?.getModels() ?? [], config), {
-										...extension,
-										models: refreshed,
-									});
-									refreshedExtensionModels = refreshed;
-								}
-								extensionOAuthCredential = oauthCredential;
+								const nextModels = refreshed === undefined ? state.extensionModels : structuredClone(refreshed);
+								const nextAt = refreshed === undefined ? state.extensionCheckedAt : Date.now();
+								const nextCredential = oauthCredential && structuredClone(oauthCredential);
+								const nextExtension =
+									extension && nextModels ? { ...extension, models: nextModels } : extension;
+								const candidate = composeCatalog(
+									providerId,
+									base,
+									config,
+									nextExtension,
+									nextCredential,
+									nextAt,
+								);
+								state.extensionModels = nextModels;
+								state.extensionCheckedAt = nextAt;
+								state.oauthCredential = nextCredential;
+								catalog = candidate;
 							},
 						});
 					}
@@ -519,6 +641,7 @@ export function composeModelProvider(
 		provider.cancelDeferred = (model, handle, options) => cancelDeferred(model, handle, options);
 	}
 
+	composedCatalogStates.set(provider, state);
 	return provider;
 }
 
@@ -538,6 +661,27 @@ export function resolveConfiguredModelHeaders(
 export interface CompatibilityRequestConfig {
 	headers?: ProviderHeaders;
 	authHeader: boolean;
+}
+
+/** Project configured header routing without resolving values or running header/key commands. */
+export function getConfiguredModelControlConnection(
+	model: Model<Api>,
+	connection: ModelAuthConnection,
+	config: ModelsJsonProvider | undefined,
+	extension: ProviderConfigInput | undefined,
+): ModelAuthConnection {
+	if (model.provider !== "anthropic") return { ...connection };
+	const headers = {
+		...model.headers,
+		...configuredHeaders(config, extension),
+		...rawModelHeaders(model, config, extension),
+	};
+	if (
+		(extension?.authHeader ?? config?.authHeader) ||
+		Object.entries(headers).some(([name, value]) => name.toLowerCase() === "authorization" && value != null)
+	)
+		return { ...connection, type: "bearer" };
+	return { ...connection };
 }
 
 export function resolveCompatibilityRequestConfig(

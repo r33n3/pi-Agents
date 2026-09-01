@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+import { type ModelControls, validateModelControls } from "../model-controls.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
@@ -24,6 +25,7 @@ import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
+import { lazyStream } from "./lazy.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
@@ -128,6 +130,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 		};
 
 		try {
+			if (options?.controls !== undefined) validateModelControls(model, options.controls);
 			// Create OpenAI client
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
@@ -143,6 +146,19 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			if (nextParams !== undefined) {
 				params = nextParams as ResponseCreateParamsStreaming;
 			}
+			const sent: ModelControls = {
+				reasoningMode: params.reasoning?.mode,
+				reasoningEffort: params.reasoning?.effort ?? undefined,
+				processingTier: params.service_tier ?? undefined,
+			};
+			if (options?.controls !== undefined) {
+				for (const key of Object.keys(options.controls) as (keyof ModelControls)[]) {
+					if (options.controls[key] !== undefined && options.controls[key] !== sent[key])
+						throw new Error(`Request overrides conflict with selected ${key}`);
+				}
+				validateModelControls(model, sent);
+			}
+			output.execution = { requested: { ...options?.controls }, sent };
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
@@ -160,7 +176,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			stream.push({ type: "start", partial: output });
 
 			await processResponsesStream(openaiStream, output, stream, model, {
-				serviceTier: options?.serviceTier,
+				serviceTier: params.service_tier,
 				grammarToolInputProperties,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 			});
@@ -200,6 +216,11 @@ export const streamSimple: StreamFunction<"openai-responses", SimpleStreamOption
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
+	if (options?.controls !== undefined && options.reasoning !== undefined) {
+		return lazyStream(model, async () => {
+			throw new Error("Choose native model controls or legacy reasoning, not both");
+		});
+	}
 	getClientApiKey(model.provider, options?.apiKey, options?.headers);
 
 	const base = {
@@ -287,7 +308,7 @@ function buildParams(
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 	const disableImplicitPromptCache = cacheRetention === "none" && compat.supportsExplicitPromptCacheMode;
-	const params: ResponseCreateParamsStreaming & { prompt_cache_options?: { mode: "explicit" } } = {
+	const params: ResponseCreateParamsStreaming = {
 		model: model.id,
 		input: messages,
 		stream: true,
@@ -330,12 +351,47 @@ function buildParams(
 				summary: options?.reasoningSummary || "auto",
 			};
 			params.include = ["reasoning.encrypted_content"];
-		} else if (model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null) {
+		} else if (
+			options?.controls === undefined &&
+			model.provider !== "github-copilot" &&
+			model.thinkingLevelMap?.off !== null
+		) {
 			params.reasoning = {
 				effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<typeof params.reasoning>["effort"],
 			};
 		}
 		if (model.provider === "xai") params.include = ["reasoning.encrypted_content"];
+	}
+	if (options?.controls !== undefined) {
+		const controls = options.controls;
+		if (controls.reasoningMode !== undefined)
+			params.reasoning = { ...params.reasoning, mode: controls.reasoningMode };
+		if (controls.reasoningEffort !== undefined) {
+			const effort = controls.reasoningEffort;
+			if (
+				effort !== "none" &&
+				effort !== "minimal" &&
+				effort !== "low" &&
+				effort !== "medium" &&
+				effort !== "high" &&
+				effort !== "xhigh" &&
+				effort !== "max"
+			)
+				throw new Error("Unsupported Responses reasoning effort");
+			if (options.reasoningEffort !== undefined && effort !== params.reasoning?.effort)
+				throw new Error("Conflicting reasoning effort selections");
+			params.reasoning = { ...params.reasoning, effort };
+		}
+		if (model.reasoning && (controls.reasoningMode !== undefined || controls.reasoningEffort !== undefined))
+			params.include = ["reasoning.encrypted_content"];
+		if (controls.processingTier !== undefined) {
+			const tier = controls.processingTier;
+			if (tier !== "auto" && tier !== "default" && tier !== "fast" && tier !== "priority" && tier !== "flex")
+				throw new Error("Unsupported Responses processing tier");
+			if (options.serviceTier !== undefined && tier !== options.serviceTier)
+				throw new Error("Conflicting processing tier selections");
+			params.service_tier = tier;
+		}
 	}
 
 	// Last so custom keys override the named request fields.
@@ -354,6 +410,7 @@ function getServiceTierCostMultiplier(
 		case "flex":
 			return 0.5;
 		case "priority":
+		case "fast":
 			return model.id === "gpt-5.5" ? 2.5 : 2;
 		default:
 			return 1;

@@ -1,3 +1,5 @@
+import { ModelControlsError } from "@earendil-works/pi-ai";
+import { ModelControlsSchema } from "@earendil-works/pi-protocol";
 import Type from "typebox";
 import type { ToolDefinition } from "../extensions/types.ts";
 import type {
@@ -40,6 +42,12 @@ const configureParameters = Type.Object({
 	),
 	model: Type.Optional(Type.String({ description: "Canonical provider/model-id from the active model catalog" })),
 	thinking: Type.Optional(thinking),
+	modelControls: Type.Optional(
+		Type.Union([ModelControlsSchema, Type.Null()], {
+			description:
+				"Provider-native settings for the selected model. Omit to preserve, {} for provider defaults, null for legacy thinking. Choose premium processing only when the user requests it.",
+		}),
+	),
 	memory: Type.Optional(Type.Union([Type.Literal("none"), Type.Literal("notes")])),
 	executor: Type.Optional(Type.Union([Type.Literal("session"), Type.Literal("harness")])),
 	permissionPolicy: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("workspace-write")])),
@@ -104,6 +112,8 @@ export function createAgentRegistryTools(
 			parameters: configureParameters,
 			executionMode: "sequential",
 			async execute(_toolCallId, parameters) {
+				if (parameters.modelControls != null && parameters.thinking !== undefined)
+					throw new ModelControlsError("Choose agent modelControls or legacy thinking, not both");
 				const existing = await findExistingAgent(registry, parameters.id, parameters.name);
 				const staged = (await lifecycle.list()).find(
 					(record) =>
@@ -112,6 +122,12 @@ export function createAgentRegistryTools(
 				);
 				const base = staged?.configuration ?? (existing ? configurationFromAgent(existing) : undefined);
 				const model = parameters.model === undefined ? base?.model : parseModel(parameters.model);
+				const modelControls =
+					parameters.modelControls !== undefined
+						? (parameters.modelControls ?? undefined)
+						: parameters.thinking === undefined
+							? base?.modelControls
+							: undefined;
 				const tools = normalizeTools(parameters.tools ?? base?.tools ?? ["read", "list"]);
 				const access = parameters.browserAccess ?? base?.browserAccess ?? "disabled";
 				if (access === "disabled") remove(tools, "browser");
@@ -135,7 +151,8 @@ export function createAgentRegistryTools(
 					projectRoot,
 					tools,
 					model,
-					thinking: parameters.thinking ?? base?.thinking,
+					thinking: modelControls === undefined ? (parameters.thinking ?? base?.thinking) : undefined,
+					modelControls,
 					memory: parameters.memory ?? base?.memory ?? "none",
 					executor: parameters.executor ?? base?.executor ?? "harness",
 					permissionPolicy,
@@ -303,6 +320,7 @@ function configurationFromAgent(definition: AgentDefinition): AgentBuildConfigur
 		tools: [...definition.tools],
 		model: definition.model ? { ...definition.model } : undefined,
 		thinking: definition.thinking,
+		modelControls: definition.modelControls === undefined ? undefined : { ...definition.modelControls },
 		memory: definition.memory,
 		executor: definition.executor,
 		permissionPolicy: definition.permissionPolicy,

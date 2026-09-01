@@ -9,5 +9,6 @@ export type {
 } from "./jsonl.ts";
 export { JsonlSessionRepo } from "./jsonl.ts";
 export * from "./memory.ts";
+export { validateSessionModelControls } from "./model-controls.ts";
 export * from "./session.ts";
 export * from "./types.ts";

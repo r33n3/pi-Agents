@@ -6,6 +6,8 @@ export interface ModelsStoreEntry {
 	lastModified?: number;
 	/** Unix timestamp of the last completed remote check. */
 	checkedAt?: number;
+	/** Last successful catalog-body retrieval/revalidation, not an unavailable-endpoint check. Unix milliseconds. */
+	validatedAt?: number;
 	/**
 	 * Opaque validator from the remote catalog's ETag header, stored verbatim
 	 * (quotes included) and echoed back as If-None-Match.
