@@ -333,6 +333,9 @@ export function getModelControlCapabilities(
 						processingTier: capabilities.processingTier,
 					},
 	);
+	for (const key of ["reasoningMode", "reasoningEffort", "reasoningBudget", "processingTier"] as const) {
+		if (implemented[key] === undefined) delete implemented[key];
+	}
 	const adapterValues =
 		model.api === "google-generative-ai"
 			? { reasoningEffort: ["minimal", "low", "medium", "high"], processingTier: [] }

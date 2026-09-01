@@ -125,7 +125,7 @@ describe("Anthropic native model controls", () => {
 		for (const model of bundledModels) {
 			const controls = getModelControlCapabilities(model);
 			if (!reviewedAnthropicModelIds.has(model.id)) {
-				expect(controls).toEqual({});
+				expect(controls).toStrictEqual({});
 				continue;
 			}
 			expect(controls.reasoningMode?.values.length).toBeGreaterThan(0);
@@ -295,7 +295,7 @@ describe("Anthropic native model controls", () => {
 			{ id: "claude-opus-6" },
 			{ controls: {} },
 		])
-			expect(getModelControlCapabilities({ ...model, ...override })).toEqual({});
+			expect(getModelControlCapabilities({ ...model, ...override })).toStrictEqual({});
 	});
 	it("checks OAuth and an injected client's real endpoint before dispatch", async () => {
 		const fake = fakeAPI();
