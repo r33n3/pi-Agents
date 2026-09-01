@@ -20,6 +20,7 @@ describe("switch-project argument handling", () => {
 		]);
 	});
 
+	// Allow the 15-second child timeout plus cleanup on slower Windows CI runners.
 	test.runIf(process.platform === "win32")("preserves Windows arguments and metacharacter paths", () => {
 		const root = mkdtempSync(join(tmpdir(), "pi-launch & %PATH% [test] "));
 		try {
@@ -43,7 +44,7 @@ describe("switch-project argument handling", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
-	});
+	}, 20_000);
 
 	test("rejects NUL arguments before launching", () => {
 		expect(() => windowsProjectScript("node", ["bad\0value"], "C:/project")).toThrow("NUL");
