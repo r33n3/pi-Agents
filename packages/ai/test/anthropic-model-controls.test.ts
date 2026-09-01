@@ -81,6 +81,22 @@ const nativeCases = Object.values(ANTHROPIC_MODELS).flatMap((model) => {
 	);
 });
 
+const reviewedAnthropicModelIds = new Set([
+	"claude-fable-5",
+	"claude-haiku-4-5",
+	"claude-haiku-4-5-20251001",
+	"claude-opus-4-5",
+	"claude-opus-4-5-20251101",
+	"claude-opus-4-6",
+	"claude-opus-4-7",
+	"claude-opus-4-8",
+	"claude-opus-5",
+	"claude-sonnet-4-5",
+	"claude-sonnet-4-5-20250929",
+	"claude-sonnet-4-6",
+	"claude-sonnet-5",
+]);
+
 describe("Anthropic native model controls", () => {
 	it.each(nativeCases)("serializes $model.id $controls through the real SDK", async ({ model, controls }) => {
 		const fake = fakeAPI();
@@ -98,9 +114,20 @@ describe("Anthropic native model controls", () => {
 		expect(result.execution?.reported).toBeUndefined();
 	});
 	it("covers all bundled Anthropic entries without generic effort inheritance", () => {
-		expect(Object.values(ANTHROPIC_MODELS)).toHaveLength(13);
-		for (const model of Object.values(ANTHROPIC_MODELS)) {
+		const bundledModels = Object.values(ANTHROPIC_MODELS);
+		expect(
+			new Set(
+				bundledModels
+					.filter((model) => Object.keys(getModelControlCapabilities(model)).length > 0)
+					.map((model) => model.id),
+			),
+		).toEqual(reviewedAnthropicModelIds);
+		for (const model of bundledModels) {
 			const controls = getModelControlCapabilities(model);
+			if (!reviewedAnthropicModelIds.has(model.id)) {
+				expect(controls).toEqual({});
+				continue;
+			}
 			expect(controls.reasoningMode?.values.length).toBeGreaterThan(0);
 			expect(controls.reasoningEffort?.values ?? []).not.toContain("minimal");
 			expect(getModelControlCapabilityErrors(controls)).toEqual([]);
