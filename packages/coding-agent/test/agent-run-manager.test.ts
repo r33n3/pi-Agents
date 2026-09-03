@@ -139,7 +139,8 @@ describe("AgentRunManager", () => {
 		}).toThrow();
 
 		executor.executions[0].resolve({ output: "Result", transcript: [] });
-		await expect.poll(() => runs.get(run.id)?.status).toBe("succeeded");
+		// In-memory status changes before cleanup and persistence finish; restart only after completion.
+		await expect(runs.waitForCompletion(run.id)).resolves.toMatchObject({ status: "succeeded" });
 		expect(runs.isActive(run.id)).toBe(false);
 		expect(await readFile(join(root, "artifacts", "research", run.id, "result.md"), "utf8")).toBe("Result\n");
 		await expect(runs.readResult(run.id)).resolves.toBe("Result\n");

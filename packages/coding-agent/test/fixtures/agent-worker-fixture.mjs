@@ -96,10 +96,10 @@ async function runHostActionScenario(message) {
 			requestId: `request-${++requestCounter}`,
 			action: { family: "filesystem.read", path: "slow.txt" },
 		};
-		// Give the parent enough time to begin the intentionally blocked action before simulating a crash.
-		const exitAfterDelivery = () => setTimeout(() => process.exit(7), 100);
-		if (process.send) process.send(request, exitAfterDelivery);
-		else exitAfterDelivery();
+		process.send?.(request);
+		// Crash only after the test host confirms that the blocked action has started.
+		await requestCapabilityTool("test_wait_for_host_action", {});
+		process.exit(7);
 		return;
 	}
 	let output;
