@@ -54,7 +54,11 @@ packages. No user credentials or live Claude session were used.
 - The three focused source suites pass: 16 tests.
 - `npm run check` passes, including browser bundling, TypeScript, and lockfile
   consistency checks.
-- The preceding collaboration/lifecycle changes passed 190 affected tests.
+- The preceding collaboration/lifecycle changes passed 205 focused tests, then
+  the protected Linux and Windows CI checks and CodeQL scans before PR #23 merged.
+- GitHub's separate optional AI review could not run because the account lacks
+  a Copilot license; it did not report a code finding. Repository protections
+  were not changed.
 - Protected-branch Linux and Windows CI remain mandatory before merging.
 
 A later runtime migration should map the fork's protocol/model-control additions
