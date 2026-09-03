@@ -52,6 +52,10 @@ packages. No user credentials or live Claude session were used.
 ## Validation and deferred work
 
 - The three focused source suites pass: 16 tests.
+- CI also exposed a restart-test race in `agent-run-manager.test.ts`: it polled
+  in-memory success before final persistence completed. The test now awaits
+  `waitForCompletion()` before restoring a manager. All 44 tests in the five
+  targeted suites pass after this correction; runtime behavior is unchanged.
 - `npm run check` passes, including browser bundling, TypeScript, and lockfile
   consistency checks.
 - The preceding collaboration/lifecycle changes passed 205 focused tests, then
