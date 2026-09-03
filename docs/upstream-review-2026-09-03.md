@@ -56,6 +56,10 @@ packages. No user credentials or live Claude session were used.
   in-memory success before final persistence completed. The test now awaits
   `waitForCompletion()` before restoring a manager. All 44 tests in the five
   targeted suites pass after this correction; runtime behavior is unchanged.
+- The post-merge main run exposed a crash-fixture timing race: its 100 ms delay
+  could expire before host dispatch started. The fixture now waits for an
+  explicit host-start acknowledgement before exiting. All 62 tests in the six
+  targeted suites pass with both test corrections; production code is unchanged.
 - `npm run check` passes, including browser bundling, TypeScript, and lockfile
   consistency checks.
 - The preceding collaboration/lifecycle changes passed 205 focused tests, then

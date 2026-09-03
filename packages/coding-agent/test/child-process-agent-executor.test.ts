@@ -393,7 +393,18 @@ describe("ChildProcessAgentExecutor", () => {
 			const executor = new ChildProcessAgentExecutor({
 				agentDir: process.cwd(),
 				serveRoot,
-				capabilityTools: () => [],
+				capabilityTools: () => [
+					{
+						name: "test_wait_for_host_action",
+						label: "Wait for host action",
+						description: "Synchronizes the test worker crash with the blocked host action",
+						parameters: Type.Object({}),
+						async execute() {
+							await actionStarted;
+							return { content: [{ type: "text", text: "started" }], details: undefined };
+						},
+					},
+				],
 				workerPath,
 				governedActions: new GovernedActionService(audit),
 				hostFileSystem: blockingHostFileSystem(
