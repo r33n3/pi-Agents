@@ -160,6 +160,11 @@ describe("saved agent native model settings", () => {
 		const buildId = configured.details!.buildId;
 		lifecycle = new AgentBuildLifecycleService(root, registry, runs);
 		expect((await lifecycle.get(buildId)).configuration!.modelControls).toEqual(input.modelControls);
+		await expect(lifecycle.publishDraft(buildId)).rejects.toThrow("accept its current proof");
+		const initialProof = await lifecycle.startProof(buildId, "Prove the unpublished synthetic agent");
+		await runs.waitForCompletion(initialProof.proof!.runId);
+		expect(contexts[0].definition).toMatchObject({ revision: 1, modelControls: input.modelControls });
+		await lifecycle.reviewProof(buildId, true);
 		const published = await lifecycle.publishDraft(buildId);
 		const agentId = published.agentId!;
 		expect((await registry.get(agentId))!.modelControls).toEqual(input.modelControls);
@@ -177,8 +182,8 @@ describe("saved agent native model settings", () => {
 		expect((await registry.get(agentId))!.modelControls).toEqual(input.modelControls);
 		const proof = await lifecycle.startProof(buildId, "Run synthetic proof");
 		await runs.waitForCompletion(proof.proof!.runId);
-		expect(contexts[0].definition).toMatchObject({ revision: 2, modelControls: { reasoningEffort: "high" } });
-		expect(contexts[0].definition.thinking).toBeUndefined();
+		expect(contexts[1].definition).toMatchObject({ revision: 2, modelControls: { reasoningEffort: "high" } });
+		expect(contexts[1].definition.thinking).toBeUndefined();
 		await lifecycle.reviewProof(buildId, true);
 		await lifecycle.assertPromotionAllowed(proof.proof!.runId);
 		await lifecycle.markPromoted(proof.proof!.runId, "synthetic-review", join(root, "synthetic-skill"));
