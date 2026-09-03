@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ModelRef } from "@earendil-works/pi-protocol";
 import type {
@@ -10,6 +10,15 @@ import type {
 	AgentExecutor,
 } from "./agent-executor.ts";
 import type { AgentDefinition, AgentRegistry } from "./agent-registry.ts";
+import {
+	type AgentExecutionConfigurationSeed,
+	type AgentRunCapabilityBinding,
+	type AgentRunConfigurationSnapshot,
+	assertAgentExecutionConfigurationSeedIntegrity,
+	assertAgentRunConfigurationSnapshotIntegrity,
+	createAgentExecutionConfigurationSeed,
+	createAgentRunConfigurationSnapshot,
+} from "./agent-run-configuration-snapshot.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
 export type AgentRunStatus = "starting" | "running" | "succeeded" | "failed" | "aborted";
@@ -39,8 +48,15 @@ export interface AgentRunRecord {
 	error?: string;
 	model?: ModelRef;
 	agentRevision: number;
+	snapshotDigest?: string;
 	temporarySourceAgentId?: string;
 	usage?: AgentRunUsage;
+}
+
+export interface AgentRunConfigurationOptions {
+	defaultModel?: ModelRef;
+	resolveCapabilityBindings?: (definition: AgentDefinition) => readonly AgentRunCapabilityBinding[];
+	revokeRunApprovals?: (runId: string, reason: string) => Promise<void>;
 }
 
 interface ActiveRun {
@@ -64,15 +80,23 @@ export class AgentRunManager implements AsyncDisposable {
 	readonly #artifactsRoot: string;
 	readonly #queue = new SerialOperationQueue();
 	readonly #records = new Map<string, AgentRunRecord>();
+	readonly #admittedRunIds = new Set<string>();
 	readonly #activeByAgent = new Map<string, ActiveRun>();
 	readonly #activeByWorkspace = new Map<string, Set<ActiveRun>>();
 	readonly #activeByRun = new Map<string, ActiveRun>();
 	readonly #activeByResource = new Map<string, ActiveRun>();
 	readonly #maxConcurrentRuns: number;
+	readonly #configuration: AgentRunConfigurationOptions;
 	#disposed = false;
 	#disposePromise: Promise<void> | undefined;
 
-	constructor(registry: AgentRegistry, executor: AgentExecutor, artifactsRoot: string, maxConcurrentRuns = 4) {
+	constructor(
+		registry: AgentRegistry,
+		executor: AgentExecutor,
+		artifactsRoot: string,
+		maxConcurrentRuns = 4,
+		configuration: AgentRunConfigurationOptions = {},
+	) {
 		if (!Number.isSafeInteger(maxConcurrentRuns) || maxConcurrentRuns < 1) {
 			throw new Error("Agent maxConcurrentRuns must be positive");
 		}
@@ -80,6 +104,7 @@ export class AgentRunManager implements AsyncDisposable {
 		this.#executor = executor;
 		this.#artifactsRoot = resolve(artifactsRoot);
 		this.#maxConcurrentRuns = maxConcurrentRuns;
+		this.#configuration = configuration;
 	}
 
 	async initialize(): Promise<void> {
@@ -93,6 +118,12 @@ export class AgentRunManager implements AsyncDisposable {
 				try {
 					const value: unknown = JSON.parse(await readFile(resolve(artifactDirectory, "run.json"), "utf8"));
 					const record = parseRunRecord(value, artifactDirectory);
+					if (record.snapshotDigest) {
+						const snapshot: unknown = JSON.parse(
+							await readFile(resolve(artifactDirectory, "run-snapshot.json"), "utf8"),
+						);
+						assertAgentRunConfigurationSnapshotIntegrity(snapshot, record.snapshotDigest);
+					}
 					if (record.status === "starting" || record.status === "running") {
 						record.status = "failed";
 						record.finishedAt = Date.now();
@@ -115,12 +146,54 @@ export class AgentRunManager implements AsyncDisposable {
 		return this.#records.get(runId);
 	}
 
+	async getConfiguration(runId: string): Promise<AgentExecutionConfigurationSeed | undefined> {
+		const record = this.#records.get(runId);
+		if (!record?.snapshotDigest) return undefined;
+		const value: unknown = JSON.parse(await readFile(resolve(record.artifactDirectory, "run-snapshot.json"), "utf8"));
+		assertAgentRunConfigurationSnapshotIntegrity(value, record.snapshotDigest);
+		const snapshot = value as AgentRunConfigurationSnapshot;
+		return structuredClone(snapshot.configuration);
+	}
+
+	isActive(runId: string): boolean {
+		const active = this.#activeByRun.get(runId);
+		const status = this.#records.get(runId)?.status;
+		return (
+			this.#admittedRunIds.has(runId) &&
+			(status === "starting" || status === "running") &&
+			active?.abortRequested !== true
+		);
+	}
+
+	assertActive(runId: string): void {
+		if (!this.isActive(runId)) throw new Error(`Agent run ${runId} is not active`);
+	}
+
 	async availability(agentId: string): Promise<"available" | "agent-busy" | "workspace-busy" | "capacity"> {
-		if (this.#activeByAgent.has(agentId)) return "agent-busy";
-		if (this.#activeByRun.size >= this.#maxConcurrentRuns) return "capacity";
 		const definition = await this.#registry.get(agentId);
 		if (!definition) throw new Error(`Agent ${agentId} was not found`);
-		const workspace = this.#registry.workspacePath(definition);
+		return this.#availabilityForDefinition(definition, this.#registry.workspacePath(definition));
+	}
+
+	availabilityForConfiguration(
+		configuration: AgentExecutionConfigurationSeed,
+	): "available" | "agent-busy" | "workspace-busy" | "capacity" {
+		assertAgentExecutionConfigurationSeedIntegrity(configuration, configuration.digest);
+		return this.#availabilityForDefinition(configuration.definition, configuration.workspace);
+	}
+
+	async createExecutionSeed(agentId: string, model?: ModelRef): Promise<AgentExecutionConfigurationSeed> {
+		const definition = await this.#registry.get(agentId);
+		if (!definition) throw new Error(`Agent ${agentId} was not found`);
+		return this.#createExecutionSeed(definition, model);
+	}
+
+	#availabilityForDefinition(
+		definition: AgentDefinition,
+		workspace: string,
+	): "available" | "agent-busy" | "workspace-busy" | "capacity" {
+		if (this.#activeByAgent.has(definition.id)) return "agent-busy";
+		if (this.#activeByRun.size >= this.#maxConcurrentRuns) return "capacity";
 		const workspaceKey = process.platform === "win32" ? resolve(workspace).toLowerCase() : resolve(workspace);
 		if (hasWorkspaceConflict(definition, this.#activeByWorkspace.get(workspaceKey))) return "workspace-busy";
 		return resourceKeys(definition).some((key) => this.#activeByResource.has(key)) ? "workspace-busy" : "available";
@@ -161,12 +234,22 @@ export class AgentRunManager implements AsyncDisposable {
 		return this.#queue.run(async () => {
 			const definition = await this.#registry.get(agentId);
 			if (!definition) throw new Error(`Agent ${agentId} was not found`);
-			return this.#startDefinition(definition, prompt, source, model);
+			return this.#startConfiguration(this.#createExecutionSeed(definition, model), prompt, source);
 		});
 	}
 
+	async startWithConfiguration(
+		configuration: AgentExecutionConfigurationSeed,
+		prompt: string,
+		source: AgentRunSource = "manual",
+	): Promise<AgentRunRecord> {
+		return this.#queue.run(async () => this.#startConfiguration(configuration, prompt, source));
+	}
+
 	async startCandidate(definition: AgentDefinition, prompt: string): Promise<AgentRunRecord> {
-		return this.#queue.run(async () => this.#startDefinition(definition, prompt, "manual"));
+		return this.#queue.run(async () =>
+			this.#startConfiguration(this.#createExecutionSeed(definition), prompt, "manual"),
+		);
 	}
 
 	async startTemporarySpecialist(sourceAgentId: string, prompt: string, model?: ModelRef): Promise<AgentRunRecord> {
@@ -178,7 +261,7 @@ export class AgentRunManager implements AsyncDisposable {
 				id: `temporary-${randomUUID()}`,
 				name: `${sourceDefinition.name} specialist`,
 			};
-			return this.#startDefinition(definition, prompt, "manual", model, sourceAgentId);
+			return this.#startConfiguration(this.#createExecutionSeed(definition, model), prompt, "manual", sourceAgentId);
 		});
 	}
 
@@ -215,20 +298,43 @@ export class AgentRunManager implements AsyncDisposable {
 		return this.dispose();
 	}
 
-	async #startDefinition(
-		definition: AgentDefinition,
+	#createExecutionSeed(definition: AgentDefinition, model?: ModelRef): AgentExecutionConfigurationSeed {
+		const effectiveModel = model ?? definition.model ?? this.#configuration.defaultModel;
+		const executionDefinition = effectiveModel ? { ...definition, model: effectiveModel } : definition;
+		if (executionDefinition.modelControls !== undefined) this.#registry.validateModelSettings(executionDefinition);
+		const capabilityBindings = this.#configuration.resolveCapabilityBindings
+			? this.#configuration.resolveCapabilityBindings(executionDefinition)
+			: definition.capabilities.length === 0
+				? []
+				: (() => {
+						throw new Error("Agent capability snapshot resolver is required");
+					})();
+		return createAgentExecutionConfigurationSeed({
+			workspace: this.#registry.workspacePath(definition),
+			definition: executionDefinition,
+			effectiveModel,
+			capabilityBindings,
+		});
+	}
+
+	async #startConfiguration(
+		configuration: AgentExecutionConfigurationSeed,
 		prompt: string,
 		source: AgentRunSource,
-		model?: ModelRef,
 		temporarySourceAgentId?: string,
 	): Promise<AgentRunRecord> {
 		if (this.#disposed) throw new Error("Agent run manager is disposed");
 		if (prompt.trim() === "") throw new Error("Agent run prompt is required");
-		const executionDefinition = model ? { ...definition, model } : definition;
-		if (executionDefinition.modelControls !== undefined) this.#registry.validateModelSettings(executionDefinition);
+		assertAgentExecutionConfigurationSeedIntegrity(configuration, configuration.digest);
+		const definition = configuration.definition;
+		const effectiveModel = configuration.effectiveModel;
+		if (definition.id !== configuration.agentId || definition.revision !== configuration.agentRevision) {
+			throw new Error("Execution configuration identity does not match its agent definition");
+		}
+		this.#registry.validateModelSettings(definition);
 		if (this.#activeByRun.size >= this.#maxConcurrentRuns) throw new Error("Agent run capacity is reached");
 		if (this.#activeByAgent.has(definition.id)) throw new Error(`Agent ${definition.id} already has an active run`);
-		const workspace = this.#registry.workspacePath(definition);
+		const workspace = configuration.workspace;
 		const workspaceKey = process.platform === "win32" ? resolve(workspace).toLowerCase() : resolve(workspace);
 		if (hasWorkspaceConflict(definition, this.#activeByWorkspace.get(workspaceKey))) {
 			throw new Error(`Agent project ${workspace} already has an active run`);
@@ -238,6 +344,7 @@ export class AgentRunManager implements AsyncDisposable {
 		if (busyResource) throw new Error(`Agent resource ${busyResource} already has an active run`);
 		const runId = randomUUID();
 		const artifactDirectory = resolve(this.#artifactsRoot, definition.id, runId);
+		const snapshot = createAgentRunConfigurationSnapshot(runId, configuration);
 		const record: AgentRunRecord = {
 			id: runId,
 			agentId: definition.id,
@@ -246,17 +353,20 @@ export class AgentRunManager implements AsyncDisposable {
 			status: "starting",
 			createdAt: Date.now(),
 			artifactDirectory,
-			model,
+			model: effectiveModel,
 			agentRevision: definition.revision,
+			snapshotDigest: snapshot.digest,
 			temporarySourceAgentId,
 		};
-		this.#records.set(runId, record);
+		await this.#persistSnapshot(snapshot, artifactDirectory);
 		await this.#persistRecord(record);
+		this.#records.set(runId, record);
+		this.#admittedRunIds.add(runId);
 		try {
 			const execution = await this.#executor.start({
 				runId,
-				definition: executionDefinition,
-				workspace,
+				definition: snapshot.configuration.definition,
+				workspace: snapshot.configuration.workspace,
 				prompt: record.prompt,
 			});
 			record.status = "running";
@@ -288,6 +398,7 @@ export class AgentRunManager implements AsyncDisposable {
 			active.completion = this.#settle(active);
 			return { ...record };
 		} catch (error) {
+			this.#admittedRunIds.delete(runId);
 			record.status = "failed";
 			record.finishedAt = Date.now();
 			record.error = error instanceof Error ? error.message : String(error);
@@ -317,6 +428,7 @@ export class AgentRunManager implements AsyncDisposable {
 			record.status = active.abortRequested ? "aborted" : "failed";
 			record.error = error instanceof Error ? error.message : String(error);
 		} finally {
+			this.#admittedRunIds.delete(record.id);
 			active.unsubscribe();
 			await active.progressPersistence;
 			try {
@@ -326,6 +438,12 @@ export class AgentRunManager implements AsyncDisposable {
 				record.error = error instanceof Error ? error.message : String(error);
 			}
 			record.finishedAt = Date.now();
+			await this.#configuration
+				.revokeRunApprovals?.(record.id, `Agent run ${record.id} ${record.status}`)
+				.catch((error: unknown) => {
+					record.status = "failed";
+					record.error = `Approval revocation failed: ${error instanceof Error ? error.message : String(error)}`;
+				});
 			try {
 				await this.#persistRecord(record);
 			} catch (error) {
@@ -379,6 +497,14 @@ export class AgentRunManager implements AsyncDisposable {
 		await mkdir(record.artifactDirectory, { recursive: true });
 		await writeFile(resolve(record.artifactDirectory, "run.json"), `${JSON.stringify(record, null, 2)}\n`, "utf8");
 	}
+
+	async #persistSnapshot(snapshot: AgentRunConfigurationSnapshot, artifactDirectory: string): Promise<void> {
+		await mkdir(artifactDirectory, { recursive: true });
+		const target = resolve(artifactDirectory, "run-snapshot.json");
+		const temporary = resolve(artifactDirectory, `.run-snapshot.${randomUUID()}.tmp`);
+		await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+		await rename(temporary, target);
+	}
 }
 
 function resourceKeys(definition: AgentDefinition): string[] {
@@ -427,6 +553,7 @@ function parseRunRecord(value: unknown, artifactDirectory: string): AgentRunReco
 			record.agentRevision > 0
 				? record.agentRevision
 				: 1,
+		snapshotDigest: typeof record.snapshotDigest === "string" ? record.snapshotDigest : undefined,
 		temporarySourceAgentId:
 			typeof record.temporarySourceAgentId === "string" ? record.temporarySourceAgentId : undefined,
 		usage: record.usage === undefined ? undefined : parseRunUsage(record.usage),

@@ -143,11 +143,13 @@ export interface AgentBuildFeedbackInput {
 }
 
 export interface AgentBuildConfiguration {
+	personaId?: string;
 	name: string;
 	description: string;
 	persona: string;
 	projectRoot: string;
 	tools: string[];
+	capabilities?: AgentDefinition["capabilities"];
 	model?: { provider: string; id: string };
 	thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	modelControls?: ModelControls;
@@ -155,6 +157,9 @@ export interface AgentBuildConfiguration {
 	executor: AgentExecutorKind;
 	permissionPolicy: AgentPermissionPolicy;
 	browserAccess: BrowserAccess;
+	browserRuntime?: NonNullable<AgentDefinition["browser"]>["runtime"];
+	browserProfile?: NonNullable<AgentDefinition["browser"]>["profile"];
+	browserWorkflows?: AgentDefinition["browserWorkflows"];
 	delegateAgentIds: string[];
 	exposeA2a: boolean;
 }
@@ -256,10 +261,15 @@ export class AgentBuildLifecycleService {
 		});
 	}
 
-	async updateDraft(id: string, input: AgentBuildDraftInput): Promise<AgentBuildRecord> {
+	async updateDraft(id: string, input: AgentBuildDraftInput, expectedRevision?: number): Promise<AgentBuildRecord> {
 		return this.#queue.run(async () => {
 			await this.initialize();
 			const record = this.#required(id);
+			if (expectedRevision !== undefined && record.revision !== expectedRevision) {
+				throw new Error(
+					`Agent build ${id} changed from revision ${expectedRevision} to ${record.revision}; review the current draft before applying this update`,
+				);
+			}
 			const draft = normalizeDraft(input);
 			if (draft.configuration?.modelControls !== undefined)
 				this.#registry.validateModelSettings(draft.configuration);
@@ -396,13 +406,20 @@ export class AgentBuildLifecycleService {
 			const record = this.#required(id);
 			if (record.agentId) throw new Error("Existing-agent edits must pass proof before promotion");
 			if (!record.configuration) throw new Error("Complete the agent package before publishing it");
+			await this.#refresh(record);
+			if (record.stage !== "proven" || record.proof?.status !== "succeeded") {
+				throw new Error("Test this unpublished candidate and accept its current proof before publishing it");
+			}
+			if (record.proof.agentRevision !== 1) {
+				throw new Error("The accepted unpublished proof no longer matches the first deployed revision");
+			}
 			const definition = await this.#registry.save(newAgentInput(record.configuration));
 			record.agentId = definition.id;
 			record.agentRevision = definition.revision;
 			record.activeConfiguration = configurationFromAgent(definition);
 			record.configuration = configurationFromAgent(definition);
 			record.candidateRevision = undefined;
-			record.stage = "ready-to-test";
+			record.stage = "proven";
 			this.#touch(record);
 			await this.#persist();
 			return cloneRecord(record);
@@ -414,24 +431,24 @@ export class AgentBuildLifecycleService {
 			await this.initialize();
 			const record = this.#required(id);
 			await this.#refresh(record);
-			if (!record.agentId || record.agentRevision === undefined) {
-				throw new Error("Deploy the draft before running its proof");
-			}
+			if (!record.configuration) throw new Error("Complete the agent package before running its proof");
 			if (record.stage === "testing") throw new Error("This build already has an active proof run");
 			const request = prompt.trim();
 			if (!request) throw new Error("A concrete one-time proof task is required");
-			const activeDefinition = await this.#requiredAgent(record.agentId);
-			const candidate =
-				record.candidateRevision && record.configuration
+			const activeDefinition = record.agentId ? await this.#requiredAgent(record.agentId) : undefined;
+			const candidate = activeDefinition
+				? record.candidateRevision
 					? candidateDefinition(activeDefinition, record.configuration, record.candidateRevision)
-					: undefined;
-			if ((candidate ?? activeDefinition).modelControls !== undefined)
-				this.#registry.validateModelSettings(candidate ?? activeDefinition);
+					: undefined
+				: unpublishedCandidateDefinition(record.configuration);
+			const proofDefinition = candidate ?? activeDefinition;
+			if (!proofDefinition) throw new Error("The proof agent configuration is unavailable");
+			if (proofDefinition.modelControls !== undefined) this.#registry.validateModelSettings(proofDefinition);
 			this.#archiveProof(record);
 			const artifactBaselines = await captureArtifactBaselines(record);
 			const run = candidate
 				? await this.#runs.startCandidate(candidate, request)
-				: await this.#runs.start(record.agentId, request, "manual");
+				: await this.#runs.start(record.agentId!, request, "manual");
 			record.proof = {
 				runId: run.id,
 				agentRevision: run.agentRevision,
@@ -692,7 +709,7 @@ export class AgentBuildLifecycleService {
 		if (!changed) return false;
 		record.proof.status = status;
 		record.proof.finishedAt = run.finishedAt;
-		const expectedRevision = record.candidateRevision ?? record.agentRevision;
+		const expectedRevision = record.candidateRevision ?? record.agentRevision ?? 1;
 		if (run.agentRevision !== expectedRevision || run.agentRevision !== record.proof.agentRevision) {
 			record.stage = "ready-to-test";
 			record.proof = undefined;
@@ -793,11 +810,13 @@ function parseRecord(value: unknown): AgentBuildRecord {
 
 function configurationFromAgent(definition: AgentDefinition): AgentBuildConfiguration {
 	return {
+		personaId: definition.personaId,
 		name: definition.name,
 		description: definition.description,
 		persona: definition.persona,
 		projectRoot: definition.projectRoot,
 		tools: [...definition.tools],
+		capabilities: structuredClone(definition.capabilities),
 		model: definition.model ? { ...definition.model } : undefined,
 		thinking: definition.thinking,
 		modelControls: definition.modelControls === undefined ? undefined : { ...definition.modelControls },
@@ -805,6 +824,9 @@ function configurationFromAgent(definition: AgentDefinition): AgentBuildConfigur
 		executor: definition.executor,
 		permissionPolicy: definition.permissionPolicy,
 		browserAccess: definition.browser?.access ?? "disabled",
+		browserRuntime: definition.browser?.runtime,
+		browserProfile: structuredClone(definition.browser?.profile ?? { kind: "ephemeral" }),
+		browserWorkflows: structuredClone(definition.browserWorkflows),
 		delegateAgentIds: [...definition.delegateAgentIds],
 		exposeA2a: definition.a2a.enabled,
 	};
@@ -824,16 +846,58 @@ function candidateDefinition(
 		projectRoot: resolve(configuration.projectRoot),
 		browser: {
 			access: configuration.browserAccess,
-			runtime: active.browser?.runtime ?? "managed-chromium",
-			profile: structuredClone(active.browser?.profile ?? { kind: "ephemeral" }),
+			runtime: configuration.browserRuntime ?? active.browser?.runtime ?? "managed-chromium",
+			profile: structuredClone(configuration.browserProfile ?? active.browser?.profile ?? { kind: "ephemeral" }),
 		},
 	};
+}
+
+function unpublishedCandidateDefinition(configuration: AgentBuildConfiguration): AgentDefinition {
+	const projectRoot = resolve(configuration.projectRoot);
+	return {
+		id: agentIdFromName(configuration.name),
+		revision: 1,
+		source: "managed",
+		name: configuration.name,
+		description: configuration.description,
+		model: configuration.model ? { ...configuration.model } : undefined,
+		thinking: configuration.thinking,
+		modelControls: configuration.modelControls === undefined ? undefined : { ...configuration.modelControls },
+		tools: [...configuration.tools],
+		personaId: configuration.personaId,
+		capabilities: structuredClone(configuration.capabilities ?? []),
+		memory: configuration.memory,
+		persona: configuration.persona,
+		projectRoot,
+		workspace: projectRoot,
+		executor: configuration.executor,
+		permissionPolicy: configuration.permissionPolicy,
+		schedules: [],
+		browser: {
+			access: configuration.browserAccess,
+			runtime: configuration.browserRuntime ?? "managed-chromium",
+			profile: structuredClone(configuration.browserProfile ?? { kind: "ephemeral" }),
+		},
+		browserWorkflows: structuredClone(configuration.browserWorkflows ?? []),
+		delegateAgentIds: [...configuration.delegateAgentIds],
+		a2a: { enabled: configuration.exposeA2a },
+	};
+}
+
+function agentIdFromName(value: string): string {
+	const id = value
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-|-$/g, "")
+		.slice(0, 64);
+	if (!id) throw new Error("Agent name must contain at least one letter or number");
+	return id;
 }
 
 function candidateInput(active: AgentDefinition, configuration: AgentBuildConfiguration): AgentDefinitionInput {
 	return {
 		id: active.id,
-		personaId: active.personaId,
+		personaId: configuration.personaId ?? active.personaId,
 		name: configuration.name,
 		description: configuration.description,
 		model: configuration.model,
@@ -841,7 +905,7 @@ function candidateInput(active: AgentDefinition, configuration: AgentBuildConfig
 		thinking: configuration.thinking,
 		modelControls: configuration.modelControls === undefined ? undefined : { ...configuration.modelControls },
 		tools: [...configuration.tools],
-		capabilities: structuredClone(active.capabilities),
+		capabilities: structuredClone(configuration.capabilities ?? active.capabilities),
 		memory: configuration.memory,
 		persona: configuration.persona,
 		projectRoot: configuration.projectRoot,
@@ -850,10 +914,10 @@ function candidateInput(active: AgentDefinition, configuration: AgentBuildConfig
 		schedules: structuredClone(active.schedules),
 		browser: {
 			access: configuration.browserAccess,
-			runtime: active.browser?.runtime ?? "managed-chromium",
-			profile: structuredClone(active.browser?.profile ?? { kind: "ephemeral" }),
+			runtime: configuration.browserRuntime ?? active.browser?.runtime ?? "managed-chromium",
+			profile: structuredClone(configuration.browserProfile ?? active.browser?.profile ?? { kind: "ephemeral" }),
 		},
-		browserWorkflows: structuredClone(active.browserWorkflows),
+		browserWorkflows: structuredClone(configuration.browserWorkflows ?? active.browserWorkflows),
 		delegateAgentIds: [...configuration.delegateAgentIds],
 		a2a: { enabled: configuration.exposeA2a },
 	};
@@ -861,13 +925,14 @@ function candidateInput(active: AgentDefinition, configuration: AgentBuildConfig
 
 function newAgentInput(configuration: AgentBuildConfiguration): AgentDefinitionInput {
 	return {
+		personaId: configuration.personaId,
 		name: configuration.name,
 		description: configuration.description,
 		model: configuration.model,
 		thinking: configuration.thinking,
 		modelControls: configuration.modelControls === undefined ? undefined : { ...configuration.modelControls },
 		tools: [...configuration.tools],
-		capabilities: [],
+		capabilities: structuredClone(configuration.capabilities ?? []),
 		memory: configuration.memory,
 		persona: configuration.persona,
 		projectRoot: configuration.projectRoot,
@@ -876,10 +941,10 @@ function newAgentInput(configuration: AgentBuildConfiguration): AgentDefinitionI
 		schedules: [],
 		browser: {
 			access: configuration.browserAccess,
-			runtime: "managed-chromium",
-			profile: { kind: "ephemeral" },
+			runtime: configuration.browserRuntime ?? "managed-chromium",
+			profile: structuredClone(configuration.browserProfile ?? { kind: "ephemeral" }),
 		},
-		browserWorkflows: [],
+		browserWorkflows: structuredClone(configuration.browserWorkflows ?? []),
 		delegateAgentIds: [...configuration.delegateAgentIds],
 		a2a: { enabled: configuration.exposeA2a },
 	};
@@ -904,11 +969,16 @@ function parseConfiguration(value: unknown): AgentBuildConfiguration | undefined
 		};
 	}
 	return {
+		personaId:
+			typeof configuration.personaId === "string" && configuration.personaId.trim()
+				? configuration.personaId.trim()
+				: undefined,
 		name: requiredString(configuration.name, "configuration name"),
 		description: requiredString(configuration.description, "configuration description"),
 		persona: requiredString(configuration.persona, "configuration persona"),
 		projectRoot: resolve(requiredString(configuration.projectRoot, "configuration project root")),
 		tools: parseStringArray(configuration.tools, "configuration tools"),
+		capabilities: parseAgentCapabilityGrants(configuration.capabilities),
 		model: parsedModel,
 		modelControls: parseAgentModelControls(configuration),
 		thinking:
@@ -931,11 +1001,73 @@ function parseConfiguration(value: unknown): AgentBuildConfiguration | undefined
 			["disabled", "loopback", "public-web", "private-network"],
 			"configuration browser access",
 		),
+		browserRuntime:
+			configuration.browserRuntime === undefined
+				? undefined
+				: oneOf(
+						configuration.browserRuntime,
+						["managed-chromium", "installed-chrome"],
+						"configuration browser runtime",
+					),
+		browserProfile: parseBrowserProfile(configuration.browserProfile),
+		browserWorkflows: parseBrowserWorkflowGrants(configuration.browserWorkflows),
 		delegateAgentIds: parseStringArray(configuration.delegateAgentIds, "configuration delegate agent ids").map((id) =>
 			validatedIdentifier(id, "delegate agent id"),
 		),
 		exposeA2a: requiredBoolean(configuration.exposeA2a, "configuration exposeA2a"),
 	};
+}
+
+function parseAgentCapabilityGrants(value: unknown): AgentDefinition["capabilities"] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error("configuration capabilities must be an array");
+	return value.map((entry, index) => {
+		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+			throw new Error(`configuration capabilities[${index}] must be an object`);
+		}
+		const grant = entry as Record<string, unknown>;
+		return {
+			capabilityId: requiredString(grant.capabilityId, `configuration capabilities[${index}].capabilityId`),
+			capabilityVersion: positiveInteger(
+				grant.capabilityVersion,
+				`configuration capabilities[${index}].capabilityVersion`,
+			),
+			providerId:
+				typeof grant.providerId === "string" && grant.providerId.trim() ? grant.providerId.trim() : undefined,
+			approval:
+				grant.approval === undefined
+					? undefined
+					: oneOf(grant.approval, ["never", "per-run", "always"], "configuration capability approval"),
+			connectionId:
+				typeof grant.connectionId === "string" && grant.connectionId.trim() ? grant.connectionId.trim() : undefined,
+		};
+	});
+}
+
+function parseBrowserProfile(value: unknown): NonNullable<AgentDefinition["browser"]>["profile"] | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new Error("configuration browser profile must be an object");
+	}
+	const profile = value as Record<string, unknown>;
+	if (profile.kind === "ephemeral") return { kind: "ephemeral" };
+	if (profile.kind === "named") return { kind: "named", id: requiredString(profile.id, "browser profile id") };
+	throw new Error("configuration browser profile kind must be ephemeral or named");
+}
+
+function parseBrowserWorkflowGrants(value: unknown): AgentDefinition["browserWorkflows"] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error("configuration browser workflows must be an array");
+	return value.map((entry, index) => {
+		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+			throw new Error(`configuration browser workflows[${index}] must be an object`);
+		}
+		const grant = entry as Record<string, unknown>;
+		return {
+			id: requiredString(grant.id, `configuration browser workflows[${index}].id`),
+			version: positiveInteger(grant.version, `configuration browser workflows[${index}].version`),
+		};
+	});
 }
 
 function parseAutomationIntent(value: unknown): AgentBuildAutomationIntent | undefined {
@@ -1373,6 +1505,11 @@ function nonEmptyStringArray(value: unknown, name: string): string[] {
 
 function nonNegativeInteger(value: unknown, name: string): number {
 	if (!Number.isSafeInteger(value) || Number(value) < 0) throw new Error(`${name} must be a non-negative integer`);
+	return Number(value);
+}
+
+function positiveInteger(value: unknown, name: string): number {
+	if (!Number.isSafeInteger(value) || Number(value) < 1) throw new Error(`${name} must be a positive integer`);
 	return Number(value);
 }
 

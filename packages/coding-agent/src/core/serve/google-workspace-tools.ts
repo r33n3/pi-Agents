@@ -1,8 +1,21 @@
+import { createHash } from "node:crypto";
 import Type from "typebox";
 import type { ToolDefinition } from "../extensions/types.ts";
-import type { CapabilityApprovalService } from "./capability-approval-service.ts";
+import {
+	type CapabilityApprovalActionBinding,
+	type CapabilityApprovalOwner,
+	type CapabilityApprovalService,
+	createCapabilityApprovalActionBinding,
+} from "./capability-approval-service.ts";
 import type { CredentialStore } from "./credential-store.ts";
-import type { GovernedActionDecision, GovernedActionService } from "./governed-action-service.ts";
+import {
+	type ActionAuthority,
+	assertActionAuthority,
+	GovernedActionCancelledError,
+	type GovernedActionDecision,
+	type GovernedActionService,
+	isGovernedActionCancellation,
+} from "./governed-action-service.ts";
 import type { ServeAuditIdentities } from "./serve-audit-store.ts";
 
 const API_ROOT = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -18,21 +31,133 @@ export interface GoogleWorkspaceToolOptions {
 	approvals: CapabilityApprovalService;
 	governedActions?: GovernedActionService;
 	identities?: ServeAuditIdentities;
+	approvalOwner?: CapabilityApprovalOwner;
+	authority?: ActionAuthority;
 	authorizeCapability?: (capabilityId: string) => Promise<GovernedActionDecision>;
 	persistTokens?: (values: Record<string, string>) => Promise<void>;
 	markConnectionUnhealthy?: () => Promise<void>;
 }
 
-interface MessageInput {
+export interface GoogleWorkspaceMessageApprovalInput {
 	to: string[];
 	cc?: string[];
 	subject: string;
 	text: string;
 	html?: string;
-	receiptId: string;
 	filename?: string;
 	mimeType?: string;
 	contentBase64?: string;
+}
+
+interface MessageInput extends GoogleWorkspaceMessageApprovalInput {
+	receiptId: string;
+}
+
+export interface GoogleWorkspaceApprovalRequest {
+	capabilityId: string;
+	providerId: "google-workspace";
+	connectionId: typeof CONNECTION_ID;
+	action: "draft" | "send" | "attach" | "delete";
+	target: string;
+	binding: CapabilityApprovalActionBinding;
+}
+
+interface BoundGoogleWorkspaceMessageApproval {
+	request: GoogleWorkspaceApprovalRequest;
+	dispatchInput: GoogleWorkspaceMessageApprovalInput;
+}
+
+export function bindGoogleWorkspaceMessageApproval(
+	action: "draft" | "send" | "attach",
+	input: GoogleWorkspaceMessageApprovalInput,
+): BoundGoogleWorkspaceMessageApproval {
+	if (input.to.length === 0 || input.to.length > 50) throw new Error("Gmail approval requires 1-50 recipients");
+	if (input.cc && input.cc.length > 50) throw new Error("Gmail approval allows at most 50 copied recipients");
+	const to = input.to.map((address) => boundedHeader(address, "Gmail recipient", 3, 320));
+	const cc = input.cc?.map((address) => boundedHeader(address, "Gmail copied recipient", 3, 320));
+	const subject = boundedHeader(input.subject, "Gmail subject", 0, 998);
+	const text = boundedTextInput(input.text, "Gmail text body", 500_000);
+	const html = input.html ? boundedTextInput(input.html, "Gmail HTML body", 500_000) : undefined;
+	const filename =
+		input.filename === undefined ? undefined : boundedHeader(input.filename, "Gmail attachment filename", 1, 255);
+	const normalizedMimeType =
+		input.mimeType === undefined
+			? undefined
+			: mimeType(boundedTextInput(input.mimeType, "Gmail attachment MIME type", 127, 1));
+	if (input.contentBase64 !== undefined) {
+		boundedTextInput(input.contentBase64, "Gmail attachment content", 1_500_000, 1);
+	}
+	if (action === "attach" && (!filename || !normalizedMimeType || !input.contentBase64)) {
+		throw new Error("Gmail attachment approval requires filename, MIME type, and content");
+	}
+	const attachmentBytes = input.contentBase64 === undefined ? undefined : Buffer.from(input.contentBase64, "base64");
+	if (attachmentBytes && attachmentBytes.byteLength > 1_000_000) throw new Error("Gmail attachment exceeds 1 MB");
+	const contentBase64 = attachmentBytes?.toString("base64");
+	const dispatchInput: GoogleWorkspaceMessageApprovalInput = compact({
+		to,
+		cc: cc && cc.length > 0 ? cc : undefined,
+		subject,
+		text,
+		html,
+		filename,
+		mimeType: normalizedMimeType,
+		contentBase64,
+	});
+	const target = [...to, ...(dispatchInput.cc ?? [])].join(",");
+	return {
+		request: {
+			capabilityId: `email.${action}`,
+			providerId: "google-workspace",
+			connectionId: CONNECTION_ID,
+			action,
+			target,
+			binding: createCapabilityApprovalActionBinding(
+				{
+					version: 1,
+					capabilityId: `email.${action}`,
+					providerId: "google-workspace",
+					connectionId: CONNECTION_ID,
+					action,
+					input: {
+						to,
+						cc: dispatchInput.cc ?? null,
+						subject: dispatchInput.subject,
+						text: dispatchInput.text,
+						html: dispatchInput.html ?? null,
+						filename: dispatchInput.filename ?? null,
+						mimeType: dispatchInput.mimeType ?? null,
+						attachmentContentDigest: attachmentBytes
+							? createHash("sha256").update(attachmentBytes).digest("hex")
+							: null,
+					},
+				},
+				`${display(action)} Gmail message to ${target}`,
+			),
+		},
+		dispatchInput,
+	};
+}
+
+export function bindGoogleWorkspaceDeleteApproval(messageId: string): GoogleWorkspaceApprovalRequest {
+	const target = requiredString(messageId, "Gmail message ID");
+	return {
+		capabilityId: "email.delete",
+		providerId: "google-workspace",
+		connectionId: CONNECTION_ID,
+		action: "delete",
+		target,
+		binding: createCapabilityApprovalActionBinding(
+			{
+				version: 1,
+				capabilityId: "email.delete",
+				providerId: "google-workspace",
+				connectionId: CONNECTION_ID,
+				action: "delete",
+				input: { messageId: target },
+			},
+			`Move Gmail message ${target} to trash`,
+		),
+	};
 }
 
 /** Creates Gmail tools whose credentials remain outside model context. */
@@ -49,7 +174,7 @@ export function createGoogleWorkspaceTools(options: GoogleWorkspaceToolOptions):
 			}),
 			executionMode: "parallel",
 			async execute(_id, { query, maxResults = 10 }, signal) {
-				return governedResult(options, "email.search", { query, maxResults }, async () =>
+				return governedResult(options, "email.search", { query, maxResults }, signal, async () =>
 					textResult(
 						normalizeSearchResult(
 							await client.request("/messages", signal, { q: query, maxResults: String(maxResults) }),
@@ -68,7 +193,7 @@ export function createGoogleWorkspaceTools(options: GoogleWorkspaceToolOptions):
 			}),
 			executionMode: "parallel",
 			async execute(_id, { messageId, maxBodyChars = MAX_MESSAGE_TEXT_CHARS }, signal) {
-				return governedResult(options, "email.read", { messageId }, async () =>
+				return governedResult(options, "email.read", { messageId }, signal, async () =>
 					textResult(
 						normalizeMessage(
 							await client.request(`/messages/${encodeURIComponent(messageId)}`, signal, { format: "full" }),
@@ -90,9 +215,15 @@ export function createGoogleWorkspaceTools(options: GoogleWorkspaceToolOptions):
 				receiptId: Type.String({ minLength: 1, maxLength: 128 }),
 			}),
 			async execute(_id, { messageId, receiptId }, signal) {
-				return approvedResult(options, receiptId, "email.delete", "delete", messageId, async () => {
-					await client.request(`/messages/${encodeURIComponent(messageId)}/trash`, signal, undefined, "POST");
-					return { trashed: true, messageId };
+				const approval = bindGoogleWorkspaceDeleteApproval(messageId);
+				return approvedResult(options, receiptId, approval, signal, async () => {
+					await client.request(
+						`/messages/${encodeURIComponent(approval.target)}/trash`,
+						signal,
+						undefined,
+						"POST",
+					);
+					return { trashed: true, messageId: approval.target };
 				});
 			},
 		},
@@ -123,24 +254,16 @@ function messageWriteTool(
 		}),
 		async execute(_id, input, signal) {
 			const message = input as MessageInput;
-			const recipients = [...message.to, ...(message.cc ?? [])];
-			const target = recipients.join(",");
-			return approvedResult(
-				options,
-				message.receiptId,
-				`email.${action}`,
-				action,
-				target,
-				async (idempotencyKey) => {
-					const raw = mimeMessage({ ...message, idempotencyKey });
-					const body = action === "send" ? { raw } : { message: { raw } };
-					return normalizeWriteResult(
-						action,
-						target,
-						await client.request(`/${path}`, signal, undefined, "POST", body),
-					);
-				},
-			);
+			const bound = bindGoogleWorkspaceMessageApproval(action, message);
+			return approvedResult(options, message.receiptId, bound.request, signal, async (idempotencyKey) => {
+				const raw = mimeMessage({ ...bound.dispatchInput, idempotencyKey });
+				const body = action === "send" ? { raw } : { message: { raw } };
+				return normalizeWriteResult(
+					action,
+					bound.request.target,
+					await client.request(`/${path}`, signal, undefined, "POST", body),
+				);
+			});
 		},
 	};
 }
@@ -152,6 +275,7 @@ class GmailClient {
 	readonly #now: () => number;
 	readonly #persistTokens: ((values: Record<string, string>) => Promise<void>) | undefined;
 	readonly #markConnectionUnhealthy: (() => Promise<void>) | undefined;
+	readonly #authority: ActionAuthority | undefined;
 
 	constructor(options: GoogleWorkspaceToolOptions) {
 		this.#credentials = options.credentials;
@@ -160,6 +284,7 @@ class GmailClient {
 		this.#now = options.now ?? Date.now;
 		this.#persistTokens = options.persistTokens;
 		this.#markConnectionUnhealthy = options.markConnectionUnhealthy;
+		this.#authority = options.authority;
 	}
 
 	async request(
@@ -173,6 +298,7 @@ class GmailClient {
 		for (const [name, value] of Object.entries(query ?? {})) url.searchParams.set(name, value);
 		let token = await this.#accessToken(signal);
 		for (let attempt = 0; attempt < 2; attempt += 1) {
+			assertProviderAuthority(this.#authority, signal);
 			const response = await this.#fetch(url, {
 				method,
 				signal,
@@ -209,6 +335,7 @@ class GmailClient {
 				"GOOGLE_CLIENT_SECRET",
 				"GOOGLE_OAUTH_REFRESH_TOKEN",
 			]);
+			assertProviderAuthority(this.#authority, signal);
 			const response = await this.#fetch("https://oauth2.googleapis.com/token", {
 				method: "POST",
 				signal,
@@ -234,7 +361,7 @@ class GmailClient {
 			}
 			return token;
 		} catch (error) {
-			await this.#markConnectionUnhealthy?.();
+			if (!isGovernedActionCancellation(error) && !signal?.aborted) await this.#markConnectionUnhealthy?.();
 			throw error;
 		}
 	}
@@ -253,49 +380,56 @@ class GmailClient {
 async function approvedResult(
 	options: GoogleWorkspaceToolOptions,
 	receiptId: string,
-	capabilityId: string,
-	action: string,
-	target: string,
+	approval: GoogleWorkspaceApprovalRequest,
+	signal: AbortSignal | undefined,
 	operation: (idempotencyKey: string) => Promise<unknown>,
 ) {
-	const receipt = await options.approvals.begin(receiptId, {
-		capabilityId,
-		providerId: "google-workspace",
-		connectionId: CONNECTION_ID,
-		action,
-		target,
+	const owner = approvalOwner(options);
+	const begun = await options.approvals.begin(receiptId, {
+		...approval,
+		owner,
 	});
-	if (receipt.state === "completed") return textResult(receipt.result);
-	return governedResult(
-		options,
-		capabilityId,
-		{ action, target, approval: receiptId },
-		async () => {
-			try {
-				const result = await operation(receipt.idempotencyKey);
+	if (begun.kind === "replay") return textResult(begun.result);
+	try {
+		return await governedResult(
+			options,
+			approval.capabilityId,
+			{ action: approval.action, target: approval.target, approval: receiptId },
+			signal,
+			async () => {
+				const result = await operation(begun.receipt.idempotencyKey);
 				await options.approvals.complete(receiptId, result);
 				return textResult(result);
-			} catch (error) {
-				await options.approvals.fail(receiptId, error instanceof Error ? error.message : String(error));
-				throw error;
-			}
-		},
-		receiptId,
-	);
+			},
+			receiptId,
+		);
+	} catch (error) {
+		if (isGovernedActionCancellation(error) || signal?.aborted || options.authority?.signal?.aborted) {
+			await options.approvals.cancel(receiptId, error instanceof Error ? error.message : "Action was cancelled");
+		} else {
+			await options.approvals.fail(receiptId, error instanceof Error ? error.message : String(error));
+		}
+		throw error;
+	}
 }
 
 async function governedResult<TResult>(
 	options: GoogleWorkspaceToolOptions,
 	capabilityId: string,
 	target: Record<string, unknown>,
+	signal: AbortSignal | undefined,
 	operation: () => Promise<TResult>,
 	approval?: string,
 ): Promise<TResult> {
-	if (!options.governedActions) return operation();
+	if (!options.governedActions) {
+		assertProviderAuthority(options.authority, signal);
+		return operation();
+	}
 	const result = await options.governedActions.execute({
 		family: "provider.call",
 		target,
 		identities: options.identities,
+		authority: scopedAuthority(options.authority, signal),
 		canonicalize: (value) => ({
 			providerId: "google-workspace",
 			connectionId: CONNECTION_ID,
@@ -363,6 +497,17 @@ function addressList(values: string[]): string {
 
 function header(value: string): string {
 	if (/[\r\n]/.test(value)) throw new Error("Email headers must not contain line breaks");
+	return value;
+}
+
+function boundedHeader(value: string, name: string, minimum: number, maximum: number): string {
+	return header(boundedTextInput(value.trim(), name, maximum, minimum));
+}
+
+function boundedTextInput(value: string, name: string, maximum: number, minimum = 0): string {
+	if (value.length < minimum || value.length > maximum) {
+		throw new Error(`${name} must contain ${minimum}-${maximum} characters`);
+	}
 	return value;
 }
 
@@ -502,4 +647,45 @@ function positiveInteger(value: unknown, name: string): number {
 
 function display(value: string): string {
 	return value[0]!.toUpperCase() + value.slice(1);
+}
+
+function approvalOwner(options: GoogleWorkspaceToolOptions): CapabilityApprovalOwner {
+	const owner = options.authority?.owner ?? options.approvalOwner;
+	if (!owner) throw new Error("Google Workspace write requires an explicit approval owner");
+	if (
+		options.authority &&
+		options.approvalOwner &&
+		(options.authority.owner.kind !== options.approvalOwner.kind ||
+			options.authority.owner.id !== options.approvalOwner.id)
+	) {
+		throw new Error("Google Workspace approval owner does not match action authority");
+	}
+	return owner;
+}
+
+function assertProviderAuthority(authority: ActionAuthority | undefined, signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new GovernedActionCancelledError("Google Workspace action was cancelled");
+	assertActionAuthority(authority);
+}
+
+function scopedAuthority(
+	authority: ActionAuthority | undefined,
+	signal: AbortSignal | undefined,
+): ActionAuthority | undefined {
+	if (!authority) return undefined;
+	return {
+		owner: authority.owner,
+		signal: signal ?? authority.signal,
+		assertLive: () => {
+			if (signal?.aborted) throw new GovernedActionCancelledError("Google Workspace action was cancelled");
+			assertActionAuthority(authority);
+		},
+	};
+}
+
+function compact<T extends object>(value: T): T {
+	for (const key of Object.keys(value)) {
+		if (value[key as keyof T] === undefined) delete value[key as keyof T];
+	}
+	return value;
 }

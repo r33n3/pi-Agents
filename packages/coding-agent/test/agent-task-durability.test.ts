@@ -137,7 +137,16 @@ async function setup(executor: AgentExecutor = new SequenceExecutor()) {
 		permissionPolicy: "read-only",
 		schedules: [],
 	});
-	const runs = new AgentRunManager(registry, executor, join(root, "runs"));
+	const runs = new AgentRunManager(registry, executor, join(root, "runs"), 4, {
+		resolveCapabilityBindings: (definition) =>
+			definition.capabilities.map((grant) => ({
+				capabilityId: grant.capabilityId,
+				capabilityVersion: grant.capabilityVersion,
+				providerId: grant.providerId ?? "test-provider",
+				providerDigest: "test-provider-digest",
+				connectionId: grant.connectionId,
+			})),
+	});
 	await runs.initialize();
 	const tasks = new AgentTaskService(registry, runs, join(root, "serve"));
 	await tasks.initialize();
@@ -182,6 +191,17 @@ describe("AgentTaskService durable work", () => {
 			new AgentRegistry(join(root, "registry"), { defaultWorkspace: root }),
 			new SequenceExecutor(),
 			join(root, "runs"),
+			4,
+			{
+				resolveCapabilityBindings: (definition) =>
+					definition.capabilities.map((grant) => ({
+						capabilityId: grant.capabilityId,
+						capabilityVersion: grant.capabilityVersion,
+						providerId: grant.providerId ?? "test-provider",
+						providerDigest: "test-provider-digest",
+						connectionId: grant.connectionId,
+					})),
+			},
 		);
 		await reopenedRuns.initialize();
 		const reopened = new AgentTaskService(

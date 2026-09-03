@@ -50,6 +50,15 @@ describe("ServeHost", () => {
 		await expect(host.start()).rejects.toThrow("Serve host has already been started");
 	});
 
+	test("excludes another host from the same serve directory without disturbing the owner", async () => {
+		host = new ServeHost({ agentDir: harness.tempDir, session: harness.session, port: 0 });
+		const first = await host.start();
+		const contender = new ServeHost({ agentDir: harness.tempDir, session: harness.session, port: 0 });
+
+		await expect(contender.start()).rejects.toThrow("is already owned by another Pi serve host");
+		expect((await fetch(first.url)).status).toBe(200);
+	});
+
 	test("uses and validates a caller-supplied serve token", async () => {
 		const token = "stable_background_serve_token_1234567890";
 		host = new ServeHost({ agentDir: harness.tempDir, session: harness.session, port: 0, token });

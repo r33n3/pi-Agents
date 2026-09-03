@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { TSchema } from "typebox";
@@ -63,6 +63,13 @@ export interface WorkflowRun {
 	nodeResults: WorkflowNodeRun[];
 	result?: string;
 	error?: string;
+	definitionSnapshot?: WorkflowDefinition;
+	definitionDigest?: string;
+	room?: {
+		id: string;
+		runId: string;
+		round: number;
+	};
 }
 
 export interface WorkflowNodeRun {
@@ -93,6 +100,8 @@ export class WorkflowService {
 	readonly #queue = new SerialOperationQueue();
 	readonly #definitions = new Map<string, WorkflowDefinition>();
 	readonly #runs = new Map<string, WorkflowRun>();
+	readonly #executions = new Map<string, Promise<void>>();
+	readonly #runPersistence = new Map<string, SerialOperationQueue>();
 
 	constructor(
 		root: string,
@@ -194,25 +203,52 @@ export class WorkflowService {
 	async start(workflowId: string, prompt: string): Promise<WorkflowRun> {
 		const definition = this.#definitions.get(workflowId);
 		if (!definition) throw new Error(`Workflow ${workflowId} was not found`);
+		return this.#startDefinition(definition, prompt);
+	}
+
+	/** Runs a validated, non-published definition for a trusted host-owned orchestration. */
+	async startAdHoc(
+		input: WorkflowDefinitionInput,
+		prompt: string,
+		room?: { id: string; runId: string; round: number },
+	): Promise<WorkflowRun> {
+		const definition = normalizeWorkflow(input);
+		await this.#validateAgents(definition);
+		return this.#startDefinition(definition, prompt, room);
+	}
+
+	async #startDefinition(
+		definition: WorkflowDefinition,
+		prompt: string,
+		room?: { id: string; runId: string; round: number },
+	): Promise<WorkflowRun> {
 		const trimmedPrompt = prompt.trim();
 		if (!trimmedPrompt) throw new Error("Workflow prompt is required");
 		const run: WorkflowRun = {
 			id: randomUUID(),
-			workflowId,
+			workflowId: definition.id,
 			status: "running",
 			prompt: trimmedPrompt,
 			createdAt: Date.now(),
 			taskIds: [],
 			browserRunIds: [],
 			nodeResults: [],
+			definitionSnapshot: cloneDefinition(definition),
+			definitionDigest: workflowDefinitionDigest(definition),
+			room: room ? { ...room } : undefined,
 		};
 		this.#runs.set(run.id, run);
 		await this.#persistRun(run);
-		void this.#execute(definition, run);
+		const execution = this.#execute(definition, run);
+		this.#executions.set(run.id, execution);
+		void execution.finally(() => {
+			if (this.#executions.get(run.id) === execution) this.#executions.delete(run.id);
+		});
 		return cloneRun(run);
 	}
 
 	async waitForCompletion(runId: string): Promise<WorkflowRun> {
+		await this.#executions.get(runId);
 		while (this.#runs.get(runId)?.status === "running") {
 			await new Promise((resolveWait) => setTimeout(resolveWait, 25));
 		}
@@ -225,11 +261,13 @@ export class WorkflowService {
 		const run = this.#runs.get(runId);
 		if (!run) throw new Error(`Workflow run ${runId} was not found`);
 		if (run.status !== "running") return cloneRun(run);
-		await Promise.all(run.taskIds.map((taskId) => this.#tasks.cancel(taskId).catch(() => undefined)));
-		await Promise.all(run.browserRunIds.map((runId) => this.#browser?.runner.cancel(runId).catch(() => undefined)));
 		run.status = "cancelled";
 		run.finishedAt = Date.now();
 		run.error = "Workflow was cancelled";
+		await this.#persistRun(run);
+		await Promise.all(run.taskIds.map((taskId) => this.#tasks.cancel(taskId).catch(() => undefined)));
+		await Promise.all(run.browserRunIds.map((runId) => this.#browser?.runner.cancel(runId).catch(() => undefined)));
+		await this.#executions.get(runId);
 		await this.#persistRun(run);
 		return cloneRun(run);
 	}
@@ -347,6 +385,7 @@ export class WorkflowService {
 			);
 			run.browserRunIds.push(execution.runId);
 			await this.#persistRun(run);
+			if (run.status === "cancelled") await this.#browser.runner.cancel(execution.runId);
 			const completed = await execution.completion;
 			return {
 				nodeId: node.id,
@@ -378,9 +417,18 @@ export class WorkflowService {
 			]
 				.filter((value): value is string => value !== undefined)
 				.join("\n\n"),
+			room: run.room
+				? {
+						id: run.room.id,
+						runId: run.room.runId,
+						round: run.room.round,
+						memberIndex: Math.max(0, Number(node.id.split("-").at(-1) ?? 0)),
+					}
+				: undefined,
 		});
 		run.taskIds.push(task.id);
 		await this.#persistRun(run);
+		if (run.status === "cancelled") await this.#tasks.cancel(task.id);
 		return workflowResult(node, predecessors, startedAt, await this.#tasks.waitForCompletion(task.id));
 	}
 
@@ -412,7 +460,13 @@ export class WorkflowService {
 	}
 
 	async #persistRun(run: WorkflowRun): Promise<void> {
-		await writeAtomic(resolve(this.#runsDir, run.id, "run.json"), `${JSON.stringify(run, null, 2)}\n`);
+		let queue = this.#runPersistence.get(run.id);
+		if (!queue) {
+			queue = new SerialOperationQueue();
+			this.#runPersistence.set(run.id, queue);
+		}
+		const content = `${JSON.stringify(run, null, 2)}\n`;
+		await queue.run(() => writeAtomic(resolve(this.#runsDir, run.id, "run.json"), content));
 	}
 }
 
@@ -528,6 +582,12 @@ function parseWorkflowRun(value: unknown): WorkflowRun {
 	) {
 		throw new Error("workflow run browserRunIds must be an array of strings");
 	}
+	const definitionSnapshot =
+		input.definitionSnapshot === undefined ? undefined : normalizeWorkflow(input.definitionSnapshot);
+	const definitionDigest = typeof input.definitionDigest === "string" ? input.definitionDigest : undefined;
+	if (definitionSnapshot && definitionDigest !== workflowDefinitionDigest(definitionSnapshot)) {
+		throw new Error("workflow run definition digest does not match its snapshot");
+	}
 	return {
 		id: requiredString(input.id, "workflow run id"),
 		workflowId: requiredString(input.workflowId, "workflow run workflowId"),
@@ -542,6 +602,19 @@ function parseWorkflowRun(value: unknown): WorkflowRun {
 			: [],
 		result: typeof input.result === "string" ? input.result : undefined,
 		error: typeof input.error === "string" ? input.error : undefined,
+		definitionSnapshot,
+		definitionDigest,
+		room:
+			input.room === undefined
+				? undefined
+				: (() => {
+						const room = object(input.room, "workflow run room");
+						return {
+							id: requiredIdentifier(room.id, "workflow run room.id"),
+							runId: requiredString(room.runId, "workflow run room.runId"),
+							round: positiveInteger(room.round, "workflow run room.round", Number.MAX_SAFE_INTEGER),
+						};
+					})(),
 	};
 }
 
@@ -560,6 +633,8 @@ function cloneDefinition(definition: WorkflowDefinition): WorkflowDefinition {
 function cloneRun(run: WorkflowRun): WorkflowRun {
 	return {
 		...run,
+		definitionSnapshot: run.definitionSnapshot ? cloneDefinition(run.definitionSnapshot) : undefined,
+		room: run.room ? { ...run.room } : undefined,
 		taskIds: [...run.taskIds],
 		browserRunIds: [...run.browserRunIds],
 		nodeResults: run.nodeResults.map((result) => ({
@@ -571,6 +646,10 @@ function cloneRun(run: WorkflowRun): WorkflowRun {
 				: undefined,
 		})),
 	};
+}
+
+function workflowDefinitionDigest(definition: WorkflowDefinition): string {
+	return createHash("sha256").update(JSON.stringify(definition)).digest("hex");
 }
 
 function workflowResult(

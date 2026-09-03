@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "vitest";
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
 import type { AgentTaskService } from "../src/core/serve/agent-task-service.ts";
 import { CapabilityConnectionRegistry } from "../src/core/serve/capability-connection-registry.ts";
-import { type PiAgentBundle, PiAgentBundleInstaller } from "../src/core/serve/pi-agent-bundle.ts";
+import {
+	type PiAgentBundle,
+	type PiAgentBundleInstallCheckpoint,
+	PiAgentBundleInstaller,
+} from "../src/core/serve/pi-agent-bundle.ts";
 import { PiAgentTeamLauncher } from "../src/core/serve/pi-agent-team-launcher.ts";
 import { WorkflowService } from "../src/core/serve/workflow-service.ts";
 
@@ -16,6 +20,7 @@ afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
+// WTK #1453, #1454, and #1455: effective deployment identity and factual runtime evidence.
 test("validates and idempotently installs one complete WTK Pi team bundle", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-agent-bundle-"));
 	roots.push(root);
@@ -135,10 +140,43 @@ test("validates and idempotently installs one complete WTK Pi team bundle", asyn
 	assert.equal(reboundRecord.receipt.bindingReview.bindingDigest, rebound.review.bindingDigest);
 	assert.equal((await registry.get("daily-mail-team-researcher"))?.model?.id, "qwen3.6:latest");
 	assert.equal((await registry.get("daily-mail-team-researcher"))?.revision, 2);
+	const reboundWorkspace = join(root, "rebound-workspace");
+	await mkdir(reboundWorkspace);
+	const reboundConnection = installer.reviewBindings(
+		bundle,
+		{
+			...unreviewedBindings,
+			projectRoot: reboundWorkspace,
+			models: rebound.models,
+			capabilities: {
+				researcher: [
+					{
+						...unreviewedBindings.capabilities.researcher[0]!,
+						connectionId: "google-workspace-secondary",
+					},
+				],
+			},
+		},
+		"test-operator",
+	).bindings;
+	const reboundConnectionRecord = await installer.install(bundle, reboundConnection);
+	assert.equal(reboundConnectionRecord.disposition, "updated");
+	assert.equal((await registry.get("daily-mail-team-researcher"))?.projectRoot, reboundWorkspace);
+	assert.equal(
+		(await registry.get("daily-mail-team-researcher"))?.capabilities[0]?.connectionId,
+		"google-workspace-secondary",
+	);
+	const restartedInstaller = new PiAgentBundleInstaller(join(root, "installs"), registry, workflows);
+	await restartedInstaller.initialize();
+	const restartedRetry = await restartedInstaller.install(bundle, reboundConnection);
+	assert.equal(restartedRetry.disposition, "reused");
+	assert.equal((await registry.get("daily-mail-team-researcher"))?.revision, 3);
 	const evidence = await installer.smoke("daily-mail-team", "Review yesterday's mail");
 	assert.equal(evidence.executionStatus, "completed");
 	assert.equal(evidence.contractDigest, "b".repeat(64));
-	assert.deepEqual(evidence.bindingReview, rebound.review);
+	assert.equal(evidence.authorityDigest, reboundConnectionRecord.receipt.authorityDigest);
+	assert.equal(evidence.effectiveDeploymentDigest, reboundConnectionRecord.receipt.effectiveDeploymentDigest);
+	assert.deepEqual(evidence.bindingReview, reboundConnection.review);
 	assert.deepEqual(
 		evidence.nodes.map((node) => node.budget),
 		[
@@ -160,6 +198,8 @@ test("validates and idempotently installs one complete WTK Pi team bundle", asyn
 			{ status: "passed", findings: [] },
 		],
 	);
+	assert.ok(evidence.nodes.every((node) => node.output?.content.length));
+	assert.ok(evidence.nodes.every((node) => /^[0-9a-f]{64}$/.test(node.output?.sha256 ?? "")));
 	fenceResearcherOutput = true;
 	const normalized = await installer.smoke("daily-mail-team", "Review yesterday's mail with fencing");
 	assert.equal(normalized.executionStatus, "completed");
@@ -226,6 +266,7 @@ test("fails closed before writing agents when bundle authority is widened", asyn
 	assert.deepEqual(await registry.list(), []);
 });
 
+// WTK #1456: every restart must converge without replaying revision-incrementing writes.
 test("recovers an interrupted prepared install before accepting retries", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-agent-bundle-recovery-"));
 	roots.push(root);
@@ -270,21 +311,132 @@ test("recovers an interrupted prepared install before accepting retries", async 
 	};
 	await assert.rejects(installer.install(bundle, bindings), /simulated process interruption/);
 	const transactionPath = join(root, "installs", "transactions", "daily-mail-team.json");
-	const prepared = await readFile(transactionPath, "utf8");
-	assert.match(prepared, /pi\.agents\.install-transaction\.v1/);
-	assert.doesNotMatch(prepared, /accessToken|clientSecret|apiKey/);
+	const preparedText = await readFile(transactionPath, "utf8");
+	assert.match(preparedText, /pi\.agents\.install-transaction\.v1/);
+	assert.doesNotMatch(preparedText, /accessToken|clientSecret|apiKey/);
+	const prepared = JSON.parse(preparedText) as {
+		phase: string;
+		appliedAgentIds: string[];
+		workflowApplied: boolean;
+	};
+	assert.equal(prepared.phase, "applying");
+	assert.deepEqual(prepared.appliedAgentIds, ["daily-mail-team-writer", "daily-mail-team-researcher"]);
+	assert.equal(prepared.workflowApplied, false);
+	assert.equal((await registry.get("daily-mail-team-researcher"))?.revision, 1);
+	assert.equal((await registry.get("daily-mail-team-writer"))?.revision, 1);
+
+	let recoveryFailure = true;
+	workflows.save = async (input) => {
+		if (recoveryFailure) {
+			recoveryFailure = false;
+			throw new Error("simulated recovery interruption");
+		}
+		return saveWorkflow(input);
+	};
+	const failedRecovery = new PiAgentBundleInstaller(join(root, "installs"), registry, workflows);
+	await assert.rejects(failedRecovery.initialize(), /simulated recovery interruption/);
+	assert.equal((await registry.get("daily-mail-team-researcher"))?.revision, 1);
+	assert.equal((await registry.get("daily-mail-team-writer"))?.revision, 1);
 
 	workflows.save = saveWorkflow;
 	const restarted = new PiAgentBundleInstaller(join(root, "installs"), registry, workflows);
 	await restarted.initialize();
 	const retried = await restarted.install(bundle, bindings);
 	assert.equal(retried.disposition, "reused");
+	assert.equal((await registry.get("daily-mail-team-researcher"))?.revision, 1);
+	assert.equal((await registry.get("daily-mail-team-writer"))?.revision, 1);
 	assert.equal(workflows.getDefinition("daily-mail-workflow")?.nodes.length, 2);
 	assert.deepEqual((await registry.list()).map((agent) => agent.id).sort(), [
 		"daily-mail-team-researcher",
 		"daily-mail-team-writer",
 	]);
 	await assert.rejects(readFile(transactionPath, "utf8"), /ENOENT/);
+});
+
+test("converges after restart at every durable install checkpoint without replaying mutations", async () => {
+	const checkpoints: PiAgentBundleInstallCheckpoint[] = [
+		{ stage: "before-prepare" },
+		{ stage: "prepared" },
+		{ stage: "applying" },
+		{ stage: "agent-applied", agentId: "daily-mail-team-writer" },
+		{ stage: "agent-checkpointed", agentId: "daily-mail-team-writer" },
+		{ stage: "agent-applied", agentId: "daily-mail-team-researcher" },
+		{ stage: "agent-checkpointed", agentId: "daily-mail-team-researcher" },
+		{ stage: "workflow-applied" },
+		{ stage: "workflow-checkpointed" },
+		{ stage: "receipt-temp-written" },
+		{ stage: "receipt-committed" },
+	];
+
+	for (const target of checkpoints) {
+		const root = await mkdtemp(join(tmpdir(), `pi-agent-bundle-fault-${target.stage}-`));
+		roots.push(root);
+		const workspace = join(root, "workspace");
+		const agentsRoot = join(root, "agents");
+		const workflowsRoot = join(root, "workflows");
+		const installsRoot = join(root, "installs");
+		const registry = new AgentRegistry(agentsRoot, { defaultWorkspace: workspace });
+		await registry.initialize();
+		const workflows = new WorkflowService(workflowsRoot, registry, {} as AgentTaskService);
+		await workflows.initialize();
+		let interrupted = false;
+		const installer = new PiAgentBundleInstaller(installsRoot, registry, workflows, {
+			onInstallCheckpoint: (observed) => {
+				if (!interrupted && installCheckpointMatches(observed, target)) {
+					interrupted = true;
+					throw new Error(`simulated interruption at ${installCheckpointLabel(target)}`);
+				}
+			},
+		});
+		const bundle = fixtureBundle();
+		const bindings = installer.reviewBindings(
+			bundle,
+			{
+				projectRoot: workspace,
+				credentialRefs: ["google-workspace"],
+				models: {
+					researcher: { provider: "ollama", id: "qwen3.8:latest" },
+					writer: { provider: "ollama", id: "qwen3.8:latest" },
+				},
+				capabilities: {
+					researcher: [
+						{
+							capabilityId: "email.read",
+							capabilityVersion: 1,
+							providerId: "google-workspace",
+							connectionId: "google-workspace-primary",
+							approval: "never",
+						},
+					],
+				},
+			},
+			"test-operator",
+		).bindings;
+
+		await assert.rejects(
+			installer.install(bundle, bindings),
+			new RegExp(`simulated interruption at ${installCheckpointLabel(target)}`),
+		);
+		assert.equal(interrupted, true, `checkpoint ${installCheckpointLabel(target)} was not observed`);
+
+		const restartedRegistry = new AgentRegistry(agentsRoot, { defaultWorkspace: workspace });
+		await restartedRegistry.initialize();
+		const restartedWorkflows = new WorkflowService(workflowsRoot, restartedRegistry, {} as AgentTaskService);
+		await restartedWorkflows.initialize();
+		const restarted = new PiAgentBundleInstaller(installsRoot, restartedRegistry, restartedWorkflows);
+		await restarted.initialize();
+		const retried = await restarted.install(bundle, bindings);
+
+		assert.equal(retried.disposition, target.stage === "before-prepare" ? "created" : "reused");
+		assert.equal((await restartedRegistry.get("daily-mail-team-researcher"))?.revision, 1);
+		assert.equal((await restartedRegistry.get("daily-mail-team-writer"))?.revision, 1);
+		assert.equal(restartedWorkflows.getDefinition("daily-mail-workflow")?.nodes.length, 2);
+		await assert.rejects(readFile(join(installsRoot, "transactions", "daily-mail-team.json"), "utf8"), /ENOENT/);
+		assert.deepEqual(
+			(await readdir(installsRoot, { recursive: true })).filter((path) => path.endsWith(".tmp")),
+			[],
+		);
+	}
 });
 
 test("replaces an incomplete early v1 install record with a complete reviewed receipt", async () => {
@@ -514,6 +666,20 @@ test("prepares and idempotently launches a reviewed team into its coordinator co
 		/changed after review/,
 	);
 });
+
+function installCheckpointMatches(
+	observed: PiAgentBundleInstallCheckpoint,
+	target: PiAgentBundleInstallCheckpoint,
+): boolean {
+	return (
+		observed.stage === target.stage &&
+		(!("agentId" in target) || ("agentId" in observed && observed.agentId === target.agentId))
+	);
+}
+
+function installCheckpointLabel(checkpoint: PiAgentBundleInstallCheckpoint): string {
+	return "agentId" in checkpoint ? `${checkpoint.stage}:${checkpoint.agentId}` : checkpoint.stage;
+}
 
 function fixtureBundle(): PiAgentBundle {
 	return {

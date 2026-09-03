@@ -5,6 +5,7 @@ import {
 	describeModelControls,
 	type ModelSettingsSelection,
 	mergeModelSettingsDraft,
+	modelSettingsButtonPresentation,
 	modelSettingsError,
 	parseModelControls,
 } from "../src/core/serve/browser/model-settings.ts";
@@ -91,6 +92,30 @@ describe("browser model settings projection", () => {
 			"Effort: low · Processing: fast",
 		);
 		expect(modelSettingsError(selection, NATIVE_UI_MODELS)).toBeUndefined();
+	});
+	test("presents unavailable, available, and active model-settings gear states", () => {
+		const legacy = NATIVE_UI_MODELS.find((model) => model.id === "legacy");
+		const native = NATIVE_UI_MODELS.find((model) => model.id === "native");
+		expect(modelSettingsButtonPresentation(legacy, undefined)).toMatchObject({
+			state: "unavailable",
+			disabled: true,
+		});
+		expect(modelSettingsButtonPresentation(native, undefined)).toMatchObject({
+			state: "available",
+			disabled: false,
+		});
+		expect(modelSettingsButtonPresentation(native, {})).toMatchObject({
+			state: "available",
+			disabled: false,
+		});
+		expect(modelSettingsButtonPresentation(native, { processingTier: "fast" })).toMatchObject({
+			state: "active",
+			disabled: false,
+		});
+		expect(modelSettingsButtonPresentation(undefined, { processingTier: "removed" })).toMatchObject({
+			state: "active",
+			disabled: false,
+		});
 	});
 	test("copies exact values without inferring premiums or normalizing spellings", () => {
 		const original = { reasoningEffort: "high" };

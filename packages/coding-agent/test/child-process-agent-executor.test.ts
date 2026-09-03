@@ -56,7 +56,7 @@ describe("ChildProcessAgentExecutor", () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
-			capabilityToolNames: () => [],
+			capabilityTools: () => [],
 			workerPath,
 		});
 		const execution = await executor.start(context("done"));
@@ -74,7 +74,7 @@ describe("ChildProcessAgentExecutor", () => {
 			const executor = new ChildProcessAgentExecutor({
 				agentDir: process.cwd(),
 				serveRoot,
-				capabilityToolNames: () => [],
+				capabilityTools: () => [],
 				workerPath: sourceWorkerPath,
 			});
 			const execution = await executor.start(context("source", "run-source", workspace));
@@ -90,7 +90,7 @@ describe("ChildProcessAgentExecutor", () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
-			capabilityToolNames: () => [],
+			capabilityTools: () => [],
 			workerPath,
 		});
 		const execution = await executor.start(context("large"));
@@ -105,7 +105,7 @@ describe("ChildProcessAgentExecutor", () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
-			capabilityToolNames: () => [],
+			capabilityTools: () => [],
 			workerPath,
 		});
 		const execution = await executor.start(context("result-without-ipc"));
@@ -118,7 +118,7 @@ describe("ChildProcessAgentExecutor", () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
-			capabilityToolNames: () => [],
+			capabilityTools: () => [],
 			workerPath,
 		});
 		const execution = await executor.start(context("error-without-ipc"));
@@ -127,11 +127,11 @@ describe("ChildProcessAgentExecutor", () => {
 		await executor.dispose();
 	});
 
-	test("passes only the selected model credential over private IPC", async () => {
+	test("does not forward provider configuration through the worker environment", async () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
-			capabilityToolNames: () => ["email_search", "firecrawl_search", "searxng_search"],
+			capabilityTools: () => [],
 			workerPath,
 			resolveModelApiKey: async (model) =>
 				model.provider === "openai" && model.id === "test" ? "ephemeral-provider-value" : undefined,
@@ -153,10 +153,8 @@ describe("ChildProcessAgentExecutor", () => {
 		expect(inspected.modelCredentialReceived).toBe(true);
 		expect(inspected.googleAccess).toBeUndefined();
 		expect(inspected.firecrawlKey).toBeUndefined();
-		expect(inspected).toMatchObject({
-			firecrawlUrl: "http://127.0.0.1:3002",
-			searxngUrl: "http://127.0.0.1:8080",
-		});
+		expect(inspected.firecrawlUrl).toBeUndefined();
+		expect(inspected.searxngUrl).toBeUndefined();
 		expect(inspected.secret).toBeUndefined();
 		await executor.dispose();
 	});
@@ -168,7 +166,7 @@ describe("ChildProcessAgentExecutor", () => {
 			const executor = new ChildProcessAgentExecutor({
 				agentDir: process.cwd(),
 				serveRoot,
-				capabilityToolNames: () => [],
+				capabilityTools: () => [],
 				workerPath,
 			});
 			const first = await executor.start(context("inspect", "run-one", firstWorkspace));
@@ -203,7 +201,6 @@ describe("ChildProcessAgentExecutor", () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
-			capabilityToolNames: () => [tool.name],
 			capabilityTools: () => [tool],
 			workerPath,
 		});
@@ -219,7 +216,7 @@ describe("ChildProcessAgentExecutor", () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
-			capabilityToolNames: () => [],
+			capabilityTools: () => [],
 			workerPath,
 		});
 		const stopped = await executor.start(context("slow", "run-stopped"));
@@ -239,7 +236,7 @@ describe("ChildProcessAgentExecutor", () => {
 			const executor = new ChildProcessAgentExecutor({
 				agentDir: process.cwd(),
 				serveRoot,
-				capabilityToolNames: () => [],
+				capabilityTools: () => [],
 				workerPath,
 				governedActions: new GovernedActionService(audit),
 			});
@@ -280,7 +277,7 @@ describe("ChildProcessAgentExecutor", () => {
 			const executor = new ChildProcessAgentExecutor({
 				agentDir: process.cwd(),
 				serveRoot,
-				capabilityToolNames: () => [],
+				capabilityTools: () => [],
 				workerPath,
 				governedActions: new GovernedActionService(audit),
 			});
@@ -329,7 +326,7 @@ describe("ChildProcessAgentExecutor", () => {
 			const executor = new ChildProcessAgentExecutor({
 				agentDir: process.cwd(),
 				serveRoot,
-				capabilityToolNames: () => [],
+				capabilityTools: () => [],
 				workerPath,
 				governedActions: new GovernedActionService(new ServeAuditStore(join(serveRoot, "audit"))),
 				hostFileSystem,
@@ -361,7 +358,7 @@ describe("ChildProcessAgentExecutor", () => {
 			const executor = new ChildProcessAgentExecutor({
 				agentDir: process.cwd(),
 				serveRoot,
-				capabilityToolNames: () => [],
+				capabilityTools: () => [],
 				workerPath,
 				governedActions: new GovernedActionService(audit),
 				hostFileSystem,
@@ -396,7 +393,7 @@ describe("ChildProcessAgentExecutor", () => {
 			const executor = new ChildProcessAgentExecutor({
 				agentDir: process.cwd(),
 				serveRoot,
-				capabilityToolNames: () => [],
+				capabilityTools: () => [],
 				workerPath,
 				governedActions: new GovernedActionService(audit),
 				hostFileSystem: blockingHostFileSystem(
@@ -407,9 +404,12 @@ describe("ChildProcessAgentExecutor", () => {
 				),
 			});
 			const execution = await executor.start(context("host-action-crash", "run-host-crash", workspace));
-			const result = expect(execution.result).rejects.toThrow("exited before returning a result");
+			const result = execution.result.catch((error: unknown) => error);
 			await actionStarted;
-			await result;
+			const outcome = await result;
+			expect(outcome).toBeInstanceOf(Error);
+			if (!(outcome instanceof Error)) throw new Error("Expected the crashed worker to reject");
+			expect(outcome.message).toContain("exited before returning a result");
 			expect(hostActionAborted).toBe(true);
 			await expect
 				.poll(async () =>
@@ -427,7 +427,7 @@ describe("ChildProcessAgentExecutor", () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
-			capabilityToolNames: () => [],
+			capabilityTools: () => [],
 			workerPath,
 		});
 		const execution = await executor.start(context("slow"));
@@ -442,7 +442,7 @@ describe("ChildProcessAgentExecutor", () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
-			capabilityToolNames: () => [],
+			capabilityTools: () => [],
 			workerPath,
 			idleTimeoutMs: 30,
 			heartbeatTimeoutMs: 200,
@@ -457,7 +457,7 @@ describe("ChildProcessAgentExecutor", () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
-			capabilityToolNames: () => [],
+			capabilityTools: () => [],
 			workerPath,
 			idleTimeoutMs: 1_000,
 			heartbeatTimeoutMs: 30,
@@ -472,7 +472,7 @@ describe("ChildProcessAgentExecutor", () => {
 		const executor = new ChildProcessAgentExecutor({
 			agentDir: process.cwd(),
 			serveRoot,
-			capabilityToolNames: () => [],
+			capabilityTools: () => [],
 			workerPath,
 		});
 		const execution = await executor.start(context("ignore-abort"));

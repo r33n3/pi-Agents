@@ -13,6 +13,60 @@ export const choiceLabels = {
 	processingTier: "Processing speed / tier",
 } as const;
 
+export type ModelSettingsButtonState = "unavailable" | "available" | "active";
+
+export interface ModelSettingsButtonPresentation {
+	state: ModelSettingsButtonState;
+	disabled: boolean;
+	label: string;
+	title: string;
+}
+
+/** Keep the control present so capability changes do not shift the layout. */
+export function modelSettingsButtonPresentation(
+	model: ModelMetadata | undefined,
+	controls: ModelControls | undefined,
+): ModelSettingsButtonPresentation {
+	const modelName = model?.name ?? "this model";
+	const hasCapabilities = Boolean(
+		model?.controls &&
+			["reasoningMode", "reasoningEffort", "reasoningBudget", "processingTier"].some(
+				(key) => model.controls?.[key as keyof NonNullable<ModelMetadata["controls"]>] !== undefined,
+			),
+	);
+	const hasOverrides =
+		controls !== undefined &&
+		["reasoningMode", "reasoningEffort", "reasoningBudget", "processingTier"].some(
+			(key) => controls[key as keyof ModelControls] !== undefined,
+		);
+	if (hasOverrides) {
+		const description = describeModelControls(controls);
+		return {
+			state: "active",
+			disabled: false,
+			label: `Custom model settings active for ${modelName}`,
+			title: `Custom model settings active · ${description}`,
+		};
+	}
+	if (hasCapabilities || controls !== undefined) {
+		return {
+			state: "available",
+			disabled: false,
+			label: `Model settings available for ${modelName}`,
+			title:
+				controls === undefined
+					? `Additional model settings are available for ${modelName}`
+					: `Provider defaults active for ${modelName}; additional model settings are available`,
+		};
+	}
+	return {
+		state: "unavailable",
+		disabled: true,
+		label: `No additional model settings for ${modelName}`,
+		title: `No additional model settings are verified for ${modelName}`,
+	};
+}
+
 /** Checks transport shape only. The runtime owns provider-specific combinations and request limits. */
 export function parseModelControls(value: unknown): ModelControls {
 	if (typeof value !== "object" || value === null || Array.isArray(value))

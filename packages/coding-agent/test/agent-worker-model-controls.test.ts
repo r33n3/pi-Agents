@@ -72,7 +72,7 @@ describe("isolated agent worker native settings", () => {
 		executor = new ChildProcessAgentExecutor({
 			agentDir,
 			serveRoot: join(root, "serve"),
-			capabilityToolNames: () => [],
+			capabilityTools: () => [],
 			environment: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" },
 			timeoutMs: 20_000,
 		});

@@ -1,4 +1,5 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -7,6 +8,14 @@ import {
 	type CapabilityDefinition,
 	type CapabilityProviderManifest,
 } from "../src/core/serve/capability-broker.ts";
+import { CapabilityProviderRegistry } from "../src/core/serve/capability-provider-registry.ts";
+
+function registry(
+	definitions: readonly CapabilityDefinition[],
+	providers: readonly CapabilityProviderManifest[],
+): CapabilityProviderRegistry {
+	return new CapabilityProviderRegistry({ definitions, providers });
+}
 
 describe("CapabilityBroker", () => {
 	let root: string;
@@ -40,7 +49,10 @@ describe("CapabilityBroker", () => {
 	beforeEach(async () => {
 		root = await mkdtemp(join(tmpdir(), "pi-capability-broker-"));
 		activeTools = [];
-		broker = new CapabilityBroker(root, { activeToolNames: () => activeTools, definitions, manifests });
+		broker = new CapabilityBroker(root, {
+			activeToolNames: () => activeTools,
+			registry: registry(definitions, manifests),
+		});
 		await broker.initialize();
 	});
 
@@ -62,6 +74,16 @@ describe("CapabilityBroker", () => {
 		expect(broker.resolveToolNames([{ capabilityId: "web.search", capabilityVersion: 1 }], "session")).toEqual([
 			"fixture_search",
 		]);
+		expect(broker.resolveRunBindings([{ capabilityId: "web.search", capabilityVersion: 1 }], "session")).toEqual([
+			{
+				capabilityId: "web.search",
+				capabilityVersion: 1,
+				providerId: "fixture-search",
+				providerDigest: broker.snapshot().providers[0]?.digest,
+				connectionId: undefined,
+				toolName: "fixture_search",
+			},
+		]);
 		expect(() => broker.resolveToolNames([{ capabilityId: "web.search", capabilityVersion: 1 }], "harness")).toThrow(
 			"unavailable for the harness executor",
 		);
@@ -72,7 +94,10 @@ describe("CapabilityBroker", () => {
 		await broker.reviewProvider("fixture-search", true);
 		await broker.enableProvider("fixture-search", true);
 
-		const restored = new CapabilityBroker(root, { activeToolNames: () => activeTools, definitions, manifests });
+		const restored = new CapabilityBroker(root, {
+			activeToolNames: () => activeTools,
+			registry: registry(definitions, manifests),
+		});
 		await restored.initialize();
 		expect(restored.snapshot()).toMatchObject({
 			capabilities: [{ id: "web.search", defaultProviderId: "fixture-search", status: "active" }],
@@ -81,6 +106,37 @@ describe("CapabilityBroker", () => {
 		const audit = await readFile(join(root, "audit.jsonl"), "utf8");
 		expect(audit).toContain('"action":"provider.review"');
 		expect(audit).toContain('"action":"provider.enable"');
+	});
+
+	test("migrates legacy field-order-sensitive provider digests without quarantining reviewed state", async () => {
+		activeTools = ["fixture_search"];
+		const legacyDigest = createHash("sha256").update(JSON.stringify(manifests[0])).digest("hex");
+		await writeFile(
+			join(root, "state.json"),
+			JSON.stringify({
+				version: 1,
+				providers: {
+					"fixture-search": {
+						trust: "enabled",
+						reviewedDigest: legacyDigest,
+						enabled: true,
+						updatedAt: new Date().toISOString(),
+					},
+				},
+				defaults: { "web.search": "fixture-search" },
+			}),
+			"utf8",
+		);
+		const restored = new CapabilityBroker(root, {
+			activeToolNames: () => activeTools,
+			registry: registry(definitions, manifests),
+		});
+		await restored.initialize();
+		expect(restored.snapshot().providers[0]).toMatchObject({ trust: "enabled", enabled: true });
+		const persisted = JSON.parse(await readFile(join(root, "state.json"), "utf8")) as {
+			providers: Record<string, { reviewedDigest?: string }>;
+		};
+		expect(persisted.providers["fixture-search"]?.reviewedDigest).toBe(restored.snapshot().providers[0]?.digest);
 	});
 
 	test("keeps multiple providers enabled while changing the explicit default", async () => {
@@ -96,8 +152,7 @@ describe("CapabilityBroker", () => {
 		};
 		const providers = new CapabilityBroker(root, {
 			activeToolNames: () => activeTools,
-			definitions,
-			manifests: [...manifests, alternate],
+			registry: registry(definitions, [...manifests, alternate]),
 		});
 		await providers.initialize();
 		await providers.reviewProvider("fixture-search", true);
@@ -129,8 +184,7 @@ describe("CapabilityBroker", () => {
 		const changed = [{ ...manifests[0]!, permissions: ["network read", "new credential access"] }];
 		const restored = new CapabilityBroker(root, {
 			activeToolNames: () => activeTools,
-			definitions,
-			manifests: changed,
+			registry: registry(definitions, changed),
 		});
 		await restored.initialize();
 		expect(restored.snapshot()).toMatchObject({
@@ -145,8 +199,7 @@ describe("CapabilityBroker", () => {
 		const connectedManifest = [{ ...manifests[0]!, connectionRequired: true }];
 		const connected = new CapabilityBroker(root, {
 			activeToolNames: () => activeTools,
-			definitions,
-			manifests: connectedManifest,
+			registry: registry(definitions, connectedManifest),
 			providerConnectionAvailable: () => true,
 			connectionResolver: (id) =>
 				id === "fixture-account"
@@ -179,8 +232,7 @@ describe("CapabilityBroker", () => {
 		let connected = false;
 		const provider = new CapabilityBroker(root, {
 			activeToolNames: () => activeTools,
-			definitions,
-			manifests: [{ ...manifests[0]!, connectionRequired: true }],
+			registry: registry(definitions, [{ ...manifests[0]!, connectionRequired: true }]),
 			providerConnectionAvailable: () => connected,
 		});
 		await provider.initialize();
@@ -203,8 +255,7 @@ describe("CapabilityBroker", () => {
 			() =>
 				new CapabilityBroker(root, {
 					activeToolNames: () => activeTools,
-					definitions,
-					manifests: [dangerous],
+					registry: registry(definitions, [dangerous]),
 				}),
 		).toThrow("prohibited environment field");
 	});
@@ -241,8 +292,7 @@ describe("CapabilityBroker", () => {
 		];
 		const writes = new CapabilityBroker(root, {
 			activeToolNames: () => activeTools,
-			definitions: writeDefinitions,
-			manifests: writeManifests,
+			registry: registry(writeDefinitions, writeManifests),
 		});
 		await writes.initialize();
 		await writes.reviewProvider("fixture-mail", true);
@@ -334,8 +384,7 @@ describe("CapabilityBroker", () => {
 			() =>
 				new CapabilityBroker(root, {
 					activeToolNames: () => activeTools,
-					definitions,
-					manifests: [invalid],
+					registry: registry(definitions, [invalid]),
 				}),
 		).toThrow("groups an unbound capability");
 	});

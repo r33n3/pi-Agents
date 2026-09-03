@@ -14,6 +14,7 @@ import { LiveSessionRuntime } from "./live-session-runtime.ts";
 import type { ServeAttachment } from "./serve-attachment-store.ts";
 
 export type HostedSessionFactory = (options: CreateSessionOptions) => Promise<AgentSession>;
+export type HostedSessionClosed = (sessionId: string) => void | Promise<void>;
 
 interface HostedSession {
 	session: AgentSession;
@@ -27,12 +28,19 @@ export class CurrentSessionService implements PiServerService {
 	readonly #createdAt: number;
 	readonly #runtime: PiSessionRuntime;
 	readonly #createHostedSession: HostedSessionFactory | undefined;
+	readonly #onHostedSessionClosed: HostedSessionClosed | undefined;
 	readonly #hosted = new Map<string, HostedSession>();
 
-	constructor(session: AgentSession, createdAt = Date.now(), createHostedSession?: HostedSessionFactory) {
+	constructor(
+		session: AgentSession,
+		createdAt = Date.now(),
+		createHostedSession?: HostedSessionFactory,
+		onHostedSessionClosed?: HostedSessionClosed,
+	) {
 		this.#session = session;
 		this.#createdAt = createdAt;
 		this.#createHostedSession = createHostedSession;
+		this.#onHostedSessionClosed = onHostedSessionClosed;
 		this.#runtime = new LiveSessionRuntime(new AgentSessionServeDelegate(session, createdAt));
 	}
 
@@ -85,6 +93,7 @@ export class CurrentSessionService implements PiServerService {
 				disposed = true;
 				this.#hosted.delete(options.id);
 				hostedSession.dispose();
+				void Promise.resolve(this.#onHostedSessionClosed?.(options.id)).catch(() => {});
 			}),
 		);
 		this.#hosted.set(options.id, { session, createdAt, runtime });
@@ -96,6 +105,14 @@ export class CurrentSessionService implements PiServerService {
 		const hosted = this.#hosted.get(sessionId);
 		if (hosted) return hosted.runtime;
 		throw new PiServerError("not_found", `Unknown session: ${sessionId}`);
+	}
+
+	isActive(sessionId: string): boolean {
+		return sessionId === this.#session.sessionId || this.#hosted.has(sessionId);
+	}
+
+	assertActive(sessionId: string): void {
+		if (!this.isActive(sessionId)) throw new PiServerError("not_found", `Unknown session: ${sessionId}`);
 	}
 
 	async promptWithAttachments(sessionId: string, text: string, attachments: ServeAttachment[]): Promise<void> {

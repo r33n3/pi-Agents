@@ -8,6 +8,7 @@ import type {
 	TranscriptItem,
 } from "@earendil-works/pi-protocol";
 import { createBrowserId } from "./browser-id.ts";
+import { BrowserConnectionGeneration, BrowserSelectionGeneration } from "./connection-generations.ts";
 import { splitInlineThinking } from "./inline-thinking.ts";
 import { catalogSourceLabels, describeCatalogRefresh } from "./model-catalog-status.ts";
 import {
@@ -16,9 +17,15 @@ import {
 	type ModelSelectionCostPresentation,
 	modelSelectionCostKey,
 } from "./model-pricing.ts";
-import { describeModelControls, mergeModelSettingsDraft, modelSettingsError } from "./model-settings.ts";
+import {
+	describeModelControls,
+	mergeModelSettingsDraft,
+	modelSettingsButtonPresentation,
+	modelSettingsError,
+} from "./model-settings.ts";
 import { openModelSettings } from "./model-settings-dialog.ts";
 import { filterPresentedModels } from "./model-visibility.ts";
+import { roomRunPresentation } from "./room-presentation.ts";
 import { installThemedSelect } from "./themed-select.ts";
 import { selectTranscriptWindow } from "./transcript-window.ts";
 import { createBrowserWebSocketTransport } from "./websocket-transport.ts";
@@ -71,6 +78,13 @@ const selectedAgentMeta = element("selected-agent-meta");
 const agentActivityList = element("agent-activity-list");
 const attentionHeading = element("attention-heading");
 const openArtifactsButton = requiredElement<HTMLButtonElement>("open-artifacts");
+const newRoomButton = document.createElement("button");
+newRoomButton.type = "button";
+newRoomButton.className = "attention-inline-action";
+newRoomButton.textContent = "+";
+newRoomButton.title = "Start a bounded collaboration room";
+newRoomButton.setAttribute("aria-label", newRoomButton.title);
+openArtifactsButton.before(newRoomButton);
 selectedAgentPanel.querySelector(".agent-run-history")?.remove();
 const routineList = element("routine-list");
 const routineEditor = createRoutineEditor();
@@ -89,6 +103,14 @@ const siteMonitorList = element("site-monitor-list");
 const financeWatchlistForm = requiredElement<HTMLFormElement>("finance-watchlist-form");
 const financeWatchlistList = element("finance-watchlist-list");
 const sessionTabs = element("session-tabs");
+const agentNewContext = document.createElement("button");
+agentNewContext.type = "button";
+agentNewContext.className = "secondary-action hidden";
+agentNewContext.textContent = "New context";
+agentNewContext.title = "Start a fresh context for this agent without deleting its inbox history";
+agentNewContext.setAttribute("aria-label", agentNewContext.title);
+agentNewContext.style.cssText = "flex:0 0 auto;min-height:36px;padding:7px 10px";
+sessionTabs.after(agentNewContext);
 const connectionList = element("connection-list");
 const connectionForm = requiredElement<HTMLFormElement>("connection-form");
 const connectionUrl = requiredElement<HTMLInputElement>("connection-url");
@@ -169,14 +191,59 @@ const chatModelSettings = installModelSettingsButton(thinking, "Chat model setti
 const agentModelSettings = installModelSettingsButton(agentThinking, "Agent model settings");
 let agentModelControls: ModelControls | undefined;
 
-function installModelSettingsButton(select: HTMLSelectElement, label: string): HTMLButtonElement {
+function installModelSettingsButton(thinkingSelect: HTMLSelectElement, label: string): HTMLButtonElement {
+	const field = thinkingSelect.closest("label");
+	if (!field) throw new Error(`${label} requires a thinking field`);
+	const isBuilderField = field.parentElement?.classList.contains("builder-panel") ?? false;
+	const group = document.createElement("div");
+	group.style.cssText =
+		"display:flex;align-items:flex-end;justify-content:flex-start;gap:2px;min-width:0;padding:0;color:inherit;font-size:inherit;letter-spacing:normal;text-transform:none";
+	field.before(group);
+	group.append(field);
+	if (isBuilderField) {
+		group.style.gridColumn = "1 / -1";
+		field.style.flex = "1 1 auto";
+		field.style.minWidth = "0";
+		field.style.display = "grid";
+		field.style.gap = "5px";
+		field.style.color = "var(--muted)";
+		field.style.fontSize = "10px";
+	} else {
+		group.style.flex = "0 0 auto";
+		field.style.flex = "0 0 auto";
+	}
 	const button = document.createElement("button");
 	button.type = "button";
-	button.textContent = "Model options";
 	button.setAttribute("aria-label", label);
-	button.style.cssText = "min-height:40px;max-width:100%;white-space:normal";
-	select.closest("label")?.after(button);
+	button.style.cssText = "padding:0;transition:opacity .16s ease,color .16s ease,background .16s ease";
+	const icon = openSettingsButton.querySelector("svg");
+	if (!icon) throw new Error("Settings icon is missing");
+	button.append(icon.cloneNode(true));
+	const buttonShell = document.createElement("span");
+	buttonShell.className = "rail-heading rail-heading-actions";
+	buttonShell.style.cssText =
+		"display:flex;align-items:center;flex:0 0 28px;padding:0;color:inherit;font-size:inherit;letter-spacing:normal;text-transform:none";
+	buttonShell.append(button);
+	group.append(buttonShell);
 	return button;
+}
+
+function syncModelSettingsButton(
+	button: HTMLButtonElement,
+	metadata: ModelMetadata | undefined,
+	controls: ModelControls | undefined,
+	blocked: boolean,
+	blockedTitle: string,
+): void {
+	const presentation = modelSettingsButtonPresentation(metadata, controls);
+	button.dataset.modelSettingsState = presentation.state;
+	button.disabled = blocked || presentation.disabled;
+	button.setAttribute("aria-label", presentation.label);
+	button.title = blocked ? blockedTitle : presentation.title;
+	button.style.opacity = presentation.state === "unavailable" ? "0.3" : presentation.state === "active" ? "1" : "0.72";
+	button.style.color = presentation.state === "active" ? "var(--pi)" : "";
+	button.style.background = presentation.state === "active" ? "color-mix(in srgb,var(--pi) 14%,transparent)" : "";
+	button.style.cursor = button.disabled ? "not-allowed" : "pointer";
 }
 
 function editableChatModelSession(): PiSessionHandle | undefined {
@@ -189,31 +256,52 @@ function syncModelSettingsPresentation(): void {
 	const target = editableChatModelSession();
 	chatModelSettings.hidden = !target;
 	chatModelSettings.style.display = target ? "" : "none";
-	chatModelSettings.disabled =
+	const chatBlocked =
 		!target ||
 		target.snapshot?.phase !== "idle" ||
 		pendingSessionConfigurationUpdates.has(target.id) ||
 		(builderActive && teamFactoryBusy);
+	const chatControls = target?.snapshot?.modelControls;
+	const chatMetadata = target?.snapshot
+		? availableModels.find(
+				(entry) => entry.provider === target.snapshot?.model.provider && entry.id === target.snapshot?.model.id,
+			)
+		: undefined;
+	syncModelSettingsButton(
+		chatModelSettings,
+		chatMetadata,
+		chatControls,
+		chatBlocked,
+		"Model settings are unavailable while the chat is busy",
+	);
 	if (target) {
-		model.disabled = chatModelSettings.disabled;
-		thinking.disabled = chatModelSettings.disabled || target.snapshot?.modelControls !== undefined;
+		model.disabled = chatBlocked;
+		thinking.disabled = chatBlocked || chatControls !== undefined;
+		thinking.title =
+			chatControls === undefined
+				? "Pi thinking level"
+				: "Pi thinking is paused while provider-native model settings are active";
 		modelPicker.refresh();
 		thinkingPicker.refresh();
 	}
-	const controls = activeAgentId
-		? agents.find((entry) => entry.id === activeAgentId)?.modelControls
-		: target?.snapshot?.modelControls;
-	const native = controls !== undefined;
-	const thinkingLabel = thinking.closest("label");
-	if (thinkingLabel) thinkingLabel.style.display = native ? "none" : "";
-	chatModelSettings.textContent = native ? describeModelControls(controls) : "Model options";
-	chatModelSettings.title = `${describeModelControls(controls)} · Edit reasoning and processing separately`;
-	const agentThinkingLabel = agentThinking.closest("label");
-	if (agentThinkingLabel) agentThinkingLabel.style.display = agentModelControls !== undefined ? "none" : "";
-	agentModelSettings.textContent =
-		agentModelControls === undefined ? "Model options" : describeModelControls(agentModelControls);
-	agentModelSettings.title = "Edit agent runtime settings; this does not change the Builder chat model";
-	agentModelSettings.disabled = activeSidebarAgent?.source === "pi-agent";
+	const agentModelRef = modelRefFromValue(agentModel.value);
+	const agentMetadata = agentModelRef
+		? availableModels.find((entry) => entry.provider === agentModelRef.provider && entry.id === agentModelRef.id)
+		: undefined;
+	const agentBlocked = activeSidebarAgent?.source === "pi-agent";
+	syncModelSettingsButton(
+		agentModelSettings,
+		agentMetadata,
+		agentModelControls,
+		agentBlocked,
+		"Markdown catalog agents must be edited in their source file",
+	);
+	agentThinking.disabled = agentBlocked || agentModelControls !== undefined;
+	agentThinking.title =
+		agentModelControls === undefined
+			? "Pi thinking level"
+			: "Pi thinking is paused while provider-native model settings are active";
+	agentThinkingPicker.refresh();
 }
 
 /** Retain missing catalog references so an unrelated edit cannot turn them into inheritance. */
@@ -290,9 +378,15 @@ const openArtifactIds: string[] = [];
 const externalResultByRunId = new Map<string, string>();
 const subagentActivityByKey = new Map<string, SubagentActivity>();
 const agentConversationIds = new Map<string, string>();
+const pendingAgentDeliveryKeys = new Map<string, { prompt: string; key: string }>();
 const agentTasksByAgent = new Map<string, AgentTaskSummary[]>();
 const agentTeamStates = new Map<string, AgentTeamState>();
 let attentionItems: AttentionSummary[] = [];
+let agentRooms: AgentRoomSummary[] = [];
+let agentRoomRuns: AgentRoomRunSummary[] = [];
+let activeAgentRoomRunDialog:
+	| { runId: string; dialog: HTMLDialogElement; form: HTMLFormElement; signature: string }
+	| undefined;
 let artifacts: ArtifactSummary[] = [];
 let activeArtifactObjectUrl: string | undefined;
 let activePreviewSessionId: string | undefined;
@@ -321,7 +415,10 @@ let agentBuilderBaseline = "";
 let agentBuilderFeedback = "";
 let activeAgentImprovement: AgentImprovementContext | undefined;
 let activeAgentBuild: AgentBuildRecord | undefined;
+let activeConversationBuild: ConversationBuildView | undefined;
 let draftedAgentCriteria: unknown[] | undefined;
+let draftedAgentAssumptions: unknown[] | undefined;
+let draftedAgentClarifications: unknown[] | undefined;
 let agentBuildDraftTimer: number | undefined;
 let agentBuildPollTimer: number | undefined;
 let pendingTeamPackage: PendingTeamPackage | undefined;
@@ -333,7 +430,11 @@ let availableModels: ModelMetadata[] = [];
 let modelCostPresentations: ReadonlyMap<string, ModelSelectionCostPresentation> = new Map();
 let agentModelsInitialized = false;
 let agents: AgentSummary[] = [];
+let agentRosterEntries = new Map<string, AgentRosterEntry>();
+let showHiddenAgents = false;
+let agentRosterSearch = "";
 let agentBuilds: AgentBuildRecord[] = [];
+let conversationBuilds: ConversationBuildView[] = [];
 let personas: PersonaSummary[] = [];
 let agentEvents: EventSource | undefined;
 let agentsLoadPromise: Promise<void> | undefined;
@@ -606,11 +707,13 @@ interface AgentBuildRecord {
 	objective: string;
 	projectRoot: string;
 	configuration?: {
+		personaId?: string;
 		name: string;
 		description: string;
 		persona: string;
 		projectRoot: string;
 		tools: string[];
+		capabilities?: AgentCapabilityGrant[];
 		model?: { provider: string; id: string };
 		thinking?: ThinkingLevel;
 		modelControls?: ModelControls;
@@ -618,6 +721,9 @@ interface AgentBuildRecord {
 		executor: "session" | "harness";
 		permissionPolicy: "read-only" | "workspace-write";
 		browserAccess: "disabled" | "loopback" | "public-web" | "private-network";
+		browserRuntime?: "managed-chromium" | "installed-chrome";
+		browserProfile?: { kind: "ephemeral" } | { kind: "named"; id: string };
+		browserWorkflows?: Array<{ id: string; version: number }>;
 		delegateAgentIds: string[];
 		exposeA2a: boolean;
 	};
@@ -675,6 +781,37 @@ interface AgentBuildRecord {
 	updatedAt: number;
 }
 
+interface ConversationBuildView {
+	build: AgentBuildRecord;
+	link?: {
+		buildId: string;
+		sessionId: string;
+		mode: "create" | "edit" | "improve";
+		assumptions: Array<{
+			id: string;
+			topic: string;
+			value: string;
+			rationale: string;
+			status: "active" | "replaced" | "confirmed";
+		}>;
+		clarifications: Array<{
+			id: string;
+			topic: string;
+			question: string;
+			reason: string;
+			status: "open" | "answered" | "withdrawn";
+		}>;
+	};
+	proposals: Array<{
+		id: string;
+		action: string;
+		state: "pending" | "authorized" | "completed" | "failed" | "expired";
+		binding: { digest: string; preview: string };
+		expiresAt: number;
+	}>;
+	readiness: { ready: boolean; blockers: string[] };
+}
+
 interface AttentionSummary {
 	id: string;
 	taskId: string;
@@ -683,6 +820,47 @@ interface AttentionSummary {
 	title: string;
 	summary: string;
 	createdAt: number;
+}
+
+interface AgentRoomSummary {
+	id: string;
+	name: string;
+	purpose: string;
+	members: Array<{ agentId: string; role: string }>;
+	limits: {
+		maxRounds: number;
+		maxMessages: number;
+		maxConcurrency: number;
+		maxDurationMs: number;
+		maxTotalTokens: number;
+		maxCostUsd: number;
+	};
+	conversationId: string;
+}
+
+interface AgentRoomRunSummary {
+	id: string;
+	roomId: string;
+	status: "running" | "completed" | "needs-user" | "bounded" | "failed" | "cancelled";
+	goal: string;
+	createdAt: number;
+	finishedAt?: number;
+	rounds: Array<{
+		number: number;
+		status: "completed" | "needs-user" | "failed" | "cancelled";
+		turns: Array<{
+			agentId: string;
+			status: "reply" | "pass" | "needs-user" | "failed" | "cancelled";
+			message: string;
+			requestAgentIds?: string[];
+		}>;
+	}>;
+	messageCount: number;
+	totalTokens: number;
+	costUsd: number;
+	userQuestion?: string;
+	result?: string;
+	error?: string;
 }
 
 interface ArtifactSummary {
@@ -713,6 +891,7 @@ interface ConnectionEntry {
 	client: PiClient;
 	primary: boolean;
 	sessions: readonly SessionMetadata[];
+	generation: BrowserConnectionGeneration;
 }
 
 interface SessionTarget {
@@ -850,6 +1029,7 @@ let externalConnections: ExternalConnectionSummary[] = [];
 
 const connections = new Map<string, ConnectionEntry>();
 const reconnecting = new Set<string>();
+const selectionGeneration = new BrowserSelectionGeneration();
 const sessionAliases = readSessionAliases();
 const expandedThinking = new Map<string, boolean>();
 const thinkingCollapseTimers = new Map<string, number>();
@@ -2371,8 +2551,14 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 	apply.type = "button";
 	apply.id = "builder-chat-apply";
 	apply.className = "primary-action";
-	apply.textContent = activeSidebarAgent ? "Save candidate" : "Publish agent";
-	apply.title = "Apply the reviewed agent configuration without another model call";
+	apply.textContent = activeSidebarAgent
+		? "Save candidate"
+		: activeAgentBuild?.stage === "proven"
+			? "Review publish"
+			: "Save draft";
+	apply.title = activeSidebarAgent
+		? "Save the reviewed candidate without changing the deployed revision"
+		: "Save this package to the build lifecycle";
 	apply.addEventListener("click", () => agentForm.requestSubmit());
 	const cancel = document.createElement("button");
 	cancel.type = "button";
@@ -2485,6 +2671,32 @@ function renderAgentPackageSummary(build: AgentBuildRecord): HTMLElement {
 			"muted",
 		);
 	}
+	const conversation = activeConversationBuild?.build.id === build.id ? activeConversationBuild : undefined;
+	const assumptions = conversation?.link?.assumptions.filter((item) => item.status === "active") ?? [];
+	const questions = conversation?.link?.clarifications.filter((item) => item.status === "open") ?? [];
+	if (assumptions.length > 0) {
+		appendText(
+			details,
+			`Assumptions: ${assumptions.map((item) => `${item.topic}: ${item.value}`).join("; ")}`,
+			"muted",
+		);
+	}
+	if (questions.length > 0) {
+		appendText(details, `Open decisions: ${questions.map((item) => item.question).join(" ")}`, "run-error");
+	}
+	if (conversation) {
+		appendText(
+			details,
+			conversation.readiness.ready
+				? "Ready for publication review"
+				: `Readiness: ${conversation.readiness.blockers.join("; ") || "Candidate review is incomplete"}`,
+			conversation.readiness.ready ? "muted" : "run-error",
+		);
+		const proposal = conversation.proposals.find((item) => item.state === "pending");
+		if (proposal) {
+			appendText(details, `Awaiting your yes/no decision: ${proposal.binding.preview}`, "agent-package-proposal");
+		}
+	}
 	appendText(
 		details,
 		`Criteria: ${build.criteria.length} · Proof attempts: ${build.proofHistory.length + (build.proof ? 1 : 0)} · Evidence checks: ${build.evaluation?.checks.length ?? 0} · Feedback entries: ${build.feedback.length}`,
@@ -2514,10 +2726,13 @@ function agentConfigurationChanges(
 	active: AgentSummary,
 ): string[] {
 	const changes: string[] = [];
+	if (configuration.personaId !== active.personaId) changes.push("persona profile");
 	if (configuration.description !== active.description) changes.push("description");
 	if (configuration.persona !== active.persona) changes.push("persona instructions");
 	if (configuration.projectRoot !== active.projectRoot) changes.push("project folder");
 	if (configuration.tools.join("\0") !== active.tools.join("\0")) changes.push("tools");
+	if (JSON.stringify(configuration.capabilities ?? []) !== JSON.stringify(active.capabilities))
+		changes.push("capabilities");
 	if (
 		`${configuration.model?.provider ?? ""}/${configuration.model?.id ?? ""}` !==
 		`${active.model?.provider ?? ""}/${active.model?.id ?? ""}`
@@ -2529,6 +2744,15 @@ function agentConfigurationChanges(
 	if (configuration.executor !== active.executor) changes.push("executor");
 	if (configuration.permissionPolicy !== active.permissionPolicy) changes.push("permissions");
 	if (configuration.browserAccess !== (active.browser?.access ?? "disabled")) changes.push("browser access");
+	if ((configuration.browserRuntime ?? "managed-chromium") !== (active.browser?.runtime ?? "managed-chromium"))
+		changes.push("browser runtime");
+	if (
+		JSON.stringify(configuration.browserProfile ?? { kind: "ephemeral" }) !==
+		JSON.stringify(active.browser?.profile ?? { kind: "ephemeral" })
+	)
+		changes.push("browser profile");
+	if (JSON.stringify(configuration.browserWorkflows ?? []) !== JSON.stringify(active.browserWorkflows))
+		changes.push("browser workflows");
 	if (configuration.delegateAgentIds.join("\0") !== active.delegateAgentIds.join("\0")) changes.push("delegates");
 	if (configuration.exposeA2a !== active.a2a.enabled) changes.push("A2A exposure");
 	return changes;
@@ -2550,7 +2774,7 @@ function agentBuildStageLabel(record: AgentBuildRecord | undefined): string {
 
 function agentBuildLifecycleAction(): HTMLButtonElement | undefined {
 	const build = activeAgentBuild;
-	if (!build || build.stage === "automated" || (build.stage === "draft" && !build.agentId)) return undefined;
+	if (!build || build.stage === "automated") return undefined;
 	const button = document.createElement("button");
 	button.type = "button";
 	button.className = "lifecycle-action";
@@ -2565,8 +2789,11 @@ function agentBuildLifecycleAction(): HTMLButtonElement | undefined {
 		return button;
 	}
 	if (build.stage === "proven") {
-		button.textContent = "Save as skill";
-		button.addEventListener("click", () => void openLifecycleSkillPromotion());
+		button.textContent = build.agentId ? "Save as skill" : "Review publish";
+		button.addEventListener(
+			"click",
+			() => void (build.agentId ? openLifecycleSkillPromotion() : requestBuilderPublication()),
+		);
 		return button;
 	}
 	if (build.stage === "promoted") {
@@ -2581,10 +2808,7 @@ function agentBuildLifecycleAction(): HTMLButtonElement | undefined {
 }
 
 function openAgentBuildProofDialog(): void {
-	if (!activeAgentBuild?.agentId) {
-		setStatus("Create the agent before running a proof", true);
-		return;
-	}
+	if (!activeAgentBuild) return;
 	const build = activeAgentBuild;
 	const dialog = document.createElement("dialog");
 	dialog.className = "promotion-dialog";
@@ -2642,6 +2866,16 @@ function openAgentBuildProofDialog(): void {
 	dialog.showModal();
 	prompt.focus();
 	prompt.select();
+}
+
+async function requestBuilderPublication(): Promise<void> {
+	if (!activeAgentBuild || activeAgentBuild.agentId || activeAgentBuild.stage !== "proven") {
+		setStatus("Test and accept the current candidate before publication review", true);
+		return;
+	}
+	input.value = "Publish this exact agent package.";
+	resizeComposer();
+	await submitBuilderComposer();
 }
 
 async function openAgentBuildProofReview(): Promise<void> {
@@ -4123,10 +4357,14 @@ async function addConnection(controlUrl: string, primary = false): Promise<Conne
 		client: connectedClient,
 		primary,
 		sessions: [],
+		generation: new BrowserConnectionGeneration(),
 	};
 	connections.set(id, entry);
 	connectedClient.onConnectionStateChange((change) => {
-		if (change.state === "disconnected") void reconnect(entry);
+		if (change.state !== "disconnected" || connections.get(entry.id) !== entry || reconnecting.has(entry.id)) return;
+		entry.generation.invalidate();
+		if (activeTargetKey?.startsWith(`${entry.id}:`)) selectionGeneration.invalidate();
+		void reconnect(entry);
 	});
 	await refreshSessionTargets();
 	return entry;
@@ -4149,10 +4387,16 @@ function sessionTargets(): SessionTarget[] {
 async function refreshSessionTargets(): Promise<void> {
 	await Promise.all(
 		[...connections.values()].map(async (entry) => {
+			const generation = entry.generation.beginSessionList();
 			try {
-				entry.sessions = await entry.client.listSessions();
+				const sessions = await entry.client.listSessions();
+				if (connections.get(entry.id) === entry && entry.generation.isSessionListCurrent(generation)) {
+					entry.sessions = sessions;
+				}
 			} catch {
-				entry.sessions = [];
+				if (connections.get(entry.id) === entry && entry.generation.isSessionListCurrent(generation)) {
+					entry.sessions = [];
+				}
 			}
 		}),
 	);
@@ -4161,6 +4405,7 @@ async function refreshSessionTargets(): Promise<void> {
 
 function renderSessionNavigation(): void {
 	syncModelSettingsPresentation();
+	agentNewContext.classList.toggle("hidden", activeAgentId === undefined);
 	const targets = sessionTargets();
 	sessionTabs.replaceChildren(
 		...targets.map((target) => {
@@ -4377,37 +4622,209 @@ function renderAgentNavigationGroup(): HTMLElement {
 	create.title = "Build a new agent";
 	create.setAttribute("aria-label", create.title);
 	create.addEventListener("click", () => void openAgentBuilder());
-	heading.append(indicator, label, create);
+	heading.append(indicator, label);
+	const hiddenCount = [...agentRosterEntries.values()].filter((entry) => entry.hidden).length;
+	if (hiddenCount > 0) {
+		const hidden = document.createElement("button");
+		hidden.type = "button";
+		hidden.textContent = showHiddenAgents ? "Hide hidden" : `Hidden ${hiddenCount}`;
+		hidden.title = showHiddenAgents ? "Hide archived agents" : "Show hidden agents";
+		hidden.setAttribute("aria-label", hidden.title);
+		hidden.style.cssText = "width:auto;font-size:10px";
+		hidden.addEventListener("click", () => {
+			showHiddenAgents = !showHiddenAgents;
+			renderSessionNavigation();
+		});
+		heading.append(hidden);
+	}
+	heading.append(create);
 	group.append(heading);
+	const search = document.createElement("input");
+	search.type = "search";
+	search.value = agentRosterSearch;
+	search.placeholder = "Find agents";
+	search.setAttribute("aria-label", "Find agents");
+	search.style.cssText =
+		"width:calc(100% - 14px);margin:7px 7px 2px;border:1px solid var(--line);border-radius:8px;background:#131316;color:var(--text);padding:8px";
+	search.addEventListener("input", () => {
+		agentRosterSearch = search.value;
+		const query = agentRosterSearch.trim().toLowerCase();
+		for (const row of group.querySelectorAll<HTMLElement>("[data-agent-search]")) {
+			row.classList.toggle("hidden", Boolean(query) && !row.dataset.agentSearch?.includes(query));
+		}
+	});
+	group.append(search);
 	if (agents.length === 0) {
 		const empty = document.createElement("p");
 		empty.className = "agent-activity-empty";
 		empty.textContent = "No published agents";
 		group.append(empty);
-		return group;
 	}
-	for (const agent of agents) {
+	const visibleAgents = agents
+		.filter((agent) => showHiddenAgents || !agentRosterEntries.get(agent.id)?.hidden)
+		.sort((left, right) => {
+			const leftOrder = agentRosterEntries.get(left.id)?.pinnedOrder ?? Number.MAX_SAFE_INTEGER;
+			const rightOrder = agentRosterEntries.get(right.id)?.pinnedOrder ?? Number.MAX_SAFE_INTEGER;
+			return leftOrder - rightOrder || left.name.localeCompare(right.name);
+		});
+	for (const agent of visibleAgents) {
+		const row = document.createElement("div");
+		row.className = "nav-item session-entry session-row";
+		row.dataset.agentSearch = `${agent.id} ${agent.name} ${agent.description}`.toLowerCase();
+		row.classList.toggle(
+			"hidden",
+			Boolean(agentRosterSearch.trim()) && !row.dataset.agentSearch.includes(agentRosterSearch.trim().toLowerCase()),
+		);
 		const button = document.createElement("button");
 		button.type = "button";
-		button.className = "nav-item session-entry";
+		button.className = "session-select";
 		button.classList.toggle("active", activeAgentId === agent.id);
 		const name = document.createElement("strong");
-		name.textContent = agent.name;
+		const roster = agentRosterEntries.get(agent.id);
+		name.textContent = `${agent.name}${roster?.unreadCount ? ` (${roster.unreadCount})` : ""}`;
 		const state = document.createElement("span");
 		state.className = "muted";
 		const build = agentBuilds.find((candidate) => candidate.agentId === agent.id);
-		state.textContent = build
-			? `${agentBuildStageLabel(build)} · revision ${agent.revision}`
-			: `Revision ${agent.revision}`;
+		state.textContent = roster
+			? `${roster.status.replace("-", " ")}${roster.routines.enabled > 0 ? ` · ${roster.routines.enabled} routine${roster.routines.enabled === 1 ? "" : "s"}` : ""}`
+			: build
+				? `${agentBuildStageLabel(build)} · revision ${agent.revision}`
+				: `Revision ${agent.revision}`;
 		button.append(name, state);
 		button.addEventListener("click", () => void openAgent(agent));
-		group.append(button);
+		const menu = document.createElement("details");
+		menu.className = "agent-menu";
+		const summary = document.createElement("summary");
+		summary.textContent = "⋯";
+		summary.title = `${agent.name} roster actions`;
+		const actions = document.createElement("div");
+		const edit = document.createElement("button");
+		edit.type = "button";
+		edit.textContent = "Edit";
+		edit.addEventListener("click", () => void openAgentBuilder(agent));
+		const improve = document.createElement("button");
+		improve.type = "button";
+		improve.textContent = "Improve";
+		improve.addEventListener("click", () => openAgentImprovementReview(agent));
+		const pin = document.createElement("button");
+		pin.type = "button";
+		pin.textContent = roster?.pinnedOrder === undefined ? "Pin" : "Unpin";
+		pin.addEventListener(
+			"click",
+			() => void updateAgentPresentation(agent.id, { pinnedOrder: roster?.pinnedOrder === undefined ? 0 : null }),
+		);
+		const hide = document.createElement("button");
+		hide.type = "button";
+		hide.textContent = roster?.hidden ? "Show" : "Hide";
+		hide.addEventListener("click", () => void updateAgentPresentation(agent.id, { hidden: !roster?.hidden }));
+		actions.append(edit, improve, pin, hide);
+		menu.append(summary, actions);
+		row.append(button, menu);
+		group.append(row);
+	}
+	if (agentRooms.length > 0) {
+		const roomHeading = document.createElement("div");
+		roomHeading.className = "connection-heading";
+		const roomIndicator = document.createElement("i");
+		const roomLabel = document.createElement("span");
+		roomLabel.textContent = "Rooms";
+		const addRoom = document.createElement("button");
+		addRoom.type = "button";
+		addRoom.textContent = "+";
+		addRoom.title = "Start a bounded collaboration room";
+		addRoom.setAttribute("aria-label", addRoom.title);
+		addRoom.addEventListener("click", openAgentRoomCreator);
+		roomHeading.append(roomIndicator, roomLabel, addRoom);
+		group.append(roomHeading);
+		for (const room of agentRooms) {
+			const latest = agentRoomRuns.find((run) => run.roomId === room.id);
+			const row = document.createElement("div");
+			row.className = "nav-item session-entry session-row";
+			row.dataset.agentSearch = `${room.id} ${room.name} ${room.purpose}`.toLowerCase();
+			row.classList.toggle(
+				"hidden",
+				Boolean(agentRosterSearch.trim()) &&
+					!row.dataset.agentSearch.includes(agentRosterSearch.trim().toLowerCase()),
+			);
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "session-select";
+			const name = document.createElement("strong");
+			name.textContent = room.name;
+			const state = document.createElement("span");
+			state.className = "muted";
+			state.textContent = latest
+				? `${roomRunPresentation(latest.status).label} · ${latest.rounds.length}/${room.limits.maxRounds} rounds`
+				: `${room.members.length} members`;
+			button.append(name, state);
+			button.disabled = latest === undefined;
+			if (latest) button.addEventListener("click", () => openAgentRoomRun(latest));
+			row.append(button);
+			group.append(row);
+		}
 	}
 	return group;
 }
 
+async function updateAgentPresentation(
+	agentId: string,
+	update: { pinnedOrder?: number | null; hidden?: boolean },
+): Promise<void> {
+	if (!capabilityToken) return;
+	const response = await fetch(
+		`/agent-roster/${encodeURIComponent(agentId)}/presentation?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(update),
+		},
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not update agent roster"));
+	const entry: unknown = await response.json();
+	if (!isAgentRosterEntry(entry)) throw new Error("Agent roster returned an invalid entry");
+	agentRosterEntries.set(agentId, entry);
+	renderSessionNavigation();
+}
+
+async function markAgentRead(agentId: string): Promise<void> {
+	if (!capabilityToken || !agentRosterEntries.get(agentId)?.unreadCount) return;
+	const response = await fetch(
+		`/agent-roster/${encodeURIComponent(agentId)}/read?token=${encodeURIComponent(capabilityToken)}`,
+		{ method: "POST", headers: { "content-type": "application/json" }, body: "{}" },
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not mark agent inbox read"));
+	const entry: unknown = await response.json();
+	if (!isAgentRosterEntry(entry)) throw new Error("Agent roster returned an invalid entry");
+	agentRosterEntries.set(agentId, entry);
+	renderSessionNavigation();
+}
+
+async function startAgentContext(agentId: string): Promise<void> {
+	if (!capabilityToken) return;
+	agentNewContext.disabled = true;
+	try {
+		const response = await fetch(
+			`/agent-roster/${encodeURIComponent(agentId)}/context-checkpoints?token=${encodeURIComponent(capabilityToken)}`,
+			{ method: "POST", headers: { "content-type": "application/json" }, body: "{}" },
+		);
+		if (!response.ok) throw new Error(await responseError(response, "Could not start a new agent context"));
+		await loadSelectedAgent();
+		setStatus("New agent context started. Earlier inbox history remains available.");
+	} finally {
+		agentNewContext.disabled = false;
+	}
+}
+
 async function switchSession(target: SessionTarget, preserveWorkspace = false): Promise<void> {
+	const selection = selectionGeneration.begin();
 	if (target.key === activeTargetKey && session?.attached) {
+		const currentSession = session;
+		unsubscribeSession?.();
+		unsubscribeSession = currentSession.subscribe((snapshot) => {
+			if (!selectionGeneration.isCurrent(selection) || session !== currentSession) return;
+			if (builderActive) renderBuilderConversation(snapshot);
+			else render(snapshot);
+		});
 		if (!preserveWorkspace) {
 			builderActive = false;
 			activeAgentId = undefined;
@@ -4428,13 +4845,30 @@ async function switchSession(target: SessionTarget, preserveWorkspace = false): 
 	}
 	const entry = connections.get(target.connectionId);
 	if (!entry) throw new Error("Pi connection is unavailable");
+	const connectionEpoch = entry.generation.epoch;
 	setStatus(`Connecting to ${sessionDisplayName(target)}…`);
 	phase.textContent = "connecting";
 	input.disabled = true;
 	unsubscribeSession?.();
 	unsubscribeSession = undefined;
 	await session?.dispose().catch(() => {});
-	session = await entry.client.attachSession(target.session.id);
+	if (!selectionGeneration.isCurrent(selection)) return;
+	let nextSession: PiSessionHandle;
+	try {
+		nextSession = await entry.client.attachSession(target.session.id);
+	} catch (error) {
+		if (!selectionGeneration.isCurrent(selection) || !entry.generation.isCurrent(connectionEpoch)) return;
+		throw error;
+	}
+	if (
+		!(await selectionGeneration.retainCurrentSession(
+			selection,
+			nextSession,
+			() => connections.get(entry.id) === entry && entry.generation.isCurrent(connectionEpoch),
+		))
+	)
+		return;
+	session = nextSession;
 	activeTargetKey = target.key;
 	if (!preserveWorkspace) {
 		builderActive = false;
@@ -4447,7 +4881,8 @@ async function switchSession(target: SessionTarget, preserveWorkspace = false): 
 		persistExternalConnectionTabs();
 	}
 	populateModels(entry.client.snapshot?.models ?? []);
-	unsubscribeSession = session.subscribe((snapshot) => {
+	unsubscribeSession = nextSession.subscribe((snapshot) => {
+		if (!selectionGeneration.isCurrent(selection) || session !== nextSession) return;
 		if (builderActive) renderBuilderConversation(snapshot);
 		else render(snapshot);
 	});
@@ -5569,12 +6004,24 @@ async function responseError(response: Response, fallback: string): Promise<stri
 async function removeConnection(id: string): Promise<void> {
 	const entry = connections.get(id);
 	if (!entry || entry.primary) return;
+	entry.generation.invalidate();
+	connections.delete(id);
 	if (activeTargetKey?.startsWith(`${id}:`)) {
+		selectionGeneration.invalidate();
 		activeTargetKey = undefined;
 		const fallback = sessionTargets().find((target) => target.connectionId !== id);
 		if (fallback) await switchSession(fallback);
+		else {
+			unsubscribeSession?.();
+			unsubscribeSession = undefined;
+			const previousSession = session;
+			session = undefined;
+			await previousSession?.dispose().catch(() => {});
+			input.disabled = true;
+			phase.textContent = "disconnected";
+			setStatus("No Pi session available", true);
+		}
 	}
-	connections.delete(id);
 	await entry.client.dispose();
 	renderSessionNavigation();
 }
@@ -6573,6 +7020,21 @@ interface AgentSummary {
 	schedules: Array<{ id: string; prompt: string; intervalMinutes: number; enabled: boolean }>;
 }
 
+interface AgentRosterEntry {
+	agentId: string;
+	agentRevision: number;
+	name: string;
+	description: string;
+	inboxConversationId: string;
+	status: "needs-attention" | "active" | "queued" | "idle" | "unavailable";
+	currentTask?: { id: string; summary: string; status: AgentTaskSummary["status"] };
+	latestMessage?: { sequence: number; preview: string; createdAt: number };
+	unreadCount: number;
+	hidden: boolean;
+	pinnedOrder?: number;
+	routines: { enabled: number; nextRunAt?: number };
+}
+
 function loadAgents(): Promise<void> {
 	agentsLoadPromise ??= loadAgentsNow().finally(() => {
 		agentsLoadPromise = undefined;
@@ -6582,17 +7044,22 @@ function loadAgents(): Promise<void> {
 
 async function loadAgentsNow(): Promise<void> {
 	if (!capabilityToken) return;
-	const [response, buildsResponse] = await Promise.all([
+	const [response, buildsResponse, rosterResponse] = await Promise.all([
 		fetch(`/agents.json?token=${encodeURIComponent(capabilityToken)}`),
 		fetch(`/agent-builds.json?token=${encodeURIComponent(capabilityToken)}`),
+		fetch(`/agent-roster.json?hidden=true&token=${encodeURIComponent(capabilityToken)}`),
 	]);
 	if (!response.ok) throw new Error(`Could not load agents: HTTP ${response.status}`);
 	if (!buildsResponse.ok) throw new Error(`Could not load agent drafts: HTTP ${buildsResponse.status}`);
+	if (!rosterResponse.ok) throw new Error(`Could not load agent roster: HTTP ${rosterResponse.status}`);
 	const payload: unknown = await response.json();
 	const buildsPayload: unknown = await buildsResponse.json();
+	const rosterPayload: unknown = await rosterResponse.json();
 	if (!isAgentList(payload)) throw new Error("Agent registry returned an invalid response");
 	if (!isAgentBuildList(buildsPayload)) throw new Error("Agent build service returned an invalid response");
+	if (!isAgentRoster(rosterPayload)) throw new Error("Agent roster returned an invalid response");
 	agents = payload.agents;
+	agentRosterEntries = new Map(rosterPayload.entries.map((entry) => [entry.agentId, entry]));
 	agentBuilds = buildsPayload.builds;
 	for (let index = openAgentIds.length - 1; index >= 0; index -= 1) {
 		if (!agents.some((agent) => agent.id === openAgentIds[index])) openAgentIds.splice(index, 1);
@@ -6719,14 +7186,27 @@ async function resumeAgentBuildDraft(build: AgentBuildRecord): Promise<void> {
 
 function applyAgentBuildConfiguration(configuration: NonNullable<AgentBuildRecord["configuration"]>): void {
 	requiredElement<HTMLInputElement>("agent-name").value = configuration.name;
+	if (configuration.personaId && personas.some((persona) => persona.id === configuration.personaId)) {
+		personaSelect.value = configuration.personaId;
+	}
 	requiredElement<HTMLTextAreaElement>("agent-description").value = configuration.description;
 	requiredElement<HTMLTextAreaElement>("agent-persona").value = configuration.persona;
 	requiredElement<HTMLInputElement>("agent-project-root").value = configuration.projectRoot;
 	requiredElement<HTMLInputElement>("agent-tools").value = configuration.tools.join(",");
+	requiredElement<HTMLInputElement>("agent-capabilities").value = JSON.stringify(configuration.capabilities ?? []);
 	requiredElement<HTMLSelectElement>("agent-memory").value = configuration.memory;
 	requiredElement<HTMLSelectElement>("agent-executor").value = configuration.executor;
 	requiredElement<HTMLSelectElement>("agent-permissions").value = configuration.permissionPolicy;
 	requiredElement<HTMLSelectElement>("agent-browser-access").value = configuration.browserAccess;
+	requiredElement<HTMLSelectElement>("agent-browser-runtime").value =
+		configuration.browserRuntime ?? "managed-chromium";
+	requiredElement<HTMLSelectElement>("agent-browser-profile-kind").value =
+		configuration.browserProfile?.kind ?? "ephemeral";
+	requiredElement<HTMLInputElement>("agent-browser-profile-id").value =
+		configuration.browserProfile?.kind === "named" ? configuration.browserProfile.id : "";
+	requiredElement<HTMLInputElement>("agent-browser-workflows").value = (configuration.browserWorkflows ?? [])
+		.map((workflow) => `${workflow.id}@${workflow.version}`)
+		.join(",");
 	requiredElement<HTMLInputElement>("agent-delegates").value = configuration.delegateAgentIds.join(",");
 	requiredElement<HTMLInputElement>("agent-a2a").checked = configuration.exposeA2a;
 	agentModelControls = configuration.modelControls === undefined ? undefined : { ...configuration.modelControls };
@@ -6830,6 +7310,49 @@ function isAgentList(value: unknown): value is { agents: AgentSummary[] } {
 			entry.a2a !== null &&
 			"schedules" in entry &&
 			Array.isArray(entry.schedules),
+	);
+}
+
+function isAgentRoster(value: unknown): value is { version: 1; rosterRevision: number; entries: AgentRosterEntry[] } {
+	if (
+		typeof value !== "object" ||
+		value === null ||
+		!("version" in value) ||
+		value.version !== 1 ||
+		!("rosterRevision" in value) ||
+		typeof value.rosterRevision !== "number" ||
+		!("entries" in value) ||
+		!Array.isArray(value.entries)
+	)
+		return false;
+	return value.entries.every(isAgentRosterEntry);
+}
+
+function isAgentRosterEntry(entry: unknown): entry is AgentRosterEntry {
+	return (
+		typeof entry === "object" &&
+		entry !== null &&
+		"agentId" in entry &&
+		typeof entry.agentId === "string" &&
+		"agentRevision" in entry &&
+		typeof entry.agentRevision === "number" &&
+		"name" in entry &&
+		typeof entry.name === "string" &&
+		"description" in entry &&
+		typeof entry.description === "string" &&
+		"inboxConversationId" in entry &&
+		typeof entry.inboxConversationId === "string" &&
+		"status" in entry &&
+		["needs-attention", "active", "queued", "idle", "unavailable"].includes(String(entry.status)) &&
+		"unreadCount" in entry &&
+		Number.isSafeInteger(entry.unreadCount) &&
+		"hidden" in entry &&
+		typeof entry.hidden === "boolean" &&
+		"routines" in entry &&
+		typeof entry.routines === "object" &&
+		entry.routines !== null &&
+		"enabled" in entry.routines &&
+		Number.isSafeInteger(entry.routines.enabled)
 	);
 }
 
@@ -7380,7 +7903,9 @@ function agentBuildConfigurationInput(): AgentBuildRecord["configuration"] | und
 	if (!name || !description || !persona || !projectRoot) return undefined;
 	const modelReference = value("agent-model");
 	const separator = modelReference.indexOf("/");
+	const browserProfileKind = value("agent-browser-profile-kind");
 	return {
+		personaId: value("agent-persona-select") || undefined,
 		name,
 		description,
 		persona,
@@ -7389,6 +7914,7 @@ function agentBuildConfigurationInput(): AgentBuildRecord["configuration"] | und
 			.split(",")
 			.map((tool) => tool.trim())
 			.filter(Boolean),
+		capabilities: selectedAgentCapabilities(),
 		model:
 			separator > 0
 				? { provider: modelReference.slice(0, separator), id: modelReference.slice(separator + 1) }
@@ -7399,6 +7925,19 @@ function agentBuildConfigurationInput(): AgentBuildRecord["configuration"] | und
 		executor: value("agent-executor") as "session" | "harness",
 		permissionPolicy: value("agent-permissions") as "read-only" | "workspace-write",
 		browserAccess: value("agent-browser-access") as "disabled" | "loopback" | "public-web" | "private-network",
+		browserRuntime: value("agent-browser-runtime") as "managed-chromium" | "installed-chrome",
+		browserProfile:
+			browserProfileKind === "named"
+				? { kind: "named", id: value("agent-browser-profile-id") }
+				: { kind: "ephemeral" },
+		browserWorkflows: value("agent-browser-workflows")
+			.split(",")
+			.map((entry) => entry.trim())
+			.filter(Boolean)
+			.map((entry) => {
+				const versionSeparator = entry.lastIndexOf("@");
+				return { id: entry.slice(0, versionSeparator), version: Number(entry.slice(versionSeparator + 1)) };
+			}),
 		delegateAgentIds: value("agent-delegates")
 			.split(",")
 			.map((id) => id.trim())
@@ -7419,27 +7958,38 @@ function scheduleAgentBuildDraftPersistence(): void {
 }
 
 async function persistAgentBuildDraft(): Promise<void> {
-	if (!capabilityToken) return;
+	if (!capabilityToken || !session) return;
 	const configurationError = agentBuilderConfigurationError();
 	if (configurationError) throw new Error(configurationError);
 	const draft = agentBuildDraftInput();
 	if (!draft) return;
-	const path = activeAgentBuild ? `/agent-builds/${encodeURIComponent(activeAgentBuild.id)}` : "/agent-builds/draft";
-	const response = await fetch(`${path}?token=${encodeURIComponent(capabilityToken)}`, {
-		method: activeAgentBuild ? "PUT" : "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(draft),
-	});
+	const response = await fetch(
+		`/agent-build-conversations/apply-intent?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				sessionId: session.id,
+				mode: activeSidebarAgent ? (activeAgentImprovement ? "improve" : "edit") : "create",
+				buildId: activeAgentBuild?.id,
+				expectedBuildRevision: activeAgentBuild?.revision,
+				draft,
+				assumptions: draftedAgentAssumptions,
+				clarifications: draftedAgentClarifications,
+			}),
+		},
+	);
 	if (!response.ok) throw new Error(await responseError(response, "Could not save agent draft"));
 	const payload: unknown = await response.json();
-	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid draft");
-	activeAgentBuild = payload;
-	draftedAgentCriteria = payload.criteria;
+	if (!isConversationBuildView(payload)) throw new Error("Conversation build service returned an invalid draft");
+	activeConversationBuild = payload;
+	activeAgentBuild = payload.build;
+	draftedAgentCriteria = payload.build.criteria;
 	if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
 }
 
 async function loadAgentBuildForAgent(agentId: string): Promise<AgentBuildRecord | undefined> {
-	if (!capabilityToken) return undefined;
+	if (!capabilityToken || !session) return undefined;
 	const response = await fetch(`/agent-builds/for-agent?token=${encodeURIComponent(capabilityToken)}`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
@@ -7450,45 +8000,39 @@ async function loadAgentBuildForAgent(agentId: string): Promise<AgentBuildRecord
 	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid record");
 	activeAgentBuild = payload;
 	draftedAgentCriteria = payload.criteria;
-	return payload;
-}
-
-async function linkActiveAgentBuild(agentId: string): Promise<void> {
-	if (!capabilityToken) return;
-	if (!activeAgentBuild) {
-		await loadAgentBuildForAgent(agentId);
-		return;
-	}
-	const response = await fetch(
-		`/agent-builds/${encodeURIComponent(activeAgentBuild.id)}/link-agent?token=${encodeURIComponent(capabilityToken)}`,
+	const attachResponse = await fetch(
+		`/agent-build-conversations/${encodeURIComponent(payload.id)}/attach?token=${encodeURIComponent(capabilityToken)}`,
 		{
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ agentId }),
+			body: JSON.stringify({
+				sessionId: session.id,
+				mode: activeAgentImprovement ? "improve" : "edit",
+			}),
 		},
 	);
-	if (!response.ok) throw new Error(await responseError(response, "Could not link the agent build"));
-	const payload: unknown = await response.json();
-	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid record");
-	activeAgentBuild = payload;
-	draftedAgentCriteria = payload.criteria;
-	await loadAgents();
+	if (!attachResponse.ok) throw new Error(await responseError(attachResponse, "Could not attach agent build"));
+	const attached: unknown = await attachResponse.json();
+	if (!isConversationBuildView(attached)) throw new Error("Conversation build service returned an invalid record");
+	activeConversationBuild = attached;
+	return payload;
 }
 
 async function refreshActiveAgentBuild(): Promise<void> {
 	if (!capabilityToken || !activeAgentBuild) return;
 	const previousRevision = activeAgentBuild.revision;
 	const response = await fetch(
-		`/agent-builds/${encodeURIComponent(activeAgentBuild.id)}?token=${encodeURIComponent(capabilityToken)}`,
+		`/agent-build-conversations/${encodeURIComponent(activeAgentBuild.id)}?token=${encodeURIComponent(capabilityToken)}`,
 	);
 	if (!response.ok) throw new Error(await responseError(response, "Could not refresh agent build lifecycle"));
 	const payload: unknown = await response.json();
-	if (!isAgentBuildRecord(payload)) throw new Error("Agent build service returned an invalid record");
-	activeAgentBuild = payload;
-	draftedAgentCriteria = payload.criteria;
-	if (payload.revision !== previousRevision && payload.stage === "draft" && payload.configuration) {
-		applyAgentBuildConfiguration(payload.configuration);
-		agentBuilderFeedback = `Staged revision ${payload.revision} is ready to review and apply.`;
+	if (!isConversationBuildView(payload)) throw new Error("Conversation build service returned an invalid record");
+	activeConversationBuild = payload;
+	activeAgentBuild = payload.build;
+	draftedAgentCriteria = payload.build.criteria;
+	if (payload.build.revision !== previousRevision && payload.build.stage === "draft" && payload.build.configuration) {
+		applyAgentBuildConfiguration(payload.build.configuration);
+		agentBuilderFeedback = `Staged revision ${payload.build.revision} is ready to review and apply.`;
 		updateAgentBuilderReadiness();
 	}
 	if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
@@ -7512,6 +8056,18 @@ function isAgentBuildRecord(value: unknown): value is AgentBuildRecord {
 			"promoted",
 			"automated",
 		].includes(String(record.stage))
+	);
+}
+
+function isConversationBuildView(value: unknown): value is ConversationBuildView {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const view = value as Partial<ConversationBuildView>;
+	return (
+		isAgentBuildRecord(view.build) &&
+		Array.isArray(view.proposals) &&
+		typeof view.readiness === "object" &&
+		view.readiness !== null &&
+		Array.isArray(view.readiness.blockers)
 	);
 }
 
@@ -7561,6 +8117,8 @@ function applyAgentBuilderDraft(encoded: string): void {
 		"tools",
 		"delegateAgentIds",
 		"criteria",
+		"assumptions",
+		"clarifications",
 	]);
 	const unsupported = Object.keys(draft).filter((field) => !supportedFields.has(field));
 	if (unsupported.length > 0) warnings.push(`Unsupported fields: ${unsupported.join(", ")}`);
@@ -7610,6 +8168,14 @@ function applyAgentBuilderDraft(encoded: string): void {
 	if (draft.criteria !== undefined) {
 		if (Array.isArray(draft.criteria)) draftedAgentCriteria = draft.criteria;
 		else warnings.push("Improvement criteria must be an array");
+	}
+	if (draft.assumptions !== undefined) {
+		if (Array.isArray(draft.assumptions)) draftedAgentAssumptions = draft.assumptions;
+		else warnings.push("Assumptions must be an array");
+	}
+	if (draft.clarifications !== undefined) {
+		if (Array.isArray(draft.clarifications)) draftedAgentClarifications = draft.clarifications;
+		else warnings.push("Clarifications must be an array");
 	}
 	updateAgentBrowserProfileFields();
 	agentModelPicker.refresh();
@@ -8389,7 +8955,10 @@ async function openAgentBuilder(
 	teamLaunchBusy = false;
 	agentBuilderFeedback = "";
 	activeAgentBuild = undefined;
+	activeConversationBuild = undefined;
 	draftedAgentCriteria = undefined;
+	draftedAgentAssumptions = undefined;
+	draftedAgentClarifications = undefined;
 	if (agentBuildDraftTimer !== undefined) window.clearTimeout(agentBuildDraftTimer);
 	if (agentBuildPollTimer !== undefined) window.clearTimeout(agentBuildPollTimer);
 	agentBuildDraftTimer = undefined;
@@ -8448,7 +9017,7 @@ async function openAgentBuilder(
 			: agent.name
 		: "Build a new agent";
 	builderLabel = agent ? `Edit ${agent.name}` : "Agent Builder";
-	agentSubmit.textContent = agent ? "Save candidate revision" : "Publish agent";
+	agentSubmit.textContent = agent ? "Save candidate revision" : "Save draft";
 	agentCancel.textContent = agent ? "Cancel editing" : "Cancel agent";
 	activateTab(showConversation ? "agents-workspace" : "agent-builder");
 	activateBuilderTab("builder-profile-panel");
@@ -8491,7 +9060,10 @@ function closeBuilderChat(): void {
 	builderActive = false;
 	activeAgentImprovement = undefined;
 	activeAgentBuild = undefined;
+	activeConversationBuild = undefined;
 	draftedAgentCriteria = undefined;
+	draftedAgentAssumptions = undefined;
+	draftedAgentClarifications = undefined;
 	if (agentBuildDraftTimer !== undefined) window.clearTimeout(agentBuildDraftTimer);
 	if (agentBuildPollTimer !== undefined) window.clearTimeout(agentBuildPollTimer);
 	agentBuildDraftTimer = undefined;
@@ -8546,6 +9118,7 @@ async function loadSelectedAgentNow(agent: AgentSummary, token: string): Promise
 	else agentConversationIds.delete(agent.id);
 	const tasks = await loadAgentTasks(agent);
 	if (activeAgentId === agent.id) renderAgentConversation(agent, messages, tasks, teamPayload);
+	await markAgentRead(agent.id);
 }
 
 function renderAgentConversation(
@@ -8840,27 +9413,43 @@ async function loadAgentTasks(agent: AgentSummary): Promise<AgentTaskSummary[]> 
 
 async function loadAgentActivity(): Promise<void> {
 	if (!capabilityToken) return;
-	const [taskResponse, attentionResponse, artifactResponse] = await Promise.all([
-		fetch(`/agent-tasks.json?token=${encodeURIComponent(capabilityToken)}`),
-		fetch(`/attention.json?status=open&token=${encodeURIComponent(capabilityToken)}`),
-		fetch(`/artifacts.json?token=${encodeURIComponent(capabilityToken)}`),
-	]);
+	const [taskResponse, attentionResponse, artifactResponse, roomResponse, conversationBuildResponse] =
+		await Promise.all([
+			fetch(`/agent-tasks.json?token=${encodeURIComponent(capabilityToken)}`),
+			fetch(`/attention.json?status=open&token=${encodeURIComponent(capabilityToken)}`),
+			fetch(`/artifacts.json?token=${encodeURIComponent(capabilityToken)}`),
+			fetch(`/agent-rooms.json?token=${encodeURIComponent(capabilityToken)}`),
+			fetch(
+				`/agent-build-conversations.json?sessionId=${encodeURIComponent(session?.id ?? "")}&token=${encodeURIComponent(capabilityToken)}`,
+			),
+		]);
 	if (!taskResponse.ok) throw new Error(`Could not load agent activity: HTTP ${taskResponse.status}`);
 	if (!attentionResponse.ok) throw new Error(`Could not load Attention: HTTP ${attentionResponse.status}`);
 	if (!artifactResponse.ok) throw new Error(`Could not load artifacts: HTTP ${artifactResponse.status}`);
+	if (!roomResponse.ok) throw new Error(`Could not load collaboration rooms: HTTP ${roomResponse.status}`);
+	if (!conversationBuildResponse.ok)
+		throw new Error(`Could not load conversation builds: HTTP ${conversationBuildResponse.status}`);
 	const payload: unknown = await taskResponse.json();
 	if (!isAgentTaskList(payload)) throw new Error("Agent task service returned an invalid response");
 	const attentionPayload: unknown = await attentionResponse.json();
 	const artifactPayload: unknown = await artifactResponse.json();
+	const roomPayload: unknown = await roomResponse.json();
+	const conversationBuildPayload: unknown = await conversationBuildResponse.json();
 	attentionItems = attentionFromPayload(attentionPayload);
 	artifacts = artifactsFromPayload(artifactPayload);
+	const roomState = roomsFromPayload(roomPayload);
+	agentRooms = roomState.rooms;
+	agentRoomRuns = roomState.runs;
+	conversationBuilds = conversationBuildViewsFromPayload(conversationBuildPayload);
+	renderSessionNavigation();
 	for (const agent of agents) {
 		agentTasksByAgent.set(
 			agent.id,
 			payload.tasks.filter((task) => task.agentId === agent.id),
 		);
 	}
-	renderAgentActivity(payload.tasks, attentionItems);
+	renderAgentActivity(payload.tasks, attentionItems, conversationBuilds);
+	refreshOpenAgentRoomRunDialog();
 	if (activeArtifactId === artifactLibraryId) {
 		renderArtifactLibrary();
 	} else if (activeArtifactId) {
@@ -8869,7 +9458,11 @@ async function loadAgentActivity(): Promise<void> {
 	}
 }
 
-function renderAgentActivity(tasks: AgentTaskSummary[], attention: AttentionSummary[]): void {
+function renderAgentActivity(
+	tasks: AgentTaskSummary[],
+	attention: AttentionSummary[],
+	conversationViews: ConversationBuildView[],
+): void {
 	const active = tasks
 		.filter((task) =>
 			["queued", "running", "waiting_for_approval", "waiting_for_input", "stopping"].includes(task.status),
@@ -8879,10 +9472,18 @@ function renderAgentActivity(tasks: AgentTaskSummary[], attention: AttentionSumm
 	const openAttention = attention
 		.filter((item) => item.status === "open")
 		.sort((left, right) => priority[left.kind] - priority[right.kind] || right.createdAt - left.createdAt);
+	const conversationActions = conversationViews.filter(
+		(view) =>
+			view.proposals.some((proposal) => proposal.state === "pending") ||
+			(view.link?.clarifications.some((item) => item.status === "open") ?? false),
+	);
+	const conversationBuildIds = new Set(conversationActions.map((view) => view.build.id));
 	const workflowBuilds = agentBuilds
-		.filter((build) => build.stage !== "automated")
+		.filter((build) => build.stage !== "automated" && !conversationBuildIds.has(build.id))
 		.sort((left, right) => right.updatedAt - left.updatedAt);
-	const attentionCount = openAttention.length + workflowBuilds.length;
+	const roomRuns = visibleAgentRoomRuns();
+	const activeRoomCount = roomRuns.filter((run) => run.status === "running" || run.status === "needs-user").length;
+	const attentionCount = openAttention.length + conversationActions.length + workflowBuilds.length + activeRoomCount;
 	attentionHeading.textContent = attentionCount > 0 ? `Workflow · ${attentionCount}` : "Workflow";
 	const workflowTab = document.querySelector<HTMLButtonElement>('[data-tab="agents-workspace"]');
 	if (workflowTab) workflowTab.textContent = attentionCount > 0 ? `Workflow · ${attentionCount}` : "Workflow";
@@ -8892,7 +9493,13 @@ function renderAgentActivity(tasks: AgentTaskSummary[], attention: AttentionSumm
 		workflowBadge.classList.toggle("hidden", attentionCount === 0);
 	}
 	openArtifactsButton.disabled = artifacts.length === 0;
-	if (active.length === 0 && openAttention.length === 0 && workflowBuilds.length === 0) {
+	if (
+		active.length === 0 &&
+		openAttention.length === 0 &&
+		conversationActions.length === 0 &&
+		workflowBuilds.length === 0 &&
+		roomRuns.length === 0
+	) {
 		const empty = document.createElement("p");
 		empty.className = "agent-activity-empty";
 		empty.textContent = "Nothing needs attention";
@@ -8900,10 +9507,352 @@ function renderAgentActivity(tasks: AgentTaskSummary[], attention: AttentionSumm
 		return;
 	}
 	agentActivityList.replaceChildren(
+		...conversationActions.slice(0, 5).map(renderConversationBuildActivityEntry),
+		...roomRuns.slice(0, 5).map(renderRoomActivityEntry),
 		...workflowBuilds.slice(0, 5).map(renderBuildWorkflowEntry),
 		...active.slice(0, 5).map((task) => renderTaskActivityEntry(task)),
 		...openAttention.slice(0, 5).map((item) => renderAttentionEntry(item, tasks)),
 	);
+}
+
+function visibleAgentRoomRuns(): AgentRoomRunSummary[] {
+	const ordered = [...agentRoomRuns].sort((left, right) => {
+		const priority = (run: AgentRoomRunSummary) =>
+			run.status === "needs-user" ? 0 : run.status === "running" ? 1 : 2;
+		return priority(left) - priority(right) || right.createdAt - left.createdAt;
+	});
+	const terminalRooms = new Set<string>();
+	return ordered.filter((run) => {
+		if (run.status === "running" || run.status === "needs-user") return true;
+		if (terminalRooms.has(run.roomId)) return false;
+		terminalRooms.add(run.roomId);
+		return true;
+	});
+}
+
+function renderRoomActivityEntry(run: AgentRoomRunSummary): HTMLButtonElement {
+	const room = agentRooms.find((entry) => entry.id === run.roomId);
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "agent-activity-entry";
+	const presentation = roomRunPresentation(run.status);
+	button.dataset.status = presentation.activityStatus;
+	button.title = run.userQuestion ?? run.error ?? run.result ?? run.goal;
+	const indicator = document.createElement("i");
+	indicator.className = "agent-activity-status";
+	const copy = document.createElement("span");
+	const name = document.createElement("strong");
+	name.textContent = room?.name ?? run.roomId;
+	const detail = document.createElement("small");
+	detail.textContent = run.userQuestion ?? run.error ?? run.result ?? run.goal;
+	copy.append(name, detail);
+	const state = document.createElement("time");
+	state.dateTime = new Date(run.createdAt).toISOString();
+	state.textContent = presentation.label;
+	button.append(indicator, copy, state);
+	button.addEventListener("click", () => openAgentRoomRun(run));
+	return button;
+}
+
+function openAgentRoomRun(run: AgentRoomRunSummary): void {
+	activeAgentRoomRunDialog?.dialog.close();
+	const dialog = document.createElement("dialog");
+	dialog.className = "promotion-dialog";
+	const form = document.createElement("form");
+	form.method = "dialog";
+	dialog.append(form);
+	dialog.addEventListener("close", () => {
+		if (activeAgentRoomRunDialog?.dialog === dialog) activeAgentRoomRunDialog = undefined;
+		dialog.remove();
+	});
+	document.body.append(dialog);
+	activeAgentRoomRunDialog = { runId: run.id, dialog, form, signature: "" };
+	refreshOpenAgentRoomRunDialog();
+	dialog.showModal();
+}
+
+function refreshOpenAgentRoomRunDialog(): void {
+	const active = activeAgentRoomRunDialog;
+	if (!active) return;
+	const current = agentRoomRuns.find((entry) => entry.id === active.runId);
+	if (!current) return;
+	const signature = JSON.stringify(current);
+	if (active.signature === signature) return;
+	active.signature = signature;
+	const room = agentRooms.find((entry) => entry.id === current.roomId);
+	const { dialog, form } = active;
+	form.replaceChildren();
+	const heading = document.createElement("strong");
+	heading.textContent = room?.name ?? current.roomId;
+	const summary = document.createElement("p");
+	summary.className = "muted";
+	const presentation = roomRunPresentation(current.status);
+	summary.textContent = `${presentation.label} · ${current.rounds.length}/${room?.limits.maxRounds ?? "?"} rounds · ${current.messageCount} messages · ${current.totalTokens.toLocaleString()} tokens · $${current.costUsd.toFixed(4)}`;
+	form.append(heading, summary);
+	for (const round of current.rounds) {
+		const details = document.createElement("details");
+		details.open = round.number === current.rounds.length;
+		const title = document.createElement("summary");
+		title.textContent = `Round ${round.number} · ${round.status}`;
+		details.append(title);
+		for (const turn of round.turns) {
+			const line = document.createElement("p");
+			const member = room?.members.find((entry) => entry.agentId === turn.agentId);
+			line.textContent = `${member?.agentId ?? turn.agentId} · ${turn.status}: ${turn.message}`;
+			details.append(line);
+			if (turn.requestAgentIds?.length) {
+				appendText(details, `Requested follow-up from: ${turn.requestAgentIds.join(", ")}`, "muted");
+			}
+		}
+		form.append(details);
+	}
+	if (current.result) {
+		const result = document.createElement("pre");
+		result.textContent = current.result;
+		form.append(result);
+	}
+	if (current.error) {
+		const error = document.createElement("p");
+		error.className = presentation.noticeClassName;
+		error.textContent = current.error;
+		form.append(error);
+	}
+	if (current.status === "needs-user") {
+		const question = document.createElement("p");
+		question.textContent = current.userQuestion ?? "The room needs a decision.";
+		const answer = document.createElement("textarea");
+		answer.required = true;
+		answer.maxLength = 16_384;
+		answer.placeholder = "Answer the blocking question";
+		const resume = document.createElement("button");
+		resume.type = "button";
+		resume.textContent = "Continue room";
+		resume.addEventListener("click", () => {
+			if (!answer.reportValidity()) return;
+			resume.disabled = true;
+			void roomRunAction(current.id, "resume", { message: answer.value.trim() })
+				.then(() => dialog.close())
+				.catch((error: unknown) => {
+					resume.disabled = false;
+					setStatus(error instanceof Error ? error.message : String(error), true);
+				});
+		});
+		form.append(question, answer, resume);
+	}
+	const actions = document.createElement("div");
+	actions.className = "promotion-actions";
+	if (current.status === "running") {
+		const cancel = document.createElement("button");
+		cancel.type = "button";
+		cancel.className = "danger";
+		cancel.textContent = "Stop room";
+		cancel.addEventListener("click", () => {
+			cancel.disabled = true;
+			void roomRunAction(current.id, "cancel", {})
+				.then(() => dialog.close())
+				.catch((error: unknown) => {
+					cancel.disabled = false;
+					setStatus(error instanceof Error ? error.message : String(error), true);
+				});
+		});
+		actions.append(cancel);
+	}
+	const close = document.createElement("button");
+	close.type = "submit";
+	close.textContent = "Close";
+	actions.append(close);
+	form.append(actions);
+}
+
+async function roomRunAction(runId: string, action: "cancel" | "resume", body: Record<string, unknown>): Promise<void> {
+	if (!capabilityToken) throw new Error("Collaboration room access is unavailable");
+	const response = await fetch(
+		`/agent-room-runs/${encodeURIComponent(runId)}/${action}?token=${encodeURIComponent(capabilityToken)}`,
+		{ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
+	);
+	if (!response.ok) throw new Error(await responseError(response, `Could not ${action} room`));
+	await loadAgentActivity();
+}
+
+function openAgentRoomCreator(): void {
+	const dialog = document.createElement("dialog");
+	dialog.className = "promotion-dialog";
+	const form = document.createElement("form");
+	const heading = document.createElement("strong");
+	heading.textContent = "Start collaboration room";
+	const explanation = document.createElement("p");
+	explanation.className = "muted";
+	explanation.textContent =
+		"Choose at least two agents. Each round is task-backed, ordered, and bounded; room participation grants no delegation authority.";
+	const name = document.createElement("input");
+	name.required = true;
+	name.maxLength = 256;
+	name.placeholder = "Room name";
+	const purpose = document.createElement("textarea");
+	purpose.required = true;
+	purpose.maxLength = 4096;
+	purpose.placeholder = "What perspectives should this room combine?";
+	const goal = document.createElement("textarea");
+	goal.required = true;
+	goal.maxLength = 16_384;
+	goal.placeholder = "Goal for this run";
+	form.append(heading, explanation, labelledControl("Name", name), labelledControl("Purpose", purpose));
+	const memberHeading = document.createElement("strong");
+	memberHeading.textContent = "Members";
+	form.append(memberHeading);
+	const memberRows: Array<{ agent: AgentSummary; checkbox: HTMLInputElement; role: HTMLInputElement }> = [];
+	for (const agent of agents) {
+		const row = document.createElement("label");
+		row.className = "room-member-row";
+		const checkbox = document.createElement("input");
+		checkbox.type = "checkbox";
+		const role = document.createElement("input");
+		role.placeholder = `${agent.name} perspective`;
+		role.maxLength = 512;
+		role.disabled = true;
+		checkbox.addEventListener("change", () => {
+			role.disabled = !checkbox.checked;
+			if (checkbox.checked && !role.value) role.value = `${agent.name} perspective`;
+		});
+		row.append(checkbox, document.createTextNode(agent.name), role);
+		form.append(row);
+		memberRows.push({ agent, checkbox, role });
+	}
+	const limits = document.createElement("details");
+	const limitsHeading = document.createElement("summary");
+	limitsHeading.textContent = "Bounds";
+	const maxRounds = numberInput(3, 1, 6);
+	const maxConcurrency = numberInput(3, 1, 4);
+	limits.append(
+		limitsHeading,
+		labelledControl("Maximum rounds", maxRounds),
+		labelledControl("Maximum concurrent members", maxConcurrency),
+	);
+	form.append(limits, labelledControl("Goal", goal));
+	const actions = document.createElement("div");
+	actions.className = "promotion-actions";
+	const close = document.createElement("button");
+	close.type = "button";
+	close.textContent = "Cancel";
+	close.addEventListener("click", () => dialog.close());
+	const start = document.createElement("button");
+	start.type = "submit";
+	start.textContent = "Start room";
+	actions.append(close, start);
+	form.append(actions);
+	form.addEventListener("submit", (event) => {
+		event.preventDefault();
+		const members = memberRows
+			.filter((row) => row.checkbox.checked)
+			.map((row) => ({ agentId: row.agent.id, role: row.role.value.trim() || `${row.agent.name} perspective` }));
+		if (members.length < 2) {
+			setStatus("Select at least two room members", true);
+			return;
+		}
+		start.disabled = true;
+		void createAndStartAgentRoom(
+			{
+				name: name.value.trim(),
+				purpose: purpose.value.trim(),
+				members,
+				limits: { maxRounds: Number(maxRounds.value), maxConcurrency: Number(maxConcurrency.value) },
+			},
+			goal.value.trim(),
+		)
+			.then((run) => {
+				dialog.close();
+				openAgentRoomRun(run);
+			})
+			.catch((error: unknown) => {
+				start.disabled = false;
+				setStatus(error instanceof Error ? error.message : String(error), true);
+			});
+	});
+	dialog.append(form);
+	dialog.addEventListener("close", () => dialog.remove());
+	document.body.append(dialog);
+	dialog.showModal();
+}
+
+async function createAndStartAgentRoom(
+	definition: Omit<AgentRoomSummary, "id" | "conversationId" | "limits"> & {
+		limits: { maxRounds: number; maxConcurrency: number };
+	},
+	goal: string,
+): Promise<AgentRoomRunSummary> {
+	if (!capabilityToken) throw new Error("Collaboration room access is unavailable");
+	const create = await fetch(`/agent-rooms?token=${encodeURIComponent(capabilityToken)}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(definition),
+	});
+	if (!create.ok) throw new Error(await responseError(create, "Could not create room"));
+	const room: unknown = await create.json();
+	if (!isAgentRoomSummary(room)) throw new Error("Room service returned an invalid definition");
+	const start = await fetch(
+		`/agent-rooms/${encodeURIComponent(room.id)}/run?token=${encodeURIComponent(capabilityToken)}`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ goal }),
+		},
+	);
+	if (!start.ok) throw new Error(await responseError(start, "Could not start room"));
+	const run: unknown = await start.json();
+	if (!isAgentRoomRunSummary(run)) throw new Error("Room service returned an invalid run");
+	await loadAgentActivity();
+	return agentRoomRuns.find((entry) => entry.id === run.id) ?? run;
+}
+
+function labelledControl(label: string, control: HTMLElement): HTMLLabelElement {
+	const element = document.createElement("label");
+	element.append(label, control);
+	return element;
+}
+
+function numberInput(value: number, minimum: number, maximum: number): HTMLInputElement {
+	const input = document.createElement("input");
+	input.type = "number";
+	input.required = true;
+	input.min = String(minimum);
+	input.max = String(maximum);
+	input.value = String(value);
+	return input;
+}
+
+function renderConversationBuildActivityEntry(view: ConversationBuildView): HTMLButtonElement {
+	const proposal = view.proposals.find((item) => item.state === "pending");
+	const question = view.link?.clarifications.find((item) => item.status === "open");
+	const button = document.createElement("button");
+	button.type = "button";
+	button.className = "agent-activity-entry";
+	button.dataset.status = proposal ? "waiting_for_approval" : "waiting_for_input";
+	button.title = proposal?.binding.preview ?? question?.question ?? view.build.objective;
+	const indicator = document.createElement("i");
+	indicator.className = "agent-activity-status";
+	const copy = document.createElement("span");
+	const name = document.createElement("strong");
+	name.textContent = view.build.name;
+	const detail = document.createElement("small");
+	detail.textContent = proposal
+		? `${proposal.binding.preview} Reply yes or no in this chat.`
+		: (question?.question ?? "Review this agent package");
+	copy.append(name, detail);
+	const state = document.createElement("time");
+	state.textContent = proposal ? "approval" : "question";
+	button.append(indicator, copy, state);
+	button.addEventListener("click", () => void openAgentBuildRecord(view.build, view));
+	return button;
+}
+
+async function openAgentBuildRecord(build: AgentBuildRecord, conversation?: ConversationBuildView): Promise<void> {
+	const agent = agents.find((candidate) => candidate.id === build.agentId);
+	await openAgentBuilder(agent);
+	activeAgentBuild = build;
+	activeConversationBuild = conversation;
+	draftedAgentCriteria = build.criteria;
+	if (build.configuration) applyAgentBuildConfiguration(build.configuration);
+	if (session?.snapshot) renderBuilderConversation(session.snapshot);
 }
 
 function renderBuildWorkflowEntry(build: AgentBuildRecord): HTMLButtonElement {
@@ -8926,9 +9875,7 @@ function renderBuildWorkflowEntry(build: AgentBuildRecord): HTMLButtonElement {
 	state.textContent = agentBuildStageLabel(build);
 	button.append(indicator, copy, state);
 	button.addEventListener("click", () => {
-		activeAgentBuild = build;
-		const agent = agents.find((candidate) => candidate.id === build.agentId);
-		void openAgentBuilder(agent).then(() => {
+		void openAgentBuildRecord(build).then(() => {
 			if (
 				build.stage === "proof-ready" ||
 				(build.stage === "needs-refinement" && build.proof?.status === "succeeded")
@@ -8941,12 +9888,12 @@ function renderBuildWorkflowEntry(build: AgentBuildRecord): HTMLButtonElement {
 }
 
 function buildWorkflowNextAction(build: AgentBuildRecord): string {
-	if (build.stage === "draft") return build.agentId ? "Review candidate changes" : "Review and publish draft";
+	if (build.stage === "draft") return build.agentId ? "Review candidate changes" : "Review and test draft";
 	if (build.stage === "ready-to-test") return "Run one proof";
 	if (build.stage === "testing") return "Proof is running";
 	if (build.stage === "proof-ready") return "Review evidence and decide";
 	if (build.stage === "needs-refinement") return "Review failed criteria and improve";
-	if (build.stage === "proven") return "Promote accepted revision";
+	if (build.stage === "proven") return build.agentId ? "Promote accepted revision" : "Review publication";
 	return "Review and enable schedule";
 }
 
@@ -9279,6 +10226,13 @@ function attentionFromPayload(value: unknown): AttentionSummary[] {
 	return value.items.filter(isAttentionSummary);
 }
 
+function conversationBuildViewsFromPayload(value: unknown): ConversationBuildView[] {
+	if (typeof value !== "object" || value === null || !("builds" in value) || !Array.isArray(value.builds)) {
+		return [];
+	}
+	return value.builds.filter(isConversationBuildView);
+}
+
 function isAttentionSummary(value: unknown): value is AttentionSummary {
 	return (
 		typeof value === "object" &&
@@ -9297,6 +10251,83 @@ function isAttentionSummary(value: unknown): value is AttentionSummary {
 		typeof value.summary === "string" &&
 		"createdAt" in value &&
 		typeof value.createdAt === "number"
+	);
+}
+
+function roomsFromPayload(value: unknown): { rooms: AgentRoomSummary[]; runs: AgentRoomRunSummary[] } {
+	if (
+		typeof value !== "object" ||
+		value === null ||
+		!("rooms" in value) ||
+		!Array.isArray(value.rooms) ||
+		!("runs" in value) ||
+		!Array.isArray(value.runs) ||
+		!value.rooms.every(isAgentRoomSummary) ||
+		!value.runs.every(isAgentRoomRunSummary)
+	) {
+		throw new Error("Collaboration room service returned an invalid response");
+	}
+	return { rooms: value.rooms, runs: value.runs };
+}
+
+function isAgentRoomSummary(value: unknown): value is AgentRoomSummary {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"id" in value &&
+		typeof value.id === "string" &&
+		"name" in value &&
+		typeof value.name === "string" &&
+		"purpose" in value &&
+		typeof value.purpose === "string" &&
+		"conversationId" in value &&
+		typeof value.conversationId === "string" &&
+		"members" in value &&
+		Array.isArray(value.members) &&
+		value.members.every(
+			(member) =>
+				typeof member === "object" &&
+				member !== null &&
+				"agentId" in member &&
+				typeof member.agentId === "string" &&
+				"role" in member &&
+				typeof member.role === "string",
+		) &&
+		"limits" in value &&
+		typeof value.limits === "object" &&
+		value.limits !== null &&
+		"maxRounds" in value.limits &&
+		typeof value.limits.maxRounds === "number"
+	);
+}
+
+function isAgentRoomRunSummary(value: unknown): value is AgentRoomRunSummary {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"id" in value &&
+		typeof value.id === "string" &&
+		"roomId" in value &&
+		typeof value.roomId === "string" &&
+		"status" in value &&
+		(value.status === "running" ||
+			value.status === "completed" ||
+			value.status === "needs-user" ||
+			value.status === "bounded" ||
+			value.status === "failed" ||
+			value.status === "cancelled") &&
+		"goal" in value &&
+		typeof value.goal === "string" &&
+		"createdAt" in value &&
+		typeof value.createdAt === "number" &&
+		"rounds" in value &&
+		Array.isArray(value.rounds) &&
+		"messageCount" in value &&
+		typeof value.messageCount === "number" &&
+		"totalTokens" in value &&
+		typeof value.totalTokens === "number" &&
+		"costUsd" in value &&
+		typeof value.costUsd === "number"
 	);
 }
 
@@ -10235,6 +11266,8 @@ function isAgentTeamState(value: unknown): value is AgentTeamState {
 async function reconnect(entry: ConnectionEntry): Promise<void> {
 	if (reconnecting.has(entry.id)) return;
 	reconnecting.add(entry.id);
+	const connectionEpoch = entry.generation.epoch;
+	const reconnectSelection = selectionGeneration.current;
 	const activeSessionId = activeTargetKey?.startsWith(`${entry.id}:`) ? session?.id : undefined;
 	const preserveWorkspace =
 		builderActive ||
@@ -10243,31 +11276,54 @@ async function reconnect(entry: ConnectionEntry): Promise<void> {
 		activeExternalRunId !== undefined ||
 		activeExternalConnectionId !== undefined ||
 		activeArtifactId !== undefined;
-	setStatus("Disconnected. Reconnecting…", true);
-	while (!entry.client.disposed) {
-		await new Promise((resolve) => window.setTimeout(resolve, 1000));
-		try {
-			await entry.client.reconnect();
+	try {
+		setStatus("Disconnected. Reconnecting…", true);
+		while (
+			!entry.client.disposed &&
+			connections.get(entry.id) === entry &&
+			entry.generation.isCurrent(connectionEpoch)
+		) {
+			await new Promise((resolve) => window.setTimeout(resolve, 1000));
+			try {
+				await entry.client.reconnect();
+			} catch {
+				continue;
+			}
+			if (connections.get(entry.id) !== entry || !entry.generation.isCurrent(connectionEpoch)) return;
 			await refreshSessionTargets();
+			if (connections.get(entry.id) !== entry || !entry.generation.isCurrent(connectionEpoch)) return;
 			const target = sessionTargets().find(
 				(candidate) => candidate.connectionId === entry.id && candidate.session.id === activeSessionId,
 			);
-			if (target) {
+			if (target && selectionGeneration.isCurrent(reconnectSelection)) {
 				activeTargetKey = undefined;
-				await switchSession(target, preserveWorkspace);
-			} else setStatus(`Reconnected to ${entry.label}`);
-			reconnecting.delete(entry.id);
+				const reconnectAttachSelection = selectionGeneration.current + 1;
+				try {
+					await switchSession(target, preserveWorkspace);
+				} catch (error) {
+					if (selectionGeneration.isCurrent(reconnectAttachSelection)) {
+						setStatus(error instanceof Error ? error.message : String(error), true);
+					}
+				}
+			} else if (selectionGeneration.isCurrent(reconnectSelection)) {
+				setStatus(`Reconnected to ${entry.label}`);
+			}
 			return;
-		} catch {
-			// Retry until this local Pi process returns or the connection is removed.
 		}
+	} finally {
+		reconnecting.delete(entry.id);
 	}
-	reconnecting.delete(entry.id);
 }
 
 form.addEventListener("submit", (event) => {
 	event.preventDefault();
 	void submitComposer().catch((error: unknown) =>
+		setStatus(error instanceof Error ? error.message : String(error), true),
+	);
+});
+agentNewContext.addEventListener("click", () => {
+	if (!activeAgentId) return;
+	void startAgentContext(activeAgentId).catch((error: unknown) =>
 		setStatus(error instanceof Error ? error.message : String(error), true),
 	);
 });
@@ -10444,17 +11500,19 @@ async function submitBuilderComposer(): Promise<void> {
 		agentBuilderBootstrapPrefix,
 		"Work progressively. Start from the user's name and intended outcome, then ask at most one concise question only when it blocks the smallest useful draft.",
 		"Do not front-load persona, memory, model, tools, permissions, schedules, or team topology. Recommend each only when the concrete task requires it.",
-		"The visible configuration form remains the source of truth. The console persists the named draft independently of this conversation.",
-		"Do not call agent_deploy or modify agent files. Return a draft marker only; the user applies the reviewed form.",
+		"The versioned build record is the source of truth. The visible form is a synchronized package view and direct-edit escape hatch.",
+		"For drafting or refinement, do not call agent_deploy or modify agent files. Return a draft marker and let the console apply it through the version-checked conversation build service.",
+		"For test, proof review, publication, promotion, or scheduling requests, use manage_agent_build with the current build ID. First prepare its exact proposal; execute only after the user's later yes/no reply supplies that proposal ID.",
 		"Never propose or create automation in this conversation. Pi unlocks that only after a one-time proof is reviewed, accepted, and promoted to a skill.",
 		editingExistingAgent
 			? "This is an edit. Include only fields the user explicitly requested to change; omit every unchanged field."
 			: "This is a new agent. Include every required field that is known and omit unknown optional fields.",
 		"When feedback identifies an observable regression, include a criteria array in the draft marker. Each item needs id, label, description, category, expectation, and evaluator. Use human for judgment; tool-receipt/tool-errors/workspace-mutation for retained tool evidence; result-text/artifact-text/artifact-change for deterministic output checks. Preserve existing passing criteria.",
+		"Include assumptions for reversible defaults as objects with topic, value, and rationale. Include at most three clarifications only for material ambiguity, each with topic, materialTopic, question, reason, and blockingActions. The Ozark region, recipients, authority, private sources, paid processing, and schedule details are material; cosmetic choices are not.",
 		'End with exactly one one-line JSON marker. For a model-only edit, use: [AGENT_DRAFT]{"model":"provider/model"}[/AGENT_DRAFT]',
 		"Never invent a model ID. Use an exact candidate below. If there is one clear match, use it without asking; otherwise ask the user to choose in Advanced configuration.",
 		`Exact model candidates for this request: ${agentBuilderModelCandidates(prompt)}`,
-		"The console applies valid marker fields to the draft only. Tell the user to review and apply the update.",
+		"The console applies valid marker fields to the versioned candidate only. Tell the user what was assumed, ask one material question when needed, and offer Try candidate when safe.",
 		`Current name: ${requiredElement<HTMLInputElement>("agent-name").value || "not set"}`,
 		`Current description: ${requiredElement<HTMLTextAreaElement>("agent-description").value || "not set"}`,
 		`Current project folder: ${requiredElement<HTMLInputElement>("agent-project-root").value || "not set"}`,
@@ -10469,6 +11527,8 @@ async function submitBuilderComposer(): Promise<void> {
 		`Current browser access: ${requiredElement<HTMLSelectElement>("agent-browser-access").value}`,
 		`Current delegates: ${requiredElement<HTMLInputElement>("agent-delegates").value || "none"}`,
 		`Current build lifecycle: ${activeAgentBuild?.stage ?? "unnamed draft"}`,
+		`Current build ID: ${activeAgentBuild?.id ?? "not created"}`,
+		`Current build revision: ${activeAgentBuild?.revision ?? "not created"}`,
 		...improvementContext,
 		`User request: ${prompt}`,
 	].join("\n");
@@ -10524,18 +11584,28 @@ async function submitAgentComposer(agentId: string): Promise<void> {
 		await loadSelectedAgent();
 		return;
 	}
-	const response = await fetch(`/agent-tasks?token=${encodeURIComponent(capabilityToken)}`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({
-			agentId,
-			conversationId: agentConversationIds.get(agentId),
-			prompt,
-			source: "chat",
-		}),
-	});
-	if (!response.ok) throw new Error(await responseError(response, "Could not message agent"));
-	await loadSelectedAgent();
+	const pending = pendingAgentDeliveryKeys.get(agentId);
+	const delivery = pending?.prompt === prompt ? pending : { prompt, key: `chat-${createBrowserId()}` };
+	pendingAgentDeliveryKeys.set(agentId, delivery);
+	try {
+		const response = await fetch(`/agent-deliveries?token=${encodeURIComponent(capabilityToken)}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ idempotencyKey: delivery.key, recipientAgentId: agentId, goal: prompt }),
+		});
+		if (!response.ok) {
+			if (response.status < 500) pendingAgentDeliveryKeys.delete(agentId);
+			throw new Error(await responseError(response, "Could not message agent"));
+		}
+		pendingAgentDeliveryKeys.delete(agentId);
+		await loadSelectedAgent();
+	} catch (error) {
+		if (!input.value.trim()) {
+			input.value = prompt;
+			resizeComposer();
+		}
+		throw error;
+	}
 }
 
 input.addEventListener("input", () => {
@@ -10804,7 +11874,6 @@ agentModelSettings.addEventListener("click", () => {
 	openModelSettings({
 		title: "Agent runtime model settings",
 		models: availableModels,
-		allowInherit: true,
 		current: {
 			model: modelRefFromValue(agentModel.value),
 			thinkingLevel: agentThinking.value as ThinkingLevel,
@@ -10916,6 +11985,7 @@ openArtifactsButton.addEventListener("click", () => {
 		setStatus(error instanceof Error ? error.message : String(error), true),
 	);
 });
+newRoomButton.addEventListener("click", () => openAgentRoomCreator());
 settingsClose.addEventListener("click", closeSettings);
 window.addEventListener("keydown", (event) => {
 	if (event.key !== "Escape") return;
@@ -10944,65 +12014,6 @@ agentForm.addEventListener("submit", (event) => {
 	const id = requiredElement<HTMLInputElement>("agent-id").value;
 	const value = (field: string) =>
 		requiredElement<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(field).value;
-	const selectedModel = value("agent-model");
-	const modelSeparator = selectedModel.indexOf("/");
-	const executor = value("agent-executor");
-	const browserAccess = value("agent-browser-access");
-	const browserRuntime = value("agent-browser-runtime");
-	const browserProfileKind = value("agent-browser-profile-kind");
-	const tools = value("agent-tools")
-		.split(",")
-		.map((entry) => entry.trim())
-		.filter(Boolean)
-		.map((entry) => (executor === "harness" && entry === "ls" ? "list" : entry));
-	if (browserAccess !== "disabled" && !tools.includes("browser")) tools.push("browser");
-	if (browserAccess === "disabled") {
-		const browserIndex = tools.indexOf("browser");
-		if (browserIndex >= 0) tools.splice(browserIndex, 1);
-	}
-	const definition = {
-		personaId: value("agent-persona-select") || undefined,
-		name: value("agent-name"),
-		description: value("agent-description"),
-		projectRoot: value("agent-project-root"),
-		tools,
-		capabilities: selectedAgentCapabilities(),
-		memory: value("agent-memory"),
-		persona: value("agent-persona"),
-		executor,
-		permissionPolicy: value("agent-permissions"),
-		thinking: agentModelControls === undefined ? value("agent-thinking") : undefined,
-		modelControls: agentModelControls === undefined ? undefined : { ...agentModelControls },
-		delegateAgentIds: value("agent-delegates")
-			.split(",")
-			.map((entry) => entry.trim())
-			.filter(Boolean),
-		a2a: { enabled: requiredElement<HTMLInputElement>("agent-a2a").checked },
-		browser: {
-			access: browserAccess,
-			runtime: browserRuntime,
-			profile:
-				browserProfileKind === "named"
-					? { kind: "named" as const, id: value("agent-browser-profile-id") }
-					: { kind: "ephemeral" as const },
-		},
-		browserWorkflows: value("agent-browser-workflows")
-			.split(",")
-			.map((entry) => entry.trim())
-			.filter(Boolean)
-			.map((entry) => {
-				const separator = entry.lastIndexOf("@");
-				return { id: entry.slice(0, separator), version: Number(entry.slice(separator + 1)) };
-			}),
-		model:
-			modelSeparator > 0
-				? {
-						provider: selectedModel.slice(0, modelSeparator),
-						id: selectedModel.slice(modelSeparator + 1),
-					}
-				: undefined,
-		schedules: activeSidebarAgent?.schedules ?? [],
-	};
 	if (id) {
 		if (activeAgentBuild?.agentId !== id) {
 			setStatus("The durable build record is unavailable. Reopen this agent before saving a candidate.", true);
@@ -11027,54 +12038,20 @@ agentForm.addEventListener("submit", (event) => {
 			});
 		return;
 	}
-	const path = "/agents";
-	const savedAgentName = definition.name;
-	setStatus("Publishing agent…");
-	void fetch(`${path}?token=${encodeURIComponent(capabilityToken)}`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(definition),
-	})
-		.then(async (response) => {
-			if (!response.ok) {
-				const payload: unknown = await response.json();
-				throw new Error(
-					typeof payload === "object" &&
-						payload !== null &&
-						"error" in payload &&
-						typeof payload.error === "string"
-						? payload.error
-						: `HTTP ${response.status}`,
-				);
+	const savedAgentName = value("agent-name");
+	const publicationReady = activeAgentBuild?.stage === "proven";
+	setStatus(publicationReady ? "Preparing publication review…" : "Saving agent draft…");
+	void persistAgentBuildDraft()
+		.then(async () => {
+			agentBuilderBaseline = agentBuilderDraftSignature();
+			if (publicationReady && activeAgentBuild?.stage === "proven") {
+				await requestBuilderPublication();
+				return;
 			}
-			const saved: unknown = await response.json();
-			void (async () => {
-				await loadAgents();
-				await Promise.all([loadRoutines(), loadWorkflows()]);
-				const savedId =
-					typeof saved === "object" && saved !== null && "id" in saved && typeof saved.id === "string"
-						? saved.id
-						: id;
-				if (savedId) {
-					requiredElement<HTMLInputElement>("agent-id").value = savedId;
-					activeSidebarAgent = agents.find((entry) => entry.id === savedId) ?? activeSidebarAgent;
-					await linkActiveAgentBuild(savedId);
-				}
-				builderLabel = `Edit ${savedAgentName}`;
-				agentSubmit.textContent = "Save candidate revision";
-				agentCancel.textContent = "Cancel editing";
-				agentBuilderBaseline = agentBuilderDraftSignature();
-				agentBuilderFeedback = `Agent ${savedAgentName} published.`;
-				activeAgentImprovement = undefined;
-				updateAgentBuilderReadiness();
-				if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
-				setStatus(agentBuilderFeedback);
-			})().catch((error: unknown) => {
-				setStatus(
-					`Agent saved; background refresh failed: ${error instanceof Error ? error.message : String(error)}`,
-					true,
-				);
-			});
+			agentBuilderFeedback = `${savedAgentName} is saved as an unpublished candidate. Review assumptions, then use Try candidate.`;
+			updateAgentBuilderReadiness();
+			if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
+			setStatus(agentBuilderFeedback);
 		})
 		.catch((error: unknown) => {
 			const message = error instanceof Error ? error.message : String(error);
@@ -11510,6 +12487,7 @@ window.setInterval(() => {
 	if (document.visibilityState !== "visible" || periodicRefreshPromise) return;
 	const activeTab = document.querySelector<HTMLButtonElement>("[data-tab].active")?.dataset.tab;
 	periodicRefreshPromise = (async () => {
+		if (agentRoomRuns.some((run) => run.status === "running")) await loadAgentActivity();
 		if (activeTab === "browser") await loadPreview();
 		if (activeTab === "agents-workspace") {
 			if (activeSidebarAgent) await loadSelectedAgent();

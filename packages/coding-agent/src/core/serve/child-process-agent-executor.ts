@@ -36,8 +36,7 @@ export interface AgentHostFileSystem {
 export interface ChildProcessAgentExecutorOptions {
 	agentDir: string;
 	serveRoot: string;
-	capabilityToolNames: (context: AgentExecutionContext) => string[];
-	capabilityTools?: (context: AgentExecutionContext) => ToolDefinition[];
+	capabilityTools: (context: AgentExecutionContext) => ToolDefinition[];
 	timeoutMs?: number;
 	idleTimeoutMs?: number;
 	heartbeatTimeoutMs?: number;
@@ -73,8 +72,7 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 				? context
 				: { ...context, definition: { ...context.definition, model: this.#options.defaultModel } };
 		const effectiveContext = { ...modeledContext, workspace: resolve(modeledContext.workspace) };
-		const capabilityToolNames = this.#options.capabilityToolNames(effectiveContext);
-		const capabilityTools = this.#options.capabilityTools?.(effectiveContext) ?? [];
+		const capabilityTools = this.#options.capabilityTools(effectiveContext);
 		const modelApiKey = effectiveContext.definition.model
 			? await this.#options.resolveModelApiKey?.(effectiveContext.definition.model)
 			: undefined;
@@ -85,7 +83,7 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 			effectiveContext.runId,
 			"worker-result.json",
 		);
-		const environment = workerEnvironment(this.#options.environment ?? process.env, capabilityToolNames);
+		const environment = workerEnvironment(this.#options.environment ?? process.env);
 		const sourceTsconfig = sourceWorkerTsconfig(workerPath);
 		if (sourceTsconfig) environment.TSX_TSCONFIG_PATH = sourceTsconfig;
 		const execution = new ChildProcessExecution(
@@ -96,7 +94,6 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 				agentDir: this.#options.agentDir,
 				serveRoot: this.#options.serveRoot,
 				resultPath,
-				capabilityToolNames,
 				capabilityTools: capabilityTools.map((tool) => ({
 					name: tool.name,
 					label: tool.label,
@@ -608,20 +605,9 @@ const RUNTIME_ENVIRONMENT_NAMES = [
 	"XDG_DATA_HOME",
 ] as const;
 
-const CAPABILITY_ENVIRONMENT_NAMES: Readonly<Record<string, readonly string[]>> = {
-	searxng_search: ["SEARXNG_BASE_URL"],
-	firecrawl_search: ["FIRECRAWL_BASE_URL"],
-	firecrawl_scrape: ["FIRECRAWL_BASE_URL"],
-	firecrawl_crawl: ["FIRECRAWL_BASE_URL"],
-};
-
-function workerEnvironment(source: NodeJS.ProcessEnv, capabilityToolNames: readonly string[]): NodeJS.ProcessEnv {
-	const names = new Set<string>(RUNTIME_ENVIRONMENT_NAMES);
-	for (const toolName of capabilityToolNames) {
-		for (const name of CAPABILITY_ENVIRONMENT_NAMES[toolName] ?? []) names.add(name);
-	}
+function workerEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const environment: NodeJS.ProcessEnv = {};
-	for (const name of names) {
+	for (const name of RUNTIME_ENVIRONMENT_NAMES) {
 		const entry = environmentEntry(source, name);
 		if (entry) environment[entry[0]] = entry[1];
 	}

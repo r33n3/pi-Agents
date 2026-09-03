@@ -2,12 +2,24 @@ import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { ModelRef } from "@earendil-works/pi-protocol";
+import type { AgentDeliveryEnvelope } from "./agent-collaboration-contract.ts";
+import {
+	type AgentContextAuthor,
+	type AgentContextPackage,
+	assertAgentContextPackageIntegrity,
+	createAgentContextPackage,
+	renderAgentContextPrompt,
+} from "./agent-context-package.ts";
 import type { AgentDefinition, AgentRegistry } from "./agent-registry.ts";
+import {
+	type AgentExecutionConfigurationSeed,
+	assertAgentExecutionConfigurationSeedIntegrity,
+} from "./agent-run-configuration-snapshot.ts";
 import type { AgentRunManager, AgentRunRecord, AgentRunUsage } from "./agent-run-manager.ts";
 import { type ArtifactRecord, ArtifactStore } from "./artifact-store.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
-export type AgentTaskSource = "chat" | "pi" | "routine" | "workflow" | "a2a";
+export type AgentTaskSource = "chat" | "pi" | "agent" | "routine" | "workflow" | "a2a";
 export type AgentTaskStatus =
 	| "queued"
 	| "running"
@@ -34,21 +46,40 @@ export interface AgentTaskContractSnapshot {
 	permissionMode: AgentPermissionMode;
 	expectedDeliverable?: { kind?: string; title?: string; artifactId?: string };
 	routine?: { id: string; revision: number; scheduledFor: number };
+	executionSeed?: AgentExecutionConfigurationSeed;
+	context?: AgentContextPackage;
+	delivery?: AgentDeliveryEnvelope;
+	room?: { id: string; runId: string; round: number; memberIndex: number };
 }
 
+export type AgentConversationKind = "agent-inbox" | "task" | "room";
+
 export interface AgentConversation {
+	version: 2;
 	id: string;
-	agentId: string;
+	kind: AgentConversationKind;
+	agentId?: string;
+	roomId?: string;
+	contextEpoch: number;
+	nextMessageSequence: number;
 	createdAt: number;
 	updatedAt: number;
+	archivedAt?: number;
 }
 
 export interface AgentConversationMessage {
+	version: 2;
 	id: string;
+	sequence: number;
 	conversationId: string;
+	author: AgentContextAuthor;
+	kind: "message" | "task-result" | "delivery" | "room-turn" | "context-checkpoint";
 	role: "user" | "agent";
-	text: string;
-	taskId: string;
+	text?: string;
+	taskId?: string;
+	deliveryId?: string;
+	artifactIds?: string[];
+	contextEpoch: number;
 	createdAt: number;
 }
 
@@ -77,6 +108,7 @@ export interface AgentTask {
 }
 
 export interface SubmitAgentTask {
+	taskId?: string;
 	agentId: string;
 	prompt: string;
 	conversationId?: string;
@@ -87,6 +119,13 @@ export interface SubmitAgentTask {
 	permissionMode?: AgentPermissionMode;
 	expectedDeliverable?: { kind?: string; title?: string; artifactId?: string };
 	routine?: { id: string; revision: number; scheduledFor: number };
+	context?: AgentContextPackage;
+	executionSeed?: AgentExecutionConfigurationSeed;
+	messageId?: string;
+	eventId?: string;
+	messageAuthor?: AgentContextAuthor;
+	delivery?: AgentDeliveryEnvelope;
+	room?: { id: string; runId: string; round: number; memberIndex: number };
 }
 
 export interface AgentTaskFilter {
@@ -162,14 +201,18 @@ export class AgentTaskService implements AsyncDisposable {
 	readonly #attentionPath: string;
 	readonly #artifacts: ArtifactStore;
 	readonly #queue = new SerialOperationQueue();
+	readonly #messageQueues = new Map<string, SerialOperationQueue>();
 	readonly #conversations = new Map<string, AgentConversation>();
-	readonly #conversationByAgent = new Map<string, string>();
+	readonly #inboxByAgent = new Map<string, string>();
+	readonly #conversationByRoom = new Map<string, string>();
+	readonly #legacyConversationIds = new Set<string>();
 	readonly #tasks = new Map<string, AgentTask>();
 	readonly #active = new Map<string, ActiveTask>();
 	readonly #completions = new Map<string, TaskCompletion>();
 	readonly #eventSequences = new Map<string, number>();
 	readonly #attention = new Map<string, AttentionItem>();
 	readonly #listeners = new Set<AgentTaskListener>();
+	#schedulingStarted = false;
 	#disposed = false;
 
 	constructor(registry: AgentRegistry, runs: AgentRunManager, root: string) {
@@ -182,7 +225,7 @@ export class AgentTaskService implements AsyncDisposable {
 		this.#artifacts = new ArtifactStore(this.#root);
 	}
 
-	async initialize(): Promise<void> {
+	async initialize(options: { deferScheduling?: boolean } = {}): Promise<void> {
 		await Promise.all([
 			mkdir(this.#conversationsDir, { recursive: true }),
 			mkdir(this.#tasksDir, { recursive: true }),
@@ -191,14 +234,22 @@ export class AgentTaskService implements AsyncDisposable {
 		for (const entry of await readdir(this.#conversationsDir, { withFileTypes: true })) {
 			if (!entry.isDirectory()) continue;
 			try {
-				const conversation = parseConversation(
+				const parsed = parseConversation(
 					JSON.parse(await readFile(resolve(this.#conversationsDir, entry.name, "conversation.json"), "utf8")),
 				);
+				const conversation = parsed.conversation;
 				this.#conversations.set(conversation.id, conversation);
-				const currentId = this.#conversationByAgent.get(conversation.agentId);
-				const current = currentId ? this.#conversations.get(currentId) : undefined;
-				if (!current || current.updatedAt < conversation.updatedAt) {
-					this.#conversationByAgent.set(conversation.agentId, conversation.id);
+				if (parsed.legacy) this.#legacyConversationIds.add(conversation.id);
+				else if (conversation.kind === "agent-inbox" && conversation.agentId) {
+					const currentId = this.#inboxByAgent.get(conversation.agentId);
+					const current = currentId ? this.#conversations.get(currentId) : undefined;
+					if (!current || current.updatedAt < conversation.updatedAt)
+						this.#inboxByAgent.set(conversation.agentId, conversation.id);
+				} else if (conversation.kind === "room" && conversation.roomId) {
+					const currentId = this.#conversationByRoom.get(conversation.roomId);
+					const current = currentId ? this.#conversations.get(currentId) : undefined;
+					if (!current || current.updatedAt < conversation.updatedAt)
+						this.#conversationByRoom.set(conversation.roomId, conversation.id);
 				}
 			} catch {
 				// Malformed conversation directories are not exposed.
@@ -239,44 +290,126 @@ export class AgentTaskService implements AsyncDisposable {
 				}
 			}
 		}
+		await this.#migrateConversations();
 		await this.#persistAttention();
+		if (!options.deferScheduling) await this.startScheduling();
+	}
+
+	async startScheduling(): Promise<void> {
+		if (this.#disposed) throw new Error("Agent task service is disposed");
+		if (this.#schedulingStarted) return;
+		this.#schedulingStarted = true;
 		await this.#schedule();
 	}
 
-	async ensureConversation(agentId: string): Promise<AgentConversation> {
+	async ensureAgentInbox(agentId: string): Promise<AgentConversation> {
 		return this.#queue.run(async () => {
 			if (!(await this.#registry.get(agentId))) throw new Error(`Agent ${agentId} was not found`);
-			const existingId = this.#conversationByAgent.get(agentId);
+			const existingId = this.#inboxByAgent.get(agentId);
 			const existing = existingId ? this.#conversations.get(existingId) : undefined;
-			if (existing) return { ...existing };
+			if (existing && existing.kind === "agent-inbox" && existing.archivedAt === undefined) return { ...existing };
 			const now = Date.now();
-			const conversation: AgentConversation = { id: randomUUID(), agentId, createdAt: now, updatedAt: now };
+			const conversation: AgentConversation = {
+				version: 2,
+				id: randomUUID(),
+				kind: "agent-inbox",
+				agentId,
+				contextEpoch: 1,
+				nextMessageSequence: 1,
+				createdAt: now,
+				updatedAt: now,
+			};
 			this.#conversations.set(conversation.id, conversation);
-			this.#conversationByAgent.set(agentId, conversation.id);
+			this.#inboxByAgent.set(agentId, conversation.id);
 			await this.#persistConversation(conversation);
 			return { ...conversation };
 		});
 	}
 
-	async createConversation(agentId: string): Promise<AgentConversation> {
+	ensureConversation(agentId: string): Promise<AgentConversation> {
+		return this.ensureAgentInbox(agentId);
+	}
+
+	async createTaskConversation(agentId: string): Promise<AgentConversation> {
 		return this.#queue.run(async () => {
 			if (!(await this.#registry.get(agentId))) throw new Error(`Agent ${agentId} was not found`);
 			const now = Date.now();
-			const conversation: AgentConversation = { id: randomUUID(), agentId, createdAt: now, updatedAt: now };
+			const conversation: AgentConversation = {
+				version: 2,
+				id: randomUUID(),
+				kind: "task",
+				agentId,
+				contextEpoch: 1,
+				nextMessageSequence: 1,
+				createdAt: now,
+				updatedAt: now,
+			};
 			this.#conversations.set(conversation.id, conversation);
 			await this.#persistConversation(conversation);
 			return { ...conversation };
+		});
+	}
+
+	createConversation(agentId: string): Promise<AgentConversation> {
+		return this.createTaskConversation(agentId);
+	}
+
+	async ensureRoomConversation(roomId: string): Promise<AgentConversation> {
+		return this.#queue.run(async () => {
+			const normalizedRoomId = requiredIdentifier(roomId, "roomId");
+			const existingId = this.#conversationByRoom.get(normalizedRoomId);
+			const existing = existingId ? this.#conversations.get(existingId) : undefined;
+			if (existing && existing.kind === "room" && existing.archivedAt === undefined) return { ...existing };
+			const now = Date.now();
+			const conversation: AgentConversation = {
+				version: 2,
+				id: randomUUID(),
+				kind: "room",
+				roomId: normalizedRoomId,
+				contextEpoch: 1,
+				nextMessageSequence: 1,
+				createdAt: now,
+				updatedAt: now,
+			};
+			this.#conversations.set(conversation.id, conversation);
+			this.#conversationByRoom.set(normalizedRoomId, conversation.id);
+			await this.#persistConversation(conversation);
+			return { ...conversation };
+		});
+	}
+
+	async appendRoomMessage(input: {
+		roomId: string;
+		id: string;
+		author: AgentContextAuthor;
+		text: string;
+		taskId?: string;
+	}): Promise<AgentConversationMessage> {
+		const conversation = await this.ensureRoomConversation(input.roomId);
+		const current = this.#conversations.get(conversation.id);
+		if (!current) throw new Error(`Room conversation ${conversation.id} was not found`);
+		return this.#appendConversationMessage(current, {
+			id: requiredString(input.id, "room message id"),
+			author: structuredClone(input.author),
+			kind: input.author.kind === "user" ? "message" : "room-turn",
+			role: input.author.kind === "user" ? "user" : "agent",
+			text: requiredString(input.text, "room message text"),
+			taskId: input.taskId,
 		});
 	}
 
 	listConversations(agentId?: string): AgentConversation[] {
 		return [...this.#conversations.values()]
 			.filter((entry) => agentId === undefined || entry.agentId === agentId)
-			.sort((left, right) => right.updatedAt - left.updatedAt)
+			.sort(
+				(left, right) =>
+					Number(right.kind === "agent-inbox") - Number(left.kind === "agent-inbox") ||
+					right.updatedAt - left.updatedAt,
+			)
 			.map((entry) => ({ ...entry }));
 	}
 
-	async listMessages(conversationId: string): Promise<AgentConversationMessage[]> {
+	async listMessages(conversationId: string, afterSequence = 0): Promise<AgentConversationMessage[]> {
 		const conversation = this.#conversations.get(conversationId);
 		if (!conversation) throw new Error(`Conversation ${conversationId} was not found`);
 		try {
@@ -284,7 +417,8 @@ export class AgentTaskService implements AsyncDisposable {
 			return content
 				.split(/\r?\n/)
 				.filter(Boolean)
-				.map((line) => parseMessage(JSON.parse(line)));
+				.map((line, index) => parseMessage(JSON.parse(line), conversation, index + 1))
+				.filter((message) => message.sequence > afterSequence);
 		} catch (error) {
 			if (isNodeError(error) && error.code === "ENOENT") return [];
 			throw error;
@@ -297,15 +431,20 @@ export class AgentTaskService implements AsyncDisposable {
 		if (!prompt) throw new Error("Agent task prompt is required");
 		const conversation = request.conversationId
 			? this.#conversations.get(request.conversationId)
-			: await this.ensureConversation(request.agentId);
+			: await this.ensureAgentInbox(request.agentId);
 		if (!conversation || conversation.agentId !== request.agentId) {
 			throw new Error("Conversation does not belong to the requested agent");
 		}
-		const definition = await this.#registry.get(request.agentId);
-		if (!definition) throw new Error(`Agent ${request.agentId} was not found`);
-		const model = request.model ?? definition.model;
+		if (!(await this.#registry.get(request.agentId))) throw new Error(`Agent ${request.agentId} was not found`);
+		const executionSeed =
+			request.executionSeed ?? (await this.#runs.createExecutionSeed(request.agentId, request.model));
+		assertAgentExecutionConfigurationSeedIntegrity(executionSeed, executionSeed.digest);
+		if (executionSeed.agentId !== request.agentId) throw new Error("Execution seed belongs to a different agent");
+		const definition = executionSeed.definition;
+		const model = executionSeed.effectiveModel ?? definition.model;
+		const context = request.context ?? (await this.#createContextPackage(conversation, prompt));
 		const task: AgentTask = {
-			id: randomUUID(),
+			id: request.taskId ?? randomUUID(),
 			conversationId: conversation.id,
 			agentId: request.agentId,
 			parentTaskId: request.parentTaskId,
@@ -320,6 +459,8 @@ export class AgentTaskService implements AsyncDisposable {
 				conversation.id,
 				this.#registry.workspacePath(definition),
 				model,
+				executionSeed,
+				context,
 			),
 			createdAt: Date.now(),
 			attemptIds: [],
@@ -328,10 +469,71 @@ export class AgentTaskService implements AsyncDisposable {
 		this.#tasks.set(task.id, task);
 		this.#completions.set(task.id, createCompletion());
 		await this.#persistTask(task);
-		await this.#appendMessage(conversation, task, "user", prompt);
-		await this.#emit(task, "task.queued");
+		await this.#appendMessage(
+			conversation,
+			task,
+			request.messageAuthor ?? requestAuthor(request),
+			request.delivery ? "delivery" : "message",
+			prompt,
+			request.messageId,
+			request.delivery?.id,
+		);
+		await this.#emit(task, "task.queued", undefined, undefined, request.eventId);
 		await this.#schedule();
 		return cloneTask(task);
+	}
+
+	async newContext(agentId: string): Promise<AgentConversationMessage> {
+		const conversation = await this.ensureAgentInbox(agentId);
+		return this.#queue.run(async () => {
+			const current = this.#conversations.get(conversation.id);
+			if (!current) throw new Error(`Conversation ${conversation.id} was not found`);
+			current.contextEpoch += 1;
+			const message = await this.#appendConversationMessage(current, {
+				id: `context-checkpoint:${current.id}:${current.contextEpoch}`,
+				author: { kind: "system" },
+				kind: "context-checkpoint",
+				role: "agent",
+				text: "New context started",
+			});
+			return cloneMessage(message);
+		});
+	}
+
+	async createContext(
+		agentId: string,
+		goal: string,
+		references: AgentContextPackage["references"] = [],
+	): Promise<AgentContextPackage> {
+		const conversation = await this.ensureAgentInbox(agentId);
+		return this.#createContextPackage(conversation, goal, references);
+	}
+
+	findTaskByAttempt(attemptId: string): AgentTask | undefined {
+		const task = [...this.#tasks.values()].find((candidate) => candidate.attemptIds.includes(attemptId));
+		return task ? this.#taskView(task) : undefined;
+	}
+
+	async ensureDeliveryMessage(taskId: string): Promise<AgentConversationMessage> {
+		const task = this.#tasks.get(taskId);
+		const delivery = task?.contract.delivery;
+		if (!task || !delivery) throw new Error(`Delivery task ${taskId} was not found`);
+		const conversation = this.#conversations.get(task.conversationId);
+		if (!conversation) throw new Error(`Conversation ${task.conversationId} was not found`);
+		return this.#appendConversationMessage(conversation, {
+			id: `delivery:${delivery.id}:request`,
+			author: deliveryAuthor(
+				delivery,
+				delivery.sender.kind === "agent"
+					? this.#tasks.get(delivery.sender.taskId)?.contract.agentRevision
+					: undefined,
+			),
+			kind: "delivery",
+			role: delivery.sender.kind === "agent" ? "agent" : "user",
+			text: delivery.goal,
+			taskId: task.id,
+			deliveryId: delivery.id,
+		});
 	}
 
 	continue(taskId: string, message: string): Promise<AgentTask> {
@@ -379,15 +581,26 @@ export class AgentTaskService implements AsyncDisposable {
 			queued.finishedAt = Date.now();
 			await this.#persistTask(queued);
 			await this.#emit(queued, "task.cancelled");
+			await this.#cancelDirectChildren(queued.id);
 			this.#completions.get(taskId)?.resolve();
 			return cloneTask(queued);
 		}
 		active.task.status = "stopping";
 		await this.#persistTask(active.task);
 		await this.#emit(active.task, "task.stopping");
-		await this.#runs.abort(active.runId);
+		const abort = this.#runs.abort(active.runId);
+		await this.#cancelDirectChildren(active.task.id);
+		await abort;
 		await active.completion;
 		return cloneTask(active.task);
+	}
+
+	async #cancelDirectChildren(taskId: string): Promise<void> {
+		await Promise.allSettled(
+			[...this.#tasks.values()]
+				.filter((task) => task.parentTaskId === taskId && !isTerminalStatus(task.status))
+				.map((task) => this.cancel(task.id)),
+		);
 	}
 
 	waitForCompletion(taskId: string): Promise<AgentTask> {
@@ -402,6 +615,10 @@ export class AgentTaskService implements AsyncDisposable {
 	getTask(taskId: string): AgentTask | undefined {
 		const task = this.#tasks.get(taskId);
 		return task ? this.#taskView(task) : undefined;
+	}
+
+	getLatestEventSequence(taskId: string): number {
+		return this.#eventSequences.get(taskId) ?? 0;
 	}
 
 	listTasks(filter: AgentTaskFilter = {}): AgentTask[] {
@@ -507,6 +724,7 @@ export class AgentTaskService implements AsyncDisposable {
 			[...this.#active.values()].map((entry) => this.#runs.abort(entry.runId).catch(() => undefined)),
 		);
 		await Promise.all([...this.#active.values()].map((entry) => entry.completion));
+		await Promise.all([...this.#messageQueues.values()].map((queue) => queue.close()));
 		await this.#queue.close();
 	}
 
@@ -549,7 +767,17 @@ export class AgentTaskService implements AsyncDisposable {
 					);
 				}
 				task.status = "completed";
-				await this.#appendMessage(this.#conversations.get(task.conversationId)!, task, "agent", task.result);
+				await this.#appendMessage(
+					this.#conversations.get(task.conversationId)!,
+					task,
+					{
+						kind: "agent",
+						agentId: task.agentId,
+						agentRevision: task.contract.agentRevision,
+					},
+					"task-result",
+					task.result,
+				);
 				await this.#persistTask(task);
 				await this.#emit(task, "task.completed");
 			} catch (error) {
@@ -576,19 +804,23 @@ export class AgentTaskService implements AsyncDisposable {
 
 	async #schedule(): Promise<void> {
 		await this.#queue.run(async () => {
-			if (this.#disposed) return;
+			if (this.#disposed || !this.#schedulingStarted) return;
 			const queued = [...this.#tasks.values()]
 				.filter((task) => task.status === "queued")
 				.sort((left, right) => left.createdAt - right.createdAt);
 			for (const task of queued) {
-				if ((await this.#runs.availability(task.agentId)) !== "available") continue;
+				const availability = task.contract.executionSeed
+					? this.#runs.availabilityForConfiguration(task.contract.executionSeed)
+					: await this.#runs.availability(task.agentId);
+				if (availability !== "available") continue;
 				try {
-					const run = await this.#runs.start(
-						task.agentId,
-						task.prompt,
-						taskSourceToRunSource(task.source),
-						task.model,
-					);
+					const run = task.contract.executionSeed
+						? await this.#runs.startWithConfiguration(
+								task.contract.executionSeed,
+								task.contract.context ? renderAgentContextPrompt(task.contract.context) : task.prompt,
+								taskSourceToRunSource(task.source),
+							)
+						: await this.#runs.start(task.agentId, task.prompt, taskSourceToRunSource(task.source), task.model);
 					task.status = "running";
 					task.startedAt = run.startedAt ?? Date.now();
 					task.attemptIds.push(run.id);
@@ -612,21 +844,146 @@ export class AgentTaskService implements AsyncDisposable {
 	async #appendMessage(
 		conversation: AgentConversation,
 		task: AgentTask,
-		role: AgentConversationMessage["role"],
+		author: AgentContextAuthor,
+		kind: AgentConversationMessage["kind"],
 		text: string,
+		id: string = randomUUID(),
+		deliveryId?: string,
 	): Promise<void> {
-		const message: AgentConversationMessage = {
-			id: randomUUID(),
-			conversationId: conversation.id,
-			role,
+		await this.#appendConversationMessage(conversation, {
+			id,
+			author,
+			kind,
+			role: author.kind === "agent" ? "agent" : "user",
 			text,
 			taskId: task.id,
-			createdAt: Date.now(),
+			deliveryId,
+			artifactIds: kind === "task-result" ? [...task.artifactIds] : undefined,
+		});
+	}
+
+	async #appendConversationMessage(
+		conversation: AgentConversation,
+		input: Omit<AgentConversationMessage, "version" | "sequence" | "conversationId" | "contextEpoch" | "createdAt">,
+	): Promise<AgentConversationMessage> {
+		let queue = this.#messageQueues.get(conversation.id);
+		if (!queue) {
+			queue = new SerialOperationQueue();
+			this.#messageQueues.set(conversation.id, queue);
+		}
+		return queue.run(async () => {
+			const existing = (await this.listMessages(conversation.id)).find((entry) => entry.id === input.id);
+			if (existing) {
+				if (!sameMessageInput(existing, input)) {
+					throw new Error(`Conversation message ${input.id} already exists with different content`);
+				}
+				return existing;
+			}
+			const message: AgentConversationMessage = {
+				version: 2,
+				...input,
+				sequence: conversation.nextMessageSequence,
+				conversationId: conversation.id,
+				contextEpoch: conversation.contextEpoch,
+				createdAt: Date.now(),
+			};
+			await mkdir(dirname(this.#messagesPath(conversation.id)), { recursive: true });
+			await appendFile(this.#messagesPath(conversation.id), `${JSON.stringify(message)}\n`, "utf8");
+			conversation.nextMessageSequence += 1;
+			conversation.updatedAt = message.createdAt;
+			await this.#persistConversation(conversation);
+			return message;
+		});
+	}
+
+	async #createContextPackage(
+		conversation: AgentConversation,
+		goal: string,
+		references: AgentContextPackage["references"] = [],
+	): Promise<AgentContextPackage> {
+		const messages = (await this.listMessages(conversation.id))
+			.filter(
+				(message) =>
+					message.contextEpoch === conversation.contextEpoch &&
+					(message.kind === "message" || message.kind === "task-result") &&
+					typeof message.text === "string",
+			)
+			.map((message) => ({ sequence: message.sequence, author: message.author, text: message.text ?? "" }));
+		return createAgentContextPackage({
+			conversationId: conversation.id,
+			contextEpoch: conversation.contextEpoch,
+			messages,
+			references,
+			goal,
+		});
+	}
+
+	async #migrateConversations(): Promise<void> {
+		const definitions = await this.#registry.list();
+		for (const conversation of this.#conversations.values()) {
+			const messages = await this.listMessages(conversation.id);
+			conversation.nextMessageSequence = Math.max(1, ...messages.map((message) => message.sequence + 1));
+			if (this.#legacyConversationIds.has(conversation.id)) {
+				await this.#persistMessages(conversation.id, messages);
+			}
+		}
+		for (const definition of definitions) {
+			const candidates = [...this.#conversations.values()]
+				.filter((conversation) => conversation.agentId === definition.id && conversation.archivedAt === undefined)
+				.sort((left, right) => right.updatedAt - left.updatedAt);
+			const explicit = candidates.filter(
+				(conversation) => conversation.kind === "agent-inbox" && !this.#legacyConversationIds.has(conversation.id),
+			);
+			const directLegacy = candidates.filter(
+				(conversation) =>
+					this.#legacyConversationIds.has(conversation.id) &&
+					[...this.#tasks.values()].some(
+						(task) => task.conversationId === conversation.id && task.source === "chat",
+					),
+			);
+			const inbox =
+				explicit[0] ?? directLegacy[0] ?? candidates.find((entry) => this.#legacyConversationIds.has(entry.id));
+			if (inbox) {
+				inbox.kind = "agent-inbox";
+				inbox.version = 2;
+				this.#inboxByAgent.set(definition.id, inbox.id);
+				await this.#persistConversation(inbox);
+			}
+			for (const conversation of candidates) {
+				if (conversation.id === inbox?.id) continue;
+				if (conversation.kind === "agent-inbox" || this.#legacyConversationIds.has(conversation.id)) {
+					conversation.kind = "task";
+					conversation.version = 2;
+					await this.#persistConversation(conversation);
+				}
+			}
+			if (!inbox) await this.#createInboxDuringInitialization(definition.id);
+		}
+		this.#legacyConversationIds.clear();
+	}
+
+	async #createInboxDuringInitialization(agentId: string): Promise<void> {
+		const now = Date.now();
+		const conversation: AgentConversation = {
+			version: 2,
+			id: randomUUID(),
+			kind: "agent-inbox",
+			agentId,
+			contextEpoch: 1,
+			nextMessageSequence: 1,
+			createdAt: now,
+			updatedAt: now,
 		};
-		await mkdir(dirname(this.#messagesPath(conversation.id)), { recursive: true });
-		await appendFile(this.#messagesPath(conversation.id), `${JSON.stringify(message)}\n`, "utf8");
-		conversation.updatedAt = message.createdAt;
+		this.#conversations.set(conversation.id, conversation);
+		this.#inboxByAgent.set(agentId, conversation.id);
 		await this.#persistConversation(conversation);
+	}
+
+	async #persistMessages(conversationId: string, messages: readonly AgentConversationMessage[]): Promise<void> {
+		await writeAtomic(
+			this.#messagesPath(conversationId),
+			messages.length > 0 ? `${messages.map((message) => JSON.stringify(message)).join("\n")}\n` : "",
+		);
 	}
 
 	#taskView(task: AgentTask): AgentTask {
@@ -640,10 +997,16 @@ export class AgentTaskService implements AsyncDisposable {
 		});
 	}
 
-	async #emit(task: AgentTask, type: AgentTaskEvent["type"], summary?: string, artifactId?: string): Promise<void> {
+	async #emit(
+		task: AgentTask,
+		type: AgentTaskEvent["type"],
+		summary?: string,
+		artifactId?: string,
+		eventId: string = randomUUID(),
+	): Promise<void> {
 		const sequence = (this.#eventSequences.get(task.id) ?? 0) + 1;
 		const event: AgentTaskEvent = {
-			id: randomUUID(),
+			id: eventId,
 			sequence,
 			type,
 			taskId: task.id,
@@ -798,28 +1161,129 @@ async function writeAtomic(path: string, content: string): Promise<void> {
 	await rename(temporary, path);
 }
 
-function parseConversation(value: unknown): AgentConversation {
+function parseConversation(value: unknown): { conversation: AgentConversation; legacy: boolean } {
 	const record = object(value, "conversation");
+	const id = requiredString(record.id, "conversation.id");
+	const agentId = optionalString(record.agentId);
+	const createdAt = requiredNumber(record.createdAt, "conversation.createdAt");
+	const updatedAt = requiredNumber(record.updatedAt, "conversation.updatedAt");
+	if (record.version !== 2) {
+		if (!agentId) throw new Error("conversation.agentId must be a string");
+		return {
+			conversation: {
+				version: 2,
+				id,
+				kind: "task",
+				agentId,
+				contextEpoch: 1,
+				nextMessageSequence: 1,
+				createdAt,
+				updatedAt,
+			},
+			legacy: true,
+		};
+	}
+	const kind = record.kind;
+	if (kind !== "agent-inbox" && kind !== "task" && kind !== "room") {
+		throw new Error("Invalid conversation kind");
+	}
+	if (kind !== "room" && !agentId) throw new Error("Agent conversation requires agentId");
+	if (kind === "room" && !optionalString(record.roomId)) throw new Error("Room conversation requires roomId");
 	return {
-		id: requiredString(record.id, "conversation.id"),
-		agentId: requiredString(record.agentId, "conversation.agentId"),
-		createdAt: requiredNumber(record.createdAt, "conversation.createdAt"),
-		updatedAt: requiredNumber(record.updatedAt, "conversation.updatedAt"),
+		conversation: {
+			version: 2,
+			id,
+			kind,
+			agentId,
+			roomId: optionalString(record.roomId),
+			contextEpoch: positiveInteger(record.contextEpoch, "conversation.contextEpoch"),
+			nextMessageSequence: positiveInteger(record.nextMessageSequence, "conversation.nextMessageSequence"),
+			createdAt,
+			updatedAt,
+			archivedAt: optionalNumber(record.archivedAt),
+		},
+		legacy: false,
 	};
 }
 
-function parseMessage(value: unknown): AgentConversationMessage {
+function parseMessage(
+	value: unknown,
+	conversation: AgentConversation,
+	fallbackSequence: number,
+): AgentConversationMessage {
 	const record = object(value, "conversation message");
 	const role = record.role;
 	if (role !== "user" && role !== "agent") throw new Error("Invalid conversation message role");
+	if (record.version !== 2) {
+		return {
+			version: 2,
+			id: requiredString(record.id, "message.id"),
+			sequence: fallbackSequence,
+			conversationId: requiredString(record.conversationId, "message.conversationId"),
+			author:
+				role === "agent"
+					? { kind: "agent", agentId: conversation.agentId ?? "legacy", agentRevision: 1 }
+					: { kind: "user", id: "local-user" },
+			kind: role === "agent" ? "task-result" : "message",
+			role,
+			text: typeof record.text === "string" ? record.text : "",
+			taskId: optionalString(record.taskId),
+			contextEpoch: 1,
+			createdAt: requiredNumber(record.createdAt, "message.createdAt"),
+		};
+	}
+	const kind = record.kind;
+	if (
+		kind !== "message" &&
+		kind !== "task-result" &&
+		kind !== "delivery" &&
+		kind !== "room-turn" &&
+		kind !== "context-checkpoint"
+	) {
+		throw new Error("Invalid conversation message kind");
+	}
 	return {
+		version: 2,
 		id: requiredString(record.id, "message.id"),
+		sequence: positiveInteger(record.sequence, "message.sequence"),
 		conversationId: requiredString(record.conversationId, "message.conversationId"),
+		author: parseMessageAuthor(record.author),
+		kind,
 		role,
-		text: typeof record.text === "string" ? record.text : "",
-		taskId: requiredString(record.taskId, "message.taskId"),
+		text: optionalString(record.text),
+		taskId: optionalString(record.taskId),
+		deliveryId: optionalString(record.deliveryId),
+		artifactIds: stringArrayOrUndefined(record.artifactIds),
+		contextEpoch: positiveInteger(record.contextEpoch, "message.contextEpoch"),
 		createdAt: requiredNumber(record.createdAt, "message.createdAt"),
 	};
+}
+
+function parseMessageAuthor(value: unknown): AgentContextAuthor {
+	const record = object(value, "message author");
+	switch (record.kind) {
+		case "user":
+			if (record.id !== "local-user") throw new Error("Invalid local user message author");
+			return { kind: "user", id: "local-user" };
+		case "pi":
+			return { kind: "pi", sessionId: requiredString(record.sessionId, "author.sessionId") };
+		case "agent":
+			return {
+				kind: "agent",
+				agentId: requiredString(record.agentId, "author.agentId"),
+				agentRevision: positiveInteger(record.agentRevision, "author.agentRevision"),
+			};
+		case "routine":
+			return {
+				kind: "routine",
+				routineId: requiredString(record.routineId, "author.routineId"),
+				revision: positiveInteger(record.revision, "author.revision"),
+			};
+		case "system":
+			return { kind: "system" };
+		default:
+			throw new Error("Invalid conversation message author");
+	}
 }
 
 function parseTask(value: unknown): AgentTask {
@@ -884,6 +1348,8 @@ function createContractSnapshot(
 	conversationId: string,
 	workspaceRoot: string,
 	model: ModelRef | undefined,
+	executionSeed: AgentExecutionConfigurationSeed,
+	context: AgentContextPackage,
 ): AgentTaskContractSnapshot {
 	const capabilityGrantIds = definition.capabilities.map((grant) =>
 		[`${grant.capabilityId}@${grant.capabilityVersion}`, grant.providerId, grant.connectionId]
@@ -907,13 +1373,78 @@ function createContractSnapshot(
 			request.permissionMode ?? (definition.permissionPolicy === "workspace-write" ? "safe_auto" : "manual"),
 		expectedDeliverable: request.expectedDeliverable ? { ...request.expectedDeliverable } : undefined,
 		routine: request.routine ? { ...request.routine } : undefined,
+		executionSeed,
+		context,
+		delivery: request.delivery ? structuredClone(request.delivery) : undefined,
+		room: request.room ? { ...request.room } : undefined,
 	};
+}
+
+function requestAuthor(request: SubmitAgentTask): AgentContextAuthor {
+	if (request.source === "routine") {
+		return {
+			kind: "routine",
+			routineId: request.routine?.id ?? request.agentId,
+			revision: request.routine?.revision ?? 1,
+		};
+	}
+	if (request.source === "workflow") {
+		return { kind: "agent", agentId: request.agentId, agentRevision: 1 };
+	}
+	if (request.source === "pi") return { kind: "pi", sessionId: "local-pi" };
+	return { kind: "user", id: "local-user" };
+}
+
+function deliveryAuthor(delivery: AgentDeliveryEnvelope, sourceRevision?: number): AgentContextAuthor {
+	switch (delivery.sender.kind) {
+		case "user":
+			return { kind: "user", id: "local-user" };
+		case "pi":
+			return { kind: "pi", sessionId: delivery.sender.sessionId };
+		case "agent":
+			return {
+				kind: "agent",
+				agentId: delivery.sender.agentId,
+				agentRevision: sourceRevision ?? 1,
+			};
+		case "routine":
+			return {
+				kind: "routine",
+				routineId: delivery.sender.routineId,
+				revision: delivery.sender.revision,
+			};
+		case "workflow":
+			return { kind: "system" };
+		case "a2a":
+			return { kind: "system" };
+	}
+}
+
+function sameMessageInput(
+	message: AgentConversationMessage,
+	input: Omit<AgentConversationMessage, "version" | "sequence" | "conversationId" | "contextEpoch" | "createdAt">,
+): boolean {
+	return (
+		message.id === input.id &&
+		JSON.stringify(message.author) === JSON.stringify(input.author) &&
+		message.kind === input.kind &&
+		message.role === input.role &&
+		message.text === input.text &&
+		message.taskId === input.taskId &&
+		message.deliveryId === input.deliveryId &&
+		JSON.stringify(message.artifactIds) === JSON.stringify(input.artifactIds)
+	);
 }
 
 function taskActor(request: SubmitAgentTask): AgentTaskContractSnapshot["actor"] {
 	if (request.source === "routine") return { kind: "routine", id: request.routine?.id ?? request.agentId };
 	if (request.source === "a2a") return { kind: "a2a", id: request.agentId };
 	if (request.source === "pi") return { kind: "pi", id: request.agentId };
+	if (request.source === "agent")
+		return {
+			kind: "agent",
+			id: request.delivery?.sender.kind === "agent" ? request.delivery.sender.agentId : request.agentId,
+		};
 	if (request.source === "workflow") return { kind: "agent", id: request.parentTaskId ?? request.agentId };
 	return { kind: "user", id: "local-user" };
 }
@@ -954,6 +1485,10 @@ function parseContract(value: unknown): AgentTaskContractSnapshot {
 		permissionMode,
 		expectedDeliverable: parseDeliverable(record.expectedDeliverable),
 		routine: parseRoutineSnapshot(record.routine),
+		executionSeed: parseExecutionSeed(record.executionSeed),
+		context: parseContextPackage(record.context),
+		delivery: parseDeliveryEnvelope(record.delivery),
+		room: parseRoomTaskSnapshot(record.room),
 	};
 }
 
@@ -1002,7 +1537,58 @@ function cloneContract(contract: AgentTaskContractSnapshot): AgentTaskContractSn
 		providerAccountRefs: [...contract.providerAccountRefs],
 		expectedDeliverable: contract.expectedDeliverable ? { ...contract.expectedDeliverable } : undefined,
 		routine: contract.routine ? { ...contract.routine } : undefined,
+		executionSeed: contract.executionSeed ? structuredClone(contract.executionSeed) : undefined,
+		context: contract.context ? structuredClone(contract.context) : undefined,
+		delivery: contract.delivery ? structuredClone(contract.delivery) : undefined,
+		room: contract.room ? { ...contract.room } : undefined,
 	};
+}
+
+function parseRoomTaskSnapshot(
+	value: unknown,
+): { id: string; runId: string; round: number; memberIndex: number } | undefined {
+	if (value === undefined) return undefined;
+	const record = object(value, "room task snapshot");
+	return {
+		id: requiredIdentifier(record.id, "room.id"),
+		runId: requiredString(record.runId, "room.runId"),
+		round: positiveInteger(record.round, "room.round"),
+		memberIndex: nonNegativeInteger(record.memberIndex, "room.memberIndex"),
+	};
+}
+
+function parseDeliveryEnvelope(value: unknown): AgentDeliveryEnvelope | undefined {
+	if (value === undefined) return undefined;
+	const record = object(value, "delivery envelope");
+	if (record.version !== 1) throw new Error("Invalid delivery envelope version");
+	const envelope = structuredClone(value as AgentDeliveryEnvelope);
+	if (
+		typeof envelope.id !== "string" ||
+		typeof envelope.taskId !== "string" ||
+		typeof envelope.recipientAgentId !== "string" ||
+		typeof envelope.requestDigest !== "string" ||
+		envelope.contextRefs.length > 16
+	) {
+		throw new Error("Invalid delivery envelope");
+	}
+	return envelope;
+}
+
+function parseExecutionSeed(value: unknown): AgentExecutionConfigurationSeed | undefined {
+	if (value === undefined) return undefined;
+	const record = object(value, "execution seed");
+	const digest = requiredString(record.digest, "executionSeed.digest");
+	assertAgentExecutionConfigurationSeedIntegrity(value, digest);
+	return structuredClone(value as AgentExecutionConfigurationSeed);
+}
+
+function parseContextPackage(value: unknown): AgentContextPackage | undefined {
+	if (value === undefined) return undefined;
+	const record = object(value, "agent context package");
+	if (record.version !== 1) throw new Error("Invalid agent context package version");
+	const context = structuredClone(value as AgentContextPackage);
+	assertAgentContextPackageIntegrity(context);
+	return context;
 }
 
 function parseTaskEvent(value: unknown, task: AgentTask, fallbackSequence: number): AgentTaskEvent {
@@ -1055,6 +1641,14 @@ function cloneAttention(item: AttentionItem): AttentionItem {
 	return { ...item, actionLabels: [...item.actionLabels] };
 }
 
+function cloneMessage(message: AgentConversationMessage): AgentConversationMessage {
+	return {
+		...message,
+		author: { ...message.author },
+		artifactIds: message.artifactIds ? [...message.artifactIds] : undefined,
+	};
+}
+
 function safeTaskSummary(value: string): string {
 	return value
 		.replace(/authorization\s*[:=]\s*(?:Bearer\s+)?\S+/gi, "Authorization=[redacted]")
@@ -1087,12 +1681,43 @@ function requiredNumber(value: unknown, name: string): number {
 	return value;
 }
 
+function positiveInteger(value: unknown, name: string): number {
+	if (!Number.isSafeInteger(value) || Number(value) < 1) throw new Error(`${name} must be a positive integer`);
+	return Number(value);
+}
+
+function nonNegativeInteger(value: unknown, name: string): number {
+	if (!Number.isSafeInteger(value) || Number(value) < 0) throw new Error(`${name} must be a non-negative integer`);
+	return Number(value);
+}
+
+function requiredIdentifier(value: unknown, name: string): string {
+	const identifier = requiredString(value, name);
+	if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(identifier)) throw new Error(`${name} contains unsupported characters`);
+	return identifier;
+}
+
+function stringArrayOrUndefined(value: unknown): string[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+		throw new Error("Expected a string array");
+	}
+	return [...value];
+}
+
 function optionalNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function isTaskSource(value: unknown): value is AgentTaskSource {
-	return value === "chat" || value === "pi" || value === "routine" || value === "workflow" || value === "a2a";
+	return (
+		value === "chat" ||
+		value === "pi" ||
+		value === "agent" ||
+		value === "routine" ||
+		value === "workflow" ||
+		value === "a2a"
+	);
 }
 
 function isTaskStatus(value: unknown): value is AgentTaskStatus {

@@ -3,6 +3,7 @@ import type { AgentSession } from "../agent-session.ts";
 import type { SourceInfo } from "../source-info.ts";
 import type { BrowserConsoleService } from "./browser-console-service.ts";
 import type { CapabilityBroker, CapabilityBrokerSnapshot } from "./capability-broker.ts";
+import { CapabilityProviderRegistry } from "./capability-provider-registry.ts";
 import type { ExternalConnectionManager } from "./external-connection-manager.ts";
 import type { PluginManagementService } from "./plugin-management-service.ts";
 
@@ -132,7 +133,11 @@ export class CapabilityCatalog {
 			mcpServers: [],
 			acpConnections,
 			modelProviders,
-			broker: this.#broker?.snapshot() ?? { capabilities: [], providers: [] },
+			broker: this.#broker?.snapshot() ?? {
+				discovery: new CapabilityProviderRegistry().snapshot(),
+				capabilities: [],
+				providers: [],
+			},
 		};
 	}
 }

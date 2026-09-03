@@ -32,11 +32,8 @@ import { BrowserWorkflowReferenceStore } from "./browser-workflow-reference-stor
 import { BrowserWorkflowRegistry } from "./browser-workflow-registry.ts";
 import { BrowserWorkflowRunner } from "./browser-workflow-runner.ts";
 import { createBrowserWorkflowTools } from "./browser-workflow-tools.ts";
-import { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
-import { createEverydayDataTools } from "./everyday-data-tools.ts";
 import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
 import { createScopedAgentTools, type ScopedAgentFileOperations } from "./scoped-agent-tools.ts";
-import { createSearxngTools } from "./searxng-tools.ts";
 import { WorkspacePreviewServer } from "./workspace-preview-server.ts";
 
 let activeSession: AgentSession | undefined;
@@ -147,16 +144,6 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 				}),
 			),
 		);
-		const everydayConfigurations = new EverydayConfigurationRegistry(
-			join(request.serveRoot, "capabilities", "everyday-data"),
-		);
-		await everydayConfigurations.initialize();
-		const brokeredTools = [
-			...createEverydayDataTools(join(request.serveRoot, "capabilities", "everyday-data"), everydayConfigurations),
-			...createSearxngTools(process.env.SEARXNG_BASE_URL),
-		];
-		customTools.push(...brokeredTools.filter((tool) => request.capabilityToolNames.includes(tool.name)));
-
 		if (definition.browser?.access && definition.browser.access !== "disabled") {
 			const browserRoot = join(request.serveRoot, "browser");
 			const captureStore = new BrowserWorkflowCaptureStore(join(browserRoot, "captures"));
@@ -219,7 +206,7 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 							? customTools.filter((entry) => entry.name.startsWith("browser_")).map((entry) => entry.name)
 							: [tool === "list" ? "ls" : tool],
 					),
-					...request.capabilityToolNames,
+					...request.capabilityTools.map((tool) => tool.name),
 				];
 		const created = await createAgentSessionFromServices({
 			services,
