@@ -25,6 +25,7 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 	readonly #registry: RoutineRegistry;
 	readonly #dispatcher: RoutineDispatcher;
 	readonly #states = new Map<string, AgentRoutineState>();
+	readonly #listeners = new Set<() => void>();
 	#timer: NodeJS.Timeout | undefined;
 	#tickActive = false;
 
@@ -35,6 +36,11 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 
 	list(): AgentRoutineState[] {
 		return [...this.#states.values()].sort((left, right) => left.name.localeCompare(right.name));
+	}
+
+	subscribe(listener: () => void): () => void {
+		this.#listeners.add(listener);
+		return () => this.#listeners.delete(listener);
 	}
 
 	async start(): Promise<void> {
@@ -71,14 +77,18 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 		}
 		this.#states.clear();
 		for (const [key, state] of next) this.#states.set(key, state);
+		this.#emit();
 	}
 
 	async runDue(now = Date.now()): Promise<void> {
+		let changed = false;
 		for (const state of this.#states.values()) {
 			if (!state.enabled || state.nextRunAt === undefined || state.nextRunAt > now) continue;
 			state.nextRunAt = nextCronRun(state.cron, state.timezone, now);
+			changed = true;
 			if (!state.activeRunId) await this.#run(state, now);
 		}
+		if (changed) this.#emit();
 	}
 
 	async runNow(id: string, now = Date.now()): Promise<AgentRoutineState> {
@@ -127,9 +137,16 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 				if (state.activeRunId !== execution.runId) return;
 				state.activeRunId = undefined;
 				state.lastError = result.error;
+				this.#emit();
 			});
+			this.#emit();
 		} catch (error) {
 			state.lastError = error instanceof Error ? error.message : String(error);
+			this.#emit();
 		}
+	}
+
+	#emit(): void {
+		for (const listener of this.#listeners) listener();
 	}
 }

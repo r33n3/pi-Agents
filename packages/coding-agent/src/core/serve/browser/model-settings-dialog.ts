@@ -1,4 +1,4 @@
-import type { ModelMetadata, ThinkingLevel } from "@earendil-works/pi-protocol";
+import type { ModelMetadata } from "@earendil-works/pi-protocol";
 import { describeCatalogRefresh, describeModelCatalog } from "./model-catalog-status.ts";
 import { choiceLabels, type ModelSettingsSelection, modelSettingsError } from "./model-settings.ts";
 
@@ -7,7 +7,6 @@ export function openModelSettings(options: {
 	title: string;
 	models: readonly ModelMetadata[];
 	current: ModelSettingsSelection;
-	allowInherit?: boolean;
 	onApply(selection: ModelSettingsSelection): Promise<void>;
 }): HTMLDialogElement {
 	const dialog = document.createElement("dialog");
@@ -24,7 +23,10 @@ export function openModelSettings(options: {
 	help.className = "muted";
 	help.style.cssText = "margin:0;flex-shrink:0";
 	help.textContent =
-		"Effort controls reasoning work. A token budget guides reasoning token use. Processing speed is separate and may cost more. Catalog support does not verify account access.";
+		"Pi thinking remains the primary reasoning control. Additional provider settings appear here. A native reasoning override pauses Pi thinking; processing speed is separate and may cost more.";
+	const modelName = document.createElement("p");
+	modelName.className = "muted";
+	modelName.style.cssText = "margin:0;flex-shrink:0";
 	const fields = document.createElement("div");
 	fields.style.cssText = "display:grid;gap:12px;min-width:0;min-height:0;overflow:auto;overscroll-behavior:contain";
 	const error = document.createElement("p");
@@ -33,6 +35,10 @@ export function openModelSettings(options: {
 	error.style.cssText = "margin:0;flex-shrink:0";
 	const actions = document.createElement("div");
 	actions.style.cssText = "display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;flex-shrink:0";
+	const usePiThinking = document.createElement("button");
+	usePiThinking.type = "button";
+	usePiThinking.textContent = "Use Pi thinking";
+	usePiThinking.style.minHeight = "44px";
 	const cancel = document.createElement("button");
 	cancel.type = "button";
 	cancel.textContent = "Cancel";
@@ -41,9 +47,8 @@ export function openModelSettings(options: {
 	apply.type = "submit";
 	apply.textContent = "Apply settings";
 	apply.style.minHeight = "44px";
-	actions.append(cancel, apply);
+	actions.append(usePiThinking, cancel, apply);
 	const controls = { ...options.current.modelControls };
-	let legacyThinking = options.current.thinkingLevel;
 	let saving = false;
 	const addSelect = (
 		parent: HTMLElement,
@@ -65,52 +70,30 @@ export function openModelSettings(options: {
 		parent.append(wrapper);
 		return select;
 	};
-	form.append(heading, help);
-	const model = addSelect(
-		form,
-		"Model",
-		[
-			...(options.allowInherit ? [{ value: "", label: "Inherit current session" }] : []),
-			...options.models.map((entry) => ({
-				value: `${entry.provider}/${entry.id}`,
-				label: `${entry.name} · ${entry.provider}`,
-			})),
-		],
-		options.current.model ? `${options.current.model.provider}/${options.current.model.id}` : "",
-	);
-	const style = addSelect(
-		form,
-		"Control style",
-		[
-			{ value: "native", label: "Provider-native controls" },
-			{ value: "legacy", label: "Legacy Pi thinking mapping" },
-		],
-		options.current.modelControls === undefined ? "legacy" : "native",
-	);
+	form.append(heading, help, modelName);
 	form.append(fields, error, actions);
 	dialog.append(form);
 	const selection = (): ModelSettingsSelection => {
-		const separator = model.value.indexOf("/");
 		return {
-			model:
-				separator > 0
-					? { provider: model.value.slice(0, separator), id: model.value.slice(separator + 1) }
-					: undefined,
-			thinkingLevel: legacyThinking,
-			modelControls: style.value === "native" ? { ...controls } : undefined,
+			model: options.current.model,
+			thinkingLevel: options.current.thinkingLevel,
+			modelControls: Object.values(controls).some((value) => value !== undefined) ? { ...controls } : undefined,
 		};
 	};
 	const validate = () => {
-		const message =
-			!options.allowInherit && !selection().model
-				? "Choose a model."
-				: modelSettingsError(selection(), options.models);
+		const message = selection().model ? modelSettingsError(selection(), options.models) : "Choose a model first.";
 		error.textContent = message ?? "";
 		apply.disabled = saving || Boolean(message);
+		usePiThinking.disabled =
+			saving ||
+			(options.current.modelControls === undefined && !Object.values(controls).some((value) => value !== undefined));
 	};
 	const renderFields = () => {
 		fields.replaceChildren();
-		const metadata = options.models.find((entry) => `${entry.provider}/${entry.id}` === model.value);
+		const metadata = options.models.find(
+			(entry) => entry.provider === options.current.model?.provider && entry.id === options.current.model.id,
+		);
+		modelName.textContent = metadata ? `${metadata.name} · ${metadata.provider}` : "Selected model unavailable";
 		const catalog = document.createElement("details");
 		const catalogSummary = document.createElement("summary");
 		const refresh = metadata?.catalogRefresh;
@@ -128,141 +111,118 @@ export function openModelSettings(options: {
 		sourceDetails.textContent = describeModelCatalog(metadata?.catalog);
 		catalog.append(sourceDetails);
 		fields.append(catalog);
-		if (style.value === "legacy") {
-			const levels = metadata?.supportedThinkingLevels ?? [
-				"off",
-				"minimal",
-				"low",
-				"medium",
-				"high",
-				"xhigh",
-				"max",
-			];
-			const thinking = addSelect(
+		const note = document.createElement("p");
+		note.className = "muted";
+		note.textContent =
+			"Provider default leaves a field unset. Unsupported saved values stay visible until corrected. The runtime validates combinations on Apply.";
+		fields.append(note);
+		for (const key of ["reasoningMode", "reasoningEffort", "processingTier"] as const) {
+			const capability = metadata?.controls?.[key];
+			if (!capability && controls[key] === undefined) continue;
+			const select = addSelect(
 				fields,
-				"Legacy thinking",
-				levels.map((value) => ({ value, label: value })),
-				legacyThinking,
+				choiceLabels[key],
+				[
+					{
+						value: "",
+						label:
+							capability?.default === undefined
+								? "Provider default (unset)"
+								: `Provider default (documented: ${capability.default})`,
+					},
+					...(capability?.values ?? []).map((value) => ({ value, label: value })),
+				],
+				controls[key] ?? "",
 			);
-			thinking.addEventListener("change", () => {
-				legacyThinking = thinking.value as ThinkingLevel;
+			if (capability?.guidance) {
+				const guidance = document.createElement("p");
+				guidance.id = `model-control-${key}-guidance`;
+				guidance.className = "muted";
+				guidance.style.cssText = "margin:0;overflow-wrap:anywhere";
+				guidance.textContent = capability.guidance;
+				select.setAttribute("aria-describedby", guidance.id);
+				fields.append(guidance);
+			}
+			select.addEventListener("change", () => {
+				if (select.value) controls[key] = select.value;
+				else delete controls[key];
 				validate();
 			});
-		} else {
-			const note = document.createElement("p");
-			note.className = "muted";
-			note.textContent =
-				"Provider default leaves the field unset; it is not a fixed promise of speed, effort, or cost. Unsupported saved values stay visible until you correct them. The runtime validates combinations on Apply or save.";
-			fields.append(note);
-			for (const key of ["reasoningMode", "reasoningEffort", "processingTier"] as const) {
-				const capability = metadata?.controls?.[key];
-				if (!capability && controls[key] === undefined) continue;
-				const select = addSelect(
-					fields,
-					choiceLabels[key],
-					[
-						{
-							value: "",
-							label:
-								capability?.default === undefined
-									? "Provider default (unset)"
-									: `Provider default (documented: ${capability.default})`,
-						},
-						...(capability?.values ?? []).map((value) => ({ value, label: value })),
-					],
-					controls[key] ?? "",
-				);
-				if (capability?.guidance) {
-					const guidance = document.createElement("p");
-					guidance.id = `model-control-${key}-guidance`;
-					guidance.className = "muted";
-					guidance.style.cssText = "margin:0;overflow-wrap:anywhere";
-					guidance.textContent = capability.guidance;
-					select.setAttribute("aria-describedby", guidance.id);
-					fields.append(guidance);
-				}
-				select.addEventListener("change", () => {
-					if (select.value) controls[key] = select.value;
-					else delete controls[key];
-					validate();
-				});
-			}
-			const budget = metadata?.controls?.reasoningBudget;
-			if (budget || controls.reasoningBudget !== undefined) {
-				const mode = addSelect(
-					fields,
-					"Reasoning token budget",
-					[
-						{ value: "default", label: "Provider default (unset)" },
-						...(budget?.automaticValue !== undefined ? [{ value: "automatic", label: "Automatic" }] : []),
-						...(budget?.disabledValue !== undefined ? [{ value: "off", label: "Off" }] : []),
-						{ value: "custom", label: "Custom token limit" },
-					],
-					controls.reasoningBudget === undefined
-						? "default"
-						: controls.reasoningBudget === budget?.automaticValue
-							? "automatic"
-							: controls.reasoningBudget === budget?.disabledValue
-								? "off"
-								: "custom",
-				);
-				const label = document.createElement("label");
-				label.style.cssText = "display:grid;gap:6px";
-				label.textContent = `Token limit (${budget?.minimum ?? "?"}–${budget?.maximum ?? "unspecified"})`;
-				const number = document.createElement("input");
-				number.type = "number";
-				number.step = "1";
-				number.setAttribute("aria-label", "Reasoning token limit");
-				number.style.cssText = "box-sizing:border-box;width:100%;min-height:44px;font:inherit";
-				number.value = controls.reasoningBudget?.toString() ?? "";
-				label.append(number);
-				fields.append(label);
-				const sync = () => {
-					label.hidden = mode.value !== "custom";
-					label.style.display = label.hidden ? "none" : "grid";
-					number.disabled = label.hidden;
-					if (mode.value === "default") delete controls.reasoningBudget;
-					else
-						controls.reasoningBudget =
-							mode.value === "automatic"
-								? -1
-								: mode.value === "off"
-									? 0
-									: number.value === ""
-										? Number.NaN
-										: Number(number.value);
-					validate();
-				};
-				mode.addEventListener("change", sync);
-				number.addEventListener("input", sync);
+		}
+		const budget = metadata?.controls?.reasoningBudget;
+		if (budget || controls.reasoningBudget !== undefined) {
+			const mode = addSelect(
+				fields,
+				"Reasoning token budget",
+				[
+					{ value: "default", label: "Provider default (unset)" },
+					...(budget?.automaticValue !== undefined ? [{ value: "automatic", label: "Automatic" }] : []),
+					...(budget?.disabledValue !== undefined ? [{ value: "off", label: "Off" }] : []),
+					{ value: "custom", label: "Custom token limit" },
+				],
+				controls.reasoningBudget === undefined
+					? "default"
+					: controls.reasoningBudget === budget?.automaticValue
+						? "automatic"
+						: controls.reasoningBudget === budget?.disabledValue
+							? "off"
+							: "custom",
+			);
+			const label = document.createElement("label");
+			label.style.cssText = "display:grid;gap:6px";
+			label.textContent = `Token limit (${budget?.minimum ?? "?"}–${budget?.maximum ?? "unspecified"})`;
+			const number = document.createElement("input");
+			number.type = "number";
+			number.step = "1";
+			number.setAttribute("aria-label", "Reasoning token limit");
+			number.style.cssText = "box-sizing:border-box;width:100%;min-height:44px;font:inherit";
+			number.value = controls.reasoningBudget?.toString() ?? "";
+			label.append(number);
+			fields.append(label);
+			const sync = () => {
 				label.hidden = mode.value !== "custom";
 				label.style.display = label.hidden ? "none" : "grid";
 				number.disabled = label.hidden;
-			}
-			const evidence = document.createElement("details");
-			const summary = document.createElement("summary");
-			summary.textContent = "Capability evidence";
-			evidence.append(summary);
-			for (const key of ["reasoningMode", "reasoningEffort", "reasoningBudget", "processingTier"] as const) {
-				const source = metadata?.controls?.[key]?.evidence;
-				if (!source) continue;
-				const paragraph = document.createElement("p");
-				paragraph.style.overflowWrap = "anywhere";
-				paragraph.textContent = `${key === "reasoningBudget" ? "Token budget" : choiceLabels[key]}: ${source.kind} · checked ${source.checkedAt} · ${source.reference}`;
-				evidence.append(paragraph);
-			}
-			if (evidence.childElementCount === 1)
-				evidence.append(
-					document.createTextNode(
-						"No native control evidence for this model and connection. Only unset defaults are available.",
-					),
-				);
-			fields.append(evidence);
+				if (mode.value === "default") delete controls.reasoningBudget;
+				else
+					controls.reasoningBudget =
+						mode.value === "automatic"
+							? -1
+							: mode.value === "off"
+								? 0
+								: number.value === ""
+									? Number.NaN
+									: Number(number.value);
+				validate();
+			};
+			mode.addEventListener("change", sync);
+			number.addEventListener("input", sync);
+			label.hidden = mode.value !== "custom";
+			label.style.display = label.hidden ? "none" : "grid";
+			number.disabled = label.hidden;
 		}
+		const evidence = document.createElement("details");
+		const summary = document.createElement("summary");
+		summary.textContent = "Capability evidence";
+		evidence.append(summary);
+		for (const key of ["reasoningMode", "reasoningEffort", "reasoningBudget", "processingTier"] as const) {
+			const source = metadata?.controls?.[key]?.evidence;
+			if (!source) continue;
+			const paragraph = document.createElement("p");
+			paragraph.style.overflowWrap = "anywhere";
+			paragraph.textContent = `${key === "reasoningBudget" ? "Token budget" : choiceLabels[key]}: ${source.kind} · checked ${source.checkedAt} · ${source.reference}`;
+			evidence.append(paragraph);
+		}
+		if (evidence.childElementCount === 1)
+			evidence.append(document.createTextNode("No additional control evidence for this model and connection."));
+		fields.append(evidence);
 		validate();
 	};
-	model.addEventListener("change", renderFields);
-	style.addEventListener("change", renderFields);
+	usePiThinking.addEventListener("click", () => {
+		for (const key of ["reasoningMode", "reasoningEffort", "reasoningBudget", "processingTier"] as const)
+			delete controls[key];
+		renderFields();
+	});
 	cancel.addEventListener("click", () => dialog.close());
 	dialog.addEventListener("cancel", (event) => {
 		if (saving) event.preventDefault();

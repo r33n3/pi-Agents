@@ -1,11 +1,15 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ExtensionContext } from "../src/core/extensions/types.ts";
 import { CapabilityApprovalService } from "../src/core/serve/capability-approval-service.ts";
 import type { ProviderAuthenticationManifest } from "../src/core/serve/capability-broker.ts";
-import { createGoogleWorkspaceTools } from "../src/core/serve/google-workspace-tools.ts";
+import {
+	bindGoogleWorkspaceDeleteApproval,
+	bindGoogleWorkspaceMessageApproval,
+	createGoogleWorkspaceTools,
+} from "../src/core/serve/google-workspace-tools.ts";
 import { GovernedActionService } from "../src/core/serve/governed-action-service.ts";
 import { ProviderEnvironmentStore } from "../src/core/serve/provider-environment-store.ts";
 import { ServeAuditStore } from "../src/core/serve/serve-audit-store.ts";
@@ -14,6 +18,7 @@ describe("createGoogleWorkspaceTools", () => {
 	let root: string;
 	let approvals: CapabilityApprovalService;
 	let environment: NodeJS.ProcessEnv;
+	const owner = { kind: "session" as const, id: "session-1" };
 	const manifest: ProviderAuthenticationManifest = {
 		kind: "oauth2",
 		fields: [
@@ -103,44 +108,26 @@ describe("createGoogleWorkspaceTools", () => {
 				headers: { "content-type": "application/json" },
 			}),
 		);
+		const input = { to: ["recipient@example.com"], subject: "Test", text: "Body" };
 		const receipt = await approvals.issue(
-			{
-				capabilityId: "email.send",
-				providerId: "google-workspace",
-				connectionId: "google-workspace-primary",
-				action: "send",
-				target: "recipient@example.com",
-			},
+			{ ...bindGoogleWorkspaceMessageApproval("send", input).request, owner },
 			true,
 		);
-		const tool = createGoogleWorkspaceTools({ approvals, environment, fetch: request }).find(
+		const tool = createGoogleWorkspaceTools({ approvals, environment, fetch: request, approvalOwner: owner }).find(
 			(entry) => entry.name === "google_workspace_email_send",
 		);
 		if (!tool) throw new Error("Send tool was not created");
-		await tool.execute(
-			"send-1",
-			{
-				to: ["recipient@example.com"],
-				subject: "Test",
-				text: "Body",
-				receiptId: receipt.id,
-			},
-			undefined,
-			undefined,
-			{} as ExtensionContext,
-		);
+		await tool.execute("send-1", { ...input, receiptId: receipt.id }, undefined, undefined, {} as ExtensionContext);
 		const requestBody = JSON.parse(String(request.mock.calls[0]?.[1]?.body)) as { raw: string };
 		const mime = Buffer.from(requestBody.raw, "base64url").toString("utf8");
 		expect(mime).toContain(`X-Pi-Idempotency-Key: ${receipt.idempotencyKey}`);
 		expect(approvals.list()[0]?.state).toBe("completed");
+		const persistedApprovals = await readFile(join(root, "approvals.json"), "utf8");
+		expect(persistedApprovals).not.toContain('"subject": "Test"');
+		expect(persistedApprovals).not.toContain('"text": "Body"');
 		await tool.execute(
 			"send-replay",
-			{
-				to: ["recipient@example.com"],
-				subject: "Test",
-				text: "Body",
-				receiptId: receipt.id,
-			},
+			{ ...input, receiptId: receipt.id },
 			undefined,
 			undefined,
 			{} as ExtensionContext,
@@ -148,19 +135,128 @@ describe("createGoogleWorkspaceTools", () => {
 		expect(request).toHaveBeenCalledTimes(1);
 	});
 
+	test("rejects every changed Gmail message field for the same receipt", async () => {
+		const request = vi.fn<typeof fetch>();
+		const approvedInput = {
+			to: ["recipient@example.com"],
+			cc: ["copy@example.com"],
+			subject: "Subject",
+			text: "Body",
+			html: "<p>Body</p>",
+			filename: "report.txt",
+			mimeType: "text/plain",
+			contentBase64: Buffer.from("content").toString("base64"),
+		};
+		const receipt = await approvals.issue(
+			{ ...bindGoogleWorkspaceMessageApproval("attach", approvedInput).request, owner },
+			true,
+		);
+		const tool = createGoogleWorkspaceTools({ approvals, environment, fetch: request, approvalOwner: owner }).find(
+			(entry) => entry.name === "google_workspace_email_attach",
+		)!;
+		const mutations = [
+			{ ...approvedInput, to: ["other@example.com"] },
+			{ ...approvedInput, cc: ["other-copy@example.com"] },
+			{ ...approvedInput, subject: "Changed" },
+			{ ...approvedInput, text: "Changed" },
+			{ ...approvedInput, html: "<p>Changed</p>" },
+			{ ...approvedInput, filename: "changed.txt" },
+			{ ...approvedInput, mimeType: "application/octet-stream" },
+			{ ...approvedInput, contentBase64: Buffer.from("changed").toString("base64") },
+		];
+		for (const input of mutations) {
+			await expect(
+				tool.execute(
+					"attach-changed",
+					{ ...input, receiptId: receipt.id },
+					undefined,
+					undefined,
+					{} as ExtensionContext,
+				),
+			).rejects.toThrow(/does not match (target|exact action)/);
+		}
+		expect(request).not.toHaveBeenCalled();
+		expect(approvals.list()[0]).toMatchObject({ state: "approved" });
+	});
+
+	test("does not strand a consumed receipt when grant or live authority is denied", async () => {
+		const request = vi.fn<typeof fetch>();
+		const input = { to: ["recipient@example.com"], subject: "Subject", text: "Body" };
+		const deniedReceipt = await approvals.issue(
+			{ ...bindGoogleWorkspaceMessageApproval("send", input).request, owner },
+			true,
+		);
+		const audit = new ServeAuditStore(join(root, "approval-audit"));
+		const deniedTool = createGoogleWorkspaceTools({
+			approvals,
+			environment,
+			fetch: request,
+			approvalOwner: owner,
+			governedActions: new GovernedActionService(audit),
+			authorizeCapability: async () => ({ decision: "deny", reason: "Grant was revoked" }),
+		}).find((entry) => entry.name === "google_workspace_email_send")!;
+		await expect(
+			deniedTool.execute(
+				"send-denied",
+				{ ...input, receiptId: deniedReceipt.id },
+				undefined,
+				undefined,
+				{} as ExtensionContext,
+			),
+		).rejects.toThrow("Grant was revoked");
+		expect(approvals.list().find((receipt) => receipt.id === deniedReceipt.id)).toMatchObject({ state: "failed" });
+
+		const cancelledReceipt = await approvals.issue(
+			{ ...bindGoogleWorkspaceMessageApproval("send", input).request, owner },
+			true,
+		);
+		let live = true;
+		const cancelledTool = createGoogleWorkspaceTools({
+			approvals,
+			environment,
+			fetch: request,
+			approvalOwner: owner,
+			governedActions: new GovernedActionService(audit),
+			authority: {
+				owner,
+				assertLive: () => {
+					if (!live) throw new Error("Session ended");
+				},
+			},
+			authorizeCapability: async () => {
+				live = false;
+				return { decision: "allow", reason: "Granted" };
+			},
+		}).find((entry) => entry.name === "google_workspace_email_send")!;
+		await expect(
+			cancelledTool.execute(
+				"send-cancelled",
+				{ ...input, receiptId: cancelledReceipt.id },
+				undefined,
+				undefined,
+				{} as ExtensionContext,
+			),
+		).rejects.toThrow("Session ended");
+		expect(approvals.list().find((receipt) => receipt.id === cancelledReceipt.id)).toMatchObject({
+			state: "cancelled",
+		});
+		expect(request).not.toHaveBeenCalled();
+	});
+
 	test("rejects header injection before making a Gmail request", async () => {
 		const request = vi.fn<typeof fetch>();
 		const receipt = await approvals.issue(
 			{
-				capabilityId: "email.send",
-				providerId: "google-workspace",
-				connectionId: "google-workspace-primary",
-				action: "send",
-				target: "recipient@example.com",
+				...bindGoogleWorkspaceMessageApproval("send", {
+					to: ["recipient@example.com"],
+					subject: "Safe",
+					text: "Body",
+				}).request,
+				owner,
 			},
 			true,
 		);
-		const tool = createGoogleWorkspaceTools({ approvals, environment, fetch: request }).find(
+		const tool = createGoogleWorkspaceTools({ approvals, environment, fetch: request, approvalOwner: owner }).find(
 			(entry) => entry.name === "google_workspace_email_send",
 		)!;
 		await expect(
@@ -229,17 +325,8 @@ describe("createGoogleWorkspaceTools", () => {
 		const request = vi
 			.fn<typeof fetch>()
 			.mockResolvedValue(new Response(JSON.stringify({ id: "message-1" }), { status: 200 }));
-		const receipt = await approvals.issue(
-			{
-				capabilityId: "email.delete",
-				providerId: "google-workspace",
-				connectionId: "google-workspace-primary",
-				action: "delete",
-				target: "message-1",
-			},
-			true,
-		);
-		const tool = createGoogleWorkspaceTools({ approvals, environment, fetch: request }).find(
+		const receipt = await approvals.issue({ ...bindGoogleWorkspaceDeleteApproval("message-1"), owner }, true);
+		const tool = createGoogleWorkspaceTools({ approvals, environment, fetch: request, approvalOwner: owner }).find(
 			(entry) => entry.name === "google_workspace_email_delete",
 		)!;
 		const result = await tool.execute(
@@ -322,32 +409,29 @@ describe("createGoogleWorkspaceTools", () => {
 			.mockResolvedValue(
 				new Response(JSON.stringify({ id: "draft-1", message: { id: "message-1" } }), { status: 200 }),
 			);
+		const approvedInput = {
+			to: ["recipient@example.com"],
+			subject: "Attachment",
+			text: "Body",
+			filename: 'report"final.txt',
+			mimeType: "text/plain",
+			contentBase64: Buffer.from("content").toString("base64"),
+		};
 		const issue = () =>
 			approvals.issue(
 				{
-					capabilityId: "email.attach",
-					providerId: "google-workspace",
-					connectionId: "google-workspace-primary",
-					action: "attach",
-					target: "recipient@example.com",
+					...bindGoogleWorkspaceMessageApproval("attach", approvedInput).request,
+					owner,
 				},
 				true,
 			);
-		const tool = createGoogleWorkspaceTools({ approvals, environment, fetch: request }).find(
+		const tool = createGoogleWorkspaceTools({ approvals, environment, fetch: request, approvalOwner: owner }).find(
 			(entry) => entry.name === "google_workspace_email_attach",
 		)!;
 		const receipt = await issue();
 		await tool.execute(
 			"attach-1",
-			{
-				to: ["recipient@example.com"],
-				subject: "Attachment",
-				text: "Body",
-				receiptId: receipt.id,
-				filename: 'report"final.txt',
-				mimeType: "text/plain",
-				contentBase64: Buffer.from("content").toString("base64"),
-			},
+			{ ...approvedInput, receiptId: receipt.id },
 			undefined,
 			undefined,
 			{} as ExtensionContext,

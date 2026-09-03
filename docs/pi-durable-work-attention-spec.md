@@ -122,8 +122,10 @@ interrupted -> queued only through explicit or policy-approved resume
 failed -> queued only through explicit retry
 ```
 
-Terminal states never transition in place. Retry appends an attempt and records
-the initiating user or policy event.
+Terminal attempt states never transition in place. Explicit retry retains the
+task identity, appends a new attempt, updates the task's aggregate status, and
+records the initiating user or policy event. Prior attempt evidence remains
+immutable.
 
 ### Durable event stream
 
@@ -517,4 +519,3 @@ and prevents mutation of a partially migrated task.
 - Bulk approval of consequential actions.
 - Displaying complete reasoning or unrestricted child transcripts.
 - A second scheduler, chat store, or job queue beside `AgentTaskService`.
-

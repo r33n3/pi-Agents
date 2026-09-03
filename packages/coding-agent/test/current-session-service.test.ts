@@ -144,6 +144,7 @@ describe("CurrentSessionService", () => {
 
 	it("projects tiered model costs into the strict protocol shape", async () => {
 		const session = {
+			sessionId: "session-main",
 			modelRuntime: {
 				getModelControlCapabilities,
 				getCatalogRefreshStatus: () => undefined,
@@ -178,7 +179,8 @@ describe("CurrentSessionService", () => {
 			},
 		} as unknown as AgentSession;
 
-		const [model] = await new CurrentSessionService(session).listModels();
+		const service = new CurrentSessionService(session);
+		const [model] = await service.listModels();
 
 		expect(model?.cost).toEqual({
 			input: 1,
@@ -197,5 +199,8 @@ describe("CurrentSessionService", () => {
 				},
 			],
 		});
+		expect(service.isActive("session-main")).toBe(true);
+		expect(service.isActive("missing")).toBe(false);
+		expect(() => service.assertActive("missing")).toThrow("Unknown session: missing");
 	});
 });

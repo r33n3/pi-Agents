@@ -13,6 +13,7 @@ import type {
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
 import { createAgentRegistryTools } from "../src/core/serve/agent-registry-tools.ts";
 import { AgentRunManager } from "../src/core/serve/agent-run-manager.ts";
+import { ConversationBuildCoordinator } from "../src/core/serve/conversation-build-coordinator.ts";
 import { RoutineRegistry } from "../src/core/serve/routine-registry.ts";
 import { RunSkillPromotionService } from "../src/core/serve/run-skill-promotion-service.ts";
 
@@ -93,19 +94,20 @@ class CompletedExecutor implements AgentExecutor {
 	}
 }
 
-async function setup(): Promise<{
+async function setup(executor: AgentExecutor = new IdleExecutor()): Promise<{
 	root: string;
 	registry: AgentRegistry;
 	lifecycle: AgentBuildLifecycleService;
+	runs: AgentRunManager;
 }> {
 	const root = await mkdtemp(join(tmpdir(), "pi-agent-tool-lifecycle-"));
 	roots.push(root);
 	const registry = new AgentRegistry(join(root, "registry"), { defaultWorkspace: join(root, "workspace") });
-	const runs = new AgentRunManager(registry, new IdleExecutor(), join(root, "runs"));
+	const runs = new AgentRunManager(registry, executor, join(root, "runs"));
 	await runs.initialize();
 	const lifecycle = new AgentBuildLifecycleService(join(root, "lifecycle"), registry, runs);
 	await lifecycle.initialize();
-	return { root, registry, lifecycle };
+	return { root, registry, lifecycle, runs };
 }
 
 describe("configure_agent lifecycle tool", () => {
@@ -226,8 +228,8 @@ describe("configure_agent lifecycle tool", () => {
 		]);
 	});
 
-	test("lets chat publish and start a proof only after explicit confirmation", async () => {
-		const { root, registry, lifecycle } = await setup();
+	test("lets chat test and publish an unpublished candidate only after explicit confirmation", async () => {
+		const { root, registry, lifecycle, runs } = await setup(new CompletedExecutor());
 		const [configure, manage] = createAgentRegistryTools(registry, lifecycle);
 		const configured = await configure.execute(
 			"configure-chat",
@@ -242,21 +244,13 @@ describe("configure_agent lifecycle tool", () => {
 		);
 		await expect(
 			manage.execute(
-				"publish-unconfirmed",
-				{ buildId: configured.details!.buildId, action: "publish", confirmed: false },
+				"proof-unconfirmed",
+				{ buildId: configured.details!.buildId, action: "run-proof", confirmed: false },
 				undefined,
 				undefined,
 				{} as ExtensionContext,
 			),
 		).rejects.toThrow("confirm");
-		await manage.execute(
-			"publish-confirmed",
-			{ buildId: configured.details!.buildId, action: "publish", confirmed: true },
-			undefined,
-			undefined,
-			{} as ExtensionContext,
-		);
-		expect(await registry.get("chat-published-agent")).toMatchObject({ revision: 1 });
 		const proof = await manage.execute(
 			"proof-confirmed",
 			{
@@ -270,9 +264,28 @@ describe("configure_agent lifecycle tool", () => {
 			{} as ExtensionContext,
 		);
 		expect(proof.details).toMatchObject({ stage: "testing" });
+		expect(await registry.list()).toEqual([]);
+		const proofBuild = await lifecycle.get(configured.details!.buildId);
+		await runs.waitForCompletion(proofBuild.proof!.runId);
+		await lifecycle.get(proofBuild.id);
+		await manage.execute(
+			"accept-proof",
+			{ buildId: proofBuild.id, action: "accept-proof", confirmed: true },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		await manage.execute(
+			"publish-confirmed",
+			{ buildId: proofBuild.id, action: "publish", confirmed: true },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		expect(await registry.get("chat-published-agent")).toMatchObject({ revision: 1 });
 	});
 
-	test("lets chat promote a proven build and enable only its retained confirmed schedule", async () => {
+	test("lets chat publish, promote, and enable only its retained confirmed schedule", async () => {
 		// This synthetic package has no connection to a user's stored agent or schedule.
 		const root = await mkdtemp(join(tmpdir(), "pi-agent-tool-complete-"));
 		roots.push(root);
@@ -310,13 +323,6 @@ describe("configure_agent lifecycle tool", () => {
 		);
 		const buildId = configured.details!.buildId;
 		await manage.execute(
-			"publish",
-			{ buildId, action: "publish", confirmed: true },
-			undefined,
-			undefined,
-			{} as ExtensionContext,
-		);
-		await manage.execute(
 			"proof",
 			{ buildId, action: "run-proof", confirmed: true, prompt: "Create today's Exampletown, Example State brief" },
 			undefined,
@@ -333,16 +339,9 @@ describe("configure_agent lifecycle tool", () => {
 			undefined,
 			{} as ExtensionContext,
 		);
-		await manage.execute(
-			"promote",
-			{ buildId, action: "promote", confirmed: true },
-			undefined,
-			undefined,
-			{} as ExtensionContext,
-		);
 		const scheduled = await manage.execute(
-			"schedule",
-			{ buildId, action: "schedule", confirmed: true, timezone: "America/Chicago" },
+			"publish-and-schedule",
+			{ buildId, action: "publish-and-schedule", confirmed: true, timezone: "America/Chicago" },
 			undefined,
 			undefined,
 			{} as ExtensionContext,
@@ -358,5 +357,77 @@ describe("configure_agent lifecycle tool", () => {
 				target: { kind: "agent", agentId: "exampletown-chat-agent" },
 			}),
 		]);
+	});
+
+	test("binds chat confirmation to one exact proposal and rejects a bare yes when several are pending", async () => {
+		const { root, registry, lifecycle } = await setup(new CompletedExecutor());
+		const conversationBuilds = new ConversationBuildCoordinator(join(root, "conversation"), lifecycle);
+		await conversationBuilds.initialize();
+		const [configure, manage] = createAgentRegistryTools(registry, lifecycle, {
+			conversationBuilds,
+			sessionId: "session-exact-approval",
+		});
+		const first = await configure.execute(
+			"configure-first",
+			{ name: "first-candidate", description: "Complete the first task", projectRoot: join(root, "first") },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		const second = await configure.execute(
+			"configure-second",
+			{ name: "second-candidate", description: "Complete the second task", projectRoot: join(root, "second") },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		const firstProposal = await manage.execute(
+			"propose-first",
+			{
+				buildId: first.details!.buildId,
+				action: "run-proof",
+				confirmed: false,
+				prompt: "Complete the first task",
+			},
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		await manage.execute(
+			"propose-second",
+			{
+				buildId: second.details!.buildId,
+				action: "run-proof",
+				confirmed: false,
+				prompt: "Complete the second task",
+			},
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		const confirmation = {
+			buildId: first.details!.buildId,
+			action: "run-proof" as const,
+			confirmed: true,
+			proposalId: firstProposal.details!.proposalId,
+			prompt: "Complete the first task",
+		};
+		await expect(
+			manage.execute(
+				"confirm-ambiguous",
+				{ ...confirmation, confirmationText: "yes" },
+				undefined,
+				undefined,
+				{} as ExtensionContext,
+			),
+		).rejects.toThrow("Several action proposals");
+		const result = await manage.execute(
+			"confirm-exact",
+			{ ...confirmation, confirmationText: "Yes, test first-candidate" },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		expect(result.details).toMatchObject({ stage: "testing", proposalState: "completed" });
 	});
 });

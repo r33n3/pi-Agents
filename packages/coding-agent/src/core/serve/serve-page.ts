@@ -1,23 +1,39 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { A2A_MEDIA_TYPE, type A2aAdapter, A2aError, type A2aTask } from "./a2a-adapter.ts";
-import type { AgentBuildLifecycleService } from "./agent-build-lifecycle-service.ts";
+import type { AgentBuildDraftInput, AgentBuildLifecycleService } from "./agent-build-lifecycle-service.ts";
+import { type AgentDeliveryContextRef, AgentDeliveryError } from "./agent-collaboration-contract.ts";
+import type { AgentCollaborationService } from "./agent-collaboration-service.ts";
 import type { AgentDefinitionInput, AgentRegistry } from "./agent-registry.ts";
+import type { AgentRoomDefinitionInput, AgentRoomService } from "./agent-room-service.ts";
+import type { AgentRosterProjection } from "./agent-roster-projection.ts";
 import type { AgentRoutineScheduler } from "./agent-routine-scheduler.ts";
 import type { AgentRunManager } from "./agent-run-manager.ts";
 import type { AgentTaskService } from "./agent-task-service.ts";
 import { SERVE_BROWSER_BUNDLE } from "./browser-bundle.generated.ts";
 import type { BrowserConsoleService } from "./browser-console-service.ts";
-import type { CapabilityApprovalRequest, CapabilityApprovalService } from "./capability-approval-service.ts";
+import type { CapabilityApprovalOwner, CapabilityApprovalService } from "./capability-approval-service.ts";
 import type { CapabilityBroker } from "./capability-broker.ts";
 import type { CapabilityCatalog } from "./capability-catalog.ts";
 import type { CapabilityConnectionInput, CapabilityConnectionRegistry } from "./capability-connection-registry.ts";
 import { matchesCapabilityToken } from "./capability-token.ts";
 import type { ClaudeSubscriptionLogin } from "./claude-subscription-login.ts";
+import type {
+	AgentBuildActionKind,
+	AgentBuildAssumptionInput,
+	AgentBuildClarificationInput,
+	ConversationBuildCoordinator,
+	ConversationBuildMode,
+} from "./conversation-build-coordinator.ts";
 import { nextCronRun } from "./cron-schedule.ts";
 import type { CurrentSessionService } from "./current-session-service.ts";
 import type { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
 import type { ExternalConnectionManager } from "./external-connection-manager.ts";
 import type { GoogleWorkspaceOAuth } from "./google-workspace-oauth.ts";
+import {
+	bindGoogleWorkspaceDeleteApproval,
+	bindGoogleWorkspaceMessageApproval,
+	type GoogleWorkspaceMessageApprovalInput,
+} from "./google-workspace-tools.ts";
 import type { InboundRoute, InboundRoutingService } from "./inbound-routing-service.ts";
 import type { PersonaCatalog } from "./persona-catalog.ts";
 import { type PiAgentBundleInstaller, parsePiAgentBundleBindings } from "./pi-agent-bundle.ts";
@@ -70,6 +86,11 @@ export function createServePage(
 	wtkAgentFactory?: WtkAgentFactoryClient,
 	runSkillPromotion?: RunSkillPromotionService,
 	agentBuildLifecycle?: AgentBuildLifecycleService,
+	agentRoster?: AgentRosterProjection,
+	agentCollaboration?: AgentCollaborationService,
+	agentRooms?: AgentRoomService,
+	localSessionId?: string,
+	conversationBuilds?: ConversationBuildCoordinator,
 ): (request: IncomingMessage, response: ServerResponse) => void {
 	return (request, response) => {
 		void serveRequest(
@@ -104,6 +125,11 @@ export function createServePage(
 			wtkAgentFactory,
 			runSkillPromotion,
 			agentBuildLifecycle,
+			agentRoster,
+			agentCollaboration,
+			agentRooms,
+			localSessionId,
+			conversationBuilds,
 		).catch((error: unknown) => {
 			if (response.headersSent) {
 				response.end();
@@ -148,6 +174,11 @@ async function serveRequest(
 	wtkAgentFactory: WtkAgentFactoryClient | undefined,
 	runSkillPromotion: RunSkillPromotionService | undefined,
 	agentBuildLifecycle: AgentBuildLifecycleService | undefined,
+	agentRoster: AgentRosterProjection | undefined,
+	agentCollaboration: AgentCollaborationService | undefined,
+	agentRooms: AgentRoomService | undefined,
+	localSessionId: string | undefined,
+	conversationBuilds: ConversationBuildCoordinator | undefined,
 ): Promise<void> {
 	const url = new URL(request.url ?? "/", "http://localhost");
 	if (url.pathname === "/capability-oauth/google-workspace/callback") {
@@ -176,6 +207,23 @@ async function serveRequest(
 	}
 	if (url.pathname === "/agent-events") {
 		serveAgentEvents(request, response, agentRegistry, agentTaskService);
+		return;
+	}
+	if (url.pathname === "/agent-roster.json" || url.pathname.startsWith("/agent-roster/")) {
+		await serveAgentRoster(request, response, url, agentRoster);
+		return;
+	}
+	if (url.pathname === "/agent-deliveries" || url.pathname.startsWith("/agent-deliveries/")) {
+		await serveAgentDeliveries(request, response, url, agentCollaboration, localSessionId);
+		return;
+	}
+	if (
+		url.pathname === "/agent-rooms.json" ||
+		url.pathname === "/agent-rooms" ||
+		url.pathname.startsWith("/agent-rooms/") ||
+		url.pathname.startsWith("/agent-room-runs/")
+	) {
+		await serveAgentRooms(request, response, url, agentRooms);
 		return;
 	}
 	if (url.pathname.startsWith("/a2a/")) {
@@ -214,6 +262,7 @@ async function serveRequest(
 			googleWorkspaceOAuth,
 			plaidConnections,
 			token,
+			capabilityApprovals,
 		);
 		return;
 	}
@@ -231,11 +280,18 @@ async function serveRequest(
 		return;
 	}
 	if (url.pathname === "/capability-connections.json" || url.pathname.startsWith("/capability-connections/")) {
-		await serveCapabilityConnections(request, response, url, capabilityConnections, agentRoutineScheduler);
+		await serveCapabilityConnections(
+			request,
+			response,
+			url,
+			capabilityConnections,
+			agentRoutineScheduler,
+			capabilityApprovals,
+		);
 		return;
 	}
 	if (url.pathname === "/capability-approvals.json") {
-		await serveCapabilityApprovals(request, response, capabilityApprovals);
+		await serveCapabilityApprovals(request, response, capabilityApprovals, currentSessionService, agentRunManager);
 		return;
 	}
 	if (url.pathname === "/capability-inbound-routes.json" || url.pathname.startsWith("/capability-inbound-routes/")) {
@@ -274,6 +330,14 @@ async function serveRequest(
 	}
 	if (url.pathname === "/agents.json" || url.pathname === "/agents" || url.pathname.startsWith("/agents/")) {
 		await serveAgents(request, response, url, agentRegistry);
+		return;
+	}
+	if (
+		url.pathname === "/agent-build-conversations.json" ||
+		url.pathname === "/agent-build-conversations" ||
+		url.pathname.startsWith("/agent-build-conversations/")
+	) {
+		await serveAgentBuildConversations(request, response, url, conversationBuilds);
 		return;
 	}
 	if (
@@ -483,6 +547,7 @@ async function serveCapabilityProviders(
 	googleOAuth: GoogleWorkspaceOAuth | undefined,
 	plaid: PlaidConnectionService | undefined,
 	capabilityToken: string,
+	approvals: CapabilityApprovalService | undefined,
 ): Promise<void> {
 	if (!broker) {
 		json(response, 503, { error: "Capability broker is unavailable" });
@@ -565,6 +630,10 @@ async function serveCapabilityProviders(
 			if (providerId === "google-workspace") {
 				if (!googleOAuth) throw new Error("Google Workspace authorization is unavailable");
 				await googleOAuth.revoke();
+				await approvals?.revoke(
+					{ connectionId: "google-workspace-primary" },
+					"Google Workspace connection was revoked",
+				);
 				json(response, 200, { revoked: true });
 				return;
 			}
@@ -613,6 +682,7 @@ async function serveCapabilityConnections(
 	url: URL,
 	registry: CapabilityConnectionRegistry | undefined,
 	scheduler: AgentRoutineScheduler | undefined,
+	approvals: CapabilityApprovalService | undefined,
 ): Promise<void> {
 	if (!registry) {
 		json(response, 503, { error: "Capability connections are unavailable" });
@@ -647,6 +717,7 @@ async function serveCapabilityConnections(
 				return;
 			}
 			const revoked = await registry.revoke(suffix);
+			await approvals?.revoke({ connectionId: suffix }, `Capability connection ${suffix} was revoked`);
 			await scheduler?.refresh();
 			json(response, 200, revoked);
 			return;
@@ -692,6 +763,8 @@ async function serveCapabilityApprovals(
 	request: IncomingMessage,
 	response: ServerResponse,
 	approvals: CapabilityApprovalService | undefined,
+	sessions: CurrentSessionService | undefined,
+	runs: AgentRunManager | undefined,
 ): Promise<void> {
 	if (!approvals) {
 		json(response, 503, { error: "Capability approvals are unavailable" });
@@ -707,18 +780,44 @@ async function serveCapabilityApprovals(
 	}
 	try {
 		const body = object(await readJsonBody(request), "capability approval request");
-		const approval: CapabilityApprovalRequest = {
-			capabilityId: requiredString(body.capabilityId, "capabilityId"),
-			providerId: requiredString(body.providerId, "providerId"),
-			connectionId: requiredString(body.connectionId, "connectionId"),
-			action: requiredString(body.action, "action"),
-			target: requiredString(body.target, "target"),
-			expiresInSeconds:
-				body.expiresInSeconds === undefined
-					? undefined
-					: positiveInteger(body.expiresInSeconds, "expiresInSeconds"),
-		};
-		json(response, 201, await approvals.issue(approval, body.approved === true));
+		for (const field of ["digest", "binding", "providerId", "connectionId", "action", "target"] as const) {
+			if (Object.hasOwn(body, field)) throw new Error(`Approval clients must not supply ${field}`);
+		}
+		const owner = capabilityApprovalOwner(body.owner);
+		if (owner.kind === "session") {
+			if (!sessions) throw new Error("Session approvals are unavailable");
+			sessions.assertActive(owner.id);
+		} else {
+			if (!runs) throw new Error("Agent run approvals are unavailable");
+			runs.assertActive(owner.id);
+		}
+		const capabilityId = requiredString(body.capabilityId, "capabilityId");
+		const input = object(body.input, "approval input");
+		const boundApproval =
+			capabilityId === "email.delete"
+				? bindGoogleWorkspaceDeleteApproval(requiredString(input.messageId, "input.messageId"))
+				: capabilityId === "email.draft" || capabilityId === "email.send" || capabilityId === "email.attach"
+					? bindGoogleWorkspaceMessageApproval(
+							capabilityId.slice("email.".length) as "draft" | "send" | "attach",
+							googleWorkspaceMessageApprovalInput(input),
+						)
+					: undefined;
+		if (!boundApproval) throw new Error(`Capability ${capabilityId} does not support exact-action approvals`);
+		json(
+			response,
+			201,
+			await approvals.issue(
+				{
+					...("request" in boundApproval ? boundApproval.request : boundApproval),
+					owner,
+					expiresInSeconds:
+						body.expiresInSeconds === undefined
+							? undefined
+							: positiveInteger(body.expiresInSeconds, "expiresInSeconds"),
+				},
+				body.approved === true,
+			),
+		);
 	} catch (error) {
 		json(response, 400, {
 			error: error instanceof Error ? error.message : "Capability approval failed",
@@ -991,7 +1090,9 @@ async function serveAgentTasks(
 	) {
 		const id = decodeURIComponent(url.pathname.slice("/agent-conversations/".length, -"/messages".length));
 		try {
-			json(response, 200, { messages: await service.listMessages(id) });
+			const afterText = url.searchParams.get("after");
+			const after = afterText === null ? 0 : nonnegativeInteger(Number(afterText), "after");
+			json(response, 200, { messages: await service.listMessages(id, after) });
 		} catch (error) {
 			json(response, 404, {
 				error: error instanceof Error ? error.message : "Conversation not found",
@@ -1074,6 +1175,216 @@ async function serveAgentTasks(
 		return;
 	}
 	response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+}
+
+async function serveAgentRoster(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	roster: AgentRosterProjection | undefined,
+): Promise<void> {
+	if (!roster) {
+		json(response, 503, { error: "Agent roster is unavailable" });
+		return;
+	}
+	if (request.method === "GET" && url.pathname === "/agent-roster.json") {
+		json(
+			response,
+			200,
+			await roster.snapshot({
+				includeHidden: url.searchParams.get("hidden") === "true",
+				search: url.searchParams.get("search") ?? undefined,
+			}),
+		);
+		return;
+	}
+	const match = url.pathname.match(/^\/agent-roster\/([^/]+)\/(presentation|read|context-checkpoints)$/);
+	if (!match || request.method !== "POST") {
+		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+		return;
+	}
+	try {
+		const agentId = decodeURIComponent(match[1]!);
+		const action = match[2];
+		const body = object(await readJsonBody(request), "agent roster request");
+		if (action === "presentation") {
+			json(
+				response,
+				200,
+				await roster.updatePresentation(agentId, {
+					hidden: body.hidden === undefined ? undefined : requiredBoolean(body.hidden, "hidden"),
+					pinnedOrder:
+						body.pinnedOrder === null
+							? null
+							: body.pinnedOrder === undefined
+								? undefined
+								: nonnegativeInteger(body.pinnedOrder, "pinnedOrder"),
+				}),
+			);
+			return;
+		}
+		if (action === "read") {
+			json(
+				response,
+				200,
+				await roster.markRead(
+					agentId,
+					body.throughSequence === undefined
+						? undefined
+						: nonnegativeInteger(body.throughSequence, "throughSequence"),
+				),
+			);
+			return;
+		}
+		json(response, 201, await roster.newContext(agentId));
+	} catch (error) {
+		json(response, 400, { error: error instanceof Error ? error.message : "Agent roster request failed" });
+	}
+}
+
+async function serveAgentDeliveries(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	service: AgentCollaborationService | undefined,
+	localSessionId: string | undefined,
+): Promise<void> {
+	if (!service || !localSessionId) {
+		json(response, 503, { error: "Agent collaboration is unavailable" });
+		return;
+	}
+	const suffix =
+		url.pathname === "/agent-deliveries" ? "" : decodeURIComponent(url.pathname.slice("/agent-deliveries/".length));
+	try {
+		if (request.method === "POST" && suffix === "") {
+			const body = object(await readJsonBody(request), "agent delivery request");
+			for (const field of ["sender", "idempotencyScope", "parentTaskId", "attemptId", "sessionId"] as const) {
+				if (Object.hasOwn(body, field)) throw new Error(`Delivery clients must not supply ${field}`);
+			}
+			json(
+				response,
+				202,
+				await service.submit(
+					{ kind: "user", id: "local-user", sessionId: localSessionId },
+					{
+						idempotencyKey: requiredString(body.idempotencyKey, "idempotencyKey"),
+						recipientAgentId: requiredString(body.recipientAgentId, "recipientAgentId"),
+						goal: requiredString(body.goal, "goal"),
+						contextRefs: deliveryContextRefs(body.contextRefs),
+						expectedDeliverable:
+							body.expectedDeliverable === undefined
+								? undefined
+								: deliveryExpectedDeliverable(body.expectedDeliverable),
+					},
+				),
+			);
+			return;
+		}
+		if (request.method === "GET" && suffix) {
+			const receipt = service.get(suffix);
+			json(response, receipt ? 200 : 404, receipt ?? { error: "Delivery not found" });
+			return;
+		}
+		if (request.method === "POST" && suffix.endsWith("/cancel")) {
+			json(
+				response,
+				200,
+				await service.cancel(suffix.slice(0, -"/cancel".length), {
+					kind: "user",
+					id: "local-user",
+					sessionId: localSessionId,
+				}),
+			);
+			return;
+		}
+		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+	} catch (error) {
+		const conflict =
+			error instanceof AgentDeliveryError &&
+			error.code === "invalid_request" &&
+			error.message.includes("idempotency key is already bound");
+		json(response, conflict ? 409 : 400, {
+			error: error instanceof Error ? error.message : "Agent delivery failed",
+			...(error instanceof AgentDeliveryError ? { code: error.code } : {}),
+		});
+	}
+}
+
+async function serveAgentRooms(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	service: AgentRoomService | undefined,
+): Promise<void> {
+	if (!service) {
+		json(response, 503, { error: "Agent room service is unavailable" });
+		return;
+	}
+	try {
+		if (url.pathname.startsWith("/agent-room-runs/")) {
+			const suffix = decodeURIComponent(url.pathname.slice("/agent-room-runs/".length));
+			if (request.method === "POST" && suffix.endsWith("/cancel")) {
+				json(response, 200, await service.cancel(suffix.slice(0, -"/cancel".length)));
+				return;
+			}
+			if (request.method === "POST" && suffix.endsWith("/resume")) {
+				const body = object(await readJsonBody(request), "room resume request");
+				json(
+					response,
+					202,
+					await service.resume(suffix.slice(0, -"/resume".length), requiredString(body.message, "message")),
+				);
+				return;
+			}
+			if (request.method === "GET" && suffix) {
+				const run = service.getRun(suffix);
+				json(response, run ? 200 : 404, run ?? { error: "Room run not found" });
+				return;
+			}
+			response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+			return;
+		}
+
+		const suffix =
+			url.pathname === "/agent-rooms.json" || url.pathname === "/agent-rooms"
+				? ""
+				: decodeURIComponent(url.pathname.slice("/agent-rooms/".length));
+		if (request.method === "GET" && suffix === "") {
+			json(response, 200, { rooms: service.listDefinitions(), runs: service.listRuns() });
+			return;
+		}
+		if (request.method === "POST" && suffix === "") {
+			json(response, 201, await service.save((await readJsonBody(request)) as AgentRoomDefinitionInput));
+			return;
+		}
+		if (request.method === "POST" && suffix.endsWith("/run")) {
+			const body = object(await readJsonBody(request), "room run request");
+			json(response, 202, await service.start(suffix.slice(0, -"/run".length), requiredString(body.goal, "goal")));
+			return;
+		}
+		if (request.method === "PUT" && suffix) {
+			const input = (await readJsonBody(request)) as AgentRoomDefinitionInput;
+			json(response, 200, await service.save({ ...input, id: suffix }));
+			return;
+		}
+		if (request.method === "DELETE" && suffix) {
+			const deleted = await service.delete(suffix);
+			json(response, deleted ? 200 : 404, deleted ? { deleted: true } : { error: "Room not found" });
+			return;
+		}
+		if (request.method === "GET" && suffix) {
+			const definition = service.getDefinition(suffix);
+			json(
+				response,
+				definition ? 200 : 404,
+				definition ? { room: definition, runs: service.listRuns(suffix) } : { error: "Room not found" },
+			);
+			return;
+		}
+		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST, PUT, DELETE" }).end();
+	} catch (error) {
+		json(response, 400, { error: error instanceof Error ? error.message : "Agent room request failed" });
+	}
 }
 
 async function serveAttention(
@@ -2173,14 +2484,20 @@ async function serveAgentBuilds(
 			json(
 				response,
 				200,
-				await lifecycle.updateDraft(suffix, {
-					name: requiredString(body.name, "name"),
-					objective: requiredString(body.objective, "objective"),
-					projectRoot: requiredString(body.projectRoot, "projectRoot"),
-					configuration: body.configuration,
-					automationIntent: body.automationIntent,
-					criteria: body.criteria,
-				}),
+				await lifecycle.updateDraft(
+					suffix,
+					{
+						name: requiredString(body.name, "name"),
+						objective: requiredString(body.objective, "objective"),
+						projectRoot: requiredString(body.projectRoot, "projectRoot"),
+						configuration: body.configuration,
+						automationIntent: body.automationIntent,
+						criteria: body.criteria,
+					},
+					body.expectedRevision === undefined
+						? undefined
+						: positiveInteger(body.expectedRevision, "expectedRevision"),
+				),
 			);
 			return;
 		}
@@ -2225,6 +2542,108 @@ async function serveAgentBuilds(
 		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST, PUT" }).end();
 	} catch (error) {
 		json(response, 400, { error: error instanceof Error ? error.message : "Invalid agent build request" });
+	}
+}
+
+async function serveAgentBuildConversations(
+	request: IncomingMessage,
+	response: ServerResponse,
+	url: URL,
+	coordinator: ConversationBuildCoordinator | undefined,
+): Promise<void> {
+	if (!coordinator) {
+		json(response, 503, { error: "Conversation build service is unavailable" });
+		return;
+	}
+	const suffix =
+		url.pathname === "/agent-build-conversations.json" || url.pathname === "/agent-build-conversations"
+			? ""
+			: decodeURIComponent(url.pathname.slice("/agent-build-conversations/".length));
+	try {
+		if (request.method === "GET" && suffix === "") {
+			json(response, 200, { builds: await coordinator.list(url.searchParams.get("sessionId") ?? undefined) });
+			return;
+		}
+		if (request.method === "GET" && suffix !== "" && !suffix.includes("/")) {
+			json(response, 200, await coordinator.inspect(suffix));
+			return;
+		}
+		if (request.method === "POST" && suffix === "apply-intent") {
+			const body = object(await readJsonBody(request), "conversation build intent");
+			json(
+				response,
+				body.buildId === undefined ? 201 : 200,
+				await coordinator.applyIntent({
+					sessionId: requiredString(body.sessionId, "sessionId"),
+					mode: conversationBuildMode(body.mode),
+					sourceMessageId: optionalString(body.sourceMessageId, "sourceMessageId"),
+					buildId: optionalString(body.buildId, "buildId"),
+					expectedBuildRevision:
+						body.expectedBuildRevision === undefined
+							? undefined
+							: positiveInteger(body.expectedBuildRevision, "expectedBuildRevision"),
+					draft: agentBuildDraft(body.draft),
+					assumptions: agentBuildAssumptions(body.assumptions),
+					clarifications: agentBuildClarifications(body.clarifications),
+					answeredClarificationIds:
+						body.answeredClarificationIds === undefined
+							? undefined
+							: stringArray(body.answeredClarificationIds, "answeredClarificationIds"),
+				}),
+			);
+			return;
+		}
+		if (request.method === "POST" && suffix.endsWith("/attach")) {
+			const body = object(await readJsonBody(request), "conversation build attachment");
+			json(
+				response,
+				200,
+				await coordinator.attach(
+					suffix.slice(0, -"/attach".length),
+					requiredString(body.sessionId, "sessionId"),
+					conversationBuildMode(body.mode),
+					optionalString(body.sourceMessageId, "sourceMessageId"),
+				),
+			);
+			return;
+		}
+		const clarificationMatch = /^([^/]+)\/clarifications\/([^/]+)\/answer$/.exec(suffix);
+		if (request.method === "POST" && clarificationMatch) {
+			const body = object(await readJsonBody(request), "clarification answer");
+			json(
+				response,
+				200,
+				await coordinator.answerClarification(
+					clarificationMatch[1],
+					clarificationMatch[2],
+					requiredString(body.answer, "answer"),
+					optionalString(body.answerMessageId, "answerMessageId"),
+				),
+			);
+			return;
+		}
+		if (request.method === "POST" && suffix.endsWith("/proposals")) {
+			const body = object(await readJsonBody(request), "agent build action proposal");
+			json(
+				response,
+				201,
+				await coordinator.prepareAction({
+					buildId: suffix.slice(0, -"/proposals".length),
+					sessionId: requiredString(body.sessionId, "sessionId"),
+					action: agentBuildActionKind(body.action),
+					payload: body.payload,
+					preview: requiredString(body.preview, "preview"),
+					expiresInSeconds:
+						body.expiresInSeconds === undefined
+							? undefined
+							: positiveInteger(body.expiresInSeconds, "expiresInSeconds"),
+				}),
+			);
+			return;
+		}
+		response.writeHead(405, { ...SECURITY_HEADERS, allow: "GET, POST" }).end();
+	} catch (error) {
+		json(response, 400, { error: error instanceof Error ? error.message : "Invalid conversation build request" });
 	}
 }
 
@@ -2572,6 +2991,92 @@ function object(value: unknown, name: string): Record<string, unknown> {
 	return value as Record<string, unknown>;
 }
 
+function agentBuildDraft(value: unknown): AgentBuildDraftInput {
+	const input = object(value, "agent build draft");
+	return {
+		name: requiredString(input.name, "draft.name"),
+		objective: requiredString(input.objective, "draft.objective"),
+		projectRoot: requiredString(input.projectRoot, "draft.projectRoot"),
+		configuration: input.configuration,
+		automationIntent: input.automationIntent,
+		criteria: input.criteria,
+		agentId: optionalString(input.agentId, "draft.agentId"),
+	};
+}
+
+function agentBuildAssumptions(value: unknown): AgentBuildAssumptionInput[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error("assumptions must be a list");
+	return value.map((entry, index) => {
+		const input = object(entry, `assumptions[${index}]`);
+		return {
+			id: optionalString(input.id, `assumptions[${index}].id`),
+			topic: requiredString(input.topic, `assumptions[${index}].topic`),
+			value: requiredString(input.value, `assumptions[${index}].value`),
+			rationale: requiredString(input.rationale, `assumptions[${index}].rationale`),
+		};
+	});
+}
+
+function agentBuildClarifications(value: unknown): AgentBuildClarificationInput[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error("clarifications must be a list");
+	return value.map((entry, index) => {
+		const input = object(entry, `clarifications[${index}]`);
+		return {
+			id: optionalString(input.id, `clarifications[${index}].id`),
+			topic: requiredString(input.topic, `clarifications[${index}].topic`),
+			materialTopic: agentBuildMaterialTopic(input.materialTopic),
+			question: requiredString(input.question, `clarifications[${index}].question`),
+			reason: requiredString(input.reason, `clarifications[${index}].reason`),
+			blockingActions: stringArray(input.blockingActions, `clarifications[${index}].blockingActions`).map(
+				agentBuildActionKind,
+			),
+		};
+	});
+}
+
+function conversationBuildMode(value: unknown): ConversationBuildMode {
+	if (value !== "create" && value !== "edit" && value !== "improve") {
+		throw new Error("mode must be create, edit, or improve");
+	}
+	return value;
+}
+
+function agentBuildActionKind(value: unknown): AgentBuildActionKind {
+	if (
+		value !== "publish" &&
+		value !== "publish-and-schedule" &&
+		value !== "run-proof" &&
+		value !== "accept-proof" &&
+		value !== "reject-proof" &&
+		value !== "promote" &&
+		value !== "schedule"
+	) {
+		throw new Error(
+			"action must be publish, publish-and-schedule, run-proof, accept-proof, reject-proof, promote, or schedule",
+		);
+	}
+	return value;
+}
+
+function agentBuildMaterialTopic(value: unknown): AgentBuildClarificationInput["materialTopic"] {
+	if (
+		value !== "outcome" &&
+		value !== "scope" &&
+		value !== "recipient" &&
+		value !== "authority" &&
+		value !== "data-source" &&
+		value !== "schedule" &&
+		value !== "cost" &&
+		value !== "acceptance" &&
+		value !== "identity"
+	) {
+		throw new Error("materialTopic is invalid");
+	}
+	return value;
+}
+
 function stringRecord(value: unknown, name: string): Record<string, string> {
 	const input = object(value, name);
 	const result: Record<string, string> = {};
@@ -2587,6 +3092,34 @@ function stringArray(value: unknown, name: string): string[] {
 		throw new Error(`${name} must be a list of strings`);
 	}
 	return value;
+}
+
+function capabilityApprovalOwner(value: unknown): CapabilityApprovalOwner {
+	const input = object(value, "approval owner");
+	if (input.kind !== "session" && input.kind !== "agent-run") throw new Error("approval owner kind is invalid");
+	return { kind: input.kind, id: requiredString(input.id, "approval owner id") };
+}
+
+function googleWorkspaceMessageApprovalInput(input: Record<string, unknown>): GoogleWorkspaceMessageApprovalInput {
+	return {
+		to: stringArray(input.to, "input.to"),
+		cc: input.cc === undefined ? undefined : stringArray(input.cc, "input.cc"),
+		subject: stringValue(input.subject, "input.subject"),
+		text: stringValue(input.text, "input.text"),
+		html: optionalStringValue(input.html, "input.html"),
+		filename: optionalStringValue(input.filename, "input.filename"),
+		mimeType: optionalStringValue(input.mimeType, "input.mimeType"),
+		contentBase64: optionalStringValue(input.contentBase64, "input.contentBase64"),
+	};
+}
+
+function stringValue(value: unknown, name: string): string {
+	if (typeof value !== "string") throw new Error(`${name} must be a string`);
+	return value;
+}
+
+function optionalStringValue(value: unknown, name: string): string | undefined {
+	return value === undefined ? undefined : stringValue(value, name);
 }
 
 function escapeHtml(value: string): string {
@@ -2607,6 +3140,44 @@ function requiredString(value: unknown, name: string): string {
 function optionalString(value: unknown, name: string): string | undefined {
 	if (value === undefined) return undefined;
 	return requiredString(value, name);
+}
+
+function requiredBoolean(value: unknown, name: string): boolean {
+	if (typeof value !== "boolean") throw new Error(`${name} must be a boolean`);
+	return value;
+}
+
+function deliveryContextRefs(value: unknown): AgentDeliveryContextRef[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) throw new Error("contextRefs must be a list");
+	return value.map((entry, index) => {
+		const ref = object(entry, `contextRefs[${index}]`);
+		const kind = oneOf(ref.kind, ["task-result", "artifact", "message"] as const, `contextRefs[${index}].kind`);
+		if (kind === "task-result") {
+			return { kind, taskId: requiredString(ref.taskId, `contextRefs[${index}].taskId`) };
+		}
+		if (kind === "artifact") {
+			return {
+				kind,
+				artifactId: requiredString(ref.artifactId, `contextRefs[${index}].artifactId`),
+				versionId: optionalString(ref.versionId, `contextRefs[${index}].versionId`),
+			};
+		}
+		return {
+			kind,
+			conversationId: requiredString(ref.conversationId, `contextRefs[${index}].conversationId`),
+			sequence: nonnegativeInteger(ref.sequence, `contextRefs[${index}].sequence`),
+		};
+	});
+}
+
+function deliveryExpectedDeliverable(value: unknown): { kind?: string; title?: string; artifactId?: string } {
+	const input = object(value, "expectedDeliverable");
+	return {
+		kind: optionalString(input.kind, "expectedDeliverable.kind"),
+		title: optionalString(input.title, "expectedDeliverable.title"),
+		artifactId: optionalString(input.artifactId, "expectedDeliverable.artifactId"),
+	};
 }
 
 function finiteNumber(value: unknown, name: string): number {
@@ -2691,6 +3262,7 @@ body.browser-popout{display:block}body.browser-popout>.mobile-panel-state,body.b
 .themed-select-option:disabled{opacity:1!important;background:#0c0c0e!important;color:#50515a!important;cursor:not-allowed}.themed-select-list.mobile-sheet .themed-select-option:disabled{background:#09090b!important;color:#494a52!important}
 .controls .themed-select[data-select-id="thinking"]{width:120px}
 .themed-select-list.mobile-anchored .themed-select-dismiss{display:grid;place-items:center}.themed-select-list.mobile-anchored .themed-select-option{min-height:44px;padding:11px 10px}.themed-select-list.mobile-anchored .themed-select-cost-filters{overflow-x:auto;min-height:34px}
+.promotion-dialog .room-member-row{grid-template-columns:auto minmax(72px,auto) minmax(0,1fr);align-items:center}.promotion-dialog .room-member-row input[type=checkbox]{width:auto}
 </style></head><body>
 <input id="mobile-panel-none" class="mobile-panel-state" type="radio" name="mobile-panel" checked><input id="mobile-panel-left" class="mobile-panel-state" type="radio" name="mobile-panel"><input id="mobile-panel-right" class="mobile-panel-state" type="radio" name="mobile-panel"><label class="mobile-panel-scrim" for="mobile-panel-none" aria-label="Close side panel"></label><label class="mobile-panel-close mobile-panel-close-left" for="mobile-panel-none" title="Close sessions" aria-label="Close sessions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></label><label class="mobile-panel-close mobile-panel-close-right" for="mobile-panel-none" title="Close workspace" aria-label="Close workspace"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></label>
 <svg class="hidden" aria-hidden="true"><defs><symbol id="external-icon-anthropic" viewBox="0 0 24 24"><path fill="currentColor" d="M13.3 3h3.5L22 21h-3.4l-1.2-4.2h-5.9L10.2 21H6.8l6.5-18Zm-.9 10.8h4.1l-2-7-2.1 7ZM2 3h3.3l3.8 12.4L7.4 21 2 3Z"/></symbol><symbol id="external-icon-openai" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.65"><ellipse cx="12" cy="8" rx="3.4" ry="5.2"/><ellipse cx="12" cy="8" rx="3.4" ry="5.2" transform="rotate(60 12 12)"/><ellipse cx="12" cy="8" rx="3.4" ry="5.2" transform="rotate(120 12 12)"/><ellipse cx="12" cy="8" rx="3.4" ry="5.2" transform="rotate(180 12 12)"/><ellipse cx="12" cy="8" rx="3.4" ry="5.2" transform="rotate(240 12 12)"/><ellipse cx="12" cy="8" rx="3.4" ry="5.2" transform="rotate(300 12 12)"/></g></symbol><symbol id="external-icon-hermes" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M6.2 18.7h11.6M8 18.7v-5.3a4 4 0 0 1 8 0v5.3M8.4 12.1c-2.5-.2-4.2-1.4-5.4-3.6 2.3-.3 4.2.3 5.7 1.8M15.6 12.1c2.5-.2 4.2-1.4 5.4-3.6-2.3-.3-4.2.3-5.7 1.8M9.3 7.1c.7-.7 1.6-1.1 2.7-1.1s2 .4 2.7 1.1M12 6V3.5"/></symbol><symbol id="external-icon-pi" viewBox="0 0 24 24"><text x="12" y="18" text-anchor="middle" fill="currentColor" font-size="20" font-family="serif">π</text></symbol></defs></svg>

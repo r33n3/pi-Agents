@@ -1,3 +1,4 @@
+import type { CapabilityApprovalOwner } from "./capability-approval-service.ts";
 import type {
 	ServeAuditActionInput,
 	ServeAuditErrorClassification,
@@ -13,17 +14,28 @@ export interface GovernedActionDecision {
 	approval?: string;
 }
 
+export interface ActionAuthority {
+	owner: CapabilityApprovalOwner;
+	signal?: AbortSignal;
+	assertLive: () => void;
+}
+
 export interface GovernedActionRequest<TTarget, TCredentials, TResult> {
 	family: string;
 	target: TTarget;
 	identities?: ServeAuditIdentities;
+	authority?: ActionAuthority;
 	canonicalize: (target: TTarget) => ServeAuditActionInput["target"];
 	authorize: (context: {
 		action: ServeAuditActionInput;
 		identities?: ServeAuditIdentities;
 	}) => Promise<GovernedActionDecision> | GovernedActionDecision;
 	resolveCredentials?: () => Promise<TCredentials>;
-	dispatch: (context: { action: ServeAuditActionInput; credentials: TCredentials | undefined }) => Promise<TResult>;
+	dispatch: (context: {
+		action: ServeAuditActionInput;
+		credentials: TCredentials | undefined;
+		authority?: ActionAuthority;
+	}) => Promise<TResult>;
 }
 
 export type GovernedActionResult<TResult> =
@@ -63,14 +75,29 @@ export class GovernedActionService {
 			target: request.canonicalize(request.target),
 		};
 		let authorization: GovernedActionDecision;
+		let cancellationAfterAuthorization: GovernedActionCancelledError | undefined;
 		try {
+			assertActionAuthority(request.authority);
 			authorization = await request.authorize({ action, identities: request.identities });
-		} catch {
-			authorization = {
-				decision: "deny",
-				reason: "Authorization evaluation failed closed",
-				policy: "invalid",
-			};
+			try {
+				assertActionAuthority(request.authority);
+			} catch (error) {
+				cancellationAfterAuthorization = cancelledError(error);
+			}
+		} catch (error) {
+			if (error instanceof GovernedActionCancelledError) {
+				authorization = {
+					decision: "deny",
+					reason: error.message,
+					policy: "inactive-authority",
+				};
+			} else {
+				authorization = {
+					decision: "deny",
+					reason: "Authorization evaluation failed closed",
+					policy: "invalid",
+				};
+			}
 		}
 		const decision = await this.#audit.appendDecision({
 			identities: request.identities,
@@ -83,8 +110,12 @@ export class GovernedActionService {
 
 		const startedAt = this.#now();
 		try {
+			if (cancellationAfterAuthorization) throw cancellationAfterAuthorization;
+			assertActionAuthority(request.authority);
 			const credentials = await request.resolveCredentials?.();
-			const value = await request.dispatch({ action, credentials });
+			assertActionAuthority(request.authority);
+			const value = await request.dispatch({ action, credentials, authority: request.authority });
+			assertActionAuthority(request.authority);
 			try {
 				await this.#audit.appendOutcome({
 					correlationId: decision.correlationId,
@@ -104,7 +135,7 @@ export class GovernedActionService {
 					correlationId: decision.correlationId,
 					identities: request.identities,
 					action: decision.action,
-					outcome: error instanceof GovernedActionCancelledError ? "cancelled" : "failed",
+					outcome: isGovernedActionCancellation(error) ? "cancelled" : "failed",
 					durationMs: elapsed(this.#now(), startedAt),
 					error: safeError(error),
 				});
@@ -117,10 +148,35 @@ export class GovernedActionService {
 }
 
 export class GovernedActionCancelledError extends Error {
-	constructor(message = "Action was cancelled") {
-		super(message);
+	constructor(message = "Action was cancelled", options: ErrorOptions = {}) {
+		super(message, options);
 		this.name = "GovernedActionCancelledError";
 	}
+}
+
+export function assertActionAuthority(authority: ActionAuthority | undefined): void {
+	if (!authority) return;
+	if (authority.signal?.aborted) throw new GovernedActionCancelledError("Action authority was cancelled");
+	try {
+		authority.assertLive();
+	} catch (error) {
+		if (error instanceof GovernedActionCancelledError) throw error;
+		throw cancelledError(error);
+	}
+	if (authority.signal?.aborted) throw new GovernedActionCancelledError("Action authority was cancelled");
+}
+
+export function isGovernedActionCancellation(error: unknown): boolean {
+	if (error instanceof GovernedActionCancelledError) return true;
+	if (!(error instanceof Error)) return false;
+	return error.name === "AbortError" || ("code" in error && error.code === "ABORT_ERR");
+}
+
+function cancelledError(error: unknown): GovernedActionCancelledError {
+	return new GovernedActionCancelledError(
+		error instanceof Error && error.message ? error.message : "Action authority is no longer live",
+		{ cause: error },
+	);
 }
 
 function elapsed(now: number, startedAt: number): number {
@@ -132,8 +188,8 @@ function safeError(error: unknown): {
 	code?: string;
 	message: string;
 } {
-	if (error instanceof GovernedActionCancelledError) {
-		return { classification: "cancelled", message: error.message };
+	if (isGovernedActionCancellation(error)) {
+		return { classification: "cancelled", message: error instanceof Error ? error.message : "Action was cancelled" };
 	}
 	if (error instanceof Error) {
 		const code = "code" in error && typeof error.code === "string" ? error.code : undefined;

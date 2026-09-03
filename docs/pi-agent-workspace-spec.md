@@ -20,26 +20,24 @@ must not create separate run models.
 
 ## User experience
 
-The center remains the selected live Pi session. The right workspace has
-exactly three top-level tabs:
+The left pane owns Pi Sessions and the persistent Agents roster. The center
+shows the selected live Pi session or agent inbox conversation. The right
+drawer provides Browser and Workflow/Attention assistance; Agent Builder
+configuration opens there when requested from the conversational build or edit
+flow.
 
-1. **Browser** — managed Chromium navigation, shared user/agent control,
-   walkthrough recording, and session-bound pop-out windows.
-2. **Agents** — visual agent selection, persistent agent chat, active and
-   queued tasks, scheduled-run history, workflow progress, outputs, artifacts,
-   and errors.
-3. **Agent Builder** — conversational creation plus structured Profile,
-   Model & Tools, Connections, and Automation configuration.
+This ownership keeps agents formatted as persistent participants beside Pi
+sessions without turning the right drawer into another navigation hierarchy.
+Approvals, questions, workflow progress, and supporting browser state may open
+in the drawer while the user continues the conversation in the center.
 
-The left rail is reserved for Pi session selection and connection management.
-Agent selection is not duplicated there.
+### Agents roster and inbox
 
-### Agents tab
-
-Agents appear as two-column cards containing persona image, agent name, status,
-and current task summary. Selecting a card opens that agent's persistent
-conversation. Sending a message creates a task in that conversation; it does
-not open the old isolated-run form.
+Agents appear below Sessions as compact roster rows containing persona image,
+agent name, status, unread or attention state, and current task summary.
+Selecting a row focuses that agent's persistent conversation in the center.
+Sending a message creates a task in that conversation; it does not open the old
+isolated-run form or create a replacement inbox.
 
 The selected-agent view contains:
 
@@ -55,9 +53,16 @@ The selected-agent view contains:
 Tool activity and orchestration events are collapsed by default. Agent and user
 messages remain expanded.
 
-### Agent Builder tab
+### Agent Builder workflow
 
-Agent Builder contains these internal sections:
+Agent Builder begins as a conversation in the center. Its structured
+configuration opens in the right drawer. The conversation-first creation,
+selective clarification, in-chat testing,
+feedback refinement, readiness review, exact yes/no approval, and later-edit
+contract follows the
+[conversation-first agent building specification](pi-conversation-first-agent-building-spec.md).
+The structured drawer is a synchronized view of the authoritative build record,
+not a separate draft or deployment path. It contains these internal sections:
 
 - **Chat** — conversationally create or revise the definition.
 - **Profile** — name, image, description, persona, and project folder.
@@ -180,7 +185,7 @@ registry already reads that catalog. Managed JSON files are not a public write
 API. Agent Builder and Pi use registry operations rather than constructing file
 paths.
 
-Once deployed, an agent appears in the Agents tab on the next registry event;
+Once deployed, an agent appears in the left Agents roster on the next registry event;
 no server restart is required.
 
 ## Persona catalog
@@ -274,11 +279,17 @@ productivity connections, and the two delivery waves follow the
 
 ## Persistent conversations and tasks
 
+Stable agent inbox identity, roster presentation, bounded context, durable
+agent-to-agent delivery, and collaboration rooms follow the
+[agent roster and collaboration specification](pi-agent-roster-collaboration-spec.md).
+That collaboration layer submits through `AgentTaskService` and
+`WorkflowService`; it does not introduce another task or conversation runtime.
+
 ### Contract
 
 ```ts
 interface AgentTaskService {
-  ensureConversation(agentId: string): Promise<AgentConversation>;
+  ensureAgentInbox(agentId: string): Promise<AgentConversation>;
   submit(request: SubmitAgentTask): Promise<AgentTask>;
   continue(taskId: string, message: AgentMessageInput): Promise<AgentTask>;
   cancel(taskId: string): Promise<AgentTask>;
@@ -295,7 +306,7 @@ id, conversationId, agentId, parentTaskId, workflowRunId, source,
 status, prompt, model, timestamps, attemptIds, result, artifacts, error
 ```
 
-`source` is one of `chat`, `pi`, `routine`, `workflow`, or `a2a`. A task may
+`source` is one of `chat`, `pi`, `agent`, `routine`, `workflow`, or `a2a`. A task may
 have multiple attempts after explicit retry, but callers never manage executor
 leases directly. The service guarantees at most one mutating attempt for an
 agent project root unless the definition explicitly permits safe concurrency.
@@ -427,8 +438,9 @@ HTTP requests through A2A. This keeps the wire protocol at the system boundary.
 
 ## Routines and cron schedules
 
-Routines are created under Agent Builder > Automation and operated under the
-Agents tab. A routine targets one agent or one deployed workflow.
+Routines are created under Agent Builder > Automation and operated from the
+responsible agent's roster/inbox views. A routine targets one agent or one
+deployed workflow.
 
 ```ts
 interface RoutineDefinition {
@@ -520,10 +532,14 @@ retrieved through authenticated resource endpoints.
 ### Slice 1: consolidated workspace navigation
 
 - Rename Preview to Browser.
-- Replace Activity with Agents.
+- Place the persistent Agents roster below Sessions in the left pane.
+- Use the center for the selected session or agent inbox.
+- Use the right drawer for Browser, Workflow/Attention, and requested Builder
+  configuration.
 - Remove separate Routines and Capabilities top-level tabs.
-- Rename Builder to Agent Builder and add its internal sections.
-- Move existing run and routine history into the selected-agent view.
+- Keep Agent Builder conversational and add its structured internal sections
+  to the drawer.
+- Move existing run and routine history into the selected-agent inbox view.
 
 ### Slice 2: personas and registry operations
 
@@ -584,8 +600,10 @@ retrieved through authenticated resource endpoints.
 
 ## Acceptance criteria
 
-- The only right-workspace top-level tabs are Browser, Agents, and Agent Builder.
-- An agent deployed by Pi or Agent Builder appears under Agents without restart.
+- The left pane owns Sessions and Agents; the center owns the selected
+  conversation; the right drawer owns Browser, Workflow/Attention, and
+  requested Builder configuration.
+- An agent deployed by Pi or Agent Builder appears in the Agents roster without restart.
 - Selecting an agent opens a durable chat; sending a message creates a visible
   task and streams progress through completion.
 - Persona cards use the configured Personas catalog image and compiled

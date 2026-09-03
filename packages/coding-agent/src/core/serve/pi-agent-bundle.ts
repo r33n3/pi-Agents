@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { ModelRef } from "@earendil-works/pi-protocol";
-import type { AgentDefinitionInput, AgentPermissionPolicy, AgentRegistry } from "./agent-registry.ts";
+import type { AgentDefinition, AgentDefinitionInput, AgentPermissionPolicy, AgentRegistry } from "./agent-registry.ts";
 import type { AgentRunUsage } from "./agent-run-manager.ts";
 import type { AgentCapabilityGrant } from "./capability-broker.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
@@ -143,6 +143,8 @@ export interface PiAgentBundleRuntimeEvidence {
 	effectiveSourceDigest: string;
 	contractDigest: string;
 	bundleDigest: string;
+	authorityDigest: string;
+	effectiveDeploymentDigest: string;
 	executionForm: "pi-team-v1";
 	adapter: { id: string; version: string };
 	bindingReview: PiAgentBundleBindingReview;
@@ -167,6 +169,12 @@ export interface PiAgentBundleRuntimeEvidence {
 			status: "passed" | "failed" | "not-declared";
 			findings: string[];
 		};
+		output?: {
+			mediaType: "application/json" | "text/plain";
+			sha256: string;
+			content: string;
+		};
+		error?: string;
 	}>;
 	error?: string;
 }
@@ -182,9 +190,28 @@ interface PiAgentBundleInstallTransaction {
 	schemaVersion: "pi.agents.install-transaction.v1";
 	bundleId: string;
 	disposition: "created" | "updated";
+	phase: "prepared" | "applying";
+	appliedAgentIds: string[];
+	workflowApplied: boolean;
 	agents: AgentDefinitionInput[];
 	workflow: WorkflowDefinitionInput;
 	receipt: PiAgentBundleInstallRecord;
+}
+
+export type PiAgentBundleInstallCheckpoint =
+	| { stage: "before-prepare" }
+	| { stage: "prepared" }
+	| { stage: "applying" }
+	| { stage: "agent-applied"; agentId: string }
+	| { stage: "agent-checkpointed"; agentId: string }
+	| { stage: "workflow-applied" }
+	| { stage: "workflow-checkpointed" }
+	| { stage: "receipt-temp-written" }
+	| { stage: "receipt-committed" };
+
+export interface PiAgentBundleInstallerOptions {
+	/** Observes durable transaction boundaries. Throwing interrupts the operation so crash recovery can be tested. */
+	onInstallCheckpoint?: (checkpoint: PiAgentBundleInstallCheckpoint) => void | Promise<void>;
 }
 
 /** Validates and installs generated WTK team projections without exposing Pi registry paths. */
@@ -192,19 +219,27 @@ export class PiAgentBundleInstaller {
 	readonly #root: string;
 	readonly #registry: AgentRegistry;
 	readonly #workflows: WorkflowService;
+	readonly #options: PiAgentBundleInstallerOptions;
 	readonly #queue = new SerialOperationQueue();
 	readonly #records = new Map<string, PiAgentBundleInstallRecord>();
 
-	constructor(root: string, registry: AgentRegistry, workflows: WorkflowService) {
+	constructor(
+		root: string,
+		registry: AgentRegistry,
+		workflows: WorkflowService,
+		options: PiAgentBundleInstallerOptions = {},
+	) {
 		this.#root = resolve(root);
 		this.#registry = registry;
 		this.#workflows = workflows;
+		this.#options = options;
 	}
 
 	/** Completes every authorized prepared install left by an interrupted process. */
 	async initialize(): Promise<void> {
 		await this.#queue.run(async () => {
 			await mkdir(this.#root, { recursive: true });
+			await removeStaleAtomicTemps(this.#root);
 			for (const file of (await readdir(this.#root, { withFileTypes: true }))
 				.filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
 				.map((entry) => entry.name)
@@ -212,14 +247,7 @@ export class PiAgentBundleInstaller {
 				const record = await readInstallRecord(resolve(this.#root, file));
 				if (record) this.#records.set(record.bundleId, record);
 			}
-			const transactionsRoot = resolve(this.#root, "transactions");
-			await mkdir(transactionsRoot, { recursive: true });
-			const files = (await readdir(transactionsRoot)).filter((file) => file.endsWith(".json")).sort();
-			for (const file of files) {
-				const transactionPath = resolve(transactionsRoot, file);
-				const transaction = parseInstallTransaction(JSON.parse(await readFile(transactionPath, "utf8")));
-				await this.#applyInstallTransaction(transaction, transactionPath);
-			}
+			await this.#recoverPendingInstallTransactions();
 		});
 	}
 
@@ -257,6 +285,7 @@ export class PiAgentBundleInstaller {
 
 	async install(value: unknown, bindings: PiAgentBundleBindings): Promise<PiAgentBundleInstallResult> {
 		return this.#queue.run(async () => {
+			await this.#recoverPendingInstallTransactions();
 			const plan = createInstallPlan(value, bindings);
 			const bindingDigest = digestBindings(bindings);
 			const authorityDigest = digestAuthority(plan.bundle);
@@ -300,12 +329,17 @@ export class PiAgentBundleInstaller {
 				schemaVersion: "pi.agents.install-transaction.v1",
 				bundleId: plan.bundle.bundleId,
 				disposition: existing ? "updated" : "created",
+				phase: "prepared",
+				appliedAgentIds: [],
+				workflowApplied: false,
 				agents: plan.agents,
 				workflow: plan.workflow,
 				receipt: record,
 			};
 			const transactionPath = resolve(this.#root, "transactions", `${plan.bundle.bundleId}.json`);
+			await this.#emitInstallCheckpoint({ stage: "before-prepare" });
 			await writeAtomic(transactionPath, `${JSON.stringify(transaction, null, 2)}\n`);
+			await this.#emitInstallCheckpoint({ stage: "prepared" });
 			await this.#applyInstallTransaction(transaction, transactionPath);
 			return {
 				schemaVersion: "pi.agents.install-result.v1",
@@ -315,6 +349,34 @@ export class PiAgentBundleInstaller {
 		});
 	}
 
+	async #recoverPendingInstallTransactions(): Promise<void> {
+		const transactionsRoot = resolve(this.#root, "transactions");
+		await mkdir(transactionsRoot, { recursive: true });
+		await removeStaleAtomicTemps(transactionsRoot);
+		const files = (await readdir(transactionsRoot)).filter((file) => file.endsWith(".json")).sort();
+		for (const file of files) {
+			const transactionPath = resolve(transactionsRoot, file);
+			const transaction = parseInstallTransaction(JSON.parse(await readFile(transactionPath, "utf8")));
+			await this.#applyInstallTransaction(transaction, transactionPath);
+		}
+	}
+
+	async #recoverInstallTransaction(bundleId: string): Promise<void> {
+		const transactionPath = resolve(this.#root, "transactions", `${bundleId}.json`);
+		let value: unknown;
+		try {
+			value = JSON.parse(await readFile(transactionPath, "utf8"));
+		} catch (error) {
+			if (isNodeError(error) && error.code === "ENOENT") return;
+			throw error;
+		}
+		await this.#applyInstallTransaction(parseInstallTransaction(value), transactionPath);
+	}
+
+	async #emitInstallCheckpoint(checkpoint: PiAgentBundleInstallCheckpoint): Promise<void> {
+		await this.#options.onInstallCheckpoint?.(checkpoint);
+	}
+
 	async #applyInstallTransaction(
 		transaction: PiAgentBundleInstallTransaction,
 		transactionPath: string,
@@ -322,14 +384,42 @@ export class PiAgentBundleInstaller {
 		const recordPath = resolve(this.#root, `${transaction.bundleId}.json`);
 		const committed = await readInstallRecord(recordPath);
 		if (committed?.effectiveDeploymentDigest === transaction.receipt.effectiveDeploymentDigest) {
+			this.#records.set(committed.bundleId, committed);
 			await unlink(transactionPath).catch((error: unknown) => {
 				if (!isNodeError(error) || error.code !== "ENOENT") throw error;
 			});
 			return;
 		}
-		for (const agent of transaction.agents) await this.#registry.save(agent);
-		await this.#workflows.save(transaction.workflow);
-		await writeAtomic(recordPath, `${JSON.stringify(transaction.receipt, null, 2)}\n`);
+		if (transaction.phase === "prepared") {
+			transaction.phase = "applying";
+			await writeInstallTransaction(transactionPath, transaction);
+			await this.#emitInstallCheckpoint({ stage: "applying" });
+		}
+		for (const agent of transaction.agents) {
+			const agentId = string(agent.id, "Pi agent install transaction agent id");
+			if (!agentStateMatches(await this.#registry.get(agentId), agent)) {
+				await this.#registry.save(agent);
+				await this.#emitInstallCheckpoint({ stage: "agent-applied", agentId });
+			}
+			if (!transaction.appliedAgentIds.includes(agentId)) {
+				transaction.appliedAgentIds.push(agentId);
+				await writeInstallTransaction(transactionPath, transaction);
+				await this.#emitInstallCheckpoint({ stage: "agent-checkpointed", agentId });
+			}
+		}
+		if (!workflowStateMatches(this.#workflows.getDefinition(transaction.receipt.workflowId), transaction.workflow)) {
+			await this.#workflows.save(transaction.workflow);
+			await this.#emitInstallCheckpoint({ stage: "workflow-applied" });
+		}
+		if (!transaction.workflowApplied) {
+			transaction.workflowApplied = true;
+			await writeInstallTransaction(transactionPath, transaction);
+			await this.#emitInstallCheckpoint({ stage: "workflow-checkpointed" });
+		}
+		await writeAtomic(recordPath, `${JSON.stringify(transaction.receipt, null, 2)}\n`, async () => {
+			await this.#emitInstallCheckpoint({ stage: "receipt-temp-written" });
+		});
+		await this.#emitInstallCheckpoint({ stage: "receipt-committed" });
 		this.#records.set(transaction.receipt.bundleId, transaction.receipt);
 		await unlink(transactionPath);
 	}
@@ -337,6 +427,7 @@ export class PiAgentBundleInstaller {
 	async smoke(bundleId: string, prompt: string): Promise<PiAgentBundleRuntimeEvidence> {
 		const id = identifier(bundleId, "bundleId");
 		const goal = string(prompt, "prompt");
+		await this.#queue.run(async () => this.#recoverInstallTransaction(id));
 		const record = await readInstallRecord(resolve(this.#root, `${id}.json`));
 		if (!record) throw new Error(`Installed Pi agent bundle ${id} was not found`);
 		const started = await this.#workflows.start(record.workflowId, goal);
@@ -360,6 +451,8 @@ export class PiAgentBundleInstaller {
 				outputContract: node.outputContract
 					? { status: node.outputContract.status, findings: [...node.outputContract.findings] }
 					: { status: "not-declared" as const, findings: [] },
+				...(node.result ? { output: runtimeOutputFact(node.result) } : {}),
+				...(node.error ? { error: node.error } : {}),
 			};
 		});
 		const evidence: PiAgentBundleRuntimeEvidence = {
@@ -370,6 +463,8 @@ export class PiAgentBundleInstaller {
 			effectiveSourceDigest: record.effectiveSourceDigest,
 			contractDigest: record.contractDigest,
 			bundleDigest: record.bundleDigest,
+			authorityDigest: record.authorityDigest,
+			effectiveDeploymentDigest: record.effectiveDeploymentDigest,
 			executionForm: record.executionForm,
 			adapter: { ...record.adapter },
 			bindingReview: { ...record.bindingReview },
@@ -916,14 +1011,74 @@ function parseInstallTransaction(value: unknown): PiAgentBundleInstallTransactio
 	const receipt = readInstallRecordValue(transaction.receipt);
 	const bundleId = identifier(transaction.bundleId, "Pi agent install transaction bundleId");
 	if (receipt.bundleId !== bundleId) throw new Error("Pi agent install transaction receipt bundleId mismatch");
+	const agents = array(transaction.agents, "Pi agent install transaction agents") as AgentDefinitionInput[];
+	const agentIds = new Set(agents.map((agent) => string(agent.id, "Pi agent install transaction agent id")));
+	const appliedAgentIds =
+		transaction.appliedAgentIds === undefined
+			? []
+			: strings(transaction.appliedAgentIds, "Pi agent install transaction appliedAgentIds");
+	if (appliedAgentIds.some((agentId) => !agentIds.has(agentId))) {
+		throw new Error("Pi agent install transaction references an unknown applied agent");
+	}
 	return {
 		schemaVersion: "pi.agents.install-transaction.v1",
 		bundleId,
 		disposition: oneOf(transaction.disposition, ["created", "updated"], "Pi agent install transaction disposition"),
-		agents: array(transaction.agents, "Pi agent install transaction agents") as AgentDefinitionInput[],
+		phase:
+			transaction.phase === undefined
+				? "prepared"
+				: oneOf(transaction.phase, ["prepared", "applying"], "Pi agent install transaction phase"),
+		appliedAgentIds,
+		workflowApplied:
+			transaction.workflowApplied === undefined
+				? false
+				: boolean(transaction.workflowApplied, "Pi agent install transaction workflowApplied"),
+		agents,
 		workflow: object(transaction.workflow, "Pi agent install transaction workflow") as WorkflowDefinitionInput,
 		receipt,
 	};
+}
+
+async function writeInstallTransaction(path: string, transaction: PiAgentBundleInstallTransaction): Promise<void> {
+	await writeAtomic(path, `${JSON.stringify(transaction, null, 2)}\n`);
+}
+
+function agentStateMatches(current: AgentDefinition | undefined, intended: AgentDefinitionInput): boolean {
+	if (!current) return false;
+	return stableJson(agentState(current)) === stableJson(agentState(intended));
+}
+
+function agentState(value: AgentDefinition | AgentDefinitionInput): Record<string, unknown> {
+	return {
+		id: value.id,
+		personaId: value.personaId,
+		name: value.name,
+		description: value.description,
+		model: value.model,
+		budget: value.budget,
+		thinking: value.thinking,
+		modelControls: value.modelControls,
+		tools: value.tools,
+		capabilities: value.capabilities ?? [],
+		memory: value.memory,
+		persona: value.persona,
+		projectRoot: resolve(value.projectRoot ?? value.workspace ?? process.cwd()),
+		workspace: resolve(value.workspace ?? value.projectRoot ?? process.cwd()),
+		executor: value.executor,
+		permissionPolicy: value.permissionPolicy,
+		schedules: value.schedules,
+		browser: value.browser,
+		browserWorkflows: value.browserWorkflows ?? [],
+		delegateAgentIds: value.delegateAgentIds ?? [],
+		a2a: value.a2a ?? { enabled: false },
+	};
+}
+
+function workflowStateMatches(
+	current: ReturnType<WorkflowService["getDefinition"]>,
+	intended: WorkflowDefinitionInput,
+): boolean {
+	return current !== undefined && stableJson(current) === stableJson(intended);
 }
 
 function readInstallRecordValue(value: unknown): PiAgentBundleInstallRecord {
@@ -986,6 +1141,21 @@ function budgetStatus(
 	if (budget.maxTokens !== undefined && usage.outputTokens > budget.maxTokens) return "failed";
 	if (budget.maxCostUsd !== undefined && usage.costUsd > budget.maxCostUsd) return "failed";
 	return "passed";
+}
+
+function runtimeOutputFact(content: string): NonNullable<PiAgentBundleRuntimeEvidence["nodes"][number]["output"]> {
+	let mediaType: "application/json" | "text/plain" = "text/plain";
+	try {
+		JSON.parse(content);
+		mediaType = "application/json";
+	} catch {
+		// The raw output remains text; WTK independently parses and validates it.
+	}
+	return {
+		mediaType,
+		sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+		content,
+	};
 }
 
 function parseNodeBudgets(value: unknown): Record<string, PiAgentBundleBudget> {
@@ -1202,11 +1372,18 @@ function oneOf<const T extends string>(value: unknown, choices: readonly T[], na
 	return value as T;
 }
 
-async function writeAtomic(path: string, content: string): Promise<void> {
+async function writeAtomic(path: string, content: string, beforeRename?: () => void | Promise<void>): Promise<void> {
 	await mkdir(dirname(path), { recursive: true });
 	const temporary = `${path}.${randomUUID()}.tmp`;
 	await writeFile(temporary, content, { encoding: "utf8", flag: "wx" });
+	await beforeRename?.();
 	await rename(temporary, path);
+}
+
+async function removeStaleAtomicTemps(root: string): Promise<void> {
+	for (const entry of await readdir(root, { withFileTypes: true })) {
+		if (entry.isFile() && entry.name.endsWith(".tmp")) await unlink(resolve(root, entry.name));
+	}
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

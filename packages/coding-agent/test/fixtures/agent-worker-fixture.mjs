@@ -96,7 +96,8 @@ async function runHostActionScenario(message) {
 			requestId: `request-${++requestCounter}`,
 			action: { family: "filesystem.read", path: "slow.txt" },
 		};
-		const exitAfterDelivery = () => setTimeout(() => process.exit(7), 10);
+		// Give the parent enough time to begin the intentionally blocked action before simulating a crash.
+		const exitAfterDelivery = () => setTimeout(() => process.exit(7), 100);
 		if (process.send) process.send(request, exitAfterDelivery);
 		else exitAfterDelivery();
 		return;

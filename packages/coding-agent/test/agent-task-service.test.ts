@@ -50,8 +50,10 @@ class DeferredExecution implements AgentExecution {
 
 class FakeExecutor implements AgentExecutor {
 	readonly executions: DeferredExecution[] = [];
+	readonly contexts: AgentExecutionContext[] = [];
 
-	start(_context: AgentExecutionContext): Promise<AgentExecution> {
+	start(context: AgentExecutionContext): Promise<AgentExecution> {
+		this.contexts.push(context);
 		const execution = new DeferredExecution();
 		this.executions.push(execution);
 		return Promise.resolve(execution);
@@ -66,7 +68,7 @@ class FakeExecutor implements AgentExecutor {
 	}
 }
 
-async function setup() {
+async function setup(deferScheduling = false) {
 	const root = await mkdtemp(join(tmpdir(), "pi-agent-tasks-"));
 	roots.push(root);
 	const registry = new AgentRegistry(join(root, "registry"), { defaultWorkspace: root });
@@ -85,11 +87,23 @@ async function setup() {
 	const runs = new AgentRunManager(registry, executor, join(root, "runs"));
 	await runs.initialize();
 	const tasks = new AgentTaskService(registry, runs, join(root, "tasks"));
-	await tasks.initialize();
+	await tasks.initialize({ deferScheduling });
 	return { root, registry, executor, runs, tasks };
 }
 
 describe("AgentTaskService", () => {
+	test("defers queued execution until recovery services are ready", async () => {
+		const { executor, tasks } = await setup(true);
+		const task = await tasks.submit({ agentId: "researcher", prompt: "Wait for recovery", source: "chat" });
+		expect(task.status).toBe("queued");
+		expect(executor.executions).toHaveLength(0);
+		await tasks.startScheduling();
+		expect(executor.executions).toHaveLength(1);
+		executor.executions[0]!.resolve({ output: "Recovered", transcript: [] });
+		await expect(tasks.waitForCompletion(task.id)).resolves.toMatchObject({ status: "completed" });
+		await tasks.dispose();
+	});
+
 	test("persists a durable conversation and completed task", async () => {
 		const { root, registry, executor, runs, tasks } = await setup();
 		const task = await tasks.submit({ agentId: "researcher", prompt: "Find evidence", source: "chat" });
@@ -148,6 +162,53 @@ describe("AgentTaskService", () => {
 		executor.executions[1]!.resolve({ output: "Review done", transcript: [] });
 		await expect(tasks.waitForCompletion(first.id)).resolves.toMatchObject({ status: "completed" });
 		await expect(tasks.waitForCompletion(second.id)).resolves.toMatchObject({ status: "completed" });
+		await tasks.dispose();
+	});
+
+	test("keeps one explicit inbox even when a newer task conversation exists", async () => {
+		const { root, registry, runs, tasks } = await setup();
+		const inbox = await tasks.ensureAgentInbox("researcher");
+		const taskConversation = await tasks.createTaskConversation("researcher");
+		expect(taskConversation.kind).toBe("task");
+		expect(tasks.listConversations("researcher")[0]).toMatchObject({ id: inbox.id, kind: "agent-inbox" });
+
+		const restored = new AgentTaskService(registry, runs, join(root, "tasks"));
+		await restored.initialize();
+		expect(restored.listConversations("researcher").filter((entry) => entry.kind === "agent-inbox")).toEqual([
+			expect.objectContaining({ id: inbox.id }),
+		]);
+		await restored.dispose();
+		await tasks.dispose();
+	});
+
+	test("freezes queued execution configuration and excludes prior context epochs", async () => {
+		const { registry, executor, tasks } = await setup();
+		const first = await tasks.submit({ agentId: "researcher", prompt: "Block the agent", source: "chat" });
+		const queued = await tasks.submit({ agentId: "researcher", prompt: "Use revision one", source: "chat" });
+		expect(queued.status).toBe("queued");
+		await registry.save({
+			id: "researcher",
+			name: "Researcher updated",
+			description: "Researches with a new revision",
+			tools: ["read"],
+			memory: "none",
+			persona: "Updated",
+			executor: "harness",
+			permissionPolicy: "read-only",
+			schedules: [],
+		});
+		executor.executions[0]!.resolve({ output: "First done", transcript: [] });
+		await tasks.waitForCompletion(first.id);
+		await expect.poll(() => executor.contexts.length).toBe(2);
+		expect(executor.contexts[1]?.definition).toMatchObject({ revision: 1, name: "Researcher" });
+		executor.executions[1]!.resolve({ output: "Second done", transcript: [] });
+		await tasks.waitForCompletion(queued.id);
+
+		await tasks.newContext("researcher");
+		const afterCheckpoint = await tasks.submit({ agentId: "researcher", prompt: "Fresh context", source: "chat" });
+		expect(afterCheckpoint.contract.context).toMatchObject({ contextEpoch: 2, messages: [] });
+		executor.executions[2]!.resolve({ output: "Fresh done", transcript: [] });
+		await tasks.waitForCompletion(afterCheckpoint.id);
 		await tasks.dispose();
 	});
 });

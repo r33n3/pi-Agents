@@ -11,9 +11,14 @@ import { createAgentSession } from "../sdk.ts";
 import { SessionManager } from "../session-manager.ts";
 import { A2aAdapter } from "./a2a-adapter.ts";
 import { AgentBuildLifecycleService } from "./agent-build-lifecycle-service.ts";
-import { AgentSessionExecutor } from "./agent-executor.ts";
+import { AgentCollaborationService } from "./agent-collaboration-service.ts";
+import { createAgentCollaborationTools } from "./agent-collaboration-tools.ts";
+import { type AgentExecutionContext, AgentSessionExecutor } from "./agent-executor.ts";
+import { AgentPresentationStore } from "./agent-presentation-store.ts";
 import { type AgentDefinition, AgentRegistry } from "./agent-registry.ts";
 import { createAgentRegistryTools } from "./agent-registry-tools.ts";
+import { AgentRoomService } from "./agent-room-service.ts";
+import { AgentRosterProjection } from "./agent-roster-projection.ts";
 import { AgentRoutineScheduler } from "./agent-routine-scheduler.ts";
 import { AgentRunManager } from "./agent-run-manager.ts";
 import { AgentTaskService } from "./agent-task-service.ts";
@@ -36,6 +41,7 @@ import { CapabilityConnectionRegistry } from "./capability-connection-registry.t
 import { ChildProcessAgentExecutor } from "./child-process-agent-executor.ts";
 import { ClaudeSubscriptionLogin } from "./claude-subscription-login.ts";
 import { CodexCliExecution, isCodexSubscriptionAvailable } from "./codex-cli-execution.ts";
+import { ConversationBuildCoordinator } from "./conversation-build-coordinator.ts";
 import { createCredentialApiTools } from "./credential-api-tools.ts";
 import { CurrentSessionService } from "./current-session-service.ts";
 import { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
@@ -60,6 +66,7 @@ import { createScopedAgentTools } from "./scoped-agent-tools.ts";
 import { createSearxngTools } from "./searxng-tools.ts";
 import { ServeAttachmentStore } from "./serve-attachment-store.ts";
 import { ServeAuditStore } from "./serve-audit-store.ts";
+import { acquireServeDirectoryOwnership, type ServeDirectoryOwnership } from "./serve-directory-ownership.ts";
 import { createServePage } from "./serve-page.ts";
 import { WebSocketListener } from "./websocket-listener.ts";
 import { WorkflowService } from "./workflow-service.ts";
@@ -94,6 +101,9 @@ export class ServeHost implements AsyncDisposable {
 	#server: PiServer | undefined;
 	#agentRunManager: AgentRunManager | undefined;
 	#agentTaskService: AgentTaskService | undefined;
+	#agentCollaboration: AgentCollaborationService | undefined;
+	#agentRoster: AgentRosterProjection | undefined;
+	#agentRooms: AgentRoomService | undefined;
 	#workflowService: WorkflowService | undefined;
 	#agentRoutineScheduler: AgentRoutineScheduler | undefined;
 	#externalConnectionManager: ExternalConnectionManager | undefined;
@@ -103,6 +113,7 @@ export class ServeHost implements AsyncDisposable {
 	#attachmentStore: ServeAttachmentStore | undefined;
 	#browserSessionManager: BrowserSessionManager | undefined;
 	#workspacePreviewServer: WorkspacePreviewServer | undefined;
+	#serveDirectoryOwnership: ServeDirectoryOwnership | undefined;
 	#startAttempted = false;
 	#closePromise: Promise<void> | undefined;
 
@@ -142,6 +153,14 @@ export class ServeHost implements AsyncDisposable {
 		}
 		const token = configuredToken ?? randomBytes(32).toString("base64url");
 		const serveRoot = join(agentDir, "serve");
+		this.#serveDirectoryOwnership = await acquireServeDirectoryOwnership(serveRoot, (error) => {
+			this.#options.onError?.(
+				new Error(`Serve directory ownership was compromised: ${error.message}`, { cause: error }),
+			);
+			void this.close().catch((closeError: unknown) => {
+				this.#options.onError?.(closeError instanceof Error ? closeError : new Error(String(closeError)));
+			});
+		});
 		const auditStore = new ServeAuditStore(join(serveRoot, "audit"));
 		await auditStore.initialize();
 		const governedActions = new GovernedActionService(auditStore);
@@ -230,6 +249,8 @@ export class ServeHost implements AsyncDisposable {
 		await capabilityConnections.initialize();
 		const capabilityApprovals = new CapabilityApprovalService(join(serveRoot, "capabilities", "approvals"));
 		await capabilityApprovals.initialize();
+		let currentSessionService: CurrentSessionService | undefined;
+		let agentCollaborationService: AgentCollaborationService | undefined;
 		let providerEnvironment: ProviderEnvironmentStore | undefined;
 		const capabilityBroker = new CapabilityBroker(join(serveRoot, "capabilities"), {
 			activeToolNames: () => session.getAllTools().map((tool) => tool.name),
@@ -298,39 +319,75 @@ export class ServeHost implements AsyncDisposable {
 		);
 		brokeredTools.push(...sessionPlaidTools);
 		session.registerCustomTools(sessionPlaidTools);
-		const googleWorkspaceTools = createGoogleWorkspaceTools({
-			approvals: capabilityApprovals,
-			credentials: providerEnvironment,
-			governedActions,
-			identities: { actorId: "pi-session", sessionId: session.sessionId },
-			authorizeCapability: async (capabilityId) => {
-				try {
-					await capabilityConnections.assertGrant("google-workspace-primary", "google-workspace", capabilityId);
-					return { decision: "allow", reason: "Active provider account grant", grant: capabilityId };
-				} catch (error) {
-					return {
-						decision: "deny",
-						reason: error instanceof Error ? error.message : "Provider account grant is unavailable",
-					};
-				}
+		const authorizeGoogleCapability = async (capabilityId: string) => {
+			try {
+				await capabilityConnections.assertGrant("google-workspace-primary", "google-workspace", capabilityId);
+				return { decision: "allow" as const, reason: "Active provider account grant", grant: capabilityId };
+			} catch (error) {
+				return {
+					decision: "deny" as const,
+					reason: error instanceof Error ? error.message : "Provider account grant is unavailable",
+				};
+			}
+		};
+		const markGoogleConnectionUnhealthy = async () => {
+			const connection = await capabilityConnections.get("google-workspace-primary");
+			if (!connection || connection.status === "revoked") return;
+			await capabilityConnections.save({ ...connection, status: "unhealthy" });
+		};
+		const createOwnedGoogleWorkspaceTools = (
+			owner: { kind: "session" | "agent-run"; id: string },
+			identities: { actorId: string; sessionId?: string; agentId?: string; attemptId?: string },
+			assertLive: () => void,
+		) =>
+			createGoogleWorkspaceTools({
+				approvals: capabilityApprovals,
+				credentials: providerEnvironment,
+				governedActions,
+				identities,
+				approvalOwner: owner,
+				authority: { owner, assertLive },
+				authorizeCapability: authorizeGoogleCapability,
+				markConnectionUnhealthy: markGoogleConnectionUnhealthy,
+			});
+		const sessionApprovalOwner = { kind: "session" as const, id: session.sessionId };
+		const googleWorkspaceTools = createOwnedGoogleWorkspaceTools(
+			sessionApprovalOwner,
+			{ actorId: "pi-session", sessionId: session.sessionId },
+			() => {
+				if (!currentSessionService) throw new Error("Session authority is not active");
+				currentSessionService.assertActive(session.sessionId);
 			},
-			markConnectionUnhealthy: async () => {
-				const connection = await capabilityConnections.get("google-workspace-primary");
-				if (!connection || connection.status === "revoked") return;
-				await capabilityConnections.save({ ...connection, status: "unhealthy" });
-			},
-		});
+		);
 		brokeredTools.push(...googleWorkspaceTools);
 		session.registerCustomTools(googleWorkspaceTools);
-		const resolveAgentBrokeredTools = (definition: AgentDefinition): ToolDefinition[] => {
+		const googleWorkspaceToolNames = new Set(googleWorkspaceTools.map((tool) => tool.name));
+		const resolveAgentBrokeredTools = (
+			definition: AgentDefinition,
+			approvalOwner?: { kind: "session" | "agent-run"; id: string },
+			identities?: { actorId: string; sessionId?: string; agentId?: string; attemptId?: string },
+		): ToolDefinition[] => {
 			const names = new Set(capabilityBroker.resolveToolNames(definition.capabilities, definition.executor));
 			for (const name of definition.tools) names.add(name);
 			const allowedPlaidConnectionIds = definition.capabilities
 				.filter((grant) => grant.providerId === "plaid" && grant.connectionId)
 				.map((grant) => grant.connectionId!);
 			return [
-				...brokeredTools.filter((tool) => !plaidToolNames.has(tool.name)),
+				...brokeredTools.filter(
+					(tool) => !plaidToolNames.has(tool.name) && !googleWorkspaceToolNames.has(tool.name),
+				),
 				...createPlaidTools(plaidConnections, () => allowedPlaidConnectionIds),
+				...(approvalOwner && identities
+					? createOwnedGoogleWorkspaceTools(approvalOwner, identities, () => {
+							if (approvalOwner.kind === "agent-run") {
+								if (!this.#agentRunManager) throw new Error("Agent run authority is not active");
+								this.#agentRunManager.assertActive(approvalOwner.id);
+								return;
+							}
+							if (!currentSessionService) throw new Error("Session authority is not active");
+							currentSessionService.assertActive(approvalOwner.id);
+						})
+					: []),
 			].filter((tool) => names.has(tool.name));
 		};
 		const agentRegistry = new AgentRegistry(serveRoot, {
@@ -417,12 +474,33 @@ export class ServeHost implements AsyncDisposable {
 						})
 					: [];
 			const capabilityTools = capabilityBroker.resolveToolNames(definition.capabilities, definition.executor);
-			const agentBrokeredTools = resolveAgentBrokeredTools(definition);
+			const approvalOwner =
+				browserOwner?.kind === "agent-run"
+					? { kind: "agent-run" as const, id: browserOwner.id }
+					: browserOwner?.kind === "pi-session"
+						? { kind: "session" as const, id: browserOwner.id }
+						: undefined;
+			const identities =
+				approvalOwner?.kind === "agent-run"
+					? { actorId: "agent-run", agentId: definition.id, attemptId: approvalOwner.id }
+					: approvalOwner
+						? { actorId: "pi-session", sessionId: approvalOwner.id }
+						: undefined;
+			const agentBrokeredTools = resolveAgentBrokeredTools(definition, approvalOwner, identities);
+			const agentCollaborationTools =
+				browserOwner?.kind === "agent-run" && definition.delegateAgentIds.length > 0
+					? createAgentCollaborationTools(
+							agentCollaborationService ?? missingAgentCollaborationService(),
+							this.#agentTaskService ?? missingAgentTaskService(),
+							{ agentId: definition.id, runId: browserOwner.id },
+						)
+					: [];
 			const customTools = [
 				...scopedTools,
 				...browserTools,
 				...browserWorkflowTools,
 				...agentBrokeredTools,
+				...agentCollaborationTools,
 			] as ToolDefinition[];
 			const toolNames = isolated
 				? customTools.map((tool) => tool.name)
@@ -497,21 +575,68 @@ export class ServeHost implements AsyncDisposable {
 				if (!workerModel) return undefined;
 				return (await modelRuntime.getAuth(workerModel))?.auth.apiKey;
 			},
-			capabilityToolNames: (context) =>
-				capabilityBroker.resolveToolNames(context.definition.capabilities, context.definition.executor),
-			capabilityTools: (context) => resolveAgentBrokeredTools(context.definition),
+			capabilityTools: (context: AgentExecutionContext) =>
+				[
+					...resolveAgentBrokeredTools(
+						context.definition,
+						{ kind: "agent-run", id: context.runId },
+						{
+							actorId: "agent-run",
+							agentId: context.definition.id,
+							attemptId: context.runId,
+						},
+					),
+					...(context.definition.delegateAgentIds.length > 0
+						? createAgentCollaborationTools(
+								agentCollaborationService ?? missingAgentCollaborationService(),
+								this.#agentTaskService ?? missingAgentTaskService(),
+								{ agentId: context.definition.id, runId: context.runId },
+							)
+						: []),
+				] as ToolDefinition[],
 		});
-		this.#agentRunManager = new AgentRunManager(agentRegistry, executor, join(serveRoot, "runs"));
+		this.#agentRunManager = new AgentRunManager(agentRegistry, executor, join(serveRoot, "runs"), 4, {
+			defaultModel: session.model ? { provider: session.model.provider, id: session.model.id } : undefined,
+			resolveCapabilityBindings: (definition) =>
+				capabilityBroker.resolveRunBindings(definition.capabilities, definition.executor).map((binding) => ({
+					capabilityId: binding.capabilityId,
+					capabilityVersion: binding.capabilityVersion,
+					providerId: binding.providerId,
+					providerDigest: binding.providerDigest,
+					connectionId: binding.connectionId,
+				})),
+			revokeRunApprovals: async (runId, reason) => {
+				await capabilityApprovals.revoke({ owner: { kind: "agent-run", id: runId } }, reason);
+			},
+		});
 		await this.#agentRunManager.initialize();
 		const agentBuildLifecycle = new AgentBuildLifecycleService(serveRoot, agentRegistry, this.#agentRunManager);
 		await agentBuildLifecycle.initialize();
+		const conversationBuilds = new ConversationBuildCoordinator(serveRoot, agentBuildLifecycle);
+		await conversationBuilds.initialize();
 		const runSkillPromotion = new RunSkillPromotionService(
 			this.#agentRunManager,
 			join(agentDir, "skills"),
 			agentBuildLifecycle,
 		);
 		this.#agentTaskService = new AgentTaskService(agentRegistry, this.#agentRunManager, serveRoot);
-		await this.#agentTaskService.initialize();
+		await this.#agentTaskService.initialize({ deferScheduling: true });
+		agentCollaborationService = new AgentCollaborationService(
+			serveRoot,
+			agentRegistry,
+			this.#agentRunManager,
+			this.#agentTaskService,
+			{
+				assertLiveSession: (sessionId) => {
+					if (!currentSessionService) throw new Error("Session authority is not active");
+					currentSessionService.assertActive(sessionId);
+				},
+			},
+		);
+		this.#agentCollaboration = agentCollaborationService;
+		await agentCollaborationService.initialize();
+		const agentPresentation = new AgentPresentationStore(serveRoot);
+		await agentPresentation.initialize();
 		this.#workflowService = new WorkflowService(join(serveRoot, "workflows"), agentRegistry, this.#agentTaskService, {
 			runner: browserWorkflowRunner,
 			owner: { kind: "pi-session", id: session.sessionId },
@@ -521,6 +646,13 @@ export class ServeHost implements AsyncDisposable {
 			},
 		});
 		await this.#workflowService.initialize();
+		this.#agentRooms = new AgentRoomService(
+			join(serveRoot, "rooms"),
+			agentRegistry,
+			this.#agentTaskService,
+			this.#workflowService,
+		);
+		await this.#agentRooms.initialize();
 		const piAgentBundleInstaller = new PiAgentBundleInstaller(
 			join(serveRoot, "agent-package-installs"),
 			agentRegistry,
@@ -832,78 +964,105 @@ export class ServeHost implements AsyncDisposable {
 			},
 		});
 		await this.#agentRoutineScheduler.start();
+		this.#agentRoster = new AgentRosterProjection(
+			agentRegistry,
+			this.#agentTaskService,
+			this.#agentRoutineScheduler,
+			agentPresentation,
+		);
+		await this.#agentRoster.initialize();
+		await this.#agentTaskService.startScheduling();
 		session.registerCustomTools(
 			createAgentRegistryTools(agentRegistry, agentBuildLifecycle, {
 				promotion: runSkillPromotion,
 				routines: routineRegistry,
 				refreshRoutines: () => this.#agentRoutineScheduler!.refresh(),
+				conversationBuilds,
+				sessionId: session.sessionId,
 			}) as ToolDefinition[],
 		);
 
-		const currentSessionService = new CurrentSessionService(session, Date.now(), async (options) => {
-			const agentId = options.name?.startsWith("agent:") ? options.name.slice("agent:".length) : undefined;
-			if (agentId) {
-				const definition = await agentRegistry.get(agentId);
-				if (!definition) throw new Error(`Agent ${agentId} was not found`);
-				const workspace = agentRegistry.workspacePath(definition);
-				const agentSessionManager = SessionManager.inMemory(workspace, {
+		currentSessionService = new CurrentSessionService(
+			session,
+			Date.now(),
+			async (options) => {
+				const agentId = options.name?.startsWith("agent:") ? options.name.slice("agent:".length) : undefined;
+				if (agentId) {
+					const definition = await agentRegistry.get(agentId);
+					if (!definition) throw new Error(`Agent ${agentId} was not found`);
+					const workspace = agentRegistry.workspacePath(definition);
+					const agentSessionManager = SessionManager.inMemory(workspace, {
+						id: options.id,
+					});
+					agentSessionManager.appendSessionInfo(`agent:${definition.id}`);
+					return createConfiguredAgentSession(
+						{
+							...definition,
+							...(options.model ? { model: options.model } : {}),
+							...(options.thinkingLevel !== undefined
+								? { thinking: options.thinkingLevel, modelControls: undefined }
+								: {}),
+						},
+						workspace,
+						agentSessionManager,
+						{ kind: "pi-session", id: options.id },
+						modelRuntime,
+						options.modelControls,
+					);
+				}
+				const requestedModel = options.model;
+				const hostedModel = requestedModel
+					? modelRuntime.getModel(requestedModel.provider, requestedModel.id)
+					: session.model;
+				if (!hostedModel) throw new Error("No model is available for the browser helper session");
+				const hostedCwd = options.cwd ?? session.sessionManager.getCwd();
+				const hostedSessionManager = SessionManager.inMemory(hostedCwd, {
 					id: options.id,
 				});
-				agentSessionManager.appendSessionInfo(`agent:${definition.id}`);
-				return createConfiguredAgentSession(
-					{
-						...definition,
-						...(options.model ? { model: options.model } : {}),
-						...(options.thinkingLevel !== undefined
-							? { thinking: options.thinkingLevel, modelControls: undefined }
-							: {}),
-					},
-					workspace,
-					agentSessionManager,
-					{ kind: "pi-session", id: options.id },
-					modelRuntime,
-					options.modelControls,
-				);
-			}
-			const requestedModel = options.model;
-			const hostedModel = requestedModel
-				? modelRuntime.getModel(requestedModel.provider, requestedModel.id)
-				: session.model;
-			if (!hostedModel) throw new Error("No model is available for the browser helper session");
-			const hostedCwd = options.cwd ?? session.sessionManager.getCwd();
-			const hostedSessionManager = SessionManager.inMemory(hostedCwd, {
-				id: options.id,
-			});
-			if (options.name) hostedSessionManager.appendSessionInfo(options.name);
-			const browserTools = createBrowserTools(this.#browserSessionManager!, {
-				owner: { kind: "pi-session", id: options.id },
-				workspace: { id: options.id, root: hostedCwd },
-				access: ["loopback", "public-web"],
-				workspacePreview: this.#workspacePreviewServer,
-				workflowCompiler: browserWorkflowCompiler,
-			});
-			const browserWorkflowTools = createBrowserWorkflowTools(browserWorkflowRegistry, browserWorkflowRunner, {
-				owner: { kind: "pi-session", id: options.id },
-				workspace: { id: options.id, root: hostedCwd },
-				frontendTests: () =>
-					browserWorkflowReferences.listFrontendTests(hostedCwd).map((reference) => ({
-						id: reference.workflowId,
-						version: reference.workflowVersion,
-					})),
-			});
-			return (
-				await createAgentSession({
-					cwd: hostedCwd,
-					agentDir,
-					modelRuntime,
-					model: hostedModel,
-					thinkingLevel: options.thinkingLevel,
-					modelControls: options.modelControls,
-					customTools: [...browserTools, ...browserWorkflowTools],
-					sessionManager: hostedSessionManager,
-				})
-			).session;
-		});
+				if (options.name) hostedSessionManager.appendSessionInfo(options.name);
+				const browserTools = createBrowserTools(this.#browserSessionManager!, {
+					owner: { kind: "pi-session", id: options.id },
+					workspace: { id: options.id, root: hostedCwd },
+					access: ["loopback", "public-web"],
+					workspacePreview: this.#workspacePreviewServer,
+					workflowCompiler: browserWorkflowCompiler,
+				});
+				const browserWorkflowTools = createBrowserWorkflowTools(browserWorkflowRegistry, browserWorkflowRunner, {
+					owner: { kind: "pi-session", id: options.id },
+					workspace: { id: options.id, root: hostedCwd },
+					frontendTests: () =>
+						browserWorkflowReferences.listFrontendTests(hostedCwd).map((reference) => ({
+							id: reference.workflowId,
+							version: reference.workflowVersion,
+						})),
+				});
+				return (
+					await createAgentSession({
+						cwd: hostedCwd,
+						agentDir,
+						modelRuntime,
+						model: hostedModel,
+						thinkingLevel: options.thinkingLevel,
+						modelControls: options.modelControls,
+						customTools: [...browserTools, ...browserWorkflowTools],
+						sessionManager: hostedSessionManager,
+					})
+				).session;
+			},
+			async (sessionId) => {
+				try {
+					await capabilityApprovals.revoke(
+						{ owner: { kind: "session", id: sessionId } },
+						`Session ${sessionId} closed`,
+					);
+				} catch (error) {
+					const cause = error instanceof Error ? error : new Error(String(error));
+					this.#options.onError?.(
+						new Error(`Failed to revoke approvals for closed session ${sessionId}: ${cause.message}`, { cause }),
+					);
+				}
+			},
+		);
 		const inboundRouting = new InboundRoutingService(
 			join(serveRoot, "capabilities", "inbound"),
 			capabilityConnections,
@@ -958,6 +1117,11 @@ export class ServeHost implements AsyncDisposable {
 				wtkAgentFactory,
 				runSkillPromotion,
 				agentBuildLifecycle,
+				this.#agentRoster,
+				agentCollaborationService,
+				this.#agentRooms,
+				session.sessionId,
+				conversationBuilds,
 			),
 			auxiliary: {
 				path: "/browser-stream",
@@ -994,6 +1158,9 @@ export class ServeHost implements AsyncDisposable {
 	async #close(): Promise<void> {
 		const disposals: Array<() => Promise<void>> = [
 			() => this.#server?.close() ?? Promise.resolve(),
+			() => this.#agentRooms?.dispose() ?? Promise.resolve(),
+			() => this.#agentRoster?.dispose() ?? Promise.resolve(),
+			() => this.#agentCollaboration?.dispose() ?? Promise.resolve(),
 			() => this.#agentRoutineScheduler?.dispose() ?? Promise.resolve(),
 			() => this.#agentTaskService?.dispose() ?? Promise.resolve(),
 			() => this.#agentRunManager?.dispose() ?? Promise.resolve(),
@@ -1004,6 +1171,7 @@ export class ServeHost implements AsyncDisposable {
 			() => this.#attachmentStore?.dispose() ?? Promise.resolve(),
 			() => this.#browserSessionManager?.dispose() ?? Promise.resolve(),
 			() => this.#workspacePreviewServer?.close() ?? Promise.resolve(),
+			() => this.#serveDirectoryOwnership?.release() ?? Promise.resolve(),
 		];
 		const errors: unknown[] = [];
 		for (const dispose of disposals) {
@@ -1016,4 +1184,12 @@ export class ServeHost implements AsyncDisposable {
 		if (errors.length === 1) throw errors[0];
 		if (errors.length > 1) throw new AggregateError(errors, "Failed to close serve host");
 	}
+}
+
+function missingAgentCollaborationService(): never {
+	throw new Error("Agent collaboration is not initialized");
+}
+
+function missingAgentTaskService(): never {
+	throw new Error("Agent task service is not initialized");
 }

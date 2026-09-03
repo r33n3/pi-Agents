@@ -17,7 +17,6 @@ export interface AgentWorkerStartMessage {
 	agentDir: string;
 	serveRoot: string;
 	resultPath: string;
-	capabilityToolNames: string[];
 	capabilityTools: AgentWorkerCapabilityTool[];
 	/** Ephemeral provider credential resolved by the parent runtime; never persisted by the worker. */
 	modelApiKey?: string;

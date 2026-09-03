@@ -58,12 +58,29 @@ Validation is deterministic and offline. It rejects:
 - missing local project/model bindings; and
 - absent or stale operator review digests for the exact bundle and normalized
   consumer-local bindings; and
+- consumer-local capabilities, providers, credential slots, approval modes,
+  or role bindings that widen the explicit bundle authority ceiling; and
 - any unsupported failure-policy widening.
 
-Installation is serialized, prevalidates the complete bundle, creates role
-agents before the workflow, compensates registry changes on failure, records
-the exact bundle digest, and returns the existing record on an identical
-retry. The operation requires the normal serve capability token.
+Installation is serialized and prevalidates the complete bundle before it
+writes a durable prepared transaction. Recovery rolls that transaction
+forward through checkpointed agent and workflow application, commits the
+secret-safe install receipt only after the intended runtime state is durable,
+and removes the transaction last. Repeated recovery compares intended state
+before saving, so it converges without agent revision churn. Exact retries
+return `reused`; changed bundle or reviewed local bindings return `updated`.
+The committed identity covers the bundle, reviewed binding, authority,
+execution form, and adapter digests. The operation requires the normal serve
+capability token.
+
+The restart proof interrupts all eleven durability boundaries: before prepare,
+after prepare, after the applying-phase checkpoint, after each role-agent
+mutation and its journal checkpoint, after workflow mutation and its journal
+checkpoint, after receipt temporary-file write, and after receipt rename. A
+fresh registry, workflow service, and installer must recover from disk, leave
+both role revisions at one, remove transaction and temporary-file residue, and
+return `reused` on the exact retry (or `created` when interruption preceded the
+prepared transaction).
 
 ## Runtime execution and evidence
 
@@ -74,16 +91,22 @@ dependent nodes are marked blocked, and graph depth is rejected when it exceeds
 `maxDelegationDepth`.
 
 Smoke writes `pi.agents.runtime-evidence.v1`, binding the exact source,
-contract, bundle, adapter, execution form, workflow run, node outcomes, and
-task identities. Each node carries measured token/cost usage and a verdict for
-its declared role budget. Pi caps per-response output tokens before model
-execution and fails terminal tasks whose cumulative measured usage exceeds a
-declared ceiling. Pi reports factual execution status only. It does not judge
-the WTK goal, issue qualification, or authorize a deployable catalog claim.
-WTK may call the exact run `execution-proven` when identities and reviewed
-bindings match, every required node completed, and every declared budget has a
-matching passing receipt; goal accomplishment still requires separate WTK
-evaluation and control evidence.
+contract, bundle, authority, effective deployment, adapter, execution form,
+workflow run, node outcomes, and task identities. Each node carries measured
+token/cost usage and a verdict for its declared role budget. Pi caps
+per-response output tokens before model execution and fails terminal tasks
+whose cumulative measured usage exceeds a declared ceiling. Pi reports
+factual execution status only, including content-addressed node outputs or
+errors. It does not judge the WTK goal, issue qualification, or authorize a
+deployable catalog claim. WTK independently recomputes the authority and
+effective-deployment identities, verifies every reported output digest, and
+validates the factual output against the canonical role schema. A Pi-local
+`passed` output-contract assertion is not sufficient by itself. WTK may call
+the exact run `execution-proven` only when those identities and reviewed
+bindings match, every required node completed, every output passes WTK's
+independent validation, and every declared budget has a matching passing
+receipt; goal accomplishment still requires separate WTK evaluation and
+control evidence.
 
 ## Runtime instruction compilation
 
@@ -119,8 +142,13 @@ The reference vertical slice is a daily-mail team:
 
 ## Remaining slices
 
-1. Finish independent deterministic fixtures and goal evaluators before a WTK
-   package can move beyond `execution-proven`.
+1. Wire WTK's closed receipt producers into the operator run. WTK now derives
+   output validation from Pi's content-addressed factual outputs; derives
+   semantic, integrity, separation, safety/authority, and optional tribunal
+   receipts from one sealed held-out evaluation bundle; and derives attempt
+   accounting from an immutable preallocated plan plus every retained terminal
+   result. Package-level summaries and caller-authored flags never substitute
+   for these exact-run artifacts.
 2. Keep retained target evidence separate from catalog readiness and promotion
    authority; an unassessed or mismatched package remains compile-only.
 3. Validate concurrent prepare/launch review staleness and active-run rebinding

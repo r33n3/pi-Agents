@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -11,7 +11,7 @@ import type {
 	AgentExecutor,
 } from "../src/core/serve/agent-executor.ts";
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
-import { AgentRunManager } from "../src/core/serve/agent-run-manager.ts";
+import { type AgentRunConfigurationOptions, AgentRunManager } from "../src/core/serve/agent-run-manager.ts";
 
 const roots: string[] = [];
 
@@ -79,7 +79,10 @@ class FakeExecutor implements AgentExecutor {
 	}
 }
 
-async function setup(budget?: { maxTokens?: number; maxCostUsd?: number }): Promise<{
+async function setup(
+	budget?: { maxTokens?: number; maxCostUsd?: number },
+	configuration: AgentRunConfigurationOptions = {},
+): Promise<{
 	root: string;
 	registry: AgentRegistry;
 	executor: FakeExecutor;
@@ -101,17 +104,43 @@ async function setup(budget?: { maxTokens?: number; maxCostUsd?: number }): Prom
 		budget,
 	});
 	const executor = new FakeExecutor();
-	return { root, registry, executor, runs: new AgentRunManager(registry, executor, join(root, "artifacts")) };
+	return {
+		root,
+		registry,
+		executor,
+		runs: new AgentRunManager(registry, executor, join(root, "artifacts"), 4, configuration),
+	};
 }
 
 describe("AgentRunManager", () => {
 	test("allows only one active run per agent and persists artifacts", async () => {
 		const { root, registry, executor, runs } = await setup();
 		const run = await runs.start("research", "Investigate this");
+		expect(runs.isActive(run.id)).toBe(true);
 		await expect(runs.start("research", "Run concurrently")).rejects.toThrow("already has an active run");
+		const snapshot = JSON.parse(
+			await readFile(join(root, "artifacts", "research", run.id, "run-snapshot.json"), "utf8"),
+		) as Record<string, unknown>;
+		expect(snapshot).toMatchObject({
+			version: 1,
+			runId: run.id,
+			configuration: {
+				version: 1,
+				agentId: "research",
+				agentRevision: 1,
+				workspace: registry.workspacePath((await registry.get("research"))!),
+				capabilityBindings: [],
+			},
+			digest: run.snapshotDigest,
+		});
+		expect(Object.isFrozen(executor.contexts[0]!.definition)).toBe(true);
+		expect(() => {
+			executor.contexts[0]!.definition.persona = "Changed after admission";
+		}).toThrow();
 
 		executor.executions[0].resolve({ output: "Result", transcript: [] });
 		await expect.poll(() => runs.get(run.id)?.status).toBe("succeeded");
+		expect(runs.isActive(run.id)).toBe(false);
 		expect(await readFile(join(root, "artifacts", "research", run.id, "result.md"), "utf8")).toBe("Result\n");
 		await expect(runs.readResult(run.id)).resolves.toBe("Result\n");
 
@@ -124,12 +153,104 @@ describe("AgentRunManager", () => {
 		});
 	});
 
+	test("captures the effective model and resolved provider bindings once", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-run-snapshot-"));
+		roots.push(root);
+		const registry = new AgentRegistry(join(root, "registry"));
+		await registry.save({
+			id: "mail",
+			name: "Mail",
+			description: "Reads mail",
+			tools: ["read"],
+			capabilities: [
+				{
+					capabilityId: "communication.email.read",
+					capabilityVersion: 1,
+					providerId: "google-workspace",
+					connectionId: "primary",
+				},
+			],
+			memory: "none",
+			persona: "Careful",
+			executor: "harness",
+			permissionPolicy: "read-only",
+			schedules: [],
+		});
+		const executor = new FakeExecutor();
+		const runs = new AgentRunManager(registry, executor, join(root, "artifacts"), 4, {
+			defaultModel: { provider: "openai", id: "gpt-test" },
+			resolveCapabilityBindings: (definition) =>
+				definition.capabilities.map((grant) => ({
+					capabilityId: grant.capabilityId,
+					capabilityVersion: grant.capabilityVersion,
+					providerId: grant.providerId!,
+					providerDigest: "provider-digest",
+					connectionId: grant.connectionId,
+				})),
+		});
+		const run = await runs.start("mail", "Read messages");
+		const snapshot = JSON.parse(await readFile(join(run.artifactDirectory, "run-snapshot.json"), "utf8")) as Record<
+			string,
+			unknown
+		>;
+		expect(snapshot).toMatchObject({
+			configuration: {
+				effectiveModel: { provider: "openai", id: "gpt-test" },
+				definition: { model: { provider: "openai", id: "gpt-test" } },
+				capabilityBindings: [
+					{
+						capabilityId: "communication.email.read",
+						capabilityVersion: 1,
+						providerId: "google-workspace",
+						providerDigest: "provider-digest",
+						connectionId: "primary",
+					},
+				],
+			},
+		});
+		executor.executions[0]!.resolve({ output: "Done", transcript: [] });
+		await runs.waitForCompletion(run.id);
+	});
+
+	test("rejects a persisted run whose configuration snapshot no longer matches its digest", async () => {
+		const { root, registry, executor, runs } = await setup();
+		const run = await runs.start("research", "Investigate this");
+		executor.executions[0]!.resolve({ output: "Done", transcript: [] });
+		await runs.waitForCompletion(run.id);
+		const snapshotPath = join(run.artifactDirectory, "run-snapshot.json");
+		const snapshot = JSON.parse(await readFile(snapshotPath, "utf8")) as {
+			configuration: { definition: { persona: string } };
+		};
+		snapshot.configuration.definition.persona = "Tampered";
+		await writeFile(snapshotPath, `${JSON.stringify(snapshot)}\n`, "utf8");
+
+		const restored = new AgentRunManager(registry, new FakeExecutor(), join(root, "artifacts"));
+		await restored.initialize();
+		expect(restored.get(run.id)).toBeUndefined();
+	});
+
 	test("aborts and waits for cleanup", async () => {
 		const { executor, runs } = await setup();
 		const run = await runs.start("research", "Long task");
 		await expect(runs.abort(run.id)).resolves.toMatchObject({ status: "aborted" });
+		expect(runs.isActive(run.id)).toBe(false);
+		expect(() => runs.assertActive(run.id)).toThrow(`Agent run ${run.id} is not active`);
 		expect(executor.executions[0].aborted).toBe(true);
 		await expect.poll(() => runs.get(run.id)?.finishedAt).toBeTypeOf("number");
+	});
+
+	test("revokes outstanding approvals when a run becomes terminal", async () => {
+		const revoked: Array<{ runId: string; reason: string }> = [];
+		const { executor, runs } = await setup(undefined, {
+			revokeRunApprovals: (runId, reason) => {
+				revoked.push({ runId, reason });
+				return Promise.resolve();
+			},
+		});
+		const run = await runs.start("research", "Bounded task");
+		executor.executions[0]!.resolve({ output: "Done", transcript: [] });
+		await expect(runs.waitForCompletion(run.id)).resolves.toMatchObject({ status: "succeeded" });
+		expect(revoked).toEqual([{ runId: run.id, reason: `Agent run ${run.id} succeeded` }]);
 	});
 
 	test("fails a completed execution whose measured usage exceeds its package budget", async () => {

@@ -3,7 +3,10 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import type { AgentDeliverySender, SubmitAgentDelivery } from "../src/core/serve/agent-collaboration-contract.ts";
+import type { AgentCollaborationService } from "../src/core/serve/agent-collaboration-service.ts";
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
+import type { AgentRosterProjection } from "../src/core/serve/agent-roster-projection.ts";
 import { AgentRoutineScheduler } from "../src/core/serve/agent-routine-scheduler.ts";
 import { BrowserConsoleService } from "../src/core/serve/browser-console-service.ts";
 import { BrowserProfileStore } from "../src/core/serve/browser-profile-store.ts";
@@ -12,7 +15,10 @@ import {
 	type BrowserDriverContext,
 	BrowserSessionManager,
 } from "../src/core/serve/browser-session-manager.ts";
+import { CapabilityApprovalService } from "../src/core/serve/capability-approval-service.ts";
 import { CapabilityBroker } from "../src/core/serve/capability-broker.ts";
+import { CapabilityProviderRegistry } from "../src/core/serve/capability-provider-registry.ts";
+import type { CurrentSessionService } from "../src/core/serve/current-session-service.ts";
 import { EverydayConfigurationRegistry } from "../src/core/serve/everyday-configuration-registry.ts";
 import { ExternalConnectionManager } from "../src/core/serve/external-connection-manager.ts";
 import { ProviderEnvironmentStore } from "../src/core/serve/provider-environment-store.ts";
@@ -27,8 +33,10 @@ describe("createServePage", () => {
 	let attachmentStore: ServeAttachmentStore;
 	let browser: BrowserSessionManager;
 	let capabilityBroker: CapabilityBroker;
+	let capabilityApprovals: CapabilityApprovalService;
 	let everydayConfigurations: EverydayConfigurationRegistry;
 	let providerEnvironment: ProviderEnvironmentStore;
+	let deliveryRequests: Array<{ sender: AgentDeliverySender; request: SubmitAgentDelivery }>;
 
 	class BrowserContext implements BrowserDriverContext {
 		async setNavigationPolicy(): Promise<void> {}
@@ -143,40 +151,44 @@ describe("createServePage", () => {
 		capabilityBroker = new CapabilityBroker(join(root, "capabilities"), {
 			activeToolNames: () => ["fixture_search"],
 			environmentValue: (name) => providerEnvironment?.environmentValue(name) ?? environment[name],
-			definitions: [
-				{
-					id: "web.search",
-					version: 1,
-					name: "Web search",
-					description: "Fixture search",
-					category: "web",
-					effect: "read",
-					defaultApproval: "never",
-				},
-			],
-			manifests: [
-				{
-					id: "fixture-search",
-					name: "Fixture Search",
-					source: "fixture-search@1.0.0",
-					version: "1.0.0",
-					permissions: ["network read"],
-					authentication: {
-						kind: "environment",
-						fields: [{ env: "FIXTURE_TOKEN", label: "Fixture token", required: true, secret: true }],
+			registry: new CapabilityProviderRegistry({
+				definitions: [
+					{
+						id: "web.search",
+						version: 1,
+						name: "Web search",
+						description: "Fixture search",
+						category: "web",
+						effect: "read",
+						defaultApproval: "never",
 					},
-					bindings: [
-						{
-							capabilityId: "web.search",
-							capabilityVersion: 1,
-							toolName: "fixture_search",
-							executors: ["session"],
+				],
+				providers: [
+					{
+						id: "fixture-search",
+						name: "Fixture Search",
+						source: "fixture-search@1.0.0",
+						version: "1.0.0",
+						permissions: ["network read"],
+						authentication: {
+							kind: "environment",
+							fields: [{ env: "FIXTURE_TOKEN", label: "Fixture token", required: true, secret: true }],
 						},
-					],
-				},
-			],
+						bindings: [
+							{
+								capabilityId: "web.search",
+								capabilityVersion: 1,
+								toolName: "fixture_search",
+								executors: ["session"],
+							},
+						],
+					},
+				],
+			}),
 		});
 		await capabilityBroker.initialize();
+		capabilityApprovals = new CapabilityApprovalService(join(root, "approvals"));
+		await capabilityApprovals.initialize();
 		providerEnvironment = new ProviderEnvironmentStore(
 			root,
 			(providerId) => capabilityBroker.authenticationManifest(providerId),
@@ -188,6 +200,45 @@ describe("createServePage", () => {
 		);
 		everydayConfigurations = new EverydayConfigurationRegistry(join(root, "everyday"));
 		await everydayConfigurations.initialize();
+		const currentSessions = {
+			assertActive(sessionId: string) {
+				if (sessionId !== "session-1") throw new Error(`Unknown session: ${sessionId}`);
+			},
+		} as unknown as CurrentSessionService;
+		deliveryRequests = [];
+		const rosterEntry = {
+			agentId: "reviewer",
+			agentRevision: 1,
+			name: "Reviewer",
+			description: "Reviews work",
+			inboxConversationId: "inbox-reviewer",
+			status: "idle" as const,
+			unreadCount: 0,
+			hidden: false,
+			routines: { enabled: 0 },
+		};
+		const agentRoster = {
+			snapshot: () => Promise.resolve({ version: 1, rosterRevision: 1, entries: [rosterEntry] }),
+			updatePresentation: () => Promise.resolve(rosterEntry),
+			markRead: () => Promise.resolve(rosterEntry),
+			newContext: () => Promise.resolve({ contextEpoch: 2, sequence: 3 }),
+		} as unknown as AgentRosterProjection;
+		const agentCollaboration = {
+			submit: (sender: AgentDeliverySender, request: SubmitAgentDelivery) => {
+				deliveryRequests.push({ sender, request });
+				return Promise.resolve({
+					deliveryId: "delivery-1",
+					taskId: "task-1",
+					conversationId: "inbox-reviewer",
+					recipientAgentId: "reviewer",
+					status: "queued" as const,
+					latestEventSequence: 1,
+					artifactIds: [],
+				});
+			},
+			get: () => undefined,
+			cancel: () => Promise.reject(new Error("not used")),
+		} as unknown as AgentCollaborationService;
 		server = createServer(
 			createServePage(
 				"secret-token",
@@ -196,7 +247,7 @@ describe("createServePage", () => {
 				routineScheduler,
 				externalConnections,
 				routines,
-				undefined,
+				currentSessions,
 				attachmentStore,
 				undefined,
 				new BrowserConsoleService(browser, () => ({ installed: false, executablePath: "managed-chromium" })),
@@ -207,10 +258,22 @@ describe("createServePage", () => {
 				undefined,
 				capabilityBroker,
 				undefined,
-				undefined,
+				capabilityApprovals,
 				undefined,
 				everydayConfigurations,
 				providerEnvironment,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				agentRoster,
+				agentCollaboration,
+				undefined,
+				"session-1",
 			),
 		);
 		await new Promise<void>((resolve, reject) => {
@@ -232,6 +295,51 @@ describe("createServePage", () => {
 	test("rejects missing and incorrect capability tokens", async () => {
 		expect((await fetch(origin)).status).toBe(403);
 		expect((await fetch(`${origin}/?token=wrong`)).status).toBe(403);
+	});
+
+	test("serves the roster and derives user delivery authority from the live session", async () => {
+		const roster = await fetch(`${origin}/agent-roster.json?token=secret-token`);
+		expect(roster.status).toBe(200);
+		expect(await roster.json()).toMatchObject({ entries: [{ agentId: "reviewer" }] });
+
+		const delivery = await fetch(`${origin}/agent-deliveries?token=secret-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				idempotencyKey: "chat-1",
+				recipientAgentId: "reviewer",
+				goal: "Review this",
+			}),
+		});
+		expect(delivery.status).toBe(202);
+		expect(deliveryRequests).toEqual([
+			{
+				sender: { kind: "user", id: "local-user", sessionId: "session-1" },
+				request: {
+					idempotencyKey: "chat-1",
+					recipientAgentId: "reviewer",
+					goal: "Review this",
+					contextRefs: [],
+					expectedDeliverable: undefined,
+				},
+			},
+		]);
+	});
+
+	test("rejects client-supplied delivery authority", async () => {
+		const response = await fetch(`${origin}/agent-deliveries?token=secret-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				idempotencyKey: "chat-1",
+				recipientAgentId: "reviewer",
+				goal: "Review this",
+				sender: { kind: "agent", agentId: "forged" },
+			}),
+		});
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ error: "Delivery clients must not supply sender" });
+		expect(deliveryRequests).toEqual([]);
 	});
 
 	test("serves the console and browser bundle to an authorized caller", async () => {
@@ -347,16 +455,24 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("Pop out browser");
 		expect(bundleText).toContain("agent-session-tab");
 		expect(bundleText).toContain("Active agent conversation");
+		expect(bundleText).toContain("New context");
+		expect(bundleText).toContain("Find agents");
+		expect(bundleText).toContain("/agent-deliveries?");
+		expect(bundleText).toContain("/agent-roster.json?hidden=true");
+		expect(bundleText).toContain("Start a bounded collaboration room");
+		expect(bundleText).toContain("/agent-rooms.json?");
+		expect(bundleText).toContain("Continue room");
 		expect(bundleText).not.toContain("builder-session-tab");
 		expect(bundleText).toContain("Save candidate revision");
-		expect(bundleText).toContain("Publish agent");
+		expect(bundleText).toContain("Save draft");
+		expect(bundleText).toContain("Review publish");
 		expect(bundleText).toContain("Exit editing");
-		expect(bundleText).toContain("Do not call agent_deploy or modify agent files");
+		expect(bundleText).toContain("do not call agent_deploy or modify agent files");
 		expect(bundleText).toContain("No changes to apply.");
 		expect(bundleText).toContain("Unsaved changes. Review them, then apply the update.");
 		expect(bundleText).toContain("Never invent a model ID");
 		expect(bundleText).toContain("provider/model");
-		expect(bundleText).toContain("Apply the reviewed agent configuration without another model call");
+		expect(bundleText).toContain("versioned build record is the source of truth");
 		expect(bundleText).toContain("No drafted agent changes are ready to apply");
 		expect(bundleText).toContain("Configure and deploy a local agent");
 		expect(bundleText).toContain("builder-settings-stack");
@@ -540,6 +656,63 @@ describe("createServePage", () => {
 			body: JSON.stringify({ approved: true }),
 		});
 		expect(await enabled.json()).toMatchObject({ trust: "enabled", enabled: true });
+	});
+
+	test("issues only server-bound exact approvals for a live owner", async () => {
+		const approvalInput = {
+			to: ["recipient@example.com"],
+			subject: "Exact subject",
+			text: "Exact body",
+		};
+		const issued = await fetch(`${origin}/capability-approvals.json?token=secret-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				approved: true,
+				owner: { kind: "session", id: "session-1" },
+				capabilityId: "email.send",
+				input: approvalInput,
+			}),
+		});
+		expect(issued.status).toBe(201);
+		expect(await issued.json()).toMatchObject({
+			owner: { kind: "session", id: "session-1" },
+			capabilityId: "email.send",
+			providerId: "google-workspace",
+			connectionId: "google-workspace-primary",
+			binding: { version: 1 },
+		});
+
+		const listed = await fetch(`${origin}/capability-approvals.json?token=secret-token`);
+		const listedText = await listed.text();
+		expect(listedText).not.toContain(approvalInput.subject);
+		expect(listedText).not.toContain(approvalInput.text);
+
+		const clientDigest = await fetch(`${origin}/capability-approvals.json?token=secret-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				approved: true,
+				owner: { kind: "session", id: "session-1" },
+				capabilityId: "email.send",
+				input: approvalInput,
+				digest: "0".repeat(64),
+			}),
+		});
+		expect(clientDigest.status).toBe(400);
+		expect(await clientDigest.json()).toMatchObject({ error: "Approval clients must not supply digest" });
+
+		const inactiveOwner = await fetch(`${origin}/capability-approvals.json?token=secret-token`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				approved: true,
+				owner: { kind: "session", id: "closed-session" },
+				capabilityId: "email.send",
+				input: approvalInput,
+			}),
+		});
+		expect(inactiveOwner.status).toBe(400);
 	});
 
 	test("lists managed browser state through the capability-token boundary", async () => {

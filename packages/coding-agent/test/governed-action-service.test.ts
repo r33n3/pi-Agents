@@ -120,6 +120,67 @@ describe("GovernedActionService", () => {
 		expect(JSON.stringify(events)).not.toContain("secret");
 	});
 
+	test("records cancellation when authority ends while authorization is pending", async () => {
+		const audit = new ServeAuditStore(root);
+		const service = new GovernedActionService(audit);
+		const dispatch = vi.fn();
+		let live = true;
+		await expect(
+			service.execute({
+				family: "provider.call",
+				target: { operation: "send" },
+				canonicalize: (target) => target,
+				authority: {
+					owner: { kind: "agent-run", id: "run-1" },
+					assertLive: () => {
+						if (!live) throw new Error("Run run-1 is no longer active");
+					},
+				},
+				authorize: async () => {
+					live = false;
+					return { decision: "allow", reason: "approved" };
+				},
+				dispatch,
+			}),
+		).rejects.toThrow("no longer active");
+		expect(dispatch).not.toHaveBeenCalled();
+		expect(await audit.read()).toEqual([
+			expect.objectContaining({ kind: "decision", decision: "allow" }),
+			expect.objectContaining({ kind: "outcome", outcome: "cancelled" }),
+		]);
+	});
+
+	test("rechecks authority after credential resolution and before dispatch", async () => {
+		const audit = new ServeAuditStore(root);
+		const service = new GovernedActionService(audit);
+		const dispatch = vi.fn();
+		let live = true;
+		await expect(
+			service.execute({
+				family: "provider.call",
+				target: { operation: "send" },
+				canonicalize: (target) => target,
+				authority: {
+					owner: { kind: "agent-run", id: "run-1" },
+					assertLive: () => {
+						if (!live) throw new Error("Run run-1 is no longer active");
+					},
+				},
+				authorize: () => ({ decision: "allow", reason: "approved" }),
+				resolveCredentials: async () => {
+					live = false;
+					return "secret";
+				},
+				dispatch,
+			}),
+		).rejects.toThrow("no longer active");
+		expect(dispatch).not.toHaveBeenCalled();
+		expect(await audit.read()).toEqual([
+			expect.objectContaining({ kind: "decision", decision: "allow" }),
+			expect.objectContaining({ kind: "outcome", outcome: "cancelled" }),
+		]);
+	});
+
 	test("reports outcome_unknown without retrying when post-effect audit fails", async () => {
 		const audit = new ServeAuditStore(root);
 		const appendOutcome = vi.spyOn(audit, "appendOutcome").mockImplementationOnce(async () => {

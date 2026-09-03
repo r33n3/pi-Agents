@@ -9,6 +9,11 @@ import type {
 	AgentBuildRecord,
 } from "./agent-build-lifecycle-service.ts";
 import type { AgentDefinition, AgentRegistry } from "./agent-registry.ts";
+import type {
+	AgentBuildActionKind,
+	ConversationBuildCoordinator,
+	ConversationBuildView,
+} from "./conversation-build-coordinator.ts";
 import type { RoutineRegistry } from "./routine-registry.ts";
 import type { RunSkillPromotionService } from "./run-skill-promotion-service.ts";
 
@@ -28,6 +33,9 @@ const browserAccess = Type.Union([
 	Type.Literal("private-network"),
 ]);
 const configureParameters = Type.Object({
+	buildId: Type.Optional(Type.String({ pattern: "^build-[a-z0-9-]{1,127}$" })),
+	expectedBuildRevision: Type.Optional(Type.Integer({ minimum: 1 })),
+	mode: Type.Optional(Type.Union([Type.Literal("create"), Type.Literal("edit"), Type.Literal("improve")])),
 	id: Type.Optional(Type.String({ pattern: "^[a-z0-9][a-z0-9-]{0,63}$" })),
 	name: Type.String({ minLength: 1, maxLength: 128 }),
 	description: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })),
@@ -65,11 +73,57 @@ const configureParameters = Type.Object({
 			description: "Pass/fail/unverified improvement criteria retained with this package",
 		}),
 	),
+	assumptions: Type.Optional(
+		Type.Array(
+			Type.Object({
+				topic: Type.String({ minLength: 1, maxLength: 128 }),
+				value: Type.String({ minLength: 1, maxLength: 2_000 }),
+				rationale: Type.String({ minLength: 1, maxLength: 2_000 }),
+			}),
+			{ maxItems: 32 },
+		),
+	),
+	clarifications: Type.Optional(
+		Type.Array(
+			Type.Object({
+				id: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+				topic: Type.String({ minLength: 1, maxLength: 128 }),
+				materialTopic: Type.Union([
+					Type.Literal("outcome"),
+					Type.Literal("scope"),
+					Type.Literal("recipient"),
+					Type.Literal("authority"),
+					Type.Literal("data-source"),
+					Type.Literal("schedule"),
+					Type.Literal("cost"),
+					Type.Literal("acceptance"),
+					Type.Literal("identity"),
+				]),
+				question: Type.String({ minLength: 1, maxLength: 2_000 }),
+				reason: Type.String({ minLength: 1, maxLength: 2_000 }),
+				blockingActions: Type.Array(
+					Type.Union([
+						Type.Literal("publish"),
+						Type.Literal("publish-and-schedule"),
+						Type.Literal("run-proof"),
+						Type.Literal("accept-proof"),
+						Type.Literal("reject-proof"),
+						Type.Literal("promote"),
+						Type.Literal("schedule"),
+					]),
+					{ minItems: 1, maxItems: 6 },
+				),
+			}),
+			{ maxItems: 3 },
+		),
+	),
+	answeredClarificationIds: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 3 })),
 });
 const lifecycleParameters = Type.Object({
 	buildId: Type.String({ pattern: "^build-[a-z0-9-]{1,127}$" }),
 	action: Type.Union([
 		Type.Literal("publish"),
+		Type.Literal("publish-and-schedule"),
 		Type.Literal("run-proof"),
 		Type.Literal("accept-proof"),
 		Type.Literal("reject-proof"),
@@ -77,6 +131,10 @@ const lifecycleParameters = Type.Object({
 		Type.Literal("schedule"),
 	]),
 	confirmed: Type.Boolean({ description: "True only after the user explicitly approved this exact action" }),
+	confirmationText: Type.Optional(
+		Type.String({ minLength: 1, maxLength: 2_000, description: "The user's exact confirmation response" }),
+	),
+	proposalId: Type.Optional(Type.String({ pattern: "^proposal-[a-z0-9-]{1,127}$" })),
 	prompt: Type.Optional(Type.String({ minLength: 1, maxLength: 16_384 })),
 	feedback: Type.Optional(Type.String({ minLength: 1, maxLength: 4_000 })),
 	rating: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
@@ -85,14 +143,35 @@ const lifecycleParameters = Type.Object({
 	skillInstructions: Type.Optional(Type.String({ minLength: 1, maxLength: 65_536 })),
 	timezone: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
 });
+const inspectParameters = Type.Object({
+	buildId: Type.Optional(Type.String({ pattern: "^build-[a-z0-9-]{1,127}$" })),
+});
 
-type ConfigureAgentTool = ToolDefinition<typeof configureParameters, { buildId: string; stage: "draft" }>;
-type ManageAgentBuildTool = ToolDefinition<typeof lifecycleParameters, { buildId: string; stage: string }>;
+type ConfigureAgentTool = ToolDefinition<
+	typeof configureParameters,
+	{ buildId: string; buildRevision: number; stage: "draft"; openClarificationIds: string[] }
+>;
+type ManageAgentBuildTool = ToolDefinition<
+	typeof lifecycleParameters,
+	{
+		buildId: string;
+		stage: string;
+		proposalId?: string;
+		proposalDigest?: string;
+		proposalState?: "pending" | "completed";
+	}
+>;
+type InspectAgentBuildTool = ToolDefinition<
+	typeof inspectParameters,
+	{ builds: Array<{ buildId: string; revision: number; stage: string; ready: boolean }> }
+>;
 
 export interface AgentRegistryLifecycleTools {
 	promotion?: RunSkillPromotionService;
 	routines?: RoutineRegistry;
 	refreshRoutines?: () => Promise<void>;
+	conversationBuilds?: ConversationBuildCoordinator;
+	sessionId?: string;
 }
 
 /** Gives Pi chat the same durable draft lifecycle used by Agent Builder. */
@@ -100,7 +179,7 @@ export function createAgentRegistryTools(
 	registry: AgentRegistry,
 	lifecycle: AgentBuildLifecycleService,
 	services: AgentRegistryLifecycleTools = {},
-): [ConfigureAgentTool, ManageAgentBuildTool] {
+): [ConfigureAgentTool, ManageAgentBuildTool, InspectAgentBuildTool] {
 	return [
 		{
 			name: "configure_agent",
@@ -108,18 +187,20 @@ export function createAgentRegistryTools(
 			description:
 				"Create or update a durable agent draft for review in Agent Builder. This never deploys, runs, promotes, or schedules the agent.",
 			promptSnippet:
-				"Use configure_agent after progressively clarifying the agent's concrete goal, working folder, model, access, and success criteria. It only stages a durable draft. Tell the user to review and explicitly create or apply it, then run one proof. Automation remains locked until the user accepts the proof and promotes it to a skill.",
+				"Use configure_agent as soon as a useful reversible draft can be formed. Infer safe defaults and record them as assumptions. Ask at most one concise question when two plausible answers materially change outcome, scope, recipient, authority, data, schedule, cost, acceptance, or identity; record it in clarifications while still staging unaffected fields. Cosmetic choices are not questions. This never deploys. Test the unpublished candidate, review its evidence, then use manage_agent_build for an exact action proposal.",
 			parameters: configureParameters,
 			executionMode: "sequential",
-			async execute(_toolCallId, parameters) {
+			async execute(toolCallId, parameters) {
 				if (parameters.modelControls != null && parameters.thinking !== undefined)
 					throw new ModelControlsError("Choose agent modelControls or legacy thinking, not both");
 				const existing = await findExistingAgent(registry, parameters.id, parameters.name);
-				const staged = (await lifecycle.list()).find(
-					(record) =>
-						(existing !== undefined && record.agentId === existing.id) ||
-						(!record.agentId && record.name.toLowerCase() === parameters.name.toLowerCase()),
-				);
+				const staged = parameters.buildId
+					? await lifecycle.get(parameters.buildId)
+					: (await lifecycle.list()).find(
+							(record) =>
+								(existing !== undefined && record.agentId === existing.id) ||
+								(!record.agentId && record.name.toLowerCase() === parameters.name.toLowerCase()),
+						);
 				const base = staged?.configuration ?? (existing ? configurationFromAgent(existing) : undefined);
 				const model = parameters.model === undefined ? base?.model : parseModel(parameters.model);
 				const modelControls =
@@ -141,6 +222,7 @@ export function createAgentRegistryTools(
 				const description =
 					parameters.description ?? base?.description ?? `Complete the goal for ${parameters.name}`;
 				const configuration: AgentBuildConfiguration = {
+					personaId: base?.personaId,
 					name: parameters.name,
 					description,
 					persona:
@@ -150,6 +232,7 @@ export function createAgentRegistryTools(
 						`You are ${parameters.name}. Accomplish the stated goal using only the approved tools.`,
 					projectRoot,
 					tools,
+					capabilities: base?.capabilities,
 					model,
 					thinking: modelControls === undefined ? (parameters.thinking ?? base?.thinking) : undefined,
 					modelControls,
@@ -157,11 +240,14 @@ export function createAgentRegistryTools(
 					executor: parameters.executor ?? base?.executor ?? "harness",
 					permissionPolicy,
 					browserAccess: access,
+					browserRuntime: base?.browserRuntime,
+					browserProfile: base?.browserProfile,
+					browserWorkflows: base?.browserWorkflows,
 					delegateAgentIds: parameters.delegateAgentIds ?? base?.delegateAgentIds ?? [],
 					exposeA2a: parameters.exposeA2a ?? base?.exposeA2a ?? false,
 				};
 				const automationIntent = automation(parameters);
-				const build = await lifecycle.stageDraft({
+				const draft = {
 					name: parameters.name,
 					objective: description,
 					projectRoot,
@@ -169,18 +255,43 @@ export function createAgentRegistryTools(
 					automationIntent,
 					criteria: parameters.criteria,
 					agentId: existing?.id,
-				});
+				};
+				const conversation = services.conversationBuilds;
+				const view = conversation
+					? await conversation.applyIntent({
+							sessionId: requiredConversationSessionId(services),
+							mode: parameters.mode ?? (existing ? "edit" : "create"),
+							sourceMessageId: toolCallId,
+							buildId: parameters.buildId ?? staged?.id,
+							expectedBuildRevision: parameters.buildId ? parameters.expectedBuildRevision : staged?.revision,
+							draft,
+							assumptions: parameters.assumptions,
+							clarifications: parameters.clarifications,
+							answeredClarificationIds: parameters.answeredClarificationIds,
+						})
+					: undefined;
+				const build = view?.build ?? (await lifecycle.stageDraft(draft));
 				const scheduleNote = automationIntent
 					? " The requested schedule was retained as an intent only; it cannot be activated before proof acceptance and skill promotion."
 					: "";
+				const openClarifications = view?.link?.clarifications.filter((item) => item.status === "open") ?? [];
+				const clarificationNote =
+					openClarifications.length > 0
+						? ` Material question: ${openClarifications.map((item) => item.question).join(" ")}`
+						: "";
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Staged draft ${build.name} (${build.id}). Review its advanced configuration and explicitly ${existing ? "apply the update" : "create the agent"}.${scheduleNote}`,
+							text: `Staged draft ${build.name} (${build.id}, revision ${build.revision}). Safe defaults are recorded as assumptions. Test it before publication.${clarificationNote}${scheduleNote}`,
 						},
 					],
-					details: { buildId: build.id, stage: "draft" },
+					details: {
+						buildId: build.id,
+						buildRevision: build.revision,
+						stage: "draft",
+						openClarificationIds: openClarifications.map((item) => item.id),
+					},
 				};
 			},
 		},
@@ -190,68 +301,113 @@ export function createAgentRegistryTools(
 			description:
 				"Perform an explicitly confirmed publish, proof, or proof-review action on a durable Agent Builder package.",
 			promptSnippet:
-				"Use manage_agent_build only when the user explicitly asks to publish, run the proof, accept it, reject it, promote it, or enable its retained schedule. Confirm the exact interpreted action in plain language first and set confirmed=true only after their yes or direct command. Rejection requires a 1-5 rating and concrete feedback. Never accept a proof with failed mandatory evidence checks. Promotion and scheduling remain separate confirmations.",
+				"Use manage_agent_build when the user requests a test, proof decision, publication, promotion, or schedule. The first call must omit proposalId and use confirmed=false; it returns an exact proposal to show the user. Only after the user answers yes to that single proposal call again with its proposalId, confirmed=true, and confirmationText copied from the user's answer. Never treat the request that created a proposal as its confirmation. A bare yes is ambiguous when multiple proposals are pending. Rejection requires a 1-5 rating and concrete feedback.",
 			parameters: lifecycleParameters,
 			executionMode: "sequential",
 			async execute(_toolCallId, parameters) {
-				if (!parameters.confirmed) throw new Error("Ask the user to confirm this agent lifecycle action first");
+				const conversation = services.conversationBuilds;
+				const sessionId = conversation ? requiredConversationSessionId(services) : undefined;
+				const payload = exactActionPayload(parameters);
+				if (conversation && !parameters.proposalId) {
+					const current = await lifecycle.get(parameters.buildId);
+					const proposal = await conversation.prepareAction({
+						buildId: parameters.buildId,
+						sessionId: sessionId!,
+						action: parameters.action,
+						payload,
+						preview: actionPreview(current, parameters.action, payload),
+					});
+					return {
+						content: [
+							{
+								type: "text",
+								text: `${proposal.binding.preview}\n\nReply yes to approve this exact action, or no to leave it pending.`,
+							},
+						],
+						details: {
+							buildId: current.id,
+							stage: current.stage,
+							proposalId: proposal.id,
+							proposalDigest: proposal.binding.digest,
+							proposalState: "pending",
+						},
+					};
+				}
+				if (!parameters.confirmed)
+					throw new Error("Ask the user to confirm this exact agent lifecycle proposal first");
+				if (conversation) {
+					if (!parameters.confirmationText) throw new Error("The user's exact confirmation response is required");
+					const pendingCount = (await conversation.list(sessionId!)).reduce(
+						(count, view) => count + view.proposals.filter((proposal) => proposal.state === "pending").length,
+						0,
+					);
+					if (
+						pendingCount > 1 &&
+						/^(?:yes|y|confirm|approve|proceed)[.!]?$/i.test(parameters.confirmationText.trim())
+					) {
+						throw new Error(
+							"Several action proposals are pending; name the agent or action you intend to approve",
+						);
+					}
+					await conversation.authorizeAction({
+						proposalId: parameters.proposalId!,
+						buildId: parameters.buildId,
+						sessionId: sessionId!,
+						action: parameters.action,
+						payload,
+					});
+				}
 				let build: AgentBuildRecord;
-				if (parameters.action === "publish") build = await lifecycle.publishDraft(parameters.buildId);
-				else if (parameters.action === "run-proof") {
-					if (!parameters.prompt) throw new Error("A concrete proof task is required");
-					build = await lifecycle.startProof(parameters.buildId, parameters.prompt);
-				} else if (parameters.action === "accept-proof") {
-					build = await lifecycle.reviewProof(parameters.buildId, true);
-				} else if (parameters.action === "reject-proof") {
-					if (!parameters.feedback || parameters.rating === undefined) {
-						throw new Error("Rejecting a proof requires a 1-5 rating and improvement feedback");
+				let partialResult: Record<string, unknown> | undefined;
+				try {
+					if (parameters.action === "publish") build = await lifecycle.publishDraft(parameters.buildId);
+					else if (parameters.action === "publish-and-schedule") {
+						if (!services.promotion) throw new Error("Skill promotion is unavailable");
+						if (!services.routines) throw new Error("Agent scheduling is unavailable");
+						build = await lifecycle.publishDraft(parameters.buildId);
+						partialResult = {
+							publish: { status: "completed", agentId: build.agentId, revision: build.agentRevision },
+							promotion: { status: "pending" },
+							schedule: { status: "pending" },
+						};
+						build = await promoteAgentBuild(lifecycle, services.promotion, parameters);
+						partialResult.promotion = { status: "completed", skill: build.skill?.name };
+						build = await scheduleAgentBuild(lifecycle, services.routines, services.refreshRoutines, parameters);
+						partialResult.schedule = { status: "completed", routineIds: build.routineIds };
+					} else if (parameters.action === "run-proof") {
+						if (!parameters.prompt) throw new Error("A concrete proof task is required");
+						build = await lifecycle.startProof(parameters.buildId, parameters.prompt);
+					} else if (parameters.action === "accept-proof") {
+						build = await lifecycle.reviewProof(parameters.buildId, true);
+					} else if (parameters.action === "reject-proof") {
+						if (!parameters.feedback || parameters.rating === undefined) {
+							throw new Error("Rejecting a proof requires a 1-5 rating and improvement feedback");
+						}
+						build = await lifecycle.recordFeedback(parameters.buildId, {
+							rating: parameters.rating,
+							summary: parameters.feedback,
+						});
+					} else if (parameters.action === "promote")
+						build = await promoteAgentBuild(lifecycle, services.promotion, parameters);
+					else
+						build = await scheduleAgentBuild(lifecycle, services.routines, services.refreshRoutines, parameters);
+					if (conversation && parameters.proposalId) {
+						await conversation.completeAction(parameters.proposalId, {
+							buildId: build.id,
+							buildRevision: build.revision,
+							stage: build.stage,
+							actions: partialResult,
+						});
 					}
-					build = await lifecycle.recordFeedback(parameters.buildId, {
-						rating: parameters.rating,
-						summary: parameters.feedback,
-					});
-				} else if (parameters.action === "promote") {
-					if (!services.promotion) throw new Error("Skill promotion is unavailable");
-					const current = await lifecycle.get(parameters.buildId);
-					if (!current.proof) throw new Error("This agent build has no reviewed proof to promote");
-					await services.promotion.promote({
-						runId: current.proof.runId,
-						name: parameters.skillName ?? skillName(current.name),
-						description:
-							parameters.skillDescription ??
-							`Repeat the reviewed ${current.name} workflow for similar requests.`,
-						instructions:
-							parameters.skillInstructions ??
-							[
-								`Perform the reviewed ${current.name} workflow for this task:`,
-								"",
-								current.proof.prompt,
-								"",
-								"Respect the active workspace and capability grants. Verify every retained criterion before reporting completion.",
-							].join("\n"),
-					});
-					build = await lifecycle.get(parameters.buildId);
-				} else {
-					if (!services.routines) throw new Error("Agent scheduling is unavailable");
-					const current = await lifecycle.get(parameters.buildId);
-					if (!current.agentId || !current.automationIntent) {
-						throw new Error("Stage and confirm a schedule intent before enabling automation");
+				} catch (error) {
+					if (conversation && parameters.proposalId) {
+						await conversation.failAction(
+							parameters.proposalId,
+							error instanceof Error ? error.message : String(error),
+							partialResult,
+						);
 					}
-					await lifecycle.assertAutomationAllowed(current.agentId);
-					const routine = await services.routines.save({
-						id: current.automationIntent.mode === "replace" ? current.routineIds[0] : undefined,
-						name: `${current.name} routine`,
-						prompt: current.automationIntent.task,
-						enabled: true,
-						cron: cronFromCadence(current.automationIntent.cadence),
-						timezone: parameters.timezone ?? current.automationIntent.timezone,
-						maxDurationMinutes: 30,
-						target: { kind: "agent", agentId: current.agentId },
-						model: current.configuration?.model,
-						cwd: current.projectRoot,
-					});
-					await services.refreshRoutines?.();
-					build = await lifecycle.markAutomated(current.agentId, routine.id);
+					throw error;
 				}
 				return {
 					content: [
@@ -260,11 +416,211 @@ export function createAgentRegistryTools(
 							text: `Agent build ${build.name} is now ${build.stage}.`,
 						},
 					],
-					details: { buildId: build.id, stage: build.stage },
+					details: {
+						buildId: build.id,
+						stage: build.stage,
+						proposalId: parameters.proposalId,
+						proposalState: parameters.proposalId ? "completed" : undefined,
+					},
+				};
+			},
+		},
+		{
+			name: "inspect_agent_build",
+			label: "inspect_agent_build",
+			description:
+				"Inspect current agent draft, proof, evidence, questions, readiness, and pending approval without changing anything.",
+			promptSnippet:
+				"Use inspect_agent_build when the user asks how an agent build or test is progressing, what remains, or whether it is ready. This is read-only and never requires confirmation.",
+			parameters: inspectParameters,
+			executionMode: "sequential",
+			async execute(_toolCallId, parameters) {
+				const conversation = services.conversationBuilds;
+				const views: ConversationBuildView[] = conversation
+					? parameters.buildId
+						? [await conversation.inspect(parameters.buildId)]
+						: await conversation.list(requiredConversationSessionId(services))
+					: (parameters.buildId ? [await lifecycle.get(parameters.buildId)] : await lifecycle.list()).map(
+							(build) => ({
+								build,
+								link: undefined,
+								proposals: [],
+								readiness: { ready: build.stage === "proven", blockers: [] },
+							}),
+						);
+				const summaries = views.map((view) => {
+					const checks = view.build.evaluation?.checks ?? [];
+					const openQuestions = view.link?.clarifications.filter((item) => item.status === "open") ?? [];
+					const proposal = view.proposals.find((item) => item.state === "pending");
+					return [
+						`${view.build.name} (${view.build.id}, revision ${view.build.revision})`,
+						`Stage: ${view.build.stage}`,
+						view.build.proof
+							? `Proof: ${view.build.proof.status} (${view.build.proof.runId})`
+							: "Proof: not started",
+						checks.length > 0
+							? `Evidence: ${checks.filter((check) => check.status === "pass").length} passed, ${checks.filter((check) => check.status === "fail").length} failed, ${checks.filter((check) => check.status === "unverified").length} unverified`
+							: "Evidence: not evaluated",
+						`Readiness: ${view.readiness.ready ? "ready" : view.readiness.blockers.join("; ") || "not ready"}`,
+						...(openQuestions.length > 0
+							? [`Open decisions: ${openQuestions.map((item) => item.question).join(" ")}`]
+							: []),
+						...(proposal ? [`Pending approval: ${proposal.binding.preview}`] : []),
+					].join("\n");
+				});
+				return {
+					content: [
+						{ type: "text", text: summaries.join("\n\n") || "No agent builds are linked to this session." },
+					],
+					details: {
+						builds: views.map((view) => ({
+							buildId: view.build.id,
+							revision: view.build.revision,
+							stage: view.build.stage,
+							ready: view.readiness.ready,
+						})),
+					},
 				};
 			},
 		},
 	];
+}
+
+interface ExactAgentBuildActionParameters {
+	buildId: string;
+	action: AgentBuildActionKind;
+	prompt?: string;
+	feedback?: string;
+	rating?: number;
+	skillName?: string;
+	skillDescription?: string;
+	skillInstructions?: string;
+	timezone?: string;
+}
+
+function exactActionPayload(parameters: ExactAgentBuildActionParameters): Record<string, unknown> {
+	const payload: Record<string, unknown> = {
+		buildId: parameters.buildId,
+		action: parameters.action,
+	};
+	for (const key of [
+		"prompt",
+		"feedback",
+		"rating",
+		"skillName",
+		"skillDescription",
+		"skillInstructions",
+		"timezone",
+	] as const) {
+		if (parameters[key] !== undefined) payload[key] = parameters[key];
+	}
+	return payload;
+}
+
+function actionPreview(
+	build: AgentBuildRecord,
+	action: AgentBuildActionKind,
+	payload: Record<string, unknown>,
+): string {
+	const heading =
+		action === "run-proof"
+			? "Test candidate"
+			: action === "accept-proof"
+				? "Accept proof"
+				: action === "reject-proof"
+					? "Reject proof"
+					: action === "promote"
+						? "Promote reviewed workflow"
+						: action === "schedule"
+							? "Enable routine"
+							: action === "publish-and-schedule"
+								? "Publish, promote, and enable routine"
+								: "Publish agent";
+	const details = [`${heading}: ${build.name}`, `Build revision: ${build.revision}`, `Outcome: ${build.objective}`];
+	if (build.proof) details.push(`Proof: ${build.proof.runId} (${build.proof.status})`);
+	if (build.evaluation) {
+		details.push(
+			`Evidence: ${build.evaluation.checks.filter((check) => check.status === "pass").length}/${build.evaluation.checks.length} checks passed`,
+		);
+	}
+	if (typeof payload.prompt === "string") details.push(`Test task: ${payload.prompt}`);
+	if (typeof payload.timezone === "string") details.push(`Timezone: ${payload.timezone}`);
+	if (build.automationIntent && (action === "schedule" || action === "publish-and-schedule")) {
+		details.push(
+			`Schedule: ${build.automationIntent.cadence} ${payload.timezone ?? build.automationIntent.timezone}`,
+			`Routine task: ${build.automationIntent.task}`,
+		);
+	}
+	if (build.configuration) {
+		details.push(
+			`Model: ${build.configuration.model ? `${build.configuration.model.provider}/${build.configuration.model.id}` : "session default"}`,
+			`Model controls: ${build.configuration.modelControls ? JSON.stringify(build.configuration.modelControls) : `legacy thinking ${build.configuration.thinking ?? "inherited"}`}`,
+			`Tools: ${build.configuration.tools.join(", ") || "none"}`,
+			`Capability grants: ${build.configuration.capabilities?.map((grant) => `${grant.capabilityId}@${grant.capabilityVersion} (${grant.approval ?? "default"}${grant.providerId ? `, ${grant.providerId}` : ""}${grant.connectionId ? `, account ${grant.connectionId}` : ""})`).join("; ") || "none"}`,
+			`Permissions: ${build.configuration.permissionPolicy}`,
+			`Browser access: ${build.configuration.browserAccess}`,
+		);
+	}
+	return details.join("\n");
+}
+
+function requiredConversationSessionId(services: AgentRegistryLifecycleTools): string {
+	const sessionId = services.sessionId?.trim();
+	if (!sessionId) throw new Error("Conversation build tools require an active Pi session identity");
+	return sessionId;
+}
+
+async function promoteAgentBuild(
+	lifecycle: AgentBuildLifecycleService,
+	promotion: RunSkillPromotionService | undefined,
+	parameters: ExactAgentBuildActionParameters,
+): Promise<AgentBuildRecord> {
+	if (!promotion) throw new Error("Skill promotion is unavailable");
+	const current = await lifecycle.get(parameters.buildId);
+	if (!current.proof) throw new Error("This agent build has no reviewed proof to promote");
+	await promotion.promote({
+		runId: current.proof.runId,
+		name: parameters.skillName ?? skillName(current.name),
+		description: parameters.skillDescription ?? `Repeat the reviewed ${current.name} workflow for similar requests.`,
+		instructions:
+			parameters.skillInstructions ??
+			[
+				`Perform the reviewed ${current.name} workflow for this task:`,
+				"",
+				current.proof.prompt,
+				"",
+				"Respect the active workspace and capability grants. Verify every retained criterion before reporting completion.",
+			].join("\n"),
+	});
+	return lifecycle.get(parameters.buildId);
+}
+
+async function scheduleAgentBuild(
+	lifecycle: AgentBuildLifecycleService,
+	routines: RoutineRegistry | undefined,
+	refreshRoutines: (() => Promise<void>) | undefined,
+	parameters: ExactAgentBuildActionParameters,
+): Promise<AgentBuildRecord> {
+	if (!routines) throw new Error("Agent scheduling is unavailable");
+	const current = await lifecycle.get(parameters.buildId);
+	if (!current.agentId || !current.automationIntent) {
+		throw new Error("Stage and confirm a schedule intent before enabling automation");
+	}
+	await lifecycle.assertAutomationAllowed(current.agentId);
+	const routine = await routines.save({
+		id: current.automationIntent.mode === "replace" ? current.routineIds[0] : undefined,
+		name: `${current.name} routine`,
+		prompt: current.automationIntent.task,
+		enabled: true,
+		cron: cronFromCadence(current.automationIntent.cadence),
+		timezone: parameters.timezone ?? current.automationIntent.timezone,
+		maxDurationMinutes: 30,
+		target: { kind: "agent", agentId: current.agentId },
+		model: current.configuration?.model,
+		cwd: current.projectRoot,
+	});
+	await refreshRoutines?.();
+	return lifecycle.markAutomated(current.agentId, routine.id);
 }
 
 function skillName(value: string): string {
@@ -313,11 +669,13 @@ async function findExistingAgent(
 
 function configurationFromAgent(definition: AgentDefinition): AgentBuildConfiguration {
 	return {
+		personaId: definition.personaId,
 		name: definition.name,
 		description: definition.description,
 		persona: definition.persona,
 		projectRoot: definition.projectRoot,
 		tools: [...definition.tools],
+		capabilities: structuredClone(definition.capabilities),
 		model: definition.model ? { ...definition.model } : undefined,
 		thinking: definition.thinking,
 		modelControls: definition.modelControls === undefined ? undefined : { ...definition.modelControls },
@@ -325,6 +683,9 @@ function configurationFromAgent(definition: AgentDefinition): AgentBuildConfigur
 		executor: definition.executor,
 		permissionPolicy: definition.permissionPolicy,
 		browserAccess: definition.browser?.access ?? "disabled",
+		browserRuntime: definition.browser?.runtime,
+		browserProfile: structuredClone(definition.browser?.profile ?? { kind: "ephemeral" }),
+		browserWorkflows: structuredClone(definition.browserWorkflows),
 		delegateAgentIds: [...definition.delegateAgentIds],
 		exposeA2a: definition.a2a.enabled,
 	};
