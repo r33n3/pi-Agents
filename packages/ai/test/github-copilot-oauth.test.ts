@@ -3,6 +3,28 @@ import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
 import { githubCopilotOAuth } from "../src/auth/oauth/github-copilot.ts";
 import { createModels } from "../src/models.ts";
 import { githubCopilotProvider } from "../src/providers/github-copilot.ts";
+import type { Model } from "../src/types.ts";
+
+// Account policy behavior must not depend on models being retired from the live catalog.
+vi.mock("../src/providers/github-copilot.models.ts", () => ({
+	GITHUB_COPILOT_MODELS: Object.fromEntries(
+		["gpt-4.1", "claude-sonnet-4.5", "claude-opus-4.7", "gpt-5.4-nano", "gpt-4o", "gpt-5.4"].map((id) => [
+			id,
+			{
+				id,
+				name: id,
+				provider: "github-copilot",
+				api: "openai-completions",
+				baseUrl: "https://api.individual.githubcopilot.com",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 4096,
+			} satisfies Model<"openai-completions">,
+		]),
+	),
+}));
 
 const neverAbortedSignal = new AbortController().signal;
 

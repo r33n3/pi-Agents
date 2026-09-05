@@ -459,9 +459,9 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("Find agents");
 		expect(bundleText).toContain("/agent-deliveries?");
 		expect(bundleText).toContain("/agent-roster.json?hidden=true");
-		expect(bundleText).toContain("Start a bounded collaboration room");
+		expect(bundleText).toContain("Start team");
 		expect(bundleText).toContain("/agent-rooms.json?");
-		expect(bundleText).toContain("Continue room");
+		expect(bundleText).toContain("Continue team");
 		expect(bundleText).not.toContain("builder-session-tab");
 		expect(bundleText).toContain("Save candidate revision");
 		expect(bundleText).toContain("Save draft");
