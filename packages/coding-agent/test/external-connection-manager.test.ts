@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -8,6 +8,7 @@ import type {
 	AgentExecutionListener,
 	AgentExecutionResult,
 } from "../src/core/serve/agent-executor.ts";
+import { ExecutionAdmission } from "../src/core/serve/execution-admission.ts";
 import {
 	type ExternalConnectionExecutionRequest,
 	ExternalConnectionManager,
@@ -57,7 +58,7 @@ class DeferredExecution implements AgentExecution {
 	}
 }
 
-async function setup(): Promise<{
+async function setup(admission?: ExecutionAdmission): Promise<{
 	root: string;
 	manager: ExternalConnectionManager;
 	executions: DeferredExecution[];
@@ -91,12 +92,35 @@ async function setup(): Promise<{
 		},
 		join(root, "artifacts"),
 		root,
+		admission,
 	);
 	await manager.initialize();
 	return { root, manager, executions, requests };
 }
 
 describe("ExternalConnectionManager", () => {
+	test("shares workspace admission and releases it after failed persistence and shutdown", async () => {
+		const admission = new ExecutionAdmission(1);
+		const { root, manager, executions } = await setup(admission);
+		const release = admission.acquire("agent-run", join(root, "nested"), true);
+		await expect(manager.start({ connectionId: "openai", prompt: "Blocked", cwd: root })).rejects.toThrow();
+		expect(executions).toHaveLength(0);
+		release();
+		const artifacts = join(root, "artifacts");
+		// Initialization creates only this empty directory; a file at its path forces admission persistence to fail.
+		await rmdir(artifacts);
+		await writeFile(artifacts, "blocked");
+		await expect(manager.start({ connectionId: "openai", prompt: "Write failure", cwd: root })).rejects.toThrow();
+		expect(admission.availability(root, true)).toBe("available");
+		expect(executions).toHaveLength(0);
+		await rm(artifacts);
+		await mkdir(artifacts);
+		const run = await manager.start({ connectionId: "openai", prompt: "Cancelable", cwd: root });
+		await manager.dispose();
+		expect(manager.getRun(run.id)?.status).toBe("aborted");
+		expect(executions[0]!.aborted).toBe(true);
+		expect(admission.availability(root, true)).toBe("available");
+	});
 	test("starts a model-bound delegation and persists its returned data", async () => {
 		const { root, manager, executions, requests } = await setup();
 		const run = await manager.start({ connectionId: "openai", prompt: "Investigate", cwd: root });

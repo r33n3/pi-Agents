@@ -331,6 +331,13 @@ describe("isolated agent lifecycle release gate", () => {
 			undefined,
 			extensionContext,
 		);
+		await manage.execute(
+			"activate-refined-proof",
+			{ buildId, action: "activate", confirmed: true },
+			undefined,
+			undefined,
+			extensionContext,
+		);
 		expect(await registry.get("release-lifecycle-agent")).toMatchObject({
 			revision: 2,
 			description: "Complete, cite, and review one synthetic release task",
@@ -362,7 +369,7 @@ describe("isolated agent lifecycle release gate", () => {
 
 		expect(await restoredRegistry.get("release-lifecycle-agent")).toMatchObject({ revision: 2 });
 		expect(await restoredLifecycle.get(buildId)).toMatchObject({
-			stage: "automated",
+			stage: "proven",
 			agentRevision: 2,
 			feedback: [expect.objectContaining({ rating: 2 })],
 			routineIds: [routine!.id],

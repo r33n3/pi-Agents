@@ -11,6 +11,7 @@ import type {
 	AgentPermissionPolicy,
 	AgentRegistry,
 } from "./agent-registry.ts";
+import { normalizeCapabilityGrants, normalizeDefinition } from "./agent-registry.ts";
 import type { AgentRunManager } from "./agent-run-manager.ts";
 import type { BrowserAccess } from "./browser-policy.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
@@ -32,6 +33,7 @@ export interface AgentBuildProof {
 	status: "running" | "succeeded" | "failed" | "aborted";
 	finishedAt?: number;
 	artifactBaselines?: Record<string, AgentBuildArtifactSnapshot | null>;
+	review?: { accepted: boolean; reviewedAt: number };
 }
 
 export type AgentBuildCriterionExpectation = "required-improvement" | "non-regression" | "advisory";
@@ -108,6 +110,8 @@ export interface AgentBuildRecord {
 	projectRoot: string;
 	configuration?: AgentBuildConfiguration;
 	activeConfiguration?: AgentBuildConfiguration;
+	/** Acceptance of the deployed revision survives unrelated candidate edits. */
+	activeProof?: { runId: string; agentRevision: number };
 	candidateRevision?: number;
 	automationIntent?: AgentBuildAutomationIntent;
 	criteria: AgentBuildCriterion[];
@@ -179,6 +183,7 @@ export class AgentBuildLifecycleService {
 	readonly #path: string;
 	readonly #queue = new SerialOperationQueue();
 	readonly #records = new Map<string, AgentBuildRecord>();
+	#persistedRecords: AgentBuildRecord[] = [];
 	#initialized = false;
 
 	constructor(root: string, registry: AgentRegistry, runs: AgentRunManager) {
@@ -200,6 +205,7 @@ export class AgentBuildLifecycleService {
 		} catch (error) {
 			if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
 		}
+		this.#persistedRecords = structuredClone([...this.#records.values()]);
 		this.#initialized = true;
 	}
 
@@ -276,19 +282,21 @@ export class AgentBuildLifecycleService {
 			if (record.agentId && draft.name !== record.name) {
 				throw new Error("A deployed agent name cannot be changed through its build draft");
 			}
+			const active = record.agentId ? await this.#requiredAgent(record.agentId) : undefined;
+			const evidenceChanged =
+				draftChangesEvidence(record, draft) || (active !== undefined && active.revision !== record.agentRevision);
 			record.name = draft.name;
 			record.objective = draft.objective;
 			record.projectRoot = draft.projectRoot;
 			record.configuration = draft.configuration ?? record.configuration;
 			record.automationIntent = draft.automationIntent ?? record.automationIntent;
 			record.criteria = draft.criteria ?? record.criteria;
-			if (record.agentId) {
-				const active = await this.#requiredAgent(record.agentId);
+			if (active && evidenceChanged) {
 				record.agentRevision = active.revision;
 				record.activeConfiguration = configurationFromAgent(active);
 				record.candidateRevision = active.revision + 1;
 			}
-			this.#invalidateEvidence(record);
+			if (evidenceChanged) this.#invalidateEvidence(record);
 			this.#touch(record);
 			await this.#persist();
 			return cloneRecord(record);
@@ -413,13 +421,60 @@ export class AgentBuildLifecycleService {
 			if (record.proof.agentRevision !== 1) {
 				throw new Error("The accepted unpublished proof no longer matches the first deployed revision");
 			}
-			const definition = await this.#registry.save(newAgentInput(record.configuration));
+			const snapshot = await this.#runs.getConfiguration(record.proof.runId);
+			const definition = await this.#registry.save(
+				newAgentInput({ ...record.configuration, model: snapshot?.effectiveModel ?? record.configuration.model }),
+				0,
+			);
 			record.agentId = definition.id;
 			record.agentRevision = definition.revision;
 			record.activeConfiguration = configurationFromAgent(definition);
 			record.configuration = configurationFromAgent(definition);
 			record.candidateRevision = undefined;
 			record.stage = "proven";
+			record.activeProof = { runId: record.proof.runId, agentRevision: definition.revision };
+			this.#touch(record);
+			await this.#persist();
+			return cloneRecord(record);
+		});
+	}
+
+	/** Activates an accepted candidate; exporting its instructions is optional. */
+	async activate(id: string): Promise<AgentBuildRecord> {
+		return this.#queue.run(async () => {
+			await this.initialize();
+			const record = this.#required(id);
+			await this.#refresh(record);
+			if (
+				record.activeProof &&
+				!record.candidateRevision &&
+				record.activeProof?.runId === record.proof?.runId &&
+				record.activeProof?.agentRevision === record.agentRevision
+			)
+				return cloneRecord(record);
+			if (record.stage !== "proven" || record.proof?.status !== "succeeded" || !record.configuration) {
+				throw new Error("Test and accept the current candidate before activating it");
+			}
+			const active = record.agentId ? await this.#requiredAgent(record.agentId) : undefined;
+			const expectedRevision = record.candidateRevision ?? active?.revision ?? 1;
+			if (record.proof.agentRevision !== expectedRevision || (active && active.revision !== record.agentRevision)) {
+				throw new Error("The active agent changed after proof; restage and test the candidate");
+			}
+			const seed = await this.#runs.getConfiguration(record.proof.runId);
+			const configuration = { ...record.configuration, model: seed?.effectiveModel ?? record.configuration.model };
+			const definition =
+				active && !record.candidateRevision && JSON.stringify(active.model) === JSON.stringify(configuration.model)
+					? active
+					: await this.#registry.save(
+							active ? candidateInput(active, configuration) : newAgentInput(configuration),
+							active?.revision ?? 0,
+						);
+			record.agentId = definition.id;
+			record.agentRevision = definition.revision;
+			record.activeConfiguration = configurationFromAgent(definition);
+			record.configuration = configurationFromAgent(definition);
+			record.candidateRevision = undefined;
+			record.activeProof = { runId: record.proof.runId, agentRevision: definition.revision };
 			this.#touch(record);
 			await this.#persist();
 			return cloneRecord(record);
@@ -475,15 +530,7 @@ export class AgentBuildLifecycleService {
 			if (accepted && hasBlockingEvaluationResult(record)) {
 				throw new Error("Resolve every required failed or unverified evidence check before accepting this proof");
 			}
-			if (accepted && record.evaluation) {
-				for (const check of record.evaluation.checks) {
-					const criterion = record.criteria.find((candidate) => candidate.id === check.criterionId);
-					if (criterion?.evaluator.type === "human") {
-						check.status = "pass";
-						check.summary = "Accepted during human proof review";
-					}
-				}
-			}
+			record.proof.review = { accepted, reviewedAt: Date.now() };
 			record.stage = accepted ? "proven" : "needs-refinement";
 			this.#touch(record);
 			await this.#persist();
@@ -508,8 +555,8 @@ export class AgentBuildLifecycleService {
 				answers: parseFeedbackAnswers(input.answers),
 				createdAt: Date.now(),
 			};
-			record.feedback.push(feedback);
 			const criteria = parseCriteria(input.criteria);
+			record.feedback.push(feedback);
 			if (criteria) {
 				record.criteria = mergeCriteria(record.criteria, criteria);
 				record.evaluation = await evaluateProof(record, this.#runs);
@@ -552,19 +599,9 @@ export class AgentBuildLifecycleService {
 			) {
 				throw new Error("The accepted proof is no longer current; restage and rerun the proof");
 			}
-			if (record.candidateRevision && record.configuration && record.agentId) {
-				const active = await this.#requiredAgent(record.agentId);
-				if (active.revision !== record.agentRevision) {
-					throw new Error("The active agent changed after this candidate was proven; restage and rerun the proof");
-				}
-				const promoted = await this.#registry.save(candidateInput(active, record.configuration));
-				record.agentRevision = promoted.revision;
-				record.activeConfiguration = configurationFromAgent(promoted);
-				record.configuration = configurationFromAgent(promoted);
-				record.candidateRevision = undefined;
-			}
 			record.skill = { name, path, sourceRunId: runId };
-			record.stage = record.routineIds.length > 0 ? "automated" : "promoted";
+			if (record.activeProof && !record.candidateRevision)
+				record.stage = record.routineIds.length > 0 ? "automated" : "promoted";
 			this.#touch(record);
 			await this.#persist();
 			return cloneRecord(record);
@@ -575,10 +612,11 @@ export class AgentBuildLifecycleService {
 		await this.initialize();
 		return this.#queue.run(async () => {
 			const record = [...this.#records.values()].find((candidate) => candidate.agentId === agentId);
-			if (!record) throw new Error("Prove and promote this agent before adding automation");
+			if (!record) throw new Error("Test, accept, and activate this agent before adding automation");
 			await this.#refresh(record);
-			if (!record.skill || !["promoted", "automated"].includes(record.stage)) {
-				throw new Error("Prove this agent, accept the result, and promote it to a skill before adding automation");
+			const active = await this.#requiredAgent(agentId);
+			if (!record.activeProof || record.activeProof.agentRevision !== active.revision) {
+				throw new Error("Test, accept, and activate the current agent revision before adding automation");
 			}
 			return cloneRecord(record);
 		});
@@ -588,9 +626,12 @@ export class AgentBuildLifecycleService {
 		return this.#queue.run(async () => {
 			await this.initialize();
 			const record = [...this.#records.values()].find((candidate) => candidate.agentId === agentId);
-			if (!record?.skill) throw new Error("The agent build has not been promoted to a skill");
+			const active = await this.#requiredAgent(agentId);
+			if (!record?.activeProof || record.activeProof.agentRevision !== active.revision) {
+				throw new Error("The current agent revision has not been activated with accepted proof");
+			}
 			if (!record.routineIds.includes(routineId)) record.routineIds.push(routineId);
-			record.stage = "automated";
+			if (!record.candidateRevision) record.stage = "automated";
 			this.#touch(record);
 			await this.#persist();
 			return cloneRecord(record);
@@ -610,6 +651,8 @@ export class AgentBuildLifecycleService {
 	}
 
 	async #alignAgent(record: AgentBuildRecord, definition: AgentDefinition): Promise<boolean> {
+		if (record.agentId === definition.id && record.agentRevision === definition.revision && record.candidateRevision)
+			return this.#refresh(record);
 		const changed =
 			record.agentId !== definition.id ||
 			record.agentRevision !== definition.revision ||
@@ -627,6 +670,7 @@ export class AgentBuildLifecycleService {
 		record.activeConfiguration = configurationFromAgent(definition);
 		record.candidateRevision = undefined;
 		if (revisionChanged) {
+			record.activeProof = undefined;
 			this.#archiveProof(record);
 			record.proof = undefined;
 			record.evaluation = undefined;
@@ -655,6 +699,12 @@ export class AgentBuildLifecycleService {
 			createdAt: Date.now(),
 			updatedAt: Date.now(),
 		};
+		if (!draftChangesEvidence(record, draft) && record.agentRevision === definition.revision) {
+			record.automationIntent = draft.automationIntent ?? record.automationIntent;
+			this.#touch(record);
+			await this.#persist();
+			return cloneRecord(record);
+		}
 		record.name = draft.name;
 		record.objective = draft.objective;
 		record.projectRoot = draft.projectRoot;
@@ -729,11 +779,18 @@ export class AgentBuildLifecycleService {
 
 	async #persist(): Promise<void> {
 		const temporary = `${this.#path}.${randomUUID()}.tmp`;
-		await writeFile(temporary, `${JSON.stringify([...this.#records.values()], null, 2)}\n`, {
-			encoding: "utf8",
-			flag: "wx",
-		});
-		await rename(temporary, this.#path);
+		try {
+			await writeFile(temporary, `${JSON.stringify([...this.#records.values()], null, 2)}\n`, {
+				encoding: "utf8",
+				flag: "wx",
+			});
+			await rename(temporary, this.#path);
+			this.#persistedRecords = structuredClone([...this.#records.values()]);
+		} catch (error) {
+			this.#records.clear();
+			for (const record of structuredClone(this.#persistedRecords)) this.#records.set(record.id, record);
+			throw error;
+		}
 	}
 }
 
@@ -745,6 +802,17 @@ interface NormalizedAgentBuildDraft {
 	automationIntent?: AgentBuildAutomationIntent;
 	criteria?: AgentBuildCriterion[];
 	agentId?: string;
+}
+
+function draftChangesEvidence(record: AgentBuildRecord, draft: NormalizedAgentBuildDraft): boolean {
+	return (
+		record.name !== draft.name ||
+		record.objective !== draft.objective ||
+		record.projectRoot !== draft.projectRoot ||
+		(draft.configuration !== undefined &&
+			JSON.stringify(record.configuration) !== JSON.stringify(draft.configuration)) ||
+		(draft.criteria !== undefined && JSON.stringify(record.criteria) !== JSON.stringify(draft.criteria))
+	);
 }
 
 function normalizeDraft(input: AgentBuildDraftInput): NormalizedAgentBuildDraft {
@@ -782,6 +850,13 @@ function parseRecord(value: unknown): AgentBuildRecord {
 		projectRoot: requiredString(record.projectRoot, "build project root"),
 		configuration: parseConfiguration(record.configuration),
 		activeConfiguration: parseConfiguration(record.activeConfiguration),
+		activeProof:
+			record.activeProof === undefined
+				? undefined
+				: {
+						runId: requiredString(record.activeProof.runId, "active proof run id"),
+						agentRevision: positiveInteger(record.activeProof.agentRevision, "active proof agent revision"),
+					},
 		candidateRevision:
 			record.candidateRevision === undefined || !Number.isSafeInteger(record.candidateRevision)
 				? undefined
@@ -808,7 +883,7 @@ function parseRecord(value: unknown): AgentBuildRecord {
 	};
 }
 
-function configurationFromAgent(definition: AgentDefinition): AgentBuildConfiguration {
+export function configurationFromAgent(definition: AgentDefinition): AgentBuildConfiguration {
 	return {
 		personaId: definition.personaId,
 		name: definition.name,
@@ -968,7 +1043,7 @@ function parseConfiguration(value: unknown): AgentBuildConfiguration | undefined
 			id: requiredString(reference.id, "model id"),
 		};
 	}
-	return {
+	const parsed: AgentBuildConfiguration = {
 		personaId:
 			typeof configuration.personaId === "string" && configuration.personaId.trim()
 				? configuration.personaId.trim()
@@ -1016,32 +1091,12 @@ function parseConfiguration(value: unknown): AgentBuildConfiguration | undefined
 		),
 		exposeA2a: requiredBoolean(configuration.exposeA2a, "configuration exposeA2a"),
 	};
+	return configurationFromAgent(normalizeDefinition(newAgentInput(parsed), parsed.projectRoot));
 }
 
-function parseAgentCapabilityGrants(value: unknown): AgentDefinition["capabilities"] | undefined {
+export function parseAgentCapabilityGrants(value: unknown): AgentDefinition["capabilities"] | undefined {
 	if (value === undefined) return undefined;
-	if (!Array.isArray(value)) throw new Error("configuration capabilities must be an array");
-	return value.map((entry, index) => {
-		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
-			throw new Error(`configuration capabilities[${index}] must be an object`);
-		}
-		const grant = entry as Record<string, unknown>;
-		return {
-			capabilityId: requiredString(grant.capabilityId, `configuration capabilities[${index}].capabilityId`),
-			capabilityVersion: positiveInteger(
-				grant.capabilityVersion,
-				`configuration capabilities[${index}].capabilityVersion`,
-			),
-			providerId:
-				typeof grant.providerId === "string" && grant.providerId.trim() ? grant.providerId.trim() : undefined,
-			approval:
-				grant.approval === undefined
-					? undefined
-					: oneOf(grant.approval, ["never", "per-run", "always"], "configuration capability approval"),
-			connectionId:
-				typeof grant.connectionId === "string" && grant.connectionId.trim() ? grant.connectionId.trim() : undefined,
-		};
-	});
+	return normalizeCapabilityGrants(value);
 }
 
 function parseBrowserProfile(value: unknown): NonNullable<AgentDefinition["browser"]>["profile"] | undefined {
@@ -1128,6 +1183,7 @@ function parseCriterion(value: unknown, index: number): AgentBuildCriterion {
 	}
 	const criterion = value as Record<string, unknown>;
 	const id = requiredString(criterion.id, `improvement criteria[${index}].id`);
+	if (id.startsWith("host-")) throw new Error("The host- criterion prefix is reserved for mandatory checks");
 	assertIdentifier(id, `improvement criteria[${index}].id`);
 	return {
 		id,
@@ -1307,6 +1363,19 @@ async function evaluateProof(record: AgentBuildRecord, runs: AgentRunManager): P
 	const receipts = toolReceipts(transcript);
 	const result = (await runs.readResult(record.proof.runId)) ?? "";
 	const checks: AgentBuildCriterionResult[] = [];
+	const snapshot = await runs.getConfiguration(record.proof.runId);
+	checks.push({
+		criterionId: "host-configuration",
+		status: snapshot ? "pass" : "fail",
+		summary: snapshot ? "Execution configuration snapshot verified" : "Execution configuration snapshot is missing",
+		evidence: [record.proof.runId],
+	});
+	checks.push({
+		criterionId: "host-result",
+		status: result.trim() ? "pass" : "fail",
+		summary: result.trim() ? "A non-empty run result was recorded" : "The run produced no reviewable result",
+		evidence: [record.proof.runId],
+	});
 	for (const criterion of record.criteria) {
 		checks.push(await evaluateCriterion(record, criterion, receipts, result));
 	}
@@ -1435,6 +1504,7 @@ function textCriterionResult(
 function hasBlockingEvaluationResult(record: AgentBuildRecord): boolean {
 	if (!record.evaluation) return false;
 	return record.evaluation.checks.some((check) => {
+		if (check.criterionId.startsWith("host-")) return check.status !== "pass";
 		const criterion = record.criteria.find((candidate) => candidate.id === check.criterionId);
 		if (!criterion || criterion.expectation === "advisory" || criterion.evaluator.type === "human") return false;
 		return check.status !== "pass";
@@ -1560,6 +1630,13 @@ function parseProof(value: unknown): AgentBuildProof | undefined {
 		status: proof.status,
 		finishedAt: typeof proof.finishedAt === "number" ? proof.finishedAt : undefined,
 		artifactBaselines: parseArtifactBaselines(proof.artifactBaselines),
+		review:
+			proof.review === undefined
+				? undefined
+				: {
+						accepted: requiredBoolean(proof.review.accepted, "proof review accepted"),
+						reviewedAt: finiteNumber(proof.review.reviewedAt, "proof review timestamp"),
+					},
 	};
 }
 

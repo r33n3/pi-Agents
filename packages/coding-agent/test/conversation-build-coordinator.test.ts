@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -11,7 +11,10 @@ import type {
 } from "../src/core/serve/agent-executor.ts";
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
 import { AgentRunManager } from "../src/core/serve/agent-run-manager.ts";
-import { ConversationBuildCoordinator } from "../src/core/serve/conversation-build-coordinator.ts";
+import {
+	type AgentBuildUserMessage,
+	ConversationBuildCoordinator,
+} from "../src/core/serve/conversation-build-coordinator.ts";
 
 const roots: string[] = [];
 
@@ -62,6 +65,7 @@ async function setup(): Promise<{
 	runs: AgentRunManager;
 	lifecycle: AgentBuildLifecycleService;
 	coordinator: ConversationBuildCoordinator;
+	user: { message?: AgentBuildUserMessage };
 }> {
 	const root = await mkdtemp(join(tmpdir(), "pi-conversation-build-"));
 	roots.push(root);
@@ -79,9 +83,10 @@ async function setup(): Promise<{
 	await runs.initialize();
 	const lifecycle = new AgentBuildLifecycleService(join(root, "lifecycle"), registry, runs);
 	await lifecycle.initialize();
-	const coordinator = new ConversationBuildCoordinator(join(root, "serve"), lifecycle);
+	const user: { message?: AgentBuildUserMessage } = {};
+	const coordinator = new ConversationBuildCoordinator(join(root, "serve"), lifecycle, () => user.message);
 	await coordinator.initialize();
-	return { root, registry, runs, lifecycle, coordinator };
+	return { root, registry, runs, lifecycle, coordinator, user };
 }
 
 function ozarkDraft(root: string, description = "Create a daily Ozark outdoor brief") {
@@ -117,6 +122,90 @@ function ozarkDraft(root: string, description = "Create a daily Ozark outdoor br
 }
 
 describe("ConversationBuildCoordinator", () => {
+	test("requires fresh host-observed assent and prevents replay after restart", async () => {
+		const { root, lifecycle, coordinator, user } = await setup();
+		const view = await coordinator.applyIntent({ sessionId: "session", mode: "create", draft: ozarkDraft(root) });
+		const proposal = await coordinator.prepareAction({
+			buildId: view.build.id,
+			sessionId: "session",
+			action: "run-proof",
+			payload: { prompt: "test" },
+			preview: "Test candidate",
+		});
+		const request = {
+			proposalId: proposal.id,
+			buildId: view.build.id,
+			sessionId: "session",
+			action: "run-proof" as const,
+			payload: { prompt: "test" },
+		};
+		await expect(coordinator.authorizeAction(request)).rejects.toThrow("observed by the host");
+		user.message = { id: "prior", text: "yes", createdAt: proposal.createdAt - 1 };
+		await expect(coordinator.authorizeAction(request)).rejects.toThrow("observed by the host");
+		user.message = { id: "denial", text: "no", createdAt: proposal.createdAt + 1 };
+		await expect(coordinator.authorizeAction(request)).rejects.toThrow("not authorization");
+		user.message = { id: "accepted", text: "yes", createdAt: proposal.createdAt + 1 };
+		await coordinator.authorizeAction(request);
+		await coordinator.recordActionProgress(proposal.id, {
+			publish: { agentId: "published-agent", status: "completed" },
+			schedule: { status: "pending" },
+		});
+		const restored = new ConversationBuildCoordinator(join(root, "serve"), lifecycle, () => user.message);
+		await restored.initialize();
+		expect((await restored.inspect(view.build.id)).proposals[0]).toMatchObject({
+			state: "failed",
+			approvalMessageId: "accepted",
+			error: expect.stringContaining("Host restarted"),
+			result: { publish: { agentId: "published-agent", status: "completed" }, schedule: { status: "pending" } },
+		});
+		await expect(restored.authorizeAction(request)).rejects.toThrow("failed");
+	});
+
+	test("failed approval persistence and invalid replacement proposals preserve the pending decision", async () => {
+		const { root, coordinator, user } = await setup();
+		const view = await coordinator.applyIntent({ sessionId: "session", mode: "create", draft: ozarkDraft(root) });
+		const input = {
+			buildId: view.build.id,
+			sessionId: "session",
+			action: "run-proof" as const,
+			payload: { prompt: "test" },
+			preview: "Test candidate",
+		};
+		const proposal = await coordinator.prepareAction(input);
+		await expect(coordinator.prepareAction({ ...input, expiresInSeconds: 1 })).rejects.toThrow("expiry");
+		expect((await coordinator.inspect(view.build.id)).proposals[0]).toEqual(proposal);
+		user.message = { id: "approval", text: "yes", createdAt: proposal.createdAt + 1 };
+		const path = join(root, "serve", "agent-build-conversations.json");
+		await rename(path, `${path}.backup`);
+		await mkdir(path);
+		await expect(coordinator.authorizeAction({ ...input, proposalId: proposal.id })).rejects.toThrow();
+		expect((await coordinator.inspect(view.build.id)).proposals[0]).toEqual(proposal);
+		await rmdir(path);
+		await rename(`${path}.backup`, path);
+		await coordinator.authorizeAction({ ...input, proposalId: proposal.id });
+		await coordinator.completeAction(proposal.id, { runId: "retained-run" });
+		expect(await coordinator.authorizeAction({ ...input, proposalId: proposal.id })).toMatchObject({
+			state: "completed",
+			result: { runId: "retained-run" },
+		});
+	});
+
+	test("invalid clarification patches leave the draft and conversation unchanged", async () => {
+		const { root, coordinator } = await setup();
+		const view = await coordinator.applyIntent({ sessionId: "session", mode: "create", draft: ozarkDraft(root) });
+		await expect(
+			coordinator.applyIntent({
+				sessionId: "session",
+				mode: "edit",
+				buildId: view.build.id,
+				expectedBuildRevision: view.build.revision,
+				draft: ozarkDraft(root, "Must not persist"),
+				answeredClarificationIds: ["unknown-question"],
+			}),
+		).rejects.toThrow("was not found");
+		expect(await coordinator.inspect(view.build.id)).toEqual(view);
+	});
+
 	test("persists an Ozark draft, visible assumptions, and a material scope question across restart", async () => {
 		const { root, lifecycle, coordinator } = await setup();
 		const initial = await coordinator.applyIntent({
@@ -164,7 +253,7 @@ describe("ConversationBuildCoordinator", () => {
 	});
 
 	test("tests an unpublished candidate and binds confirmation to its exact revision and payload", async () => {
-		const { root, registry, runs, lifecycle, coordinator } = await setup();
+		const { root, registry, runs, lifecycle, coordinator, user } = await setup();
 		let view = await coordinator.applyIntent({
 			sessionId: "session-ozark",
 			mode: "create",
@@ -196,6 +285,7 @@ describe("ConversationBuildCoordinator", () => {
 				payload: { ...payload, action: "schedule" },
 			}),
 		).rejects.toThrow("exact payload");
+		user.message = { id: "user-approval", text: "yes", createdAt: proposal.createdAt + 1 };
 		await coordinator.authorizeAction({
 			proposalId: proposal.id,
 			buildId: view.build.id,

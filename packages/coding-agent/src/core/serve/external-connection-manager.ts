@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ModelRef } from "@earendil-works/pi-protocol";
 import type { AgentExecution, AgentExecutionPhase } from "./agent-executor.ts";
+import { ExecutionAdmission } from "./execution-admission.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
 export type ExternalConnectionRunStatus = "starting" | "running" | "succeeded" | "failed" | "aborted";
@@ -56,6 +57,7 @@ export type ExternalConnectionExecutionFactory = (
 ) => Promise<AgentExecution>;
 
 interface ActiveRun {
+	releaseAdmission: () => void;
 	record: ExternalConnectionRunRecord;
 	execution: AgentExecution;
 	abortRequested: boolean;
@@ -74,12 +76,14 @@ export class ExternalConnectionManager implements AsyncDisposable {
 	readonly #records = new Map<string, ExternalConnectionRunRecord>();
 	readonly #activeByRun = new Map<string, ActiveRun>();
 	#disposed = false;
+	readonly #admission: ExecutionAdmission;
 
 	constructor(
 		connections: readonly ExternalConnectionDefinition[],
 		executionFactory: ExternalConnectionExecutionFactory,
 		artifactsRoot: string,
 		defaultCwd: string,
+		admission = new ExecutionAdmission(),
 	) {
 		this.#connections = new Map(connections.map((connection) => [connection.id, connection]));
 		this.#connectionAliases = new Map(
@@ -90,6 +94,7 @@ export class ExternalConnectionManager implements AsyncDisposable {
 		this.#executionFactory = executionFactory;
 		this.#artifactsRoot = resolve(artifactsRoot);
 		this.#defaultCwd = resolve(defaultCwd);
+		this.#admission = admission;
 	}
 
 	async initialize(): Promise<void> {
@@ -168,23 +173,30 @@ export class ExternalConnectionManager implements AsyncDisposable {
 				createdAt: Date.now(),
 				artifactDirectory,
 			};
-			this.#records.set(runId, record);
-			await this.#persistRecord(record);
+			const releaseAdmission = this.#admission.acquire(runId, record.cwd, true);
 			try {
+				await this.#persistRecord(record);
+				this.#records.set(runId, record);
 				const execution = await this.#executionFactory({ runId, connection, prompt, cwd: record.cwd, model });
 				record.status = "running";
 				record.startedAt = Date.now();
-				const active: ActiveRun = { record, execution, abortRequested: false, unsubscribe: () => {} };
+				const active: ActiveRun = {
+					record,
+					execution,
+					releaseAdmission,
+					abortRequested: false,
+					unsubscribe: () => {},
+				};
 				active.unsubscribe = execution.subscribe((event) => {
 					record.phase = event.phase;
 					record.progress = externalProgressMessage(connection.name, event.phase);
 					record.lastActivityAt = event.timestamp;
 				});
 				this.#activeByRun.set(runId, active);
-				await this.#persistRecord(record);
 				active.completion = this.#settle(active);
 				return { ...record };
 			} catch (error) {
+				releaseAdmission();
 				record.status = "failed";
 				record.finishedAt = Date.now();
 				record.error = error instanceof Error ? error.message : String(error);
@@ -214,9 +226,14 @@ export class ExternalConnectionManager implements AsyncDisposable {
 	async dispose(): Promise<void> {
 		if (this.#disposed) return;
 		this.#disposed = true;
-		await Promise.all([...this.#activeByRun.values()].map((active) => active.execution.abort()));
-		await Promise.all([...this.#activeByRun.values()].map((active) => active.completion));
 		await this.#queue.close();
+		await Promise.all(
+			[...this.#activeByRun.values()].map(async (active) => {
+				active.abortRequested = true;
+				await active.execution.abort();
+			}),
+		);
+		await Promise.all([...this.#activeByRun.values()].map((active) => active.completion));
 	}
 
 	[Symbol.asyncDispose](): Promise<void> {
@@ -245,15 +262,25 @@ export class ExternalConnectionManager implements AsyncDisposable {
 		} finally {
 			active.unsubscribe();
 			record.finishedAt = Date.now();
-			await this.#persistRecord(record);
-			this.#activeByRun.delete(record.id);
-			await execution.dispose();
+			try {
+				await execution.dispose();
+				await this.#persistRecord(record);
+			} catch (error) {
+				record.status = "failed";
+				record.error = `Run finalization failed: ${error instanceof Error ? error.message : String(error)}`;
+			} finally {
+				this.#activeByRun.delete(record.id);
+				active.releaseAdmission();
+			}
 		}
 	}
 
 	async #persistRecord(record: ExternalConnectionRunRecord): Promise<void> {
 		await mkdir(record.artifactDirectory, { recursive: true });
-		await writeFile(resolve(record.artifactDirectory, "run.json"), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+		const path = resolve(record.artifactDirectory, "run.json");
+		const temporary = `${path}.${randomUUID()}.tmp`;
+		await writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+		await rename(temporary, path);
 	}
 }
 

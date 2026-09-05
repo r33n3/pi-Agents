@@ -1,4 +1,6 @@
+import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import type { ToolDefinition } from "../src/core/extensions/types.ts";
 import { ServeHost } from "../src/core/serve/serve-host.ts";
 import { createHarness, type Harness } from "./suite/harness.ts";
 
@@ -48,6 +50,44 @@ describe("ServeHost", () => {
 		await host.start();
 
 		await expect(host.start()).rejects.toThrow("Serve host has already been started");
+	});
+
+	test("dispatches Hermes directly with exact arguments and no host inference", async () => {
+		const calls: unknown[] = [];
+		const tool: ToolDefinition = {
+			name: "hermes_agent",
+			label: "Hermes",
+			description: "Synthetic local backend",
+			parameters: Type.Object({ goal: Type.String(), cwd: Type.String(), model: Type.String() }),
+			async execute(_id, parameters) {
+				calls.push(parameters);
+				return { content: [{ type: "text", text: "Direct backend result" }], details: {} };
+			},
+		};
+		harness.session.registerCustomTools([tool]);
+		host = new ServeHost({ agentDir: harness.tempDir, session: harness.session, port: 0 });
+		const { url } = await host.start();
+		const endpoint = new URL("/external-runs", url);
+		endpoint.search = new URL(url).search;
+		const response = await fetch(endpoint, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				connectionId: "hermes",
+				prompt: "Return this goal unchanged",
+				cwd: harness.tempDir,
+				model: { provider: "custom", id: "qwen3.6:latest" },
+			}),
+		});
+		expect(response.status).toBe(202);
+		const run = (await response.json()) as { id: string };
+		endpoint.pathname = `/external-runs/${run.id}/result`;
+		await expect.poll(async () => (await fetch(endpoint)).status).toBe(200);
+		expect(await (await fetch(endpoint)).text()).toContain("Direct backend result");
+		expect(calls).toEqual([
+			{ goal: "Return this goal unchanged", cwd: harness.tempDir, model: "custom/qwen3.6:latest" },
+		]);
+		expect(harness.session.messages).toEqual([]);
 	});
 
 	test("excludes another host from the same serve directory without disturbing the owner", async () => {

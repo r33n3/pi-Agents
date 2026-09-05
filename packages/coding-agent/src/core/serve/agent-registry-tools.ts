@@ -1,12 +1,15 @@
+import { randomUUID } from "node:crypto";
 import { ModelControlsError } from "@earendil-works/pi-ai";
 import { ModelControlsSchema } from "@earendil-works/pi-protocol";
 import Type from "typebox";
 import type { ToolDefinition } from "../extensions/types.ts";
-import type {
-	AgentBuildAutomationIntent,
-	AgentBuildConfiguration,
-	AgentBuildLifecycleService,
-	AgentBuildRecord,
+import {
+	type AgentBuildAutomationIntent,
+	type AgentBuildConfiguration,
+	type AgentBuildLifecycleService,
+	type AgentBuildRecord,
+	configurationFromAgent,
+	parseAgentCapabilityGrants,
 } from "./agent-build-lifecycle-service.ts";
 import type { AgentDefinition, AgentRegistry } from "./agent-registry.ts";
 import type {
@@ -14,6 +17,7 @@ import type {
 	ConversationBuildCoordinator,
 	ConversationBuildView,
 } from "./conversation-build-coordinator.ts";
+import { validateCron } from "./cron-schedule.ts";
 import type { RoutineRegistry } from "./routine-registry.ts";
 import type { RunSkillPromotionService } from "./run-skill-promotion-service.ts";
 
@@ -38,15 +42,29 @@ const configureParameters = Type.Object({
 	mode: Type.Optional(Type.Union([Type.Literal("create"), Type.Literal("edit"), Type.Literal("improve")])),
 	id: Type.Optional(Type.String({ pattern: "^[a-z0-9][a-z0-9-]{0,63}$" })),
 	name: Type.String({ minLength: 1, maxLength: 128 }),
-	description: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })),
+	description: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })),
 	systemPrompt: Type.Optional(Type.String({ minLength: 1, maxLength: 20_000 })),
 	persona: Type.Optional(Type.String({ minLength: 1, maxLength: 20_000 })),
-	projectRoot: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
+	projectRoot: Type.Optional(
+		Type.String({
+			minLength: 1,
+			maxLength: 4096,
+			description:
+				"Workspace directory. Omit to preserve the existing draft/agent workspace or use the current session directory for a new draft.",
+		}),
+	),
 	tools: Type.Optional(
 		Type.Union([
 			Type.String({ description: "Comma-separated Pi tool allowlist" }),
 			Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 128 }),
 		]),
+	),
+	capabilities: Type.Optional(
+		Type.Array(Type.Unknown(), {
+			maxItems: 128,
+			description:
+				"Complete capability grant list; each grant requires capabilityId and capabilityVersion. Omit to preserve, [] to clear.",
+		}),
 	),
 	model: Type.Optional(Type.String({ description: "Canonical provider/model-id from the active model catalog" })),
 	thinking: Type.Optional(thinking),
@@ -60,6 +78,22 @@ const configureParameters = Type.Object({
 	executor: Type.Optional(Type.Union([Type.Literal("session"), Type.Literal("harness")])),
 	permissionPolicy: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("workspace-write")])),
 	browserAccess: Type.Optional(browserAccess),
+	browserRuntime: Type.Optional(Type.Union([Type.Literal("managed-chromium"), Type.Literal("installed-chrome")])),
+	browserProfile: Type.Optional(
+		Type.Union([
+			Type.Object({ kind: Type.Literal("ephemeral") }),
+			Type.Object({ kind: Type.Literal("named"), id: Type.String({ minLength: 1, maxLength: 128 }) }),
+		]),
+	),
+	browserWorkflows: Type.Optional(
+		Type.Array(
+			Type.Object({
+				id: Type.String({ pattern: "^[a-z0-9][a-z0-9-]{0,63}$" }),
+				version: Type.Integer({ minimum: 1 }),
+			}),
+			{ maxItems: 128 },
+		),
+	),
 	delegateAgentIds: Type.Optional(Type.Array(Type.String({ pattern: "^[a-z0-9][a-z0-9-]{0,63}$" }), { maxItems: 32 })),
 	exposeA2a: Type.Optional(Type.Boolean()),
 	scheduleTask: Type.Optional(Type.String({ minLength: 1, maxLength: 16_384 })),
@@ -103,6 +137,7 @@ const configureParameters = Type.Object({
 				reason: Type.String({ minLength: 1, maxLength: 2_000 }),
 				blockingActions: Type.Array(
 					Type.Union([
+						Type.Literal("activate"),
 						Type.Literal("publish"),
 						Type.Literal("publish-and-schedule"),
 						Type.Literal("run-proof"),
@@ -122,6 +157,7 @@ const configureParameters = Type.Object({
 const lifecycleParameters = Type.Object({
 	buildId: Type.String({ pattern: "^build-[a-z0-9-]{1,127}$" }),
 	action: Type.Union([
+		Type.Literal("activate"),
 		Type.Literal("publish"),
 		Type.Literal("publish-and-schedule"),
 		Type.Literal("run-proof"),
@@ -190,7 +226,7 @@ export function createAgentRegistryTools(
 				"Use configure_agent as soon as a useful reversible draft can be formed. Infer safe defaults and record them as assumptions. Ask at most one concise question when two plausible answers materially change outcome, scope, recipient, authority, data, schedule, cost, acceptance, or identity; record it in clarifications while still staging unaffected fields. Cosmetic choices are not questions. This never deploys. Test the unpublished candidate, review its evidence, then use manage_agent_build for an exact action proposal.",
 			parameters: configureParameters,
 			executionMode: "sequential",
-			async execute(toolCallId, parameters) {
+			async execute(toolCallId, parameters, _signal, _onUpdate, context) {
 				if (parameters.modelControls != null && parameters.thinking !== undefined)
 					throw new ModelControlsError("Choose agent modelControls or legacy thinking, not both");
 				const existing = await findExistingAgent(registry, parameters.id, parameters.name);
@@ -217,7 +253,7 @@ export function createAgentRegistryTools(
 					parameters.permissionPolicy ??
 					base?.permissionPolicy ??
 					(tools.some((tool) => ["write", "edit", "bash"].includes(tool)) ? "workspace-write" : "read-only");
-				const projectRoot = parameters.projectRoot ?? base?.projectRoot;
+				const projectRoot = parameters.projectRoot ?? base?.projectRoot ?? context.cwd;
 				if (!projectRoot) throw new Error("A projectRoot is required before an agent draft can be saved");
 				const description =
 					parameters.description ?? base?.description ?? `Complete the goal for ${parameters.name}`;
@@ -232,7 +268,7 @@ export function createAgentRegistryTools(
 						`You are ${parameters.name}. Accomplish the stated goal using only the approved tools.`,
 					projectRoot,
 					tools,
-					capabilities: base?.capabilities,
+					capabilities: parseAgentCapabilityGrants(parameters.capabilities) ?? base?.capabilities,
 					model,
 					thinking: modelControls === undefined ? (parameters.thinking ?? base?.thinking) : undefined,
 					modelControls,
@@ -240,9 +276,9 @@ export function createAgentRegistryTools(
 					executor: parameters.executor ?? base?.executor ?? "harness",
 					permissionPolicy,
 					browserAccess: access,
-					browserRuntime: base?.browserRuntime,
-					browserProfile: base?.browserProfile,
-					browserWorkflows: base?.browserWorkflows,
+					browserRuntime: parameters.browserRuntime ?? base?.browserRuntime,
+					browserProfile: parameters.browserProfile ?? base?.browserProfile,
+					browserWorkflows: parameters.browserWorkflows ?? base?.browserWorkflows,
 					delegateAgentIds: parameters.delegateAgentIds ?? base?.delegateAgentIds ?? [],
 					exposeA2a: parameters.exposeA2a ?? base?.exposeA2a ?? false,
 				};
@@ -272,7 +308,7 @@ export function createAgentRegistryTools(
 					: undefined;
 				const build = view?.build ?? (await lifecycle.stageDraft(draft));
 				const scheduleNote = automationIntent
-					? " The requested schedule was retained as an intent only; it cannot be activated before proof acceptance and skill promotion."
+					? " The requested schedule was retained as an intent only; it requires proof acceptance and activation. Skill export is optional."
 					: "";
 				const openClarifications = view?.link?.clarifications.filter((item) => item.status === "open") ?? [];
 				const clarificationNote =
@@ -283,7 +319,7 @@ export function createAgentRegistryTools(
 					content: [
 						{
 							type: "text",
-							text: `Staged draft ${build.name} (${build.id}, revision ${build.revision}). Safe defaults are recorded as assumptions. Test it before publication.${clarificationNote}${scheduleNote}`,
+							text: `Staged draft ${build.name} (${build.id}, revision ${build.revision}). Workspace: ${projectRoot}${parameters.projectRoot === undefined && base?.projectRoot === undefined ? " (defaulted to the current session directory)" : ""}. Test it before publication.${clarificationNote}${scheduleNote}`,
 						},
 					],
 					details: {
@@ -301,7 +337,7 @@ export function createAgentRegistryTools(
 			description:
 				"Perform an explicitly confirmed publish, proof, or proof-review action on a durable Agent Builder package.",
 			promptSnippet:
-				"Use manage_agent_build when the user requests a test, proof decision, publication, promotion, or schedule. The first call must omit proposalId and use confirmed=false; it returns an exact proposal to show the user. Only after the user answers yes to that single proposal call again with its proposalId, confirmed=true, and confirmationText copied from the user's answer. Never treat the request that created a proposal as its confirmation. A bare yes is ambiguous when multiple proposals are pending. Rejection requires a 1-5 rating and concrete feedback.",
+				"Use manage_agent_build for testing, proof review, activation, optional skill export, or scheduling. First omit proposalId and use confirmed=false to prepare an exact proposal. After a later user approval, call again with its proposalId and confirmed=true. The host verifies the actual user message; confirmationText grants no authority. When several proposals are pending, the user must reply approve followed by the exact proposal ID. Activate after accepting proof; skill export is optional. Rejection requires a 1-5 rating and concrete feedback.",
 			parameters: lifecycleParameters,
 			executionMode: "sequential",
 			async execute(_toolCallId, parameters) {
@@ -309,6 +345,10 @@ export function createAgentRegistryTools(
 				const sessionId = conversation ? requiredConversationSessionId(services) : undefined;
 				const payload = exactActionPayload(parameters);
 				if (conversation && !parameters.proposalId) {
+					if (parameters.confirmed)
+						throw new Error(
+							"proposalId is required for confirmation. Use inspect_agent_build to recover the pending proposal ID, then retry the same approved action. Do not prepare a replacement proposal.",
+						);
 					const current = await lifecycle.get(parameters.buildId);
 					const proposal = await conversation.prepareAction({
 						buildId: parameters.buildId,
@@ -321,7 +361,7 @@ export function createAgentRegistryTools(
 						content: [
 							{
 								type: "text",
-								text: `${proposal.binding.preview}\n\nReply yes to approve this exact action, or no to leave it pending.`,
+								text: `${proposal.binding.preview}\n\nProposal ID: ${proposal.id}\nReply yes to approve this exact action, or no to leave it pending. After approval, call manage_agent_build with proposalId ${proposal.id}, confirmed=true, and the same action payload.`,
 							},
 						],
 						details: {
@@ -336,42 +376,51 @@ export function createAgentRegistryTools(
 				if (!parameters.confirmed)
 					throw new Error("Ask the user to confirm this exact agent lifecycle proposal first");
 				if (conversation) {
-					if (!parameters.confirmationText) throw new Error("The user's exact confirmation response is required");
-					const pendingCount = (await conversation.list(sessionId!)).reduce(
-						(count, view) => count + view.proposals.filter((proposal) => proposal.state === "pending").length,
-						0,
-					);
-					if (
-						pendingCount > 1 &&
-						/^(?:yes|y|confirm|approve|proceed)[.!]?$/i.test(parameters.confirmationText.trim())
-					) {
-						throw new Error(
-							"Several action proposals are pending; name the agent or action you intend to approve",
-						);
-					}
-					await conversation.authorizeAction({
+					const authorized = await conversation.authorizeAction({
 						proposalId: parameters.proposalId!,
 						buildId: parameters.buildId,
 						sessionId: sessionId!,
 						action: parameters.action,
 						payload,
 					});
+					if (authorized.state === "completed") {
+						const current = await lifecycle.get(parameters.buildId);
+						return {
+							content: [
+								{
+									type: "text",
+									text: `This action already completed. Recorded result: ${JSON.stringify(authorized.result)}`,
+								},
+							],
+							details: {
+								buildId: current.id,
+								stage: current.stage,
+								proposalId: authorized.id,
+								proposalState: "completed",
+							},
+						};
+					}
 				}
 				let build: AgentBuildRecord;
 				let partialResult: Record<string, unknown> | undefined;
 				try {
-					if (parameters.action === "publish") build = await lifecycle.publishDraft(parameters.buildId);
+					if (parameters.action === "activate") build = await lifecycle.activate(parameters.buildId);
+					else if (parameters.action === "publish") build = await lifecycle.publishDraft(parameters.buildId);
 					else if (parameters.action === "publish-and-schedule") {
-						if (!services.promotion) throw new Error("Skill promotion is unavailable");
 						if (!services.routines) throw new Error("Agent scheduling is unavailable");
+						const current = await lifecycle.get(parameters.buildId);
+						if (!current.automationIntent?.confirmed) throw new Error("Confirm the schedule intent first");
+						validateCron(
+							cronFromCadence(current.automationIntent.cadence),
+							parameters.timezone ?? current.automationIntent.timezone,
+						);
 						build = await lifecycle.publishDraft(parameters.buildId);
 						partialResult = {
 							publish: { status: "completed", agentId: build.agentId, revision: build.agentRevision },
-							promotion: { status: "pending" },
 							schedule: { status: "pending" },
 						};
-						build = await promoteAgentBuild(lifecycle, services.promotion, parameters);
-						partialResult.promotion = { status: "completed", skill: build.skill?.name };
+						if (conversation && parameters.proposalId)
+							await conversation.recordActionProgress(parameters.proposalId, partialResult);
 						build = await scheduleAgentBuild(lifecycle, services.routines, services.refreshRoutines, parameters);
 						partialResult.schedule = { status: "completed", routineIds: build.routineIds };
 					} else if (parameters.action === "run-proof") {
@@ -387,6 +436,7 @@ export function createAgentRegistryTools(
 							rating: parameters.rating,
 							summary: parameters.feedback,
 						});
+						if (build.stage === "proof-ready") build = await lifecycle.reviewProof(parameters.buildId, false);
 					} else if (parameters.action === "promote")
 						build = await promoteAgentBuild(lifecycle, services.promotion, parameters);
 					else
@@ -413,7 +463,10 @@ export function createAgentRegistryTools(
 					content: [
 						{
 							type: "text",
-							text: `Agent build ${build.name} is now ${build.stage}.`,
+							text:
+								parameters.action === "activate"
+									? `Agent ${build.name} revision ${build.agentRevision} is active. Skill export is optional.`
+									: `Agent build ${build.name} is now ${build.stage}.`,
 						},
 					],
 					details: {
@@ -455,6 +508,7 @@ export function createAgentRegistryTools(
 					return [
 						`${view.build.name} (${view.build.id}, revision ${view.build.revision})`,
 						`Stage: ${view.build.stage}`,
+						`Active accepted revision: ${view.build.activeProof?.agentRevision ?? "none"}; candidate revision: ${view.build.candidateRevision ?? "none"}`,
 						view.build.proof
 							? `Proof: ${view.build.proof.status} (${view.build.proof.runId})`
 							: "Proof: not started",
@@ -465,7 +519,7 @@ export function createAgentRegistryTools(
 						...(openQuestions.length > 0
 							? [`Open decisions: ${openQuestions.map((item) => item.question).join(" ")}`]
 							: []),
-						...(proposal ? [`Pending approval: ${proposal.binding.preview}`] : []),
+						...(proposal ? [`Pending approval (${proposal.id}): ${proposal.binding.preview}`] : []),
 					].join("\n");
 				});
 				return {
@@ -488,6 +542,7 @@ export function createAgentRegistryTools(
 
 interface ExactAgentBuildActionParameters {
 	buildId: string;
+	proposalId?: string;
 	action: AgentBuildActionKind;
 	prompt?: string;
 	feedback?: string;
@@ -534,9 +589,14 @@ function actionPreview(
 						: action === "schedule"
 							? "Enable routine"
 							: action === "publish-and-schedule"
-								? "Publish, promote, and enable routine"
-								: "Publish agent";
-	const details = [`${heading}: ${build.name}`, `Build revision: ${build.revision}`, `Outcome: ${build.objective}`];
+								? "Activate and enable routine"
+								: "Activate agent";
+	const details = [
+		`${heading}: ${build.name}`,
+		`Build revision: ${build.revision}`,
+		`Outcome: ${build.objective}`,
+		`Workspace: ${build.projectRoot}`,
+	];
 	if (build.proof) details.push(`Proof: ${build.proof.runId} (${build.proof.status})`);
 	if (build.evaluation) {
 		details.push(
@@ -607,8 +667,12 @@ async function scheduleAgentBuild(
 		throw new Error("Stage and confirm a schedule intent before enabling automation");
 	}
 	await lifecycle.assertAutomationAllowed(current.agentId);
+	if (!current.automationIntent.confirmed) throw new Error("Confirm the schedule intent before enabling automation");
 	const routine = await routines.save({
-		id: current.automationIntent.mode === "replace" ? current.routineIds[0] : undefined,
+		id:
+			current.automationIntent.mode === "replace" && current.routineIds[0]
+				? current.routineIds[0]
+				: `routine-${parameters.proposalId?.replace(/^proposal-/, "") ?? randomUUID()}`,
 		name: `${current.name} routine`,
 		prompt: current.automationIntent.task,
 		enabled: true,
@@ -616,8 +680,8 @@ async function scheduleAgentBuild(
 		timezone: parameters.timezone ?? current.automationIntent.timezone,
 		maxDurationMinutes: 30,
 		target: { kind: "agent", agentId: current.agentId },
-		model: current.configuration?.model,
-		cwd: current.projectRoot,
+		model: current.activeConfiguration?.model,
+		cwd: current.activeConfiguration?.projectRoot ?? current.projectRoot,
 	});
 	await refreshRoutines?.();
 	return lifecycle.markAutomated(current.agentId, routine.id);
@@ -667,30 +731,6 @@ async function findExistingAgent(
 	return (await registry.list()).find((agent) => agent.name.toLowerCase() === name.toLowerCase());
 }
 
-function configurationFromAgent(definition: AgentDefinition): AgentBuildConfiguration {
-	return {
-		personaId: definition.personaId,
-		name: definition.name,
-		description: definition.description,
-		persona: definition.persona,
-		projectRoot: definition.projectRoot,
-		tools: [...definition.tools],
-		capabilities: structuredClone(definition.capabilities),
-		model: definition.model ? { ...definition.model } : undefined,
-		thinking: definition.thinking,
-		modelControls: definition.modelControls === undefined ? undefined : { ...definition.modelControls },
-		memory: definition.memory,
-		executor: definition.executor,
-		permissionPolicy: definition.permissionPolicy,
-		browserAccess: definition.browser?.access ?? "disabled",
-		browserRuntime: definition.browser?.runtime,
-		browserProfile: structuredClone(definition.browser?.profile ?? { kind: "ephemeral" }),
-		browserWorkflows: structuredClone(definition.browserWorkflows),
-		delegateAgentIds: [...definition.delegateAgentIds],
-		exposeA2a: definition.a2a.enabled,
-	};
-}
-
 function parseModel(value: string): { provider: string; id: string } {
 	const separator = value.indexOf("/");
 	if (separator < 1 || separator === value.length - 1) {
@@ -723,10 +763,12 @@ function automation(parameters: {
 	if (parameters.scheduleConfirmed !== true) {
 		throw new Error("Do not choose a schedule for the user. Ask them to select or confirm the cadence first.");
 	}
+	const timezone = parameters.scheduleTimezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+	validateCron(cronFromCadence(parameters.scheduleCadence), timezone);
 	return {
 		task: parameters.scheduleTask,
 		cadence: parameters.scheduleCadence,
-		timezone: parameters.scheduleTimezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
+		timezone,
 		mode: parameters.scheduleMode ?? "replace",
 		confirmed: true,
 	};

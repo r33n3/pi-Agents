@@ -1,6 +1,7 @@
 import { type ChildProcess, fork } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, realpath, unlink, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -25,7 +26,9 @@ import type {
 	AgentWorkerResultArtifact,
 } from "./agent-worker-protocol.ts";
 import { GovernedActionCancelledError, type GovernedActionService } from "./governed-action-service.ts";
+import { type InventoryFacts, inventoryFacts, verifyInventoryOutput } from "./inventory-review.ts";
 import { MAX_SCOPED_AGENT_FILE_BYTES, resolveCanonicalWorkspacePath } from "./scoped-agent-tools.ts";
+import type { TaskInputEvidence } from "./task-input-binding.ts";
 
 export interface AgentHostFileSystem {
 	read(path: string, signal: AbortSignal): Promise<string>;
@@ -73,6 +76,15 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 				: { ...context, definition: { ...context.definition, model: this.#options.defaultModel } };
 		const effectiveContext = { ...modeledContext, workspace: resolve(modeledContext.workspace) };
 		const capabilityTools = this.#options.capabilityTools(effectiveContext);
+		if (
+			effectiveContext.inputBinding &&
+			(effectiveContext.definition.executor !== "harness" ||
+				capabilityTools.length > 0 ||
+				(effectiveContext.definition.browser?.access !== undefined &&
+					effectiveContext.definition.browser.access !== "disabled"))
+		) {
+			throw new Error("Bound file reviews require the isolated harness without external capabilities");
+		}
 		const modelApiKey = effectiveContext.definition.model
 			? await this.#options.resolveModelApiKey?.(effectiveContext.definition.model)
 			: undefined;
@@ -147,6 +159,8 @@ class ChildProcessExecution implements AgentExecution {
 	readonly #hostFileSystem: AgentHostFileSystem;
 	readonly #pendingHostActions = new Map<string, AbortController>();
 	readonly #pendingCapabilityTools = new Map<string, AbortController>();
+	readonly #inputEvidence = new Map<string, TaskInputEvidence>();
+	#inventory: InventoryFacts | undefined;
 	#resolveExit: () => void = () => {};
 	#resolve: (result: AgentExecutionResult) => void = () => {};
 	#reject: (error: Error) => void = () => {};
@@ -154,6 +168,7 @@ class ChildProcessExecution implements AgentExecution {
 	#exited = false;
 	#disposed = false;
 	#abortPromise: Promise<void> | undefined;
+	#abortRequested = false;
 	#stderr = "";
 	#phase: AgentExecutionPhase = "initializing";
 	#lastActivityAt = Date.now();
@@ -232,6 +247,37 @@ class ChildProcessExecution implements AgentExecution {
 			Math.min(WATCHDOG_INTERVAL_MS, idleTimeoutMs, heartbeatTimeoutMs),
 		);
 		this.#watchdog.unref();
+		void this.#prepareStart(start).catch((error: unknown) => {
+			this.#fail(error instanceof Error ? error : new Error(String(error)));
+			this.#terminate();
+		});
+	}
+
+	async #prepareStart(start: AgentWorkerRequest): Promise<void> {
+		if (start.type === "start" && this.#context.inputBinding) {
+			const binding = this.#context.inputBinding;
+			const root = await realpath(this.#context.workspace);
+			if (relative(root, binding.workspace) !== "") throw new Error("Bound inputs belong to a different workspace");
+			const inputContents: NonNullable<AgentExecutionContext["inputContents"]> = [];
+			for (const file of binding.files) {
+				const controller = new AbortController();
+				this.#pendingHostActions.set(`input:${file.path}`, controller);
+				try {
+					const result = await this.#executeHostAction(
+						{ family: "filesystem.read", path: file.path },
+						controller.signal,
+					);
+					if (result.family !== "filesystem.read") throw new Error("Input read returned the wrong result");
+					const inventory = file.path.toLowerCase().endsWith(".csv") ? inventoryFacts(result.content) : undefined;
+					inputContents.push({ path: file.path, content: result.content, inventory });
+				} finally {
+					this.#pendingHostActions.delete(`input:${file.path}`);
+				}
+			}
+			start.context = { ...start.context, inputContents };
+			this.#inventory = inputContents.length === 1 ? inputContents[0]?.inventory : undefined;
+		}
+		if (this.#settled || this.#abortRequested || this.#exited) return;
 		this.#child.send(start, (error) => {
 			if (error) {
 				this.#fail(error);
@@ -320,17 +366,31 @@ class ChildProcessExecution implements AgentExecution {
 
 	#completeFromArtifact(missingArtifactError?: Error): void {
 		if (this.#settled) return;
+		if (this.#abortRequested) {
+			this.#fail(new Error("Agent worker was aborted"));
+			return;
+		}
 		this.#settled = true;
 		this.#abortPendingHostActions();
 		clearTimeout(this.#timeout);
 		clearInterval(this.#watchdog);
-		void readWorkerResult(this.#resultPath).then(this.#resolve, (error: unknown) => {
-			if (missingArtifactError && isFileNotFound(error)) {
-				this.#reject(missingArtifactError);
-				return;
-			}
-			this.#reject(error instanceof Error ? error : new Error(String(error)));
-		});
+		void readWorkerResult(this.#resultPath).then(
+			(result) => {
+				try {
+					verifyInventoryOutput(result.output, this.#inventory);
+					this.#resolve({ ...result, inputEvidence: [...this.#inputEvidence.values()] });
+				} catch (error) {
+					this.#reject(error instanceof Error ? error : new Error(String(error)));
+				}
+			},
+			(error: unknown) => {
+				if (missingArtifactError && isFileNotFound(error)) {
+					this.#reject(missingArtifactError);
+					return;
+				}
+				this.#reject(error instanceof Error ? error : new Error(String(error)));
+			},
+		);
 	}
 
 	#fail(error: Error): void {
@@ -358,6 +418,7 @@ class ChildProcessExecution implements AgentExecution {
 
 	async #stop(requestAbort: boolean): Promise<void> {
 		if (this.#exited) return;
+		if (requestAbort) this.#abortRequested = true;
 		this.#abortPendingHostActions();
 		if (requestAbort && !this.#settled && this.#child.connected) {
 			await new Promise<void>((resolve) => {
@@ -497,6 +558,18 @@ class ChildProcessExecution implements AgentExecution {
 						policy: "workspace-boundary",
 					};
 				}
+				const binding = this.#context.inputBinding;
+				if (
+					binding &&
+					(requiredTool !== "read" ||
+						!binding.files.some((file) => relative(resolve(binding.workspace, file.path), canonicalPath!) === ""))
+				) {
+					return {
+						decision: "deny" as const,
+						reason: `This review is bound to ${binding.files.map((file) => file.path).join(", ")}. Use the verified input contents supplied in your task.`,
+						policy: "task-input-binding",
+					};
+				}
 				return {
 					decision: "allow" as const,
 					reason: "Agent grant and workspace policy allow this action",
@@ -508,7 +581,21 @@ class ChildProcessExecution implements AgentExecution {
 				throwIfAborted(signal);
 				try {
 					if (action.family === "filesystem.read") {
-						return { family: action.family, content: await this.#hostFileSystem.read(canonicalPath, signal) };
+						const content = await this.#hostFileSystem.read(canonicalPath, signal);
+						const binding = this.#context.inputBinding;
+						const file = binding?.files.find(
+							(entry) => relative(resolve(binding.workspace, entry.path), canonicalPath!) === "",
+						);
+						if (file) {
+							const sha256 = createHash("sha256").update(content).digest("hex");
+							if (sha256 !== file.sha256)
+								throw hostActionError(
+									"ERR_INPUT_CHANGED",
+									`Bound input ${file.path} changed. Start a new review.`,
+								);
+							this.#inputEvidence.set(file.path, { path: file.path, sha256 });
+						}
+						return { family: action.family, content };
 					}
 					if (action.family === "filesystem.list") {
 						return { family: action.family, entries: await this.#hostFileSystem.list(canonicalPath, signal) };
@@ -751,6 +838,7 @@ function safeHostActionError(error: unknown): { code: string; message: string } 
 			EISDIR: "Workspace path is a directory",
 			ENOTDIR: "Workspace path is not a directory",
 			ERR_FILE_TOO_LARGE: error.message,
+			ERR_INPUT_CHANGED: error.message,
 			ERR_GOVERNED_ACTION_DENIED: error.message,
 			ERR_HOST_ACTION_UNAVAILABLE: error.message,
 		};
