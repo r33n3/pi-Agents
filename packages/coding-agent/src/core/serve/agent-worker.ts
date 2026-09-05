@@ -11,6 +11,7 @@ import {
 	type AgentExecutionPhase,
 	agentExecutionInstructions,
 	agentExecutionResultFromMessages,
+	agentIdentityInstructions,
 } from "./agent-executor.ts";
 import type {
 	AgentWorkerCapabilityToolResponseMessage,
@@ -99,9 +100,7 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 				systemPromptOverride: (base) =>
 					[
 						base,
-						`You are the locally deployed agent "${definition.name}".`,
-						`Persona: ${definition.persona}`,
-						`Mission: ${definition.description}`,
+						agentIdentityInstructions(definition),
 						"Continue the conversation as this agent and operate only through the provided tools.",
 					]
 						.filter((entry): entry is string => entry !== undefined && entry.length > 0)

@@ -82,7 +82,7 @@ const newRoomButton = document.createElement("button");
 newRoomButton.type = "button";
 newRoomButton.className = "attention-inline-action";
 newRoomButton.textContent = "+";
-newRoomButton.title = "Start a bounded collaboration room";
+newRoomButton.title = "Create a team";
 newRoomButton.setAttribute("aria-label", newRoomButton.title);
 openArtifactsButton.before(newRoomButton);
 selectedAgentPanel.querySelector(".agent-run-history")?.remove();
@@ -247,7 +247,14 @@ function syncModelSettingsButton(
 }
 
 function editableChatModelSession(): PiSessionHandle | undefined {
-	if (activeAgentId || activeSubagentKey || activeExternalRunId || activeExternalConnectionId || activeArtifactId)
+	if (
+		activeAgentRoomId ||
+		activeAgentId ||
+		activeSubagentKey ||
+		activeExternalRunId ||
+		activeExternalConnectionId ||
+		activeArtifactId
+	)
 		return undefined;
 	return session;
 }
@@ -384,9 +391,11 @@ const agentTeamStates = new Map<string, AgentTeamState>();
 let attentionItems: AttentionSummary[] = [];
 let agentRooms: AgentRoomSummary[] = [];
 let agentRoomRuns: AgentRoomRunSummary[] = [];
-let activeAgentRoomRunDialog:
-	| { runId: string; dialog: HTMLDialogElement; form: HTMLFormElement; signature: string }
-	| undefined;
+let activeAgentRoomId: string | undefined;
+let renderedAgentRoomSignature = "";
+const openAgentRoomIds: string[] = [];
+const agentRoomDrafts = new Map<string, string>();
+const pendingAgentRoomSubmissions = new Set<string>();
 let artifacts: ArtifactSummary[] = [];
 let activeArtifactObjectUrl: string | undefined;
 let activePreviewSessionId: string | undefined;
@@ -728,6 +737,7 @@ interface AgentBuildRecord {
 		exposeA2a: boolean;
 	};
 	candidateRevision?: number;
+	activeProof?: { runId: string; agentRevision: number };
 	automationIntent?: {
 		task: string;
 		cadence: string;
@@ -826,7 +836,9 @@ interface AgentRoomSummary {
 	id: string;
 	name: string;
 	purpose: string;
-	members: Array<{ agentId: string; role: string }>;
+	members: Array<{ agentId: string; role: string; name?: string }>;
+	supervisorAgentId?: string;
+	allowRecruitment?: boolean;
 	limits: {
 		maxRounds: number;
 		maxMessages: number;
@@ -843,6 +855,7 @@ interface AgentRoomRunSummary {
 	roomId: string;
 	status: "running" | "completed" | "needs-user" | "bounded" | "failed" | "cancelled";
 	goal: string;
+	pendingAgentIds?: string[];
 	createdAt: number;
 	finishedAt?: number;
 	rounds: Array<{
@@ -853,6 +866,7 @@ interface AgentRoomRunSummary {
 			status: "reply" | "pass" | "needs-user" | "failed" | "cancelled";
 			message: string;
 			requestAgentIds?: string[];
+			recruit?: { name: string; role: string };
 		}>;
 	}>;
 	messageCount: number;
@@ -2466,6 +2480,7 @@ function setBusy(snapshot: SessionSnapshot): void {
 
 function render(snapshot: SessionSnapshot): void {
 	projectSubagentActivity(snapshot);
+	if (activeAgentRoomId) return;
 	if (activeSubagentKey) {
 		const activity = subagentActivityByKey.get(activeSubagentKey);
 		if (activity) renderSubagentInspector(activity);
@@ -2551,11 +2566,7 @@ function renderBuilderConversation(snapshot: SessionSnapshot): void {
 	apply.type = "button";
 	apply.id = "builder-chat-apply";
 	apply.className = "primary-action";
-	apply.textContent = activeSidebarAgent
-		? "Save candidate"
-		: activeAgentBuild?.stage === "proven"
-			? "Review publish"
-			: "Save draft";
+	apply.textContent = activeSidebarAgent ? "Save candidate" : "Save draft";
 	apply.title = activeSidebarAgent
 		? "Save the reviewed candidate without changing the deployed revision"
 		: "Save this package to the build lifecycle";
@@ -2688,7 +2699,7 @@ function renderAgentPackageSummary(build: AgentBuildRecord): HTMLElement {
 		appendText(
 			details,
 			conversation.readiness.ready
-				? "Ready for publication review"
+				? "Ready for review"
 				: `Readiness: ${conversation.readiness.blockers.join("; ") || "Candidate review is incomplete"}`,
 			conversation.readiness.ready ? "muted" : "run-error",
 		);
@@ -2711,6 +2722,17 @@ function renderAgentPackageSummary(build: AgentBuildRecord): HTMLElement {
 		criteria.append(item);
 	}
 	details.append(criteria);
+	if (
+		build.agentId &&
+		build.proof?.status === "succeeded" &&
+		["proven", "promoted", "automated"].includes(build.stage)
+	) {
+		const exportSkill = document.createElement("button");
+		exportSkill.type = "button";
+		exportSkill.textContent = "Export skill (optional)";
+		exportSkill.addEventListener("click", () => void openLifecycleSkillPromotion());
+		details.append(exportSkill);
+	}
 	if (build.automationIntent) {
 		appendText(
 			details,
@@ -2760,6 +2782,7 @@ function agentConfigurationChanges(
 
 function agentBuildStageLabel(record: AgentBuildRecord | undefined): string {
 	if (!record) return "Name the draft";
+	if (record.activeProof && !record.candidateRevision && record.stage === "proven") return "Active";
 	return {
 		draft: "Draft saved",
 		"ready-to-test": "Ready to test",
@@ -2788,15 +2811,12 @@ function agentBuildLifecycleAction(): HTMLButtonElement | undefined {
 		button.addEventListener("click", () => void openAgentBuildProofReview());
 		return button;
 	}
-	if (build.stage === "proven") {
-		button.textContent = build.agentId ? "Save as skill" : "Review publish";
-		button.addEventListener(
-			"click",
-			() => void (build.agentId ? openLifecycleSkillPromotion() : requestBuilderPublication()),
-		);
+	if (build.stage === "proven" && (!build.activeProof || build.candidateRevision)) {
+		button.textContent = "Review activation";
+		button.addEventListener("click", () => void requestBuilderPublication());
 		return button;
 	}
-	if (build.stage === "promoted") {
+	if (build.activeProof && !build.candidateRevision) {
 		button.textContent = "Add routine";
 		button.addEventListener("click", () => void stageRoutineFromBuild());
 		return button;
@@ -2869,11 +2889,11 @@ function openAgentBuildProofDialog(): void {
 }
 
 async function requestBuilderPublication(): Promise<void> {
-	if (!activeAgentBuild || activeAgentBuild.agentId || activeAgentBuild.stage !== "proven") {
-		setStatus("Test and accept the current candidate before publication review", true);
+	if (!activeAgentBuild || activeAgentBuild.stage !== "proven") {
+		setStatus("Test and accept the current candidate before activation review", true);
 		return;
 	}
-	input.value = "Publish this exact agent package.";
+	input.value = "Activate this exact accepted agent package.";
 	resizeComposer();
 	await submitBuilderComposer();
 }
@@ -2975,7 +2995,7 @@ async function openAgentBuildProofReview(): Promise<void> {
 		}
 		if (session?.snapshot) renderBuilderConversation(session.snapshot);
 		setStatus(
-			accepted ? "Proof accepted. Review and save it as a reusable skill." : "Proof rejected. Refine and retry.",
+			accepted ? "Proof accepted. Review activation to use this revision." : "Proof rejected. Refine and retry.",
 		);
 	};
 	refine.addEventListener("click", () => {
@@ -4418,6 +4438,7 @@ function renderSessionNavigation(): void {
 					!activeExternalConnectionId &&
 					!activeExternalRunId &&
 					!activeArtifactId &&
+					!activeAgentRoomId &&
 					target.key === activeTargetKey,
 			);
 			const button = document.createElement("button");
@@ -4430,6 +4451,7 @@ function renderSessionNavigation(): void {
 					!activeExternalConnectionId &&
 					!activeExternalRunId &&
 					!activeArtifactId &&
+					!activeAgentRoomId &&
 					target.key === activeTargetKey,
 			);
 			const sessionName = sessionDisplayName(target);
@@ -4440,6 +4462,34 @@ function renderSessionNavigation(): void {
 			button.addEventListener("dblclick", () => renameSession(target));
 			wrapper.append(button);
 			return wrapper;
+		}),
+		...openAgentRoomIds.flatMap((roomId) => {
+			const room = agentRooms.find((entry) => entry.id === roomId);
+			if (!room) return [];
+			const wrapper = document.createElement("div");
+			wrapper.className = "session-tab-wrap";
+			wrapper.classList.toggle("active", roomId === activeAgentRoomId);
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "session-tab";
+			button.textContent = room.name;
+			button.addEventListener("click", () => openAgentRoomConversation(room));
+			const close = document.createElement("button");
+			close.type = "button";
+			close.className = "session-tab-close";
+			close.textContent = "×";
+			close.setAttribute("aria-label", `Close ${room.name} chat`);
+			close.addEventListener("click", () => {
+				openAgentRoomIds.splice(openAgentRoomIds.indexOf(roomId), 1);
+				if (activeAgentRoomId === roomId) {
+					leaveAgentRoomConversation();
+					if (session?.snapshot) render(session.snapshot);
+					renderAttachments();
+				}
+				renderSessionNavigation();
+			});
+			wrapper.append(button, close);
+			return [wrapper];
 		}),
 		...openAgentIds.flatMap((agentId) => {
 			const agent = agents.find((entry) => entry.id === agentId);
@@ -4585,6 +4635,7 @@ function renderSessionNavigation(): void {
 						!activeSubagentKey &&
 						!activeExternalRunId &&
 						!activeArtifactId &&
+						!activeAgentRoomId &&
 						target.key === activeTargetKey,
 				);
 				const name = document.createElement("strong");
@@ -4638,6 +4689,13 @@ function renderAgentNavigationGroup(): HTMLElement {
 		heading.append(hidden);
 	}
 	heading.append(create);
+	const createTeam = document.createElement("button");
+	createTeam.type = "button";
+	createTeam.textContent = "Team +";
+	createTeam.style.width = "auto";
+	createTeam.setAttribute("aria-label", "Create a team");
+	createTeam.addEventListener("click", () => openAgentRoomCreator());
+	heading.append(createTeam);
 	group.append(heading);
 	const search = document.createElement("input");
 	search.type = "search";
@@ -4662,6 +4720,12 @@ function renderAgentNavigationGroup(): HTMLElement {
 	}
 	const visibleAgents = agents
 		.filter((agent) => showHiddenAgents || !agentRosterEntries.get(agent.id)?.hidden)
+		.filter(
+			(agent) =>
+				!agentRooms.some(
+					(room) => room.supervisorAgentId && room.members.some((member) => member.agentId === agent.id),
+				),
+		)
 		.sort((left, right) => {
 			const leftOrder = agentRosterEntries.get(left.id)?.pinnedOrder ?? Number.MAX_SAFE_INTEGER;
 			const rightOrder = agentRosterEntries.get(right.id)?.pinnedOrder ?? Number.MAX_SAFE_INTEGER;
@@ -4727,20 +4791,21 @@ function renderAgentNavigationGroup(): HTMLElement {
 		roomHeading.className = "connection-heading";
 		const roomIndicator = document.createElement("i");
 		const roomLabel = document.createElement("span");
-		roomLabel.textContent = "Rooms";
+		roomLabel.textContent = "Teams";
 		const addRoom = document.createElement("button");
 		addRoom.type = "button";
 		addRoom.textContent = "+";
-		addRoom.title = "Start a bounded collaboration room";
+		addRoom.title = "Create a team";
 		addRoom.setAttribute("aria-label", addRoom.title);
-		addRoom.addEventListener("click", openAgentRoomCreator);
+		addRoom.addEventListener("click", () => openAgentRoomCreator());
 		roomHeading.append(roomIndicator, roomLabel, addRoom);
 		group.append(roomHeading);
 		for (const room of agentRooms) {
 			const latest = agentRoomRuns.find((run) => run.roomId === room.id);
 			const row = document.createElement("div");
 			row.className = "nav-item session-entry session-row";
-			row.dataset.agentSearch = `${room.id} ${room.name} ${room.purpose}`.toLowerCase();
+			row.dataset.agentSearch =
+				`${room.id} ${room.name} ${room.purpose} ${room.members.map((member) => `${member.name} ${member.role}`).join(" ")}`.toLowerCase();
 			row.classList.toggle(
 				"hidden",
 				Boolean(agentRosterSearch.trim()) &&
@@ -4754,13 +4819,55 @@ function renderAgentNavigationGroup(): HTMLElement {
 			const state = document.createElement("span");
 			state.className = "muted";
 			state.textContent = latest
-				? `${roomRunPresentation(latest.status).label} · ${latest.rounds.length}/${room.limits.maxRounds} rounds`
+				? `${roomRunPresentation(latest.status).label} · ${room.members.length} members`
 				: `${room.members.length} members`;
 			button.append(name, state);
-			button.disabled = latest === undefined;
-			if (latest) button.addEventListener("click", () => openAgentRoomRun(latest));
+			button.classList.toggle("active", activeAgentRoomId === room.id);
+			button.addEventListener("click", () => openAgentRoomConversation(room));
 			row.append(button);
+			const manage = document.createElement("button");
+			manage.type = "button";
+			manage.textContent = "⋯";
+			manage.setAttribute("aria-label", `Manage ${room.name} members`);
+			manage.disabled = latest?.status === "running" || latest?.status === "needs-user";
+			manage.addEventListener("click", () => openAgentRoomCreator(room));
+			row.append(manage);
 			group.append(row);
+			if (room.supervisorAgentId) {
+				const members = document.createElement("div");
+				members.setAttribute("role", "group");
+				members.setAttribute("aria-label", `${room.name} members`);
+				members.style.cssText = "margin:0 8px 10px 18px;border-left:1px solid var(--line);padding-left:8px";
+				for (const member of room.members) {
+					const memberButton = document.createElement("button");
+					memberButton.type = "button";
+					memberButton.className = "session-select";
+					memberButton.style.cssText = "width:100%;text-align:left";
+					const memberName =
+						member.name ?? agents.find((agent) => agent.id === member.agentId)?.name ?? member.agentId;
+					const title = document.createElement("strong");
+					title.textContent = memberName;
+					const role = document.createElement("span");
+					role.className = "muted";
+					role.style.cssText =
+						"display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:210px";
+					role.textContent = member.agentId === room.supervisorAgentId ? "Supervisor" : member.role;
+					memberButton.append(title, role);
+					memberButton.title = `Talk to ${memberName} in ${room.name}`;
+					memberButton.setAttribute("aria-label", memberButton.title);
+					memberButton.addEventListener("click", () => {
+						openAgentRoomConversation(room);
+						if (member.agentId !== room.supervisorAgentId) {
+							input.value = `@${memberName} `;
+							agentRoomDrafts.set(room.id, input.value);
+							resizeComposer();
+						}
+						input.focus();
+					});
+					members.append(memberButton);
+				}
+				group.append(members);
+			}
 		}
 	}
 	return group;
@@ -4816,6 +4923,7 @@ async function startAgentContext(agentId: string): Promise<void> {
 }
 
 async function switchSession(target: SessionTarget, preserveWorkspace = false): Promise<void> {
+	if (!preserveWorkspace) leaveAgentRoomConversation();
 	const selection = selectionGeneration.begin();
 	if (target.key === activeTargetKey && session?.attached) {
 		const currentSession = session;
@@ -5865,6 +5973,12 @@ function activeAttachments(): AttachmentSummary[] {
 }
 
 function renderAttachments(): void {
+	if (activeAgentRoomId) {
+		attachmentButton.disabled = true;
+		attachmentInput.disabled = true;
+		attachmentList.replaceChildren();
+		return;
+	}
 	const local = activeConnectionIsPrimary();
 	attachmentButton.disabled = !local;
 	attachmentButton.title = local ? "Attach files" : "Attachments require a session hosted by this Pi console";
@@ -5904,6 +6018,10 @@ function renderAttachments(): void {
 }
 
 async function uploadFiles(files: Iterable<File>): Promise<void> {
+	if (activeAgentRoomId) {
+		setStatus("Team messages currently use files in the agents' workspace", true);
+		return;
+	}
 	if (!session || !activeConnectionIsPrimary()) {
 		setStatus("Attachments require a session hosted by this Pi console", true);
 		return;
@@ -7631,6 +7749,7 @@ function isExternalConnectionList(value: unknown): value is { connections: Exter
 }
 
 function openExternalConnection(connection: ExternalConnectionSummary): void {
+	leaveAgentRoomConversation();
 	selectedExternalConnectionId = connection.id;
 	builderActive = false;
 	activeAgentId = undefined;
@@ -8018,8 +8137,36 @@ async function loadAgentBuildForAgent(agentId: string): Promise<AgentBuildRecord
 	return payload;
 }
 
-async function refreshActiveAgentBuild(): Promise<void> {
-	if (!capabilityToken || !activeAgentBuild) return;
+async function refreshActiveAgentBuild(createdSince?: number): Promise<void> {
+	if (!capabilityToken) return;
+	if (createdSince !== undefined && session?.snapshot) {
+		const result = [...session.snapshot.transcript]
+			.reverse()
+			.find((item) => item.role === "tool" && item.toolName === "configure_team");
+		const draft = result?.role === "tool" ? objectRecord(objectRecord(result.details)?.teamDraft) : undefined;
+		if (
+			draft &&
+			typeof draft.preparedAt === "number" &&
+			draft.preparedAt >= createdSince &&
+			isPiAgentTeamPreview(draft.preview)
+		) {
+			pendingTeamPackage = { bundle: draft.bundle, bindings: draft.bindings, preview: draft.preview };
+			renderBuilderConversation(session.snapshot);
+			return;
+		}
+	}
+	if (!activeAgentBuild && createdSince !== undefined && session) {
+		const response = await fetch(
+			`/agent-build-conversations.json?sessionId=${encodeURIComponent(session.id)}&token=${encodeURIComponent(capabilityToken)}`,
+		);
+		if (!response.ok) throw new Error(await responseError(response, "Could not load drafted agent"));
+		const views = conversationBuildViewsFromPayload(await response.json());
+		activeAgentBuild = views
+			.filter((view) => view.build.updatedAt >= createdSince)
+			.sort((left, right) => right.build.updatedAt - left.build.updatedAt)[0]?.build;
+		if (activeAgentBuild?.configuration) applyAgentBuildConfiguration(activeAgentBuild.configuration);
+	}
+	if (!activeAgentBuild) return;
 	const previousRevision = activeAgentBuild.revision;
 	const response = await fetch(
 		`/agent-build-conversations/${encodeURIComponent(activeAgentBuild.id)}?token=${encodeURIComponent(capabilityToken)}`,
@@ -8030,10 +8177,15 @@ async function refreshActiveAgentBuild(): Promise<void> {
 	activeConversationBuild = payload;
 	activeAgentBuild = payload.build;
 	draftedAgentCriteria = payload.build.criteria;
-	if (payload.build.revision !== previousRevision && payload.build.stage === "draft" && payload.build.configuration) {
+	if (payload.build.revision !== previousRevision && payload.build.configuration) {
 		applyAgentBuildConfiguration(payload.build.configuration);
 		agentBuilderFeedback = `Staged revision ${payload.build.revision} is ready to review and apply.`;
 		updateAgentBuilderReadiness();
+	}
+	if (payload.build.agentId && payload.build.activeProof && !payload.build.candidateRevision) {
+		await loadAgents();
+		activeSidebarAgent = agents.find((agent) => agent.id === payload.build.agentId);
+		requiredElement<HTMLInputElement>("agent-id").value = payload.build.agentId;
 	}
 	if (session?.snapshot && builderActive) renderBuilderConversation(session.snapshot);
 }
@@ -8239,13 +8391,15 @@ function resizeComposer(): void {
 }
 
 function activePromptHistory(): PromptHistory | undefined {
-	const key = builderActive
-		? `builder:${activeSidebarAgent?.id ?? "new"}:${session?.id ?? ""}`
-		: activeAgentId
-			? `agent:${activeAgentId}`
-			: activeExternalConnectionId
-				? `external:${activeExternalConnectionId}`
-				: session?.id;
+	const key = activeAgentRoomId
+		? `team:${activeAgentRoomId}`
+		: builderActive
+			? `builder:${activeSidebarAgent?.id ?? "new"}:${session?.id ?? ""}`
+			: activeAgentId
+				? `agent:${activeAgentId}`
+				: activeExternalConnectionId
+					? `external:${activeExternalConnectionId}`
+					: session?.id;
 	if (!key) return undefined;
 	let history = promptHistoryBySession.get(key);
 	if (!history) {
@@ -8386,6 +8540,7 @@ function installRailSectionResizer(): void {
 }
 
 async function openAgent(agent?: AgentSummary): Promise<void> {
+	leaveAgentRoomConversation();
 	if (!agent) {
 		await openAgentBuilder();
 		return;
@@ -8421,6 +8576,7 @@ function toggleSubagentInspector(key: string, item: Extract<TranscriptItem, { ro
 }
 
 function openSubagentInspector(key: string): void {
+	leaveAgentRoomConversation();
 	const activity = subagentActivityByKey.get(key);
 	if (!activity) return;
 	builderActive = false;
@@ -8450,6 +8606,7 @@ function closeSubagentTab(key: string): void {
 }
 
 function openExternalRun(run: ExternalRunSummary): void {
+	leaveAgentRoomConversation();
 	builderActive = false;
 	activeAgentId = undefined;
 	activeSubagentKey = undefined;
@@ -8634,6 +8791,7 @@ function closeAgentTab(agentId: string): void {
 }
 
 async function openArtifact(artifactId: string): Promise<void> {
+	leaveAgentRoomConversation();
 	if (!capabilityToken) return;
 	let artifact = artifacts.find((entry) => entry.id === artifactId);
 	if (!artifact) {
@@ -8659,6 +8817,7 @@ async function openArtifact(artifactId: string): Promise<void> {
 }
 
 async function openArtifactLibrary(): Promise<void> {
+	leaveAgentRoomConversation();
 	if (!capabilityToken) return;
 	if (artifacts.length === 0) await loadAgentActivity();
 	builderActive = false;
@@ -9021,6 +9180,7 @@ async function openAgentBuilder(
 	agentCancel.textContent = agent ? "Cancel editing" : "Cancel agent";
 	activateTab(showConversation ? "agents-workspace" : "agent-builder");
 	activateBuilderTab("builder-profile-panel");
+	leaveAgentRoomConversation();
 	builderActive = true;
 	activeAgentId = undefined;
 	activeSubagentKey = undefined;
@@ -9057,6 +9217,7 @@ async function openAgentBuilder(
 }
 
 function closeBuilderChat(): void {
+	if (!builderActive) return;
 	builderActive = false;
 	activeAgentImprovement = undefined;
 	activeAgentBuild = undefined;
@@ -9194,6 +9355,10 @@ function renderAgentConversation(
 }
 
 function renderAgentTeamRun(run: AgentTeamRun, historical: boolean): HTMLElement[] {
+	const result =
+		run.status === "completed"
+			? (run.nodes.find((node) => node.label === activeAgentId)?.result ?? run.result)
+			: run.result;
 	if (historical) {
 		const article = document.createElement("article");
 		article.className = "message assistant agent-team-history";
@@ -9204,7 +9369,7 @@ function renderAgentTeamRun(run: AgentTeamRun, historical: boolean): HTMLElement
 		const body = document.createElement("div");
 		body.className = "agent-message-content";
 		appendText(body, run.prompt, "muted");
-		if (run.result) appendAgentMarkdown(body, run.result);
+		if (result) appendAgentMarkdown(body, result);
 		else appendText(body, run.error ?? "The team run did not produce a result.", "run-error");
 		disclosure.append(summary, body);
 		article.append(disclosure);
@@ -9227,11 +9392,24 @@ function renderAgentTeamRun(run: AgentTeamRun, historical: boolean): HTMLElement
 		for (const node of run.nodes) {
 			const line = document.createElement("p");
 			line.className = `agent-team-node agent-team-node-${node.status}`;
-			line.textContent = `${node.label} · ${node.progress ?? node.status}`;
+			line.textContent = `${agents.find((agent) => agent.id === node.label)?.name ?? node.label} · ${node.status}`;
 			body.append(line);
 		}
-	} else if (run.result) appendAgentMarkdown(body, run.result);
+	} else if (result) appendAgentMarkdown(body, result);
 	else appendText(body, run.error ?? "The team run did not produce a result.", "run-error");
+	if (run.status !== "running") {
+		const details = document.createElement("details");
+		const summary = document.createElement("summary");
+		summary.textContent = "Team steps";
+		details.append(summary);
+		for (const node of run.nodes) {
+			const name = agents.find((agent) => agent.id === node.label)?.name ?? node.label;
+			appendText(details, `${name} · ${node.status}`, "muted");
+			if (node.result) appendAgentMarkdown(details, node.result);
+			if (node.error) appendText(details, node.error, "run-error");
+		}
+		body.append(details);
+	}
 	response.append(body);
 	return [request, response];
 }
@@ -9440,6 +9618,11 @@ async function loadAgentActivity(): Promise<void> {
 	const roomState = roomsFromPayload(roomPayload);
 	agentRooms = roomState.rooms;
 	agentRoomRuns = roomState.runs;
+	if (
+		!agentsLoadPromise &&
+		agentRooms.some((room) => room.members.some((member) => !agents.some((agent) => agent.id === member.agentId)))
+	)
+		await loadAgents();
 	conversationBuilds = conversationBuildViewsFromPayload(conversationBuildPayload);
 	renderSessionNavigation();
 	for (const agent of agents) {
@@ -9449,7 +9632,7 @@ async function loadAgentActivity(): Promise<void> {
 		);
 	}
 	renderAgentActivity(payload.tasks, attentionItems, conversationBuilds);
-	refreshOpenAgentRoomRunDialog();
+	renderAgentRoomConversation();
 	if (activeArtifactId === artifactLibraryId) {
 		renderArtifactLibrary();
 	} else if (activeArtifactId) {
@@ -9554,114 +9737,183 @@ function renderRoomActivityEntry(run: AgentRoomRunSummary): HTMLButtonElement {
 	return button;
 }
 
-function openAgentRoomRun(run: AgentRoomRunSummary): void {
-	activeAgentRoomRunDialog?.dialog.close();
-	const dialog = document.createElement("dialog");
-	dialog.className = "promotion-dialog";
-	const form = document.createElement("form");
-	form.method = "dialog";
-	dialog.append(form);
-	dialog.addEventListener("close", () => {
-		if (activeAgentRoomRunDialog?.dialog === dialog) activeAgentRoomRunDialog = undefined;
-		dialog.remove();
-	});
-	document.body.append(dialog);
-	activeAgentRoomRunDialog = { runId: run.id, dialog, form, signature: "" };
-	refreshOpenAgentRoomRunDialog();
-	dialog.showModal();
+function leaveAgentRoomConversation(): void {
+	if (!activeAgentRoomId) return;
+	agentRoomDrafts.set(activeAgentRoomId, input.value);
+	activeAgentRoomId = undefined;
+	renderedAgentRoomSignature = "";
+	input.value = "";
+	resizeComposer();
 }
 
-function refreshOpenAgentRoomRunDialog(): void {
-	const active = activeAgentRoomRunDialog;
-	if (!active) return;
-	const current = agentRoomRuns.find((entry) => entry.id === active.runId);
-	if (!current) return;
-	const signature = JSON.stringify(current);
-	if (active.signature === signature) return;
-	active.signature = signature;
-	const room = agentRooms.find((entry) => entry.id === current.roomId);
-	const { dialog, form } = active;
-	form.replaceChildren();
-	const heading = document.createElement("strong");
-	heading.textContent = room?.name ?? current.roomId;
-	const summary = document.createElement("p");
-	summary.className = "muted";
-	const presentation = roomRunPresentation(current.status);
-	summary.textContent = `${presentation.label} · ${current.rounds.length}/${room?.limits.maxRounds ?? "?"} rounds · ${current.messageCount} messages · ${current.totalTokens.toLocaleString()} tokens · $${current.costUsd.toFixed(4)}`;
-	form.append(heading, summary);
-	for (const round of current.rounds) {
-		const details = document.createElement("details");
-		details.open = round.number === current.rounds.length;
-		const title = document.createElement("summary");
-		title.textContent = `Round ${round.number} · ${round.status}`;
-		details.append(title);
-		for (const turn of round.turns) {
-			const line = document.createElement("p");
-			const member = room?.members.find((entry) => entry.agentId === turn.agentId);
-			line.textContent = `${member?.agentId ?? turn.agentId} · ${turn.status}: ${turn.message}`;
-			details.append(line);
-			if (turn.requestAgentIds?.length) {
-				appendText(details, `Requested follow-up from: ${turn.requestAgentIds.join(", ")}`, "muted");
+function openAgentRoomRun(run: AgentRoomRunSummary): void {
+	const room = agentRooms.find((entry) => entry.id === run.roomId);
+	if (room) openAgentRoomConversation(room);
+}
+
+function openAgentRoomConversation(room: AgentRoomSummary): void {
+	if (activeAgentRoomId !== room.id) {
+		leaveAgentRoomConversation();
+		input.value = agentRoomDrafts.get(room.id) ?? "";
+	}
+	activeAgentRoomId = room.id;
+	builderActive = false;
+	activeSidebarAgent = undefined;
+	activeAgentId = undefined;
+	activeSubagentKey = undefined;
+	activeExternalRunId = undefined;
+	activeExternalConnectionId = undefined;
+	activeArtifactId = undefined;
+	persistExternalRunTabs();
+	persistExternalConnectionTabs();
+	if (!openAgentRoomIds.includes(room.id)) openAgentRoomIds.push(room.id);
+	selectedAgentPanel.classList.add("hidden");
+	mobilePanelNone.checked = true;
+	renderedAgentRoomSignature = "";
+	renderAgentRoomConversation();
+	renderSessionNavigation();
+	resizeComposer();
+	input.focus();
+}
+
+function renderAgentRoomConversation(): void {
+	const room = agentRooms.find((entry) => entry.id === activeAgentRoomId);
+	if (!room) return;
+	const runs = agentRoomRuns.filter((run) => run.roomId === room.id).sort((a, b) => a.createdAt - b.createdAt);
+	const current = runs.at(-1);
+	const running = current?.status === "running";
+	const needsUser = current?.status === "needs-user";
+	const submitting = pendingAgentRoomSubmissions.has(room.id);
+	const supervisor = room.members.find((member) => member.agentId === room.supervisorAgentId);
+	const signature = JSON.stringify([room, runs, submitting]);
+	if (renderedAgentRoomSignature !== signature) {
+		const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
+		const previousScrollTop = transcript.scrollTop;
+		const firstRender = !renderedAgentRoomSignature;
+		renderedAgentRoomSignature = signature;
+		const heading = document.createElement("header");
+		heading.className = "subagent-inspector-heading";
+		appendText(heading, room.name, "message-label");
+		appendText(
+			heading,
+			`${supervisor ? `${supervisor.name ?? supervisor.agentId} · Supervisor · ` : ""}${room.members.length} members`,
+			"muted",
+		);
+		const items: HTMLElement[] = [heading];
+		if (!current) appendText(heading, room.purpose, "muted");
+		for (const run of runs) {
+			const request = document.createElement("article");
+			request.className = "message user";
+			appendText(request, "you", "message-label");
+			appendAgentMarkdown(request, run.goal);
+			items.push(request);
+			for (const round of run.rounds) {
+				for (const turn of round.turns) {
+					const message = document.createElement("article");
+					message.className = "message assistant";
+					const member = room.members.find((entry) => entry.agentId === turn.agentId);
+					appendText(message, member?.name ?? turn.agentId, "message-label");
+					if (turn.requestAgentIds?.length)
+						appendText(
+							message,
+							`To: ${turn.requestAgentIds.map((id) => room.members.find((entry) => entry.agentId === id)?.name ?? id).join(", ")}`,
+							"muted",
+						);
+					const body = document.createElement("div");
+					body.className = "agent-message-content";
+					appendAgentMarkdown(body, turn.message);
+					message.append(body);
+					if (turn.recruit) appendText(message, `Bringing in ${turn.recruit.name}: ${turn.recruit.role}`, "muted");
+					items.push(message);
+				}
+			}
+			if (run.error) {
+				const notice = document.createElement("article");
+				notice.className = `message assistant ${roomRunPresentation(run.status).noticeClassName}`;
+				notice.textContent = run.error;
+				items.push(notice);
 			}
 		}
-		form.append(details);
-	}
-	if (current.result) {
-		const result = document.createElement("pre");
-		result.textContent = current.result;
-		form.append(result);
-	}
-	if (current.error) {
-		const error = document.createElement("p");
-		error.className = presentation.noticeClassName;
-		error.textContent = current.error;
-		form.append(error);
-	}
-	if (current.status === "needs-user") {
-		const question = document.createElement("p");
-		question.textContent = current.userQuestion ?? "The room needs a decision.";
-		const answer = document.createElement("textarea");
-		answer.required = true;
-		answer.maxLength = 16_384;
-		answer.placeholder = "Answer the blocking question";
-		const resume = document.createElement("button");
-		resume.type = "button";
-		resume.textContent = "Continue room";
-		resume.addEventListener("click", () => {
-			if (!answer.reportValidity()) return;
-			resume.disabled = true;
-			void roomRunAction(current.id, "resume", { message: answer.value.trim() })
-				.then(() => dialog.close())
-				.catch((error: unknown) => {
-					resume.disabled = false;
-					setStatus(error instanceof Error ? error.message : String(error), true);
+		if (running || needsUser || submitting) {
+			const activity = document.createElement("article");
+			activity.className = "message assistant agent-running";
+			appendText(
+				activity,
+				needsUser
+					? (current.userQuestion ?? "The team needs your input.")
+					: submitting
+						? "Sending to team…"
+						: `Working: ${(current?.pendingAgentIds ?? []).map((id) => room.members.find((member) => member.agentId === id)?.name ?? id).join(", ") || room.name}`,
+				"muted",
+			);
+			if (needsUser) {
+				const stop = document.createElement("button");
+				stop.type = "button";
+				stop.textContent = "Stop team";
+				stop.addEventListener("click", () => {
+					stop.disabled = true;
+					void roomRunAction(current.id, "cancel", {}).catch((error: unknown) => {
+						stop.disabled = false;
+						setStatus(error instanceof Error ? error.message : String(error), true);
+					});
 				});
-		});
-		form.append(question, answer, resume);
+				activity.append(stop);
+			}
+			items.push(activity);
+		}
+		transcript.replaceChildren(...items);
+		transcript.scrollTop = firstRender || nearBottom ? transcript.scrollHeight : previousScrollTop;
 	}
-	const actions = document.createElement("div");
-	actions.className = "promotion-actions";
-	if (current.status === "running") {
-		const cancel = document.createElement("button");
-		cancel.type = "button";
-		cancel.className = "danger";
-		cancel.textContent = "Stop room";
-		cancel.addEventListener("click", () => {
-			cancel.disabled = true;
-			void roomRunAction(current.id, "cancel", {})
-				.then(() => dialog.close())
-				.catch((error: unknown) => {
-					cancel.disabled = false;
-					setStatus(error instanceof Error ? error.message : String(error), true);
-				});
-		});
-		actions.append(cancel);
+	phase.textContent = submitting ? "sending" : current ? roomRunPresentation(current.status).label : "idle";
+	input.disabled = submitting;
+	input.placeholder = needsUser ? "Answer the team's question…" : `Message ${room.name}…`;
+	input.setAttribute("aria-label", `Message ${room.name}`);
+	send.disabled = submitting;
+	send.classList.toggle("is-stopping", running);
+	send.setAttribute("aria-label", running ? "Stop team" : needsUser ? "Continue team" : "Send to team");
+	model.disabled = true;
+	thinking.disabled = true;
+	attachmentButton.disabled = true;
+	attachmentInput.disabled = true;
+	attachmentList.replaceChildren();
+	const agent = agents.find((entry) => entry.id === room.supervisorAgentId);
+	if (agent?.model) model.value = `${agent.model.provider}/${agent.model.id}`;
+	modelPicker.refresh();
+	if (agent) setSessionPath(agent.projectRoot, false);
+	sessionStats.textContent = `${room.name} · ${phase.textContent}`;
+	sessionStats.title = "Team conversation";
+	setStatus(
+		supervisor ? `Messages go to ${supervisor.name ?? supervisor.agentId}, your team supervisor` : room.purpose,
+	);
+}
+
+async function submitAgentRoomComposer(roomId: string): Promise<void> {
+	if (pendingAgentRoomSubmissions.has(roomId)) return;
+	const current = agentRoomRuns.filter((run) => run.roomId === roomId).sort((a, b) => b.createdAt - a.createdAt)[0];
+	const prompt = input.value.trim();
+	if (current?.status !== "running" && !prompt) return;
+	pendingAgentRoomSubmissions.add(roomId);
+	if (current?.status !== "running") {
+		recordPromptHistory(prompt);
+		input.value = "";
+		agentRoomDrafts.set(roomId, "");
+		resizeComposer();
 	}
-	const close = document.createElement("button");
-	close.type = "submit";
-	close.textContent = "Close";
-	actions.append(close);
-	form.append(actions);
+	renderAgentRoomConversation();
+	try {
+		if (current?.status === "running") await roomRunAction(current.id, "cancel", {});
+		else if (current?.status === "needs-user") await roomRunAction(current.id, "resume", { message: prompt });
+		else await startAgentRoom(roomId, prompt);
+	} catch (error) {
+		if (current?.status !== "running") {
+			agentRoomDrafts.set(roomId, prompt);
+			if (activeAgentRoomId === roomId && !input.value) input.value = prompt;
+		}
+		throw error;
+	} finally {
+		pendingAgentRoomSubmissions.delete(roomId);
+		renderAgentRoomConversation();
+	}
 }
 
 async function roomRunAction(runId: string, action: "cancel" | "resume", body: Record<string, unknown>): Promise<void> {
@@ -9674,29 +9926,51 @@ async function roomRunAction(runId: string, action: "cancel" | "resume", body: R
 	await loadAgentActivity();
 }
 
-function openAgentRoomCreator(): void {
+function openAgentRoomCreator(existing?: AgentRoomSummary): void {
 	const dialog = document.createElement("dialog");
 	dialog.className = "promotion-dialog";
 	const form = document.createElement("form");
 	const heading = document.createElement("strong");
-	heading.textContent = "Start collaboration room";
+	heading.textContent = existing ? `Manage ${existing.name}` : "Create a team";
 	const explanation = document.createElement("p");
 	explanation.className = "muted";
 	explanation.textContent =
-		"Choose at least two agents. Each round is task-backed, ordered, and bounded; room participation grants no delegation authority.";
+		"Choose a supervisor and the agents it can recruit and communicate with. New specialists stay in this team and inherit only the supervisor's read-only file tools and model.";
 	const name = document.createElement("input");
 	name.required = true;
 	name.maxLength = 256;
-	name.placeholder = "Room name";
+	name.placeholder = "Team name";
+	name.value = existing?.name ?? "";
 	const purpose = document.createElement("textarea");
 	purpose.required = true;
 	purpose.maxLength = 4096;
 	purpose.placeholder = "What perspectives should this room combine?";
+	purpose.value = existing?.purpose ?? "";
 	const goal = document.createElement("textarea");
-	goal.required = true;
+	goal.required = !existing;
 	goal.maxLength = 16_384;
 	goal.placeholder = "Goal for this run";
 	form.append(heading, explanation, labelledControl("Name", name), labelledControl("Purpose", purpose));
+	const supervisor = document.createElement("select");
+	supervisor.setAttribute("aria-label", "Team supervisor");
+	const allMembers = document.createElement("option");
+	allMembers.value = "";
+	allMembers.textContent = "Round-based collaboration (no supervisor)";
+	supervisor.append(allMembers);
+	for (const agent of agents) {
+		const option = document.createElement("option");
+		option.value = agent.id;
+		option.textContent = agent.name;
+		supervisor.append(option);
+	}
+	supervisor.value = existing ? (existing.supervisorAgentId ?? "") : (agents[0]?.id ?? "");
+	const recruit = document.createElement("input");
+	recruit.type = "checkbox";
+	recruit.checked = existing?.allowRecruitment ?? false;
+	form.append(
+		labelledControl("Supervisor", supervisor),
+		labelledControl("Allow supervisor to add missing specialists (up to 8 members)", recruit),
+	);
 	const memberHeading = document.createElement("strong");
 	memberHeading.textContent = "Members";
 	form.append(memberHeading);
@@ -9706,10 +9980,15 @@ function openAgentRoomCreator(): void {
 		row.className = "room-member-row";
 		const checkbox = document.createElement("input");
 		checkbox.type = "checkbox";
+		checkbox.setAttribute("aria-label", `Include ${agent.name}`);
+		checkbox.checked =
+			existing?.members.some((member) => member.agentId === agent.id) ?? agent.id === supervisor.value;
 		const role = document.createElement("input");
 		role.placeholder = `${agent.name} perspective`;
 		role.maxLength = 512;
-		role.disabled = true;
+		role.disabled = !checkbox.checked;
+		role.value =
+			existing?.members.find((member) => member.agentId === agent.id)?.role ?? agent.description.slice(0, 512);
 		checkbox.addEventListener("change", () => {
 			role.disabled = !checkbox.checked;
 			if (checkbox.checked && !role.value) role.value = `${agent.name} perspective`;
@@ -9721,14 +10000,15 @@ function openAgentRoomCreator(): void {
 	const limits = document.createElement("details");
 	const limitsHeading = document.createElement("summary");
 	limitsHeading.textContent = "Bounds";
-	const maxRounds = numberInput(3, 1, 6);
+	const maxRounds = numberInput(existing?.limits.maxRounds ?? 12, 1, 32);
 	const maxConcurrency = numberInput(3, 1, 4);
 	limits.append(
 		limitsHeading,
 		labelledControl("Maximum rounds", maxRounds),
 		labelledControl("Maximum concurrent members", maxConcurrency),
 	);
-	form.append(limits, labelledControl("Goal", goal));
+	form.append(limits);
+	if (!existing) form.append(labelledControl("Goal", goal));
 	const actions = document.createElement("div");
 	actions.className = "promotion-actions";
 	const close = document.createElement("button");
@@ -9737,31 +10017,34 @@ function openAgentRoomCreator(): void {
 	close.addEventListener("click", () => dialog.close());
 	const start = document.createElement("button");
 	start.type = "submit";
-	start.textContent = "Start room";
+	start.textContent = existing ? "Save team" : "Start team";
 	actions.append(close, start);
 	form.append(actions);
 	form.addEventListener("submit", (event) => {
 		event.preventDefault();
 		const members = memberRows
-			.filter((row) => row.checkbox.checked)
+			.filter((row) => row.checkbox.checked || row.agent.id === supervisor.value)
 			.map((row) => ({ agentId: row.agent.id, role: row.role.value.trim() || `${row.agent.name} perspective` }));
-		if (members.length < 2) {
-			setStatus("Select at least two room members", true);
+		if (members.length < (supervisor.value ? 1 : 2)) {
+			setStatus("Choose a supervisor or at least two collaboration members", true);
 			return;
 		}
 		start.disabled = true;
 		void createAndStartAgentRoom(
 			{
+				...(existing ? { id: existing.id } : {}),
 				name: name.value.trim(),
 				purpose: purpose.value.trim(),
 				members,
+				supervisorAgentId: supervisor.value || undefined,
+				allowRecruitment: Boolean(supervisor.value) && recruit.checked,
 				limits: { maxRounds: Number(maxRounds.value), maxConcurrency: Number(maxConcurrency.value) },
 			},
 			goal.value.trim(),
 		)
 			.then((run) => {
 				dialog.close();
-				openAgentRoomRun(run);
+				if (run) openAgentRoomRun(run);
 			})
 			.catch((error: unknown) => {
 				start.disabled = false;
@@ -9777,9 +10060,10 @@ function openAgentRoomCreator(): void {
 async function createAndStartAgentRoom(
 	definition: Omit<AgentRoomSummary, "id" | "conversationId" | "limits"> & {
 		limits: { maxRounds: number; maxConcurrency: number };
+		id?: string;
 	},
 	goal: string,
-): Promise<AgentRoomRunSummary> {
+): Promise<AgentRoomRunSummary | undefined> {
 	if (!capabilityToken) throw new Error("Collaboration room access is unavailable");
 	const create = await fetch(`/agent-rooms?token=${encodeURIComponent(capabilityToken)}`, {
 		method: "POST",
@@ -9789,8 +10073,16 @@ async function createAndStartAgentRoom(
 	if (!create.ok) throw new Error(await responseError(create, "Could not create room"));
 	const room: unknown = await create.json();
 	if (!isAgentRoomSummary(room)) throw new Error("Room service returned an invalid definition");
+	if (definition.id) {
+		await loadAgentActivity();
+		return undefined;
+	}
+	return startAgentRoom(room.id, goal);
+}
+
+async function startAgentRoom(roomId: string, goal: string): Promise<AgentRoomRunSummary> {
 	const start = await fetch(
-		`/agent-rooms/${encodeURIComponent(room.id)}/run?token=${encodeURIComponent(capabilityToken)}`,
+		`/agent-rooms/${encodeURIComponent(roomId)}/run?token=${encodeURIComponent(capabilityToken ?? "")}`,
 		{
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -9893,7 +10185,10 @@ function buildWorkflowNextAction(build: AgentBuildRecord): string {
 	if (build.stage === "testing") return "Proof is running";
 	if (build.stage === "proof-ready") return "Review evidence and decide";
 	if (build.stage === "needs-refinement") return "Review failed criteria and improve";
-	if (build.stage === "proven") return build.agentId ? "Promote accepted revision" : "Review publication";
+	if (build.stage === "proven")
+		return build.activeProof && !build.candidateRevision
+			? "Add a schedule or export a skill"
+			: "Activate accepted revision";
 	return "Review and enable schedule";
 }
 
@@ -11275,7 +11570,8 @@ async function reconnect(entry: ConnectionEntry): Promise<void> {
 		activeSubagentKey !== undefined ||
 		activeExternalRunId !== undefined ||
 		activeExternalConnectionId !== undefined ||
-		activeArtifactId !== undefined;
+		activeArtifactId !== undefined ||
+		activeAgentRoomId !== undefined;
 	try {
 		setStatus("Disconnected. Reconnecting…", true);
 		while (
@@ -11342,6 +11638,10 @@ sessionPathForm.addEventListener("submit", (event) => {
 });
 
 async function submitComposer(): Promise<void> {
+	if (activeAgentRoomId) {
+		await submitAgentRoomComposer(activeAgentRoomId);
+		return;
+	}
 	if (activeSubagentKey || activeExternalRunId || activeArtifactId) return;
 	if (activeExternalConnectionId) {
 		await submitExternalComposer(activeExternalConnectionId);
@@ -11501,18 +11801,19 @@ async function submitBuilderComposer(): Promise<void> {
 		"Work progressively. Start from the user's name and intended outcome, then ask at most one concise question only when it blocks the smallest useful draft.",
 		"Do not front-load persona, memory, model, tools, permissions, schedules, or team topology. Recommend each only when the concrete task requires it.",
 		"The versioned build record is the source of truth. The visible form is a synchronized package view and direct-edit escape hatch.",
-		"For drafting or refinement, do not call agent_deploy or modify agent files. Return a draft marker and let the console apply it through the version-checked conversation build service.",
-		"For test, proof review, publication, promotion, or scheduling requests, use manage_agent_build with the current build ID. First prepare its exact proposal; execute only after the user's later yes/no reply supplies that proposal ID.",
-		"Never propose or create automation in this conversation. Pi unlocks that only after a one-time proof is reviewed, accepted, and promoted to a skill.",
+		"For a read-only team with multiple specialists, use configure_team with ordered steps and a final coordinator. The host wires the workflow and presents a Launch team review card. Do not substitute a single agent that only describes delegation. Use the existing package import path for other team capabilities.",
+		"For drafting or refinement, use configure_agent with the current build ID and expectedBuildRevision when available. Do not call agent_deploy or modify agent files. The host persists and validates the candidate.",
+		"For test, proof review, activation, skill export, or scheduling requests, use manage_agent_build with the current build ID. First prepare its exact proposal; execute only after a later user approval. The host verifies the actual user message. With several pending proposals, ask for approve followed by the exact proposal ID.",
+		"After proof acceptance, activate the reviewed revision. Scheduling requires an active accepted revision and confirmed schedule intent. Skill export is optional. Candidate changes do not disable the previously accepted active revision.",
 		editingExistingAgent
 			? "This is an edit. Include only fields the user explicitly requested to change; omit every unchanged field."
 			: "This is a new agent. Include every required field that is known and omit unknown optional fields.",
-		"When feedback identifies an observable regression, include a criteria array in the draft marker. Each item needs id, label, description, category, expectation, and evaluator. Use human for judgment; tool-receipt/tool-errors/workspace-mutation for retained tool evidence; result-text/artifact-text/artifact-change for deterministic output checks. Preserve existing passing criteria.",
+		"When feedback identifies an observable regression, include a criteria array in configure_agent. Each item needs id, label, description, category, expectation, and evaluator. Use human for judgment; tool-receipt/tool-errors/workspace-mutation for retained tool evidence; result-text/artifact-text/artifact-change for deterministic output checks. Preserve existing passing criteria.",
 		"Include assumptions for reversible defaults as objects with topic, value, and rationale. Include at most three clarifications only for material ambiguity, each with topic, materialTopic, question, reason, and blockingActions. The Ozark region, recipients, authority, private sources, paid processing, and schedule details are material; cosmetic choices are not.",
-		'End with exactly one one-line JSON marker. For a model-only edit, use: [AGENT_DRAFT]{"model":"provider/model"}[/AGENT_DRAFT]',
+		"Use configure_agent for changes and report its returned build ID. Do not also emit an AGENT_DRAFT marker for the same change.",
 		"Never invent a model ID. Use an exact candidate below. If there is one clear match, use it without asking; otherwise ask the user to choose in Advanced configuration.",
 		`Exact model candidates for this request: ${agentBuilderModelCandidates(prompt)}`,
-		"The console applies valid marker fields to the versioned candidate only. Tell the user what was assumed, ask one material question when needed, and offer Try candidate when safe.",
+		"The console applies validated tool changes to the versioned candidate only. Tell the user what was assumed, ask one material question when needed, and offer Try candidate when safe.",
 		`Current name: ${requiredElement<HTMLInputElement>("agent-name").value || "not set"}`,
 		`Current description: ${requiredElement<HTMLTextAreaElement>("agent-description").value || "not set"}`,
 		`Current project folder: ${requiredElement<HTMLInputElement>("agent-project-root").value || "not set"}`,
@@ -11532,9 +11833,10 @@ async function submitBuilderComposer(): Promise<void> {
 		...improvementContext,
 		`User request: ${prompt}`,
 	].join("\n");
+	const submittedAt = Date.now();
 	try {
 		await chatSession.prompt(message);
-		if (builderActive && session === chatSession) await refreshActiveAgentBuild();
+		if (builderActive && session === chatSession) await refreshActiveAgentBuild(submittedAt);
 	} catch (error) {
 		if (!input.value.trim()) {
 			input.value = prompt;
@@ -11610,6 +11912,7 @@ async function submitAgentComposer(agentId: string): Promise<void> {
 
 input.addEventListener("input", () => {
 	resizeComposer();
+	if (activeAgentRoomId) agentRoomDrafts.set(activeAgentRoomId, input.value);
 	const history = activePromptHistory();
 	if (!history) return;
 	history.index = history.entries.length;
@@ -11732,7 +12035,7 @@ previewImage.addEventListener(
 	{ passive: false },
 );
 input.addEventListener("paste", (event) => {
-	if (builderActive) return;
+	if (builderActive || activeAgentRoomId) return;
 	const files = [...(event.clipboardData?.files ?? [])];
 	if (files.length > 0) {
 		event.preventDefault();
@@ -12023,7 +12326,7 @@ agentForm.addEventListener("submit", (event) => {
 		void persistAgentBuildDraft()
 			.then(async () => {
 				agentBuilderBaseline = agentBuilderDraftSignature();
-				agentBuilderFeedback = `Candidate revision ${activeAgentBuild?.candidateRevision ?? ""} saved. The active agent remains unchanged until proof acceptance and promotion.`;
+				agentBuilderFeedback = `Candidate revision ${activeAgentBuild?.candidateRevision ?? ""} saved. Accept its proof and activate it to update the active agent.`;
 				activeAgentImprovement = undefined;
 				updateAgentBuilderReadiness();
 				await loadAgents();

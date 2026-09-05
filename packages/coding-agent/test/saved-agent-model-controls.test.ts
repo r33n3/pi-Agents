@@ -141,7 +141,7 @@ describe("saved agent native model settings", () => {
 		expect(start).toHaveBeenCalledTimes(1);
 	});
 
-	test("preserves settings through chat draft, reload, publish, candidate proof and promotion", async () => {
+	test("preserves settings through chat draft, reload, publish, candidate proof, export and activation", async () => {
 		const [configure] = createAgentRegistryTools(registry, lifecycle);
 		const context = {} as ExtensionContext;
 		const configured = await configure.execute(
@@ -187,6 +187,8 @@ describe("saved agent native model settings", () => {
 		await lifecycle.reviewProof(buildId, true);
 		await lifecycle.assertPromotionAllowed(proof.proof!.runId);
 		await lifecycle.markPromoted(proof.proof!.runId, "synthetic-review", join(root, "synthetic-skill"));
+		expect((await registry.get(agentId))!).toMatchObject({ revision: 1, modelControls: input.modelControls });
+		await lifecycle.activate(buildId);
 		expect((await registry.get(agentId))!).toMatchObject({ revision: 2, modelControls: { reasoningEffort: "high" } });
 		const restored = new AgentBuildLifecycleService(root, registry, runs);
 		expect((await restored.get(buildId)).activeConfiguration!.modelControls).toEqual({ reasoningEffort: "high" });

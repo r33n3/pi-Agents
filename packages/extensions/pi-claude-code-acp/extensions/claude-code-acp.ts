@@ -76,7 +76,8 @@ class AutoApproveClient implements acp.Client {
 	}
 }
 
-async function createSession(cwd: string, model: string, authentication: ClaudeAuthenticationMode): Promise<SessionHandle> {
+async function createSession(cwd: string, model: string, authentication: ClaudeAuthenticationMode, signal?: AbortSignal): Promise<SessionHandle> {
+	signal?.throwIfAborted();
 	if (!existsSync(cwd)) {
 		throw new Error(`claude_code: cwd does not exist: ${cwd}`);
 	}
@@ -144,6 +145,14 @@ async function createSession(cwd: string, model: string, authentication: ClaudeA
 	proc.on("exit", () => {
 		sessions.delete(sessionKey);
 	});
+	let abortStartup: () => void = () => {};
+	const aborted = new Promise<never>((_resolve, reject) => {
+		abortStartup = () => {
+			proc.kill();
+			reject(signal?.reason ?? new Error("Claude Code startup aborted"));
+		};
+		signal?.addEventListener("abort", abortStartup, { once: true });
+	});
 
 	try {
 		await Promise.race([
@@ -156,6 +165,7 @@ async function createSession(cwd: string, model: string, authentication: ClaudeA
 				handle.sessionId = session.sessionId;
 			})(),
 			errorPromise,
+			aborted,
 		]);
 	} catch (err) {
 		proc.kill();
@@ -164,16 +174,18 @@ async function createSession(cwd: string, model: string, authentication: ClaudeA
 		throw effectiveErr instanceof Error
 			? new Error(`${effectiveErr.message}${stderrNote}`, { cause: effectiveErr })
 			: new Error(`${String(effectiveErr)}${stderrNote}`);
+	} finally {
+		signal?.removeEventListener("abort", abortStartup);
 	}
 
 	return handle;
 }
 
-function getSession(cwd: string, model: string, authentication: ClaudeAuthenticationMode): Promise<SessionHandle> {
+function getSession(cwd: string, model: string, authentication: ClaudeAuthenticationMode, signal?: AbortSignal): Promise<SessionHandle> {
 	const sessionKey = `${cwd}\0${model}\0${authentication}`;
 	let pending = sessions.get(sessionKey);
 	if (!pending) {
-		pending = createSession(cwd, model, authentication).catch((err) => {
+		pending = createSession(cwd, model, authentication, signal).catch((err) => {
 			sessions.delete(sessionKey);
 			throw err;
 		});
@@ -208,11 +220,21 @@ const claudeCodeTool = defineTool({
 		),
 	}),
 
-	async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+	async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		signal?.throwIfAborted();
 		const cwd = params.cwd ? resolvePath(ctx.cwd, params.cwd) : ctx.cwd;
 		const model = (params.model ?? "claude-sonnet-5").replace(/^anthropic\//, "");
 		const authentication = params.authentication ?? "subscription";
-		const handle = await getSession(cwd, model, authentication);
+		const handle = await getSession(cwd, model, authentication, signal);
+		const abort = () => {
+			sessions.delete(`${cwd}\0${model}\0${authentication}`);
+			handle.proc.kill();
+		};
+		if (signal?.aborted) {
+			abort();
+			signal.throwIfAborted();
+		}
+		signal?.addEventListener("abort", abort, { once: true });
 
 		let buffer = "";
 		handle.onChunk = (text) => {
@@ -236,6 +258,7 @@ const claudeCodeTool = defineTool({
 				? new Error(`${err.message}${stderrNote}`, { cause: err })
 				: new Error(`${String(err)}${stderrNote}`);
 		} finally {
+			signal?.removeEventListener("abort", abort);
 			handle.onChunk = undefined;
 			// In one-shot modes there's no future turn to reuse this session for, and the
 			// kept-alive child process (open stdio pipes) would otherwise block pi's own

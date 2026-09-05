@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentExecution, AgentExecutionContext, AgentExecutor } from "../src/core/serve/agent-executor.ts";
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
 import { AgentRoomService } from "../src/core/serve/agent-room-service.ts";
@@ -150,6 +150,194 @@ async function saveRoom(rooms: AgentRoomService, limits: { maxRounds?: number } 
 }
 
 describe("AgentRoomService", () => {
+	test("addresses a roster member directly and returns control to the supervisor", async () => {
+		const executor = new RoomExecutor("one-round");
+		const { tasks, rooms } = await setup("one-round", executor);
+		await rooms.save({
+			id: "addressed-team",
+			name: "Addressed team",
+			purpose: "Review",
+			supervisorAgentId: "researcher",
+			members: [
+				{ agentId: "researcher", role: "Supervise" },
+				{ agentId: "reviewer", role: "Review" },
+			],
+		});
+		const completed = await rooms.waitForCompletion(
+			(await rooms.start("addressed-team", "@reviewer check the evidence")).id,
+		);
+		expect(completed.status).toBe("completed");
+		expect(executor.contexts.map((context) => context.definition.id)).toEqual(["reviewer", "researcher"]);
+		await rooms.dispose();
+		await tasks.dispose();
+	});
+	test("stops a supervised task at its turn limit without waking other members", async () => {
+		const executor = new RoomExecutor("reply");
+		const { tasks, rooms } = await setup("reply", executor);
+		await rooms.save({
+			id: "bounded-team",
+			name: "Bounded team",
+			purpose: "Review",
+			supervisorAgentId: "researcher",
+			members: [
+				{ agentId: "researcher", role: "Supervise" },
+				{ agentId: "reviewer", role: "Review" },
+			],
+			limits: { maxRounds: 1 },
+		});
+		const run = await rooms.waitForCompletion((await rooms.start("bounded-team", "Review the evidence")).id);
+		expect(run.status).toBe("bounded");
+		expect(executor.contexts.map((context) => context.definition.id)).toEqual(["researcher"]);
+		await rooms.dispose();
+		await tasks.dispose();
+	});
+
+	test("cancels the supervisor and rejects roster changes while its task is active", async () => {
+		const executor = new ControlledRoomExecutor();
+		const { tasks, rooms } = await setup("reply", executor);
+		const definition = await rooms.save({
+			id: "stoppable-team",
+			name: "Stoppable team",
+			purpose: "Review",
+			supervisorAgentId: "researcher",
+			members: [
+				{ agentId: "researcher", role: "Supervise" },
+				{ agentId: "reviewer", role: "Review" },
+			],
+		});
+		const started = await rooms.start(definition.id, "Review evidence");
+		await expect.poll(() => executor.contexts.length).toBe(1);
+		await expect(rooms.save(definition)).rejects.toThrow("active run");
+		const cancelled = await rooms.cancel(started.id);
+		expect(cancelled.status).toBe("cancelled");
+		expect(cancelled.taskIds).toHaveLength(1);
+		expect(tasks.getTask(cancelled.taskIds[0]!)?.status).toBe("cancelled");
+		await rooms.dispose();
+		await tasks.dispose();
+	});
+
+	test("supervisor recruits from its roster, routes peer requests, and receives the final evidence", async () => {
+		const executor = new RoomExecutor("one-round");
+		const contexts: AgentExecutionContext[] = [];
+		vi.spyOn(executor, "start").mockImplementation(async (context) => {
+			contexts.push(context);
+			const index = contexts.length;
+			const output = {
+				outcome: "reply",
+				message: index === 3 ? "Final checked evidence" : `Evidence ${index}`,
+				requestAgentIds: index === 1 ? ["reviewer"] : index === 2 ? ["observer", "researcher"] : [],
+			};
+			return {
+				result: Promise.resolve({ output: JSON.stringify(output), transcript: [] }),
+				subscribe: () => () => {},
+				abort: async () => {},
+				dispose: async () => {},
+				[Symbol.asyncDispose]: async () => {},
+			};
+		});
+		const { registry, tasks, rooms } = await setup("one-round", executor);
+		await registry.save({ ...(await registry.get("reviewer"))!, id: "observer", name: "Observer" });
+		await rooms.save({
+			id: "supervised",
+			name: "Review team",
+			purpose: "Review evidence",
+			supervisorAgentId: "researcher",
+			members: [
+				{ agentId: "researcher", role: "Supervise" },
+				{ agentId: "reviewer", role: "Check evidence" },
+				{ agentId: "observer", role: "Answer the reviewer's question" },
+			],
+		});
+		const completed = await rooms.waitForCompletion((await rooms.start("supervised", "Review this design")).id);
+		expect(completed.status).toBe("completed");
+		expect(contexts.map((context) => context.definition.id)).toEqual([
+			"researcher",
+			"reviewer",
+			"observer",
+			"researcher",
+		]);
+		expect(contexts[3]?.prompt).toContain("Final checked evidence");
+		expect(contexts.every((context) => context.prompt.includes("Review this design"))).toBe(true);
+		expect(completed.rounds.every((round) => round.turns.length === 1)).toBe(true);
+		await rooms.dispose();
+		await tasks.dispose();
+	});
+
+	test("recruits one bounded specialist and retains membership across restart", async () => {
+		const executor = new RoomExecutor("one-round");
+		const contexts: AgentExecutionContext[] = [];
+		vi.spyOn(executor, "start").mockImplementation(async (context) => {
+			contexts.push(context);
+			const output =
+				contexts.length === 1
+					? {
+							outcome: "reply",
+							message: "Check the source",
+							requestAgentIds: [],
+							recruit: [{ name: "Source checker", role: "Read and verify the source" }],
+						}
+					: { outcome: "reply", message: "Source verified", requestAgentIds: [] };
+			return {
+				result: Promise.resolve({ output: JSON.stringify(output), transcript: [] }),
+				subscribe: () => () => {},
+				abort: async () => {},
+				dispose: async () => {},
+				[Symbol.asyncDispose]: async () => {},
+			};
+		});
+		const { root, registry, tasks, workflows, rooms } = await setup("one-round", executor);
+		await rooms.save({
+			id: "staffing",
+			name: "Staffing team",
+			purpose: "Check evidence",
+			supervisorAgentId: "researcher",
+			allowRecruitment: true,
+			members: [{ agentId: "researcher", role: "Supervise" }],
+		});
+		const completed = await rooms.waitForCompletion((await rooms.start("staffing", "Check the source")).id);
+		expect(completed.status).toBe("completed");
+		expect(contexts).toHaveLength(3);
+		const recruited = contexts[1]!.definition;
+		expect(recruited).toMatchObject({
+			name: "Source checker",
+			tools: ["read"],
+			permissionPolicy: "read-only",
+			schedules: [],
+			delegateAgentIds: [],
+			capabilities: [],
+			memory: "none",
+		});
+		expect(contexts[2]?.prompt).toContain(recruited.id);
+		expect(rooms.getDefinition("staffing")?.members).toHaveLength(2);
+		const restored = new AgentRoomService(join(root, "rooms"), registry, tasks, workflows);
+		await restored.initialize();
+		expect(restored.getRun(completed.id)?.definitionSnapshot?.members).toHaveLength(2);
+		expect(restored.getDefinition("staffing")?.members[1]?.name).toBe("Source checker");
+		await restored.dispose();
+		await rooms.dispose();
+		await tasks.dispose();
+	});
+
+	test.each([
+		{ requestAgentIds: ["reviewer"] },
+		{ requestAgentIds: [], recruit: [{ name: "Unauthorized", role: "Do work" }] },
+	])("rejects unauthorized supervisor action %j", async (action) => {
+		const { tasks, rooms } = await setup("one-round", new RoomExecutor("one-round", action));
+		await rooms.save({
+			id: "restricted",
+			name: "Restricted",
+			purpose: "Check",
+			supervisorAgentId: "researcher",
+			members: [{ agentId: "researcher", role: "Supervise" }],
+		});
+		const run = await rooms.waitForCompletion((await rooms.start("restricted", "Check evidence")).id);
+		expect(run.status).toBe("failed");
+		expect(run.taskIds).toHaveLength(1);
+		expect(rooms.getDefinition("restricted")?.members).toHaveLength(1);
+		await rooms.dispose();
+		await tasks.dispose();
+	});
+
 	test("persists stable ordered rounds backed by ordinary room-scoped tasks", async () => {
 		const executor = new RoomExecutor("converge");
 		const { root, registry, tasks, workflows, rooms } = await setup("converge", executor);

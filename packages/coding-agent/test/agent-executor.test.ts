@@ -1,6 +1,26 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, test } from "vitest";
-import { agentExecutionInstructions, agentExecutionResultFromMessages } from "../src/core/serve/agent-executor.ts";
+import {
+	agentExecutionInstructions,
+	agentExecutionResultFromMessages,
+	agentIdentityInstructions,
+} from "../src/core/serve/agent-executor.ts";
+
+test("saved input defaults are qualified in the identity used by worker system prompts", () => {
+	const instructions = agentIdentityInstructions({
+		name: "Calculator",
+		persona: "Read inventory.csv. Remain read-only.",
+		description: "Calculate inventory value",
+	});
+	expect(instructions).toContain("Read inventory.csv. Remain read-only.");
+	expect(instructions.indexOf("explicit inputs in the current task replace those defaults")).toBeLessThan(
+		instructions.indexOf("Read inventory.csv"),
+	);
+	expect(instructions).toContain("never substitute a default file or an earlier result");
+	expect(instructions).toContain("does not override access restrictions, permissions, or safety constraints");
+	expect(instructions).toContain("obtain fresh tool evidence yourself or from teammates in this run");
+	expect(instructions).toContain("even when the filename and question are identical");
+});
 
 test("agent execution instructions anchor relative dates to host time", () => {
 	const instructions = agentExecutionInstructions(

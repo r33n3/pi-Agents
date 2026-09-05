@@ -13,7 +13,10 @@ import type {
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
 import { createAgentRegistryTools } from "../src/core/serve/agent-registry-tools.ts";
 import { AgentRunManager } from "../src/core/serve/agent-run-manager.ts";
-import { ConversationBuildCoordinator } from "../src/core/serve/conversation-build-coordinator.ts";
+import {
+	type AgentBuildUserMessage,
+	ConversationBuildCoordinator,
+} from "../src/core/serve/conversation-build-coordinator.ts";
 import { RoutineRegistry } from "../src/core/serve/routine-registry.ts";
 import { RunSkillPromotionService } from "../src/core/serve/run-skill-promotion-service.ts";
 
@@ -111,6 +114,54 @@ async function setup(executor: AgentExecutor = new IdleExecutor()): Promise<{
 }
 
 describe("configure_agent lifecycle tool", () => {
+	test("defaults a minimal draft to the session workspace and reports the assumption", async () => {
+		const { root, registry, lifecycle } = await setup();
+		const [tool] = createAgentRegistryTools(registry, lifecycle);
+		const cwd = join(root, "research");
+		const result = await tool.execute("minimal", { name: "researcher" }, undefined, undefined, {
+			cwd,
+		} as ExtensionContext);
+		expect(await lifecycle.get(result.details!.buildId)).toMatchObject({
+			projectRoot: cwd,
+			configuration: { projectRoot: cwd, permissionPolicy: "read-only" },
+			stage: "draft",
+		});
+		expect(result.content).toEqual([
+			expect.objectContaining({ text: expect.stringContaining(`Workspace: ${cwd} (defaulted`) }),
+		]);
+		expect(await registry.list()).toEqual([]);
+	});
+
+	test("preserves a staged workspace across sessions and honors an explicit replacement", async () => {
+		const { root, registry, lifecycle } = await setup();
+		const [tool] = createAgentRegistryTools(registry, lifecycle);
+		const firstRoot = join(root, "first");
+		const context = { cwd: join(root, "second") } as ExtensionContext;
+		await tool.execute("create", { name: "researcher", projectRoot: firstRoot }, undefined, undefined, context);
+		const updated = await tool.execute(
+			"edit",
+			{ name: "researcher", description: "Review sources" },
+			undefined,
+			undefined,
+			context,
+		);
+		expect((await lifecycle.get(updated.details!.buildId)).configuration?.projectRoot).toBe(firstRoot);
+		const replacement = join(root, "third");
+		await tool.execute("move", { name: "researcher", projectRoot: replacement }, undefined, undefined, context);
+		expect((await lifecycle.get(updated.details!.buildId)).configuration?.projectRoot).toBe(replacement);
+		expect(await lifecycle.list()).toHaveLength(1);
+	});
+
+	test("rejects a missing workspace without writing a draft when context has no directory", async () => {
+		const { registry, lifecycle } = await setup();
+		const [tool] = createAgentRegistryTools(registry, lifecycle);
+		await expect(
+			tool.execute("missing", { name: "researcher" }, undefined, undefined, {} as ExtensionContext),
+		).rejects.toThrow("projectRoot is required");
+		expect(await lifecycle.list()).toEqual([]);
+		expect(await registry.list()).toEqual([]);
+	});
+
 	test("stages configuration and automation intent without deploying or scheduling", async () => {
 		const { root, registry, lifecycle } = await setup();
 		const [tool] = createAgentRegistryTools(registry, lifecycle);
@@ -210,11 +261,10 @@ describe("configure_agent lifecycle tool", () => {
 				id: "reviewer",
 				name: "Reviewer",
 				description: "Review two boundaries",
-				projectRoot: join(root, "workspace"),
 			},
 			undefined,
 			undefined,
-			{} as ExtensionContext,
+			{ cwd: join(root, "other-session") } as ExtensionContext,
 		);
 
 		expect(await registry.get("reviewer")).toMatchObject({ revision: 1, description: "Review one boundary" });
@@ -223,7 +273,10 @@ describe("configure_agent lifecycle tool", () => {
 				stage: "draft",
 				agentId: "reviewer",
 				agentRevision: 1,
-				configuration: expect.objectContaining({ description: "Review two boundaries" }),
+				configuration: expect.objectContaining({
+					description: "Review two boundaries",
+					projectRoot: join(root, "workspace"),
+				}),
 			}),
 		]);
 	});
@@ -285,7 +338,7 @@ describe("configure_agent lifecycle tool", () => {
 		expect(await registry.get("chat-published-agent")).toMatchObject({ revision: 1 });
 	});
 
-	test("lets chat publish, promote, and enable only its retained confirmed schedule", async () => {
+	test("lets chat publish and enable its retained confirmed schedule without skill export", async () => {
 		// This synthetic package has no connection to a user's stored agent or schedule.
 		const root = await mkdtemp(join(tmpdir(), "pi-agent-tool-complete-"));
 		roots.push(root);
@@ -357,13 +410,44 @@ describe("configure_agent lifecycle tool", () => {
 				target: { kind: "agent", agentId: "exampletown-chat-agent" },
 			}),
 		]);
+		const initialRoutine = (await routines.list())[0]!;
+		await configure.execute(
+			"additional-intent",
+			{
+				id: "exampletown-chat-agent",
+				name: "exampletown-chat-agent",
+				scheduleTask: "Create an evening brief",
+				scheduleCadence: "daily 18:00",
+				scheduleTimezone: "America/Chicago",
+				scheduleConfirmed: true,
+				scheduleMode: "additional",
+			},
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		expect((await lifecycle.get(buildId)).stage).toBe("automated");
+		await manage.execute(
+			"additional-schedule",
+			{ buildId, action: "schedule", confirmed: true },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		expect(await routines.list()).toHaveLength(2);
+		expect((await routines.list()).find((routine) => routine.id === initialRoutine.id)).toEqual(initialRoutine);
 	});
 
 	test("binds chat confirmation to one exact proposal and rejects a bare yes when several are pending", async () => {
-		const { root, registry, lifecycle } = await setup(new CompletedExecutor());
-		const conversationBuilds = new ConversationBuildCoordinator(join(root, "conversation"), lifecycle);
+		const { root, registry, lifecycle, runs } = await setup(new CompletedExecutor());
+		let userMessage: AgentBuildUserMessage | undefined;
+		const conversationBuilds = new ConversationBuildCoordinator(
+			join(root, "conversation"),
+			lifecycle,
+			() => userMessage,
+		);
 		await conversationBuilds.initialize();
-		const [configure, manage] = createAgentRegistryTools(registry, lifecycle, {
+		const [configure, manage, inspect] = createAgentRegistryTools(registry, lifecycle, {
 			conversationBuilds,
 			sessionId: "session-exact-approval",
 		});
@@ -393,6 +477,37 @@ describe("configure_agent lifecycle tool", () => {
 			undefined,
 			{} as ExtensionContext,
 		);
+		// Live UI regression: proposal IDs must reach model-visible content, not only UI details.
+		expect(firstProposal.content).toEqual([
+			expect.objectContaining({ text: expect.stringContaining(firstProposal.details!.proposalId!) }),
+		]);
+		await expect(
+			manage.execute(
+				"missing-proposal-id",
+				{
+					buildId: first.details!.buildId,
+					action: "run-proof",
+					confirmed: true,
+					prompt: "Complete the first task",
+				},
+				undefined,
+				undefined,
+				{} as ExtensionContext,
+			),
+		).rejects.toThrow("proposalId is required");
+		const retained = await conversationBuilds.inspect(first.details!.buildId);
+		expect(retained.proposals).toHaveLength(1);
+		expect(retained.proposals[0]).toMatchObject({ id: firstProposal.details!.proposalId, state: "pending" });
+		const inspected = await inspect.execute(
+			"recover-proposal",
+			{ buildId: first.details!.buildId },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+		expect(inspected.content).toEqual([
+			expect.objectContaining({ text: expect.stringContaining(firstProposal.details!.proposalId!) }),
+		]);
 		await manage.execute(
 			"propose-second",
 			{
@@ -412,6 +527,7 @@ describe("configure_agent lifecycle tool", () => {
 			proposalId: firstProposal.details!.proposalId,
 			prompt: "Complete the first task",
 		};
+		userMessage = { id: "ambiguous", text: "yes", createdAt: Date.now() + 1 };
 		await expect(
 			manage.execute(
 				"confirm-ambiguous",
@@ -420,7 +536,12 @@ describe("configure_agent lifecycle tool", () => {
 				undefined,
 				{} as ExtensionContext,
 			),
-		).rejects.toThrow("Several action proposals");
+		).rejects.toThrow();
+		userMessage = {
+			id: "approval-1",
+			text: `approve ${firstProposal.details!.proposalId}`,
+			createdAt: Date.now() + 1,
+		};
 		const result = await manage.execute(
 			"confirm-exact",
 			{ ...confirmation, confirmationText: "Yes, test first-candidate" },
@@ -429,5 +550,6 @@ describe("configure_agent lifecycle tool", () => {
 			{} as ExtensionContext,
 		);
 		expect(result.details).toMatchObject({ stage: "testing", proposalState: "completed" });
+		await runs.waitForCompletion((await lifecycle.get(first.details!.buildId)).proof!.runId);
 	});
 });

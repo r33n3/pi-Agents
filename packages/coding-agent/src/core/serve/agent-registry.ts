@@ -161,7 +161,7 @@ export class AgentRegistry {
 		}
 	}
 
-	async save(input: AgentDefinitionInput): Promise<AgentDefinition> {
+	async save(input: AgentDefinitionInput, expectedRevision?: number): Promise<AgentDefinition> {
 		return this.#queue.run(async () => {
 			await this.initialize();
 			const normalized = normalizeDefinition(input, this.#defaultWorkspace);
@@ -179,7 +179,13 @@ export class AgentRegistry {
 				if (!isNodeError(error) || error.code !== "ENOENT") throw error;
 			}
 			const catalogDefinition = previous ? undefined : await this.#readCatalog(normalized.id);
-			const definition = { ...normalized, revision: (previous?.revision ?? catalogDefinition?.revision ?? 0) + 1 };
+			const currentRevision = previous?.revision ?? catalogDefinition?.revision ?? 0;
+			if (expectedRevision !== undefined && currentRevision !== expectedRevision) {
+				throw new Error(
+					`Agent ${normalized.id} changed from revision ${expectedRevision} to ${currentRevision}; review it before saving`,
+				);
+			}
+			const definition = { ...normalized, revision: currentRevision + 1 };
 			for (const delegateId of definition.delegateAgentIds) {
 				if (delegateId === definition.id) throw new Error("An agent cannot delegate to itself");
 				if (!(await this.get(delegateId))) throw new Error(`Delegate agent ${delegateId} was not found`);
@@ -324,7 +330,7 @@ export class AgentRegistry {
 	}
 }
 
-function normalizeDefinition(value: unknown, defaultWorkspace: string): AgentDefinition {
+export function normalizeDefinition(value: unknown, defaultWorkspace: string): AgentDefinition {
 	const input = record(value, "agent definition");
 	const name = requiredString(input.name, "name");
 	const id = input.id === undefined ? slugify(name) : requiredString(input.id, "id");
@@ -426,7 +432,7 @@ function normalizeBrowserWorkflows(value: unknown): AgentBrowserWorkflowGrant[] 
 	return grants;
 }
 
-function normalizeCapabilityGrants(value: unknown): AgentCapabilityGrant[] {
+export function normalizeCapabilityGrants(value: unknown): AgentCapabilityGrant[] {
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) throw new Error("capabilities must be an array");
 	const grants = value.map((entry, index) => {

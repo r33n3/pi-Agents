@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added sidebar team rosters with supervisors, scoped specialist recruitment, targeted member communication, and retained team conversations.
+- Added conversational preparation of read-only teams with reviewed launch into one coordinator chat.
 - Added bounded static `page_read` source evidence and a separately reviewed Pi Public Web capability for sessions and isolated agents.
 - Added a progressive agent build lifecycle with durable drafts, one-time proof runs, retained result review, proof-gated skill promotion, and explicit automation confirmation.
 - Added canonical WTK agent-package validation, Pi runtime compilation, governed team launch, and retained qualification evidence integration.
@@ -25,11 +27,21 @@
 
 ### Changed
 
+- Moved team conversations into the main chat panel with sidebar selection, retained team drafts, and shared send, stop, and continue controls.
+- Added explicit activation of accepted agent revisions with optional skill export, preserving active routines during candidate refinement.
+- Routed Claude and Hermes connections directly through backend adapters with shared agent/external-run capacity and workspace exclusion.
 - Moved Agent Builder conversations into temporary main-chat tabs while retaining synchronized configuration in the Agent Builder workspace.
 - Isolated deployed-agent runtime environments from host secrets and routed permitted filesystem actions through typed, auditable host RPC.
 
 ### Fixed
 
+- Clarified reusable agent input defaults and required fresh evidence for new file reviews in shared worker instructions.
+- Distinguished the current workflow request from reusable step instructions, and showed coordinator answers with expandable specialist reports and readable progress labels.
+- Included lifecycle proposal IDs in model-visible tool responses and preserved pending proposals when confirmation omits its ID.
+- Ignored stale Agent Builder exit events after switching to an agent chat so subsequent replies remain visible.
+- Verified conversational lifecycle approvals against later host-observed user messages, retained replay results and interrupted-action progress, and connected browser helper sessions to durable build tools.
+- Shared draft/registry configuration validation, preserved mandatory proof checks and human-review provenance, and prevented additional schedules from overwriting existing routines.
+- Preserved worker cancellation outcomes when a stopped process exits before delivering its result notification.
 - Bounded everyday provider downloads across redirects, DNS resolution, headers, and streamed bodies; rejected private DNS answers and credential-bearing URLs.
 - Fixed weather format negotiation and ambiguous location selection, and distinguished valid empty feeds from malformed or non-feed pages with single-pass entity decoding.
 - Updated vulnerable transitive dependencies in the sandbox and Gondolin extension examples to `shell-quote` 1.10.0 and `undici` 6.28.0.
@@ -38,6 +50,7 @@
 - Fixed managed-browser live frames being dropped by WebSocket state checks or blocked by the console content security policy.
 - Fixed managed-browser screencasting overwhelming the serve control plane by coalescing frames and limiting delivery to ten frames per second.
 - Fixed public browser sessions accepting literal private addresses and managed Chromium recordings losing semantic click and typing targets.
+- Fixed new chat agent drafts rejecting an omitted workspace despite an active session directory, and aligned agent-building guidance with the serve lifecycle.
 
 ## [0.84.4] - 2026-08-28
 

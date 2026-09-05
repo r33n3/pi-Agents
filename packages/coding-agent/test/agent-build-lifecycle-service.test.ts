@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -98,6 +98,110 @@ async function saveReviewer(registry: AgentRegistry): Promise<void> {
 }
 
 describe("AgentBuildLifecycleService", () => {
+	test("only one writer can replace an expected active revision", async () => {
+		const { registry } = await setup();
+		await saveReviewer(registry);
+		const active = (await registry.get("reviewer"))!;
+		await expect(registry.save({ ...active, description: "Must not overwrite" }, 0)).rejects.toThrow("changed");
+		const writers = await Promise.allSettled([
+			registry.save({ ...active, description: "First candidate" }, active.revision),
+			registry.save({ ...active, description: "Second candidate" }, active.revision),
+		]);
+		expect(writers.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+		expect(writers.filter((result) => result.status === "rejected")).toHaveLength(1);
+		expect((await registry.get("reviewer"))?.revision).toBe(2);
+	});
+	test("rejects activation without accepted evidence and rolls back memory after a failed write", async () => {
+		const { root, lifecycle } = await setup();
+		const draft = { name: "Review", objective: "Review one file", projectRoot: join(root, "workspace") };
+		const build = await lifecycle.createDraft(draft);
+		await expect(lifecycle.activate(build.id)).rejects.toThrow("Test and accept");
+		const path = join(root, "lifecycle", "agent-builds.json");
+		await rename(path, `${path}.backup`);
+		await mkdir(path);
+		await expect(lifecycle.updateDraft(build.id, { ...draft, objective: "Changed" })).rejects.toThrow();
+		expect(await lifecycle.get(build.id)).toEqual(build);
+		await rmdir(path);
+		await rename(`${path}.backup`, path);
+		expect((await lifecycle.updateDraft(build.id, { ...draft, objective: "Retried" })).objective).toBe("Retried");
+	});
+	test("keeps active automation eligible through candidate rejection, restart, and replacement", async () => {
+		const { root, registry, runs, executor, lifecycle } = await setup();
+		await saveReviewer(registry);
+		const build = await lifecycle.ensureForAgent("reviewer");
+		const first = await lifecycle.startProof(build.id, "Review the active boundary");
+		executor.executions[0]!.resolve({ output: "Reviewed active boundary", transcript: [] });
+		await runs.waitForCompletion(first.proof!.runId);
+		await lifecycle.reviewProof(build.id, true);
+		await lifecycle.activate(build.id);
+		await lifecycle.markAutomated("reviewer", "daily-review");
+		const candidate = await lifecycle.updateDraft(build.id, {
+			name: build.name,
+			objective: "Review two boundaries",
+			projectRoot: build.projectRoot,
+			configuration: {
+				...build.configuration!,
+				description: "Review two boundaries",
+				persona: "Review both boundaries",
+			},
+		});
+		expect(await lifecycle.ensureForAgent("reviewer")).toMatchObject({
+			candidateRevision: 2,
+			objective: "Review two boundaries",
+		});
+		await expect(lifecycle.assertAutomationAllowed("reviewer")).resolves.toMatchObject({
+			activeProof: { agentRevision: 1 },
+		});
+		const second = await lifecycle.startProof(candidate.id, "Review both boundaries");
+		executor.executions[1]!.resolve({ output: "Only one reviewed", transcript: [] });
+		await runs.waitForCompletion(second.proof!.runId);
+		await lifecycle.reviewProof(build.id, false);
+		const restored = new AgentBuildLifecycleService(join(root, "lifecycle"), registry, runs);
+		await restored.initialize();
+		await expect(restored.assertAutomationAllowed("reviewer")).resolves.toMatchObject({
+			stage: "needs-refinement",
+			activeProof: { agentRevision: 1 },
+		});
+		expect(await registry.get("reviewer")).toMatchObject({ revision: 1, persona: "Careful" });
+		const third = await restored.startProof(build.id, "Review both boundaries");
+		executor.executions[2]!.resolve({ output: "Both reviewed", transcript: [] });
+		await runs.waitForCompletion(third.proof!.runId);
+		await restored.reviewProof(build.id, true);
+		const activated = await restored.activate(build.id);
+		expect(activated).toMatchObject({
+			activeProof: { runId: third.proof!.runId, agentRevision: 2 },
+			routineIds: ["daily-review"],
+		});
+		expect(activated.skill).toBeUndefined();
+		await restored.activate(build.id);
+		expect(await registry.get("reviewer")).toMatchObject({ revision: 2, persona: "Review both boundaries" });
+		await expect(restored.assertAutomationAllowed("reviewer")).resolves.toMatchObject({ agentRevision: 2 });
+		await saveReviewer(registry);
+		await expect(restored.assertAutomationAllowed("reviewer")).rejects.toThrow("activate");
+	});
+
+	test("empty custom criteria cannot allow an empty proof result", async () => {
+		const { registry, runs, executor, lifecycle } = await setup();
+		await saveReviewer(registry);
+		const build = await lifecycle.ensureForAgent("reviewer");
+		await lifecycle.updateDraft(build.id, {
+			name: build.name,
+			objective: build.objective,
+			projectRoot: build.projectRoot,
+			criteria: [],
+		});
+		const proof = await lifecycle.startProof(build.id, "Review once");
+		executor.executions[0]!.resolve({ output: "  ", transcript: [] });
+		await runs.waitForCompletion(proof.proof!.runId);
+		expect(await lifecycle.get(build.id)).toMatchObject({
+			stage: "needs-refinement",
+			evaluation: {
+				checks: expect.arrayContaining([expect.objectContaining({ criterionId: "host-result", status: "fail" })]),
+			},
+		});
+		await expect(lifecycle.reviewProof(build.id, true)).rejects.toThrow("must be reviewed");
+	});
+
 	test("persists a named draft and rejects a collision with a deployed agent", async () => {
 		const { root, registry, lifecycle } = await setup();
 		const draft = await lifecycle.createDraft({
@@ -151,7 +255,7 @@ describe("AgentBuildLifecycleService", () => {
 		await expect(lifecycle.assertPromotionAllowed(testing.proof!.runId)).rejects.toThrow("not the reviewed proof");
 	});
 
-	test("unlocks automation only after the accepted proof is promoted", async () => {
+	test("unlocks automation after accepted proof activation without a skill export", async () => {
 		const { registry, runs, executor, lifecycle } = await setup();
 		await saveReviewer(registry);
 		const build = await lifecycle.ensureForAgent("reviewer");
@@ -160,7 +264,12 @@ describe("AgentBuildLifecycleService", () => {
 		await runs.waitForCompletion(testing.proof!.runId);
 		await lifecycle.get(build.id);
 		await lifecycle.reviewProof(build.id, true);
-		await expect(lifecycle.assertAutomationAllowed("reviewer")).rejects.toThrow("promote it to a skill");
+		await expect(lifecycle.assertAutomationAllowed("reviewer")).rejects.toThrow("activate");
+		await lifecycle.activate(build.id);
+		await expect(lifecycle.assertAutomationAllowed("reviewer")).resolves.toMatchObject({
+			stage: "proven",
+			activeProof: { runId: testing.proof!.runId, agentRevision: 1 },
+		});
 
 		await lifecycle.markPromoted(testing.proof!.runId, "review-boundary", "C:/skills/review-boundary/SKILL.md");
 		await expect(lifecycle.assertAutomationAllowed("reviewer")).resolves.toMatchObject({ stage: "promoted" });
@@ -170,7 +279,7 @@ describe("AgentBuildLifecycleService", () => {
 		});
 	});
 
-	test("runs an existing-agent candidate without replacing the active revision until promotion", async () => {
+	test("exports a proven candidate without activating it, then explicitly activates", async () => {
 		const { root, registry, runs, executor, lifecycle } = await setup();
 		await saveReviewer(registry);
 		const build = await lifecycle.ensureForAgent("reviewer");
@@ -203,6 +312,8 @@ describe("AgentBuildLifecycleService", () => {
 		await lifecycle.get(build.id);
 		await lifecycle.reviewProof(build.id, true);
 		await lifecycle.markPromoted(proof.proof!.runId, "review-boundary", "C:/skills/review-boundary/SKILL.md");
+		expect(await registry.get("reviewer")).toMatchObject({ revision: 1, persona: "Careful" });
+		await lifecycle.activate(build.id);
 		expect(await registry.get("reviewer")).toMatchObject({ revision: 2, persona: "More careful" });
 	});
 

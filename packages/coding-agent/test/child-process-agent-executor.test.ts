@@ -487,7 +487,7 @@ describe("ChildProcessAgentExecutor", () => {
 			workerPath,
 		});
 		const execution = await executor.start(context("ignore-abort"));
-		const result = expect(execution.result).rejects.toThrow("exited before returning a result");
+		const result = expect(execution.result).rejects.toThrow("aborted");
 		await execution.abort();
 		await result;
 		await execution.dispose();

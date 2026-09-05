@@ -459,15 +459,15 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("Find agents");
 		expect(bundleText).toContain("/agent-deliveries?");
 		expect(bundleText).toContain("/agent-roster.json?hidden=true");
-		expect(bundleText).toContain("Start a bounded collaboration room");
+		expect(bundleText).toContain("Start team");
 		expect(bundleText).toContain("/agent-rooms.json?");
-		expect(bundleText).toContain("Continue room");
+		expect(bundleText).toContain("Continue team");
 		expect(bundleText).not.toContain("builder-session-tab");
 		expect(bundleText).toContain("Save candidate revision");
 		expect(bundleText).toContain("Save draft");
-		expect(bundleText).toContain("Review publish");
+		expect(bundleText).toContain("Review activation");
 		expect(bundleText).toContain("Exit editing");
-		expect(bundleText).toContain("do not call agent_deploy or modify agent files");
+		expect(bundleText).toContain("Do not call agent_deploy or modify agent files");
 		expect(bundleText).toContain("No changes to apply.");
 		expect(bundleText).toContain("Unsaved changes. Review them, then apply the update.");
 		expect(bundleText).toContain("Never invent a model ID");
@@ -501,7 +501,7 @@ describe("createServePage", () => {
 		expect(bundleText).toContain("Inspect agent run");
 		expect(bundleText).toContain("Subagent inspector is read-only");
 		expect(bundleText).toContain("Agent Builder applied a draft");
-		expect(bundleText).toContain("[AGENT_DRAFT]");
+		expect(bundleText.includes("Use configure_agent for changes")).toBe(true);
 		expect(bundleText).toContain("Complete the delegation task, working directory, and model");
 		expect(bundleText).toContain("Select a model supported by this delegation connection");
 		expect(bundleText).toContain("Delegated run output");

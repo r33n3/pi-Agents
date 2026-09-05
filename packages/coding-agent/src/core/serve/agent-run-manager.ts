@@ -19,7 +19,15 @@ import {
 	createAgentExecutionConfigurationSeed,
 	createAgentRunConfigurationSnapshot,
 } from "./agent-run-configuration-snapshot.ts";
+import { ExecutionAdmission } from "./execution-admission.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
+import {
+	inputEvidenceError,
+	parseTaskInputBinding,
+	parseTaskInputEvidence,
+	type TaskInputBinding,
+	type TaskInputEvidence,
+} from "./task-input-binding.ts";
 
 export type AgentRunStatus = "starting" | "running" | "succeeded" | "failed" | "aborted";
 export type AgentRunSource = "manual" | "routine";
@@ -32,6 +40,8 @@ export interface AgentRunUsage {
 }
 
 export interface AgentRunRecord {
+	inputBinding?: TaskInputBinding;
+	inputEvidence?: TaskInputEvidence[];
 	id: string;
 	agentId: string;
 	prompt: string;
@@ -54,12 +64,14 @@ export interface AgentRunRecord {
 }
 
 export interface AgentRunConfigurationOptions {
+	admission?: ExecutionAdmission;
 	defaultModel?: ModelRef;
 	resolveCapabilityBindings?: (definition: AgentDefinition) => readonly AgentRunCapabilityBinding[];
 	revokeRunApprovals?: (runId: string, reason: string) => Promise<void>;
 }
 
 interface ActiveRun {
+	releaseAdmission: () => void;
 	record: AgentRunRecord;
 	execution: AgentExecution;
 	workspaceKey: string;
@@ -87,6 +99,7 @@ export class AgentRunManager implements AsyncDisposable {
 	readonly #activeByResource = new Map<string, ActiveRun>();
 	readonly #maxConcurrentRuns: number;
 	readonly #configuration: AgentRunConfigurationOptions;
+	readonly #admission: ExecutionAdmission;
 	#disposed = false;
 	#disposePromise: Promise<void> | undefined;
 
@@ -105,6 +118,7 @@ export class AgentRunManager implements AsyncDisposable {
 		this.#artifactsRoot = resolve(artifactsRoot);
 		this.#maxConcurrentRuns = maxConcurrentRuns;
 		this.#configuration = configuration;
+		this.#admission = configuration.admission ?? new ExecutionAdmission(maxConcurrentRuns);
 	}
 
 	async initialize(): Promise<void> {
@@ -193,6 +207,8 @@ export class AgentRunManager implements AsyncDisposable {
 		workspace: string,
 	): "available" | "agent-busy" | "workspace-busy" | "capacity" {
 		if (this.#activeByAgent.has(definition.id)) return "agent-busy";
+		const shared = this.#admission.availability(workspace, definition.permissionPolicy === "workspace-write");
+		if (shared !== "available") return shared;
 		if (this.#activeByRun.size >= this.#maxConcurrentRuns) return "capacity";
 		const workspaceKey = process.platform === "win32" ? resolve(workspace).toLowerCase() : resolve(workspace);
 		if (hasWorkspaceConflict(definition, this.#activeByWorkspace.get(workspaceKey))) return "workspace-busy";
@@ -242,8 +258,11 @@ export class AgentRunManager implements AsyncDisposable {
 		configuration: AgentExecutionConfigurationSeed,
 		prompt: string,
 		source: AgentRunSource = "manual",
+		inputBinding?: TaskInputBinding,
 	): Promise<AgentRunRecord> {
-		return this.#queue.run(async () => this.#startConfiguration(configuration, prompt, source));
+		return this.#queue.run(async () =>
+			this.#startConfiguration(configuration, prompt, source, undefined, inputBinding),
+		);
 	}
 
 	async startCandidate(definition: AgentDefinition, prompt: string): Promise<AgentRunRecord> {
@@ -322,6 +341,7 @@ export class AgentRunManager implements AsyncDisposable {
 		prompt: string,
 		source: AgentRunSource,
 		temporarySourceAgentId?: string,
+		inputBinding?: TaskInputBinding,
 	): Promise<AgentRunRecord> {
 		if (this.#disposed) throw new Error("Agent run manager is disposed");
 		if (prompt.trim() === "") throw new Error("Agent run prompt is required");
@@ -346,6 +366,7 @@ export class AgentRunManager implements AsyncDisposable {
 		const artifactDirectory = resolve(this.#artifactsRoot, definition.id, runId);
 		const snapshot = createAgentRunConfigurationSnapshot(runId, configuration);
 		const record: AgentRunRecord = {
+			inputBinding: inputBinding ? structuredClone(inputBinding) : undefined,
 			id: runId,
 			agentId: definition.id,
 			prompt: prompt.trim(),
@@ -358,16 +379,22 @@ export class AgentRunManager implements AsyncDisposable {
 			snapshotDigest: snapshot.digest,
 			temporarySourceAgentId,
 		};
-		await this.#persistSnapshot(snapshot, artifactDirectory);
-		await this.#persistRecord(record);
-		this.#records.set(runId, record);
-		this.#admittedRunIds.add(runId);
+		const releaseAdmission = this.#admission.acquire(
+			runId,
+			workspace,
+			definition.permissionPolicy === "workspace-write",
+		);
 		try {
+			await this.#persistSnapshot(snapshot, artifactDirectory);
+			await this.#persistRecord(record);
+			this.#records.set(runId, record);
+			this.#admittedRunIds.add(runId);
 			const execution = await this.#executor.start({
 				runId,
 				definition: snapshot.configuration.definition,
 				workspace: snapshot.configuration.workspace,
 				prompt: record.prompt,
+				inputBinding: record.inputBinding,
 			});
 			record.status = "running";
 			record.startedAt = Date.now();
@@ -376,6 +403,7 @@ export class AgentRunManager implements AsyncDisposable {
 			record.lastActivityAt = record.startedAt;
 			record.lastHeartbeatAt = record.startedAt;
 			const active: ActiveRun = {
+				releaseAdmission,
 				record,
 				execution,
 				workspaceKey,
@@ -394,10 +422,10 @@ export class AgentRunManager implements AsyncDisposable {
 			this.#activeByWorkspace.set(workspaceKey, workspaceRuns);
 			this.#activeByRun.set(runId, active);
 			for (const key of requiredResources) this.#activeByResource.set(key, active);
-			await this.#persistRecord(record);
 			active.completion = this.#settle(active);
 			return { ...record };
 		} catch (error) {
+			releaseAdmission();
 			this.#admittedRunIds.delete(runId);
 			record.status = "failed";
 			record.finishedAt = Date.now();
@@ -411,6 +439,7 @@ export class AgentRunManager implements AsyncDisposable {
 		const { record, execution } = active;
 		try {
 			const result = await execution.result;
+			record.inputEvidence = result.inputEvidence;
 			await mkdir(record.artifactDirectory, { recursive: true });
 			await Promise.all([
 				writeFile(resolve(record.artifactDirectory, "result.md"), `${result.output}\n`, "utf8"),
@@ -421,7 +450,10 @@ export class AgentRunManager implements AsyncDisposable {
 				),
 			]);
 			record.usage = summarizeExecutionUsage(result);
-			const budgetError = active.abortRequested ? undefined : budgetViolation(record.usage, active.budget);
+			const budgetError = active.abortRequested
+				? undefined
+				: (inputEvidenceError(record.inputBinding, result.inputEvidence) ??
+					budgetViolation(record.usage, active.budget));
 			record.status = active.abortRequested ? "aborted" : budgetError ? "failed" : "succeeded";
 			record.error = budgetError;
 		} catch (error) {
@@ -458,6 +490,7 @@ export class AgentRunManager implements AsyncDisposable {
 			for (const key of active.resourceKeys) {
 				if (this.#activeByResource.get(key) === active) this.#activeByResource.delete(key);
 			}
+			active.releaseAdmission();
 		}
 	}
 
@@ -533,6 +566,8 @@ function parseRunRecord(value: unknown, artifactDirectory: string): AgentRunReco
 	if (typeof record.createdAt !== "number") throw new Error("Invalid run timestamp");
 	return {
 		id: record.id,
+		inputBinding: parseTaskInputBinding(record.inputBinding),
+		inputEvidence: parseTaskInputEvidence(record.inputEvidence),
 		agentId: record.agentId,
 		prompt: record.prompt,
 		source: record.source,

@@ -19,6 +19,7 @@ const MAX_SOURCE_MESSAGE_IDS = 100;
 
 export type ConversationBuildMode = "create" | "edit" | "improve";
 export type AgentBuildActionKind =
+	| "activate"
 	| "publish"
 	| "publish-and-schedule"
 	| "run-proof"
@@ -100,6 +101,13 @@ export interface AgentBuildActionProposal {
 	completedAt?: number;
 	result?: unknown;
 	error?: string;
+	approvalMessageId?: string;
+}
+
+export interface AgentBuildUserMessage {
+	id: string;
+	text: string;
+	createdAt: number;
 }
 
 export interface ConversationBuildView {
@@ -136,10 +144,17 @@ export class ConversationBuildCoordinator {
 	readonly #path: string;
 	readonly #queue = new SerialOperationQueue();
 	#state: PersistedState = { version: STORE_VERSION, links: {}, proposals: {} };
+	#persistedState: PersistedState = structuredClone(this.#state);
 	#initialized = false;
+	readonly #readUserMessage?: (sessionId: string) => AgentBuildUserMessage | undefined;
 
-	constructor(root: string, lifecycle: AgentBuildLifecycleService) {
+	constructor(
+		root: string,
+		lifecycle: AgentBuildLifecycleService,
+		readUserMessage?: (sessionId: string) => AgentBuildUserMessage | undefined,
+	) {
 		this.#lifecycle = lifecycle;
+		this.#readUserMessage = readUserMessage;
 		this.#path = resolve(root, "agent-build-conversations.json");
 	}
 
@@ -148,6 +163,14 @@ export class ConversationBuildCoordinator {
 		await mkdir(dirname(this.#path), { recursive: true });
 		try {
 			this.#state = parseState(JSON.parse(await readFile(this.#path, "utf8")) as unknown);
+			this.#persistedState = structuredClone(this.#state);
+			for (const proposal of Object.values(this.#state.proposals)) {
+				if (proposal.state !== "authorized") continue;
+				proposal.state = "failed";
+				proposal.error =
+					"Host restarted during this action. Inspect the build and recorded progress before preparing another action.";
+			}
+			await this.#persist();
 		} catch (error) {
 			if (!isNodeError(error) || error.code !== "ENOENT") throw error;
 			await this.#persist();
@@ -163,6 +186,27 @@ export class ConversationBuildCoordinator {
 			const assumptions = normalizeAssumptionInputs(input.assumptions);
 			const clarifications = normalizeClarificationInputs(input.clarifications);
 			const answeredIds = stringArray(input.answeredClarificationIds, "answeredClarificationIds");
+			const existingBuild = input.buildId
+				? await this.#lifecycle.get(input.buildId)
+				: (await this.#lifecycle.list()).find((build) =>
+						input.draft.agentId
+							? build.agentId === input.draft.agentId
+							: !build.agentId && build.name.toLowerCase() === input.draft.name.toLowerCase(),
+					);
+			const pendingLink = structuredClone(existingBuild ? this.#state.links[existingBuild.id] : undefined) ?? {
+				buildId: "pending",
+				sessionId,
+				mode: input.mode,
+				sourceMessageIds: [],
+				assumptions: [],
+				clarifications: [],
+				lastPresentedBuildRevision: 1,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			};
+			mergeAssumptions(pendingLink, assumptions, sourceMessageId);
+			answerClarifications(pendingLink, answeredIds, undefined, sourceMessageId);
+			mergeClarifications(pendingLink, clarifications);
 			let build: AgentBuildRecord;
 			if (input.buildId) {
 				if (!Number.isSafeInteger(input.expectedBuildRevision) || Number(input.expectedBuildRevision) < 1) {
@@ -173,9 +217,8 @@ export class ConversationBuildCoordinator {
 				build = await this.#lifecycle.stageDraft(input.draft);
 			}
 			const link = this.#upsertLink(build, sessionId, input.mode, sourceMessageId);
-			mergeAssumptions(link, assumptions, sourceMessageId);
-			answerClarifications(link, answeredIds, undefined, sourceMessageId);
-			mergeClarifications(link, clarifications);
+			link.assumptions = pendingLink.assumptions;
+			link.clarifications = pendingLink.clarifications;
 			link.lastPresentedBuildRevision = build.revision;
 			link.updatedAt = Date.now();
 			this.#expireBuildProposals(build.id, "The draft changed after this action was prepared");
@@ -288,7 +331,6 @@ export class ConversationBuildCoordinator {
 				throw new Error(`Answer before ${action}: ${blockers.map((item) => item.question).join(" ")}`);
 			}
 			assertActionReady(build, action);
-			this.#expireBuildProposals(build.id, "A newer action proposal replaced this one");
 			const now = Date.now();
 			const ttlSeconds = input.expiresInSeconds ?? DEFAULT_PROPOSAL_TTL_MS / 1_000;
 			if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 30 || ttlSeconds > 3_600) {
@@ -305,6 +347,7 @@ export class ConversationBuildCoordinator {
 				createdAt: now,
 				expiresAt: now + ttlSeconds * 1_000,
 			};
+			this.#expireBuildProposals(build.id, "A newer action proposal replaced this one");
 			this.#state.proposals[proposal.id] = proposal;
 			link.activeProposalId = proposal.id;
 			link.updatedAt = now;
@@ -323,6 +366,16 @@ export class ConversationBuildCoordinator {
 		return this.#queue.run(async () => {
 			await this.initialize();
 			const proposal = this.#requiredProposal(input.proposalId);
+			if (
+				proposal.buildId !== input.buildId ||
+				proposal.sessionId !== input.sessionId ||
+				proposal.action !== actionKind(input.action)
+			)
+				throw new Error("The action proposal does not belong to this build, session, and action");
+			const binding = createCapabilityApprovalActionBinding(input.payload, proposal.binding.preview);
+			if (binding.digest !== proposal.binding.digest)
+				throw new Error("The action proposal does not match the exact payload");
+			if (proposal.state === "completed") return structuredClone(proposal);
 			if (proposal.state !== "pending") throw new Error(`Action proposal ${proposal.id} is ${proposal.state}`);
 			if (proposal.expiresAt <= Date.now()) {
 				proposal.state = "expired";
@@ -342,9 +395,30 @@ export class ConversationBuildCoordinator {
 				await this.#persist();
 				throw new Error("The build changed after review; inspect and confirm a fresh action proposal");
 			}
-			const binding = createCapabilityApprovalActionBinding(input.payload, proposal.binding.preview);
-			if (binding.digest !== proposal.binding.digest)
-				throw new Error("The action proposal does not match the exact payload");
+			const message = this.#readUserMessage?.(proposal.sessionId);
+			if (!message || message.createdAt <= proposal.createdAt) {
+				throw new Error("Approval requires a new user message observed by the host after this proposal");
+			}
+			if (
+				Object.values(this.#state.proposals).some(
+					(item) => item.sessionId === proposal.sessionId && item.approvalMessageId === message.id,
+				)
+			) {
+				throw new Error("This user approval has already been used");
+			}
+			const explicit = message.text.trim().toLowerCase() === `approve ${proposal.id}`;
+			const pending = Object.values(this.#state.proposals).filter(
+				(item) => item.sessionId === proposal.sessionId && item.state === "pending" && item.expiresAt > Date.now(),
+			);
+			if (
+				!explicit &&
+				(pending.length !== 1 || !/^(?:yes|y|confirm|approve|proceed)[.!]?$/i.test(message.text.trim()))
+			) {
+				throw new Error(
+					`Reply yes to a single pending proposal, or approve ${proposal.id}. Model-supplied confirmation is not authorization.`,
+				);
+			}
+			proposal.approvalMessageId = message.id;
 			proposal.state = "authorized";
 			await this.#persist();
 			return structuredClone(proposal);
@@ -353,6 +427,16 @@ export class ConversationBuildCoordinator {
 
 	async completeAction(proposalId: string, result: unknown): Promise<AgentBuildActionProposal> {
 		return this.#finishAction(proposalId, "completed", result);
+	}
+
+	async recordActionProgress(proposalId: string, result: unknown): Promise<void> {
+		return this.#queue.run(async () => {
+			await this.initialize();
+			const proposal = this.#requiredProposal(proposalId);
+			if (proposal.state !== "authorized") throw new Error(`Action proposal ${proposal.id} is ${proposal.state}`);
+			proposal.result = structuredClone(result);
+			await this.#persist();
+		});
 	}
 
 	async failAction(proposalId: string, error: string, result?: unknown): Promise<AgentBuildActionProposal> {
@@ -468,8 +552,14 @@ export class ConversationBuildCoordinator {
 
 	async #persist(): Promise<void> {
 		const temporary = `${this.#path}.${randomUUID()}.tmp`;
-		await writeFile(temporary, `${JSON.stringify(this.#state, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
-		await rename(temporary, this.#path);
+		try {
+			await writeFile(temporary, `${JSON.stringify(this.#state, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+			await rename(temporary, this.#path);
+			this.#persistedState = structuredClone(this.#state);
+		} catch (error) {
+			this.#state = structuredClone(this.#persistedState);
+			throw error;
+		}
 	}
 }
 
@@ -568,7 +658,11 @@ function answerClarifications(
 function readinessBlockers(build: AgentBuildRecord, link: AgentBuildConversationLink | undefined): string[] {
 	const blockers =
 		link?.clarifications
-			.filter((item) => item.status === "open" && item.blockingActions.includes("publish"))
+			.filter(
+				(item) =>
+					item.status === "open" &&
+					(item.blockingActions.includes("publish") || item.blockingActions.includes("activate")),
+			)
 			.map((item) => item.question) ?? [];
 	if (!build.configuration) blockers.push("Complete the agent package");
 	if (!build.agentId && build.stage !== "proven") blockers.push("Run and accept one current candidate proof");
@@ -578,8 +672,12 @@ function readinessBlockers(build: AgentBuildRecord, link: AgentBuildConversation
 }
 
 function assertActionReady(build: AgentBuildRecord, action: AgentBuildActionKind): void {
+	if (action === "activate") {
+		if (build.stage !== "proven") throw new Error("Test and accept the current candidate before activation");
+		return;
+	}
 	if (action === "publish" || action === "publish-and-schedule") {
-		if (build.agentId) throw new Error("This agent is already published; promote an accepted candidate instead");
+		if (build.agentId) throw new Error("This agent is already published; activate an accepted candidate instead");
 		if (build.stage !== "proven") throw new Error("Test and accept this unpublished candidate before publishing it");
 		if (action === "publish-and-schedule" && !build.automationIntent?.confirmed) {
 			throw new Error("Confirm the exact schedule intent before preparing publication and automation");
@@ -600,8 +698,8 @@ function assertActionReady(build: AgentBuildRecord, action: AgentBuildActionKind
 		if (build.stage !== "proven") throw new Error("Accept the current proof before promotion");
 		return;
 	}
-	if (!build.agentId || !build.skill || !["promoted", "automated"].includes(build.stage)) {
-		throw new Error("Publish, prove, accept, and promote this agent before scheduling it");
+	if (!build.agentId || !build.activeProof || build.activeProof.agentRevision !== build.agentRevision) {
+		throw new Error("Test, accept, and activate this agent before scheduling it");
 	}
 }
 
@@ -707,6 +805,7 @@ function parseProposal(value: unknown): AgentBuildActionProposal {
 		completedAt: input.completedAt === undefined ? undefined : finiteNumber(input.completedAt, "completedAt"),
 		result: input.result,
 		error: optionalString(input.error),
+		approvalMessageId: optionalString(input.approvalMessageId),
 	};
 }
 
@@ -735,7 +834,16 @@ function materialTopic(value: unknown): AgentBuildMaterialTopic {
 function actionKind(value: unknown): AgentBuildActionKind {
 	return oneOf(
 		value,
-		["publish", "publish-and-schedule", "run-proof", "accept-proof", "reject-proof", "promote", "schedule"] as const,
+		[
+			"activate",
+			"publish",
+			"publish-and-schedule",
+			"run-proof",
+			"accept-proof",
+			"reject-proof",
+			"promote",
+			"schedule",
+		] as const,
 		"agent build action",
 	);
 }

@@ -44,8 +44,10 @@ import { CodexCliExecution, isCodexSubscriptionAvailable } from "./codex-cli-exe
 import { ConversationBuildCoordinator } from "./conversation-build-coordinator.ts";
 import { createCredentialApiTools } from "./credential-api-tools.ts";
 import { CurrentSessionService } from "./current-session-service.ts";
+import { DirectToolExecution } from "./direct-tool-execution.ts";
 import { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
 import { createEverydayDataTools } from "./everyday-data-tools.ts";
+import { ExecutionAdmission } from "./execution-admission.ts";
 import { type ExternalConnectionDefinition, ExternalConnectionManager } from "./external-connection-manager.ts";
 import { GoogleWorkspaceOAuth } from "./google-workspace-oauth.ts";
 import { createGoogleWorkspaceTools } from "./google-workspace-tools.ts";
@@ -68,6 +70,7 @@ import { ServeAttachmentStore } from "./serve-attachment-store.ts";
 import { ServeAuditStore } from "./serve-audit-store.ts";
 import { acquireServeDirectoryOwnership, type ServeDirectoryOwnership } from "./serve-directory-ownership.ts";
 import { createServePage } from "./serve-page.ts";
+import { createTeamDraftTool } from "./team-draft-tool.ts";
 import { WebSocketListener } from "./websocket-listener.ts";
 import { WorkflowService } from "./workflow-service.ts";
 import { WorkspacePreviewServer } from "./workspace-preview-server.ts";
@@ -107,7 +110,6 @@ export class ServeHost implements AsyncDisposable {
 	#workflowService: WorkflowService | undefined;
 	#agentRoutineScheduler: AgentRoutineScheduler | undefined;
 	#externalConnectionManager: ExternalConnectionManager | undefined;
-	#externalSessionExecutor: AgentSessionExecutor | undefined;
 	#claudeSubscriptionLogin: ClaudeSubscriptionLogin | undefined;
 	#providerEnvironment: ProviderEnvironmentStore | undefined;
 	#attachmentStore: ServeAttachmentStore | undefined;
@@ -541,11 +543,6 @@ export class ServeHost implements AsyncDisposable {
 			});
 			return created.session;
 		};
-		const createExecutionSession = async (context: Parameters<AgentSessionExecutor["start"]>[0]) =>
-			createConfiguredAgentSession(context.definition, context.workspace, undefined, {
-				kind: "agent-run",
-				id: context.runId,
-			});
 		const createOpenAiApiExecutionSession = async (context: Parameters<AgentSessionExecutor["start"]>[0]) => {
 			const apiKey = (
 				await providerEnvironment.resolveTrusted("openai-api", ["OPENAI_API_KEY"])
@@ -595,7 +592,9 @@ export class ServeHost implements AsyncDisposable {
 						: []),
 				] as ToolDefinition[],
 		});
+		const executionAdmission = new ExecutionAdmission(4);
 		this.#agentRunManager = new AgentRunManager(agentRegistry, executor, join(serveRoot, "runs"), 4, {
+			admission: executionAdmission,
 			defaultModel: session.model ? { provider: session.model.provider, id: session.model.id } : undefined,
 			resolveCapabilityBindings: (definition) =>
 				capabilityBroker.resolveRunBindings(definition.capabilities, definition.executor).map((binding) => ({
@@ -612,7 +611,33 @@ export class ServeHost implements AsyncDisposable {
 		await this.#agentRunManager.initialize();
 		const agentBuildLifecycle = new AgentBuildLifecycleService(serveRoot, agentRegistry, this.#agentRunManager);
 		await agentBuildLifecycle.initialize();
-		const conversationBuilds = new ConversationBuildCoordinator(serveRoot, agentBuildLifecycle);
+		const buildSessions = new Map([[session.sessionId, session]]);
+		const conversationBuilds = new ConversationBuildCoordinator(serveRoot, agentBuildLifecycle, (sessionId) => {
+			const sourceSession = buildSessions.get(sessionId);
+			if (!sourceSession) return undefined;
+			for (const entry of [...sourceSession.sessionManager.getBranch()].reverse()) {
+				if (entry.type !== "message" || entry.message.role !== "user") continue;
+				const content = entry.message.content;
+				const text =
+					typeof content === "string"
+						? content
+						: content
+								.filter((block) => block.type === "text")
+								.map((block) => block.text)
+								.join("\n");
+				const userRequest = text.startsWith(
+					"You are Agent Builder, a temporary specialist helping configure and deploy one local Pi agent.",
+				)
+					? text.lastIndexOf("\nUser request: ")
+					: -1;
+				return {
+					id: entry.id,
+					createdAt: Date.parse(entry.timestamp),
+					text: userRequest < 0 ? text : text.slice(userRequest + "\nUser request: ".length),
+				};
+			}
+			return undefined;
+		});
 		await conversationBuilds.initialize();
 		const runSkillPromotion = new RunSkillPromotionService(
 			this.#agentRunManager,
@@ -797,7 +822,6 @@ export class ServeHost implements AsyncDisposable {
 				models: hermesModels.models,
 			},
 		];
-		this.#externalSessionExecutor = new AgentSessionExecutor(createExecutionSession);
 		const externalOpenAiApiExecutor = new AgentSessionExecutor(createOpenAiApiExecutionSession);
 		this.#externalConnectionManager = new ExternalConnectionManager(
 			externalConnections,
@@ -809,36 +833,37 @@ export class ServeHost implements AsyncDisposable {
 				if (isCodexSubscription) {
 					return new CodexCliExecution({ cwd: request.cwd, prompt: request.prompt, model: request.model.id });
 				}
-				const executionExecutor =
-					request.connection.id === "openai-api" ? externalOpenAiApiExecutor : this.#externalSessionExecutor!;
-				return executionExecutor.start({
+				if (isClaude || isHermes) {
+					const toolName = isClaude ? "claude_code" : "hermes_agent";
+					const tool = session.getToolDefinition(toolName);
+					if (!tool) throw new Error(`Selected backend ${toolName} is unavailable`);
+					const parameters = isClaude
+						? {
+								prompt: request.prompt,
+								cwd: request.cwd,
+								model: request.model.id,
+								authentication: isClaudeSubscription ? "subscription" : "api-key",
+							}
+						: { goal: request.prompt, cwd: request.cwd, model: `${request.model.provider}/${request.model.id}` };
+					return new DirectToolExecution(tool, request.runId, parameters, session.extensionRunner.createContext());
+				}
+				if (request.connection.id !== "openai-api") throw new Error(`Unsupported backend ${request.connection.id}`);
+				return externalOpenAiApiExecutor.start({
 					runId: request.runId,
 					workspace: request.cwd,
-					prompt: isClaude
-						? `Call claude_code immediately with this exact task, working directory, model, and authentication profile. Return its result without replacing it with your own work.\n\nTask: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}\n\nAuthentication: ${isClaudeSubscription ? "subscription" : "api-key"}`
-						: isHermes
-							? `Call hermes_agent immediately with this exact goal, working directory, and model. Return its result without replacing it with your own work.\n\nGoal: ${request.prompt}\n\nWorking directory: ${request.cwd}\n\nModel: ${request.model.provider}/${request.model.id}`
-							: request.prompt,
+					prompt: request.prompt,
 					definition: {
 						id: `external-${request.connection.id}`,
 						revision: 1,
 						source: "managed",
 						name: request.connection.name,
 						description: request.connection.description,
-						model: isClaude ? undefined : isHermes ? luna : request.model,
+						model: request.model,
 						thinking: undefined,
-						tools: isClaude
-							? ["claude_code"]
-							: isHermes
-								? ["hermes_agent"]
-								: ["read", "grep", "find", "ls", "bash", "write", "edit"],
+						tools: ["read", "grep", "find", "ls", "bash", "write", "edit"],
 						capabilities: [],
 						memory: "none",
-						persona: isClaude
-							? "Delegate through the claude_code tool immediately and report its returned data."
-							: isHermes
-								? "Delegate through the hermes_agent tool immediately and report its returned data."
-								: "Complete the delegated task independently and return a concise result.",
+						persona: "Complete the delegated task independently and return a concise result.",
 						projectRoot: request.cwd,
 						workspace: request.cwd,
 						executor: "session",
@@ -852,6 +877,7 @@ export class ServeHost implements AsyncDisposable {
 			},
 			join(serveRoot, "external-runs"),
 			session.sessionManager.getCwd(),
+			executionAdmission,
 		);
 		await this.#externalConnectionManager.initialize();
 
@@ -972,6 +998,7 @@ export class ServeHost implements AsyncDisposable {
 		);
 		await this.#agentRoster.initialize();
 		await this.#agentTaskService.startScheduling();
+		session.registerCustomTools([createTeamDraftTool(piAgentTeamLauncher)]);
 		session.registerCustomTools(
 			createAgentRegistryTools(agentRegistry, agentBuildLifecycle, {
 				promotion: runSkillPromotion,
@@ -1036,7 +1063,7 @@ export class ServeHost implements AsyncDisposable {
 							version: reference.workflowVersion,
 						})),
 				});
-				return (
+				const hostedSession = (
 					await createAgentSession({
 						cwd: hostedCwd,
 						agentDir,
@@ -1048,8 +1075,21 @@ export class ServeHost implements AsyncDisposable {
 						sessionManager: hostedSessionManager,
 					})
 				).session;
+				hostedSession.registerCustomTools([createTeamDraftTool(piAgentTeamLauncher)]);
+				hostedSession.registerCustomTools(
+					createAgentRegistryTools(agentRegistry, agentBuildLifecycle, {
+						promotion: runSkillPromotion,
+						routines: routineRegistry,
+						refreshRoutines: () => this.#agentRoutineScheduler!.refresh(),
+						conversationBuilds,
+						sessionId: hostedSession.sessionId,
+					}) as ToolDefinition[],
+				);
+				buildSessions.set(hostedSession.sessionId, hostedSession);
+				return hostedSession;
 			},
 			async (sessionId) => {
+				buildSessions.delete(sessionId);
 				try {
 					await capabilityApprovals.revoke(
 						{ owner: { kind: "session", id: sessionId } },
@@ -1165,7 +1205,6 @@ export class ServeHost implements AsyncDisposable {
 			() => this.#agentTaskService?.dispose() ?? Promise.resolve(),
 			() => this.#agentRunManager?.dispose() ?? Promise.resolve(),
 			() => this.#externalConnectionManager?.dispose() ?? Promise.resolve(),
-			() => this.#externalSessionExecutor?.dispose() ?? Promise.resolve(),
 			() => this.#claudeSubscriptionLogin?.dispose() ?? Promise.resolve(),
 			() => this.#providerEnvironment?.dispose() ?? Promise.resolve(),
 			() => this.#attachmentStore?.dispose() ?? Promise.resolve(),

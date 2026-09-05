@@ -18,6 +18,7 @@ import {
 import type { AgentRunManager, AgentRunRecord, AgentRunUsage } from "./agent-run-manager.ts";
 import { type ArtifactRecord, ArtifactStore } from "./artifact-store.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
+import { bindTaskInputs, parseTaskInputBinding, type TaskInputBinding } from "./task-input-binding.ts";
 
 export type AgentTaskSource = "chat" | "pi" | "agent" | "routine" | "workflow" | "a2a";
 export type AgentTaskStatus =
@@ -34,6 +35,7 @@ export type AgentTaskStatus =
 export type AgentPermissionMode = "manual" | "safe_auto" | "unrestricted";
 
 export interface AgentTaskContractSnapshot {
+	inputBinding?: TaskInputBinding;
 	goal: string;
 	actor: { kind: "pi" | "agent" | "user" | "routine" | "a2a"; id: string };
 	conversationId: string;
@@ -108,6 +110,7 @@ export interface AgentTask {
 }
 
 export interface SubmitAgentTask {
+	inputBinding?: TaskInputBinding;
 	taskId?: string;
 	agentId: string;
 	prompt: string;
@@ -441,6 +444,9 @@ export class AgentTaskService implements AsyncDisposable {
 		assertAgentExecutionConfigurationSeedIntegrity(executionSeed, executionSeed.digest);
 		if (executionSeed.agentId !== request.agentId) throw new Error("Execution seed belongs to a different agent");
 		const definition = executionSeed.definition;
+		const inputBinding =
+			request.inputBinding ??
+			(request.source === "chat" ? await bindTaskInputs(prompt, executionSeed.workspace) : undefined);
 		const model = executionSeed.effectiveModel ?? definition.model;
 		const context = request.context ?? (await this.#createContextPackage(conversation, prompt));
 		const task: AgentTask = {
@@ -454,7 +460,7 @@ export class AgentTaskService implements AsyncDisposable {
 			prompt,
 			model,
 			contract: createContractSnapshot(
-				request,
+				{ ...request, inputBinding },
 				definition,
 				conversation.id,
 				this.#registry.workspacePath(definition),
@@ -819,6 +825,7 @@ export class AgentTaskService implements AsyncDisposable {
 								task.contract.executionSeed,
 								task.contract.context ? renderAgentContextPrompt(task.contract.context) : task.prompt,
 								taskSourceToRunSource(task.source),
+								task.contract.inputBinding,
 							)
 						: await this.#runs.start(task.agentId, task.prompt, taskSourceToRunSource(task.source), task.model);
 					task.status = "running";
@@ -1361,6 +1368,7 @@ function createContractSnapshot(
 		.filter((value): value is string => value !== undefined);
 	return {
 		goal: request.prompt.trim(),
+		inputBinding: request.inputBinding ? structuredClone(request.inputBinding) : undefined,
 		actor: taskActor(request),
 		conversationId,
 		agentId: definition.id,
@@ -1474,6 +1482,7 @@ function parseContract(value: unknown): AgentTaskContractSnapshot {
 	}
 	return {
 		goal: requiredString(record.goal, "contract.goal"),
+		inputBinding: parseTaskInputBinding(record.inputBinding),
 		actor: { kind, id: requiredString(actor.id, "contract.actor.id") },
 		conversationId: requiredString(record.conversationId, "contract.conversationId"),
 		agentId: requiredString(record.agentId, "contract.agentId"),
@@ -1531,6 +1540,7 @@ function parseRoutineSnapshot(value: unknown): { id: string; revision: number; s
 function cloneContract(contract: AgentTaskContractSnapshot): AgentTaskContractSnapshot {
 	return {
 		...contract,
+		inputBinding: contract.inputBinding ? structuredClone(contract.inputBinding) : undefined,
 		actor: { ...contract.actor },
 		model: contract.model ? { ...contract.model } : undefined,
 		capabilityGrantIds: [...contract.capabilityGrantIds],

@@ -46,7 +46,7 @@ process.on("message", (message) => {
 		return;
 	}
 	if (activePrompt === "silent") return;
-	if (["filesystem", "escape", "host-action-slow", "host-action-crash"].includes(activePrompt)) {
+	if (["bound-review", "filesystem", "escape", "host-action-slow", "host-action-crash"].includes(activePrompt)) {
 		void runHostActionScenario(message);
 		return;
 	}
@@ -104,7 +104,14 @@ async function runHostActionScenario(message) {
 	}
 	let output;
 	try {
-		if (activePrompt === "filesystem") {
+		if (activePrompt === "bound-review") {
+			try {
+				await requestHostAction({ family: "filesystem.read", path: "inventory.csv" });
+				output = { unexpectedRead: true };
+			} catch (error) {
+				output = { inputs: message.context.inputContents, denied: error.message };
+			}
+		} else if (activePrompt === "filesystem") {
 			output = await Promise.all([
 				requestHostAction({ family: "filesystem.read", path: "input.txt" }),
 				requestHostAction({ family: "filesystem.list", path: "." }),
