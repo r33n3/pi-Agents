@@ -10,6 +10,7 @@ import {
 	CapabilityProviderMetadataSchema,
 	type ProviderCapabilityGroup,
 } from "./capability-provider-contract.ts";
+import { FLIGHT_SEARCH_METADATA } from "./flight-search-metadata.ts";
 
 const WAVE_ONE_DEFINITIONS: readonly CapabilityDefinition[] = [
 	{
@@ -145,7 +146,7 @@ const WAVE_ONE_MANIFESTS: readonly CapabilityProviderManifest[] = [
 				capabilityId: "web.search",
 				capabilityVersion: 1,
 				toolName: "searxng_search",
-				executors: ["session"],
+				executors: ["session", "harness"],
 			},
 		],
 	},
@@ -180,27 +181,28 @@ const WAVE_ONE_MANIFESTS: readonly CapabilityProviderManifest[] = [
 			kind: "environment",
 			fields: [
 				{ env: "FIRECRAWL_BASE_URL", label: "Firecrawl URL", required: false, secret: false, format: "url" },
-				{ env: "FIRECRAWL_API_KEY", label: "Firecrawl API key", required: true, secret: true },
+				{ env: "FIRECRAWL_API_KEY", label: "Firecrawl API key (hosted service)", required: false, secret: true },
 			],
+			requiredAnyOf: ["FIRECRAWL_BASE_URL", "FIRECRAWL_API_KEY"],
 		},
 		bindings: [
 			{
 				capabilityId: "web.search",
 				capabilityVersion: 1,
 				toolName: "firecrawl_search",
-				executors: ["session"],
+				executors: ["session", "harness"],
 			},
 			{
 				capabilityId: "web.fetch",
 				capabilityVersion: 1,
 				toolName: "firecrawl_scrape",
-				executors: ["session"],
+				executors: ["session", "harness"],
 			},
 			{
 				capabilityId: "web.scrape",
 				capabilityVersion: 1,
 				toolName: "firecrawl_scrape",
-				executors: ["session"],
+				executors: ["session", "harness"],
 			},
 			{
 				capabilityId: "web.crawl",
@@ -616,8 +618,8 @@ function displayName(value: string): string {
 const metadataValidator = Compile(CapabilityProviderMetadataSchema);
 
 export const BUILTIN_CAPABILITY_PROVIDER_METADATA: CapabilityProviderMetadata = {
-	definitions: [...WAVE_ONE_DEFINITIONS, ...WAVE_TWO_DEFINITIONS],
-	providers: [...WAVE_ONE_MANIFESTS, ...WAVE_TWO_MANIFESTS],
+	definitions: [...WAVE_ONE_DEFINITIONS, ...WAVE_TWO_DEFINITIONS, ...FLIGHT_SEARCH_METADATA.definitions],
+	providers: [...WAVE_ONE_MANIFESTS, ...WAVE_TWO_MANIFESTS, ...FLIGHT_SEARCH_METADATA.providers],
 };
 
 /** Parses immutable, secret-free capability metadata without importing provider runtime modules. */
@@ -702,6 +704,9 @@ function validateMetadata(metadata: CapabilityProviderMetadata): void {
 			environmentNames.add(field.env);
 		}
 		const bindingIds = new Set<string>();
+		for (const name of manifest.authentication?.requiredAnyOf ?? []) {
+			if (!environmentNames.has(name)) throw new Error(`Provider ${manifest.id} requires undeclared field ${name}`);
+		}
 		for (const binding of manifest.bindings) {
 			const bindingId = `${binding.capabilityId}@${binding.capabilityVersion}`;
 			if (bindingIds.has(bindingId)) throw new Error(`Provider ${manifest.id} binds ${bindingId} more than once`);

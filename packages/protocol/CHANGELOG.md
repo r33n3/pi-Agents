@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolved recursive JSON schema references directly during message validation to prevent large team-review snapshots from blocking chat updates and cancellation.
+
 ## [0.84.4] - 2026-08-28
 
 ## [0.84.3] - 2026-08-24

@@ -1,6 +1,12 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
+import { CapabilityBroker } from "../src/core/serve/capability-broker.ts";
+import { CapabilityConnectionRegistry } from "../src/core/serve/capability-connection-registry.ts";
+import * as publicWeb from "../src/core/serve/public-web-fetch.ts";
 import { ServeHost } from "../src/core/serve/serve-host.ts";
 import { createHarness, type Harness } from "./suite/harness.ts";
 
@@ -15,6 +21,8 @@ describe("ServeHost", () => {
 	afterEach(async () => {
 		await host?.close();
 		harness.cleanup();
+		vi.unstubAllEnvs();
+		vi.restoreAllMocks();
 	});
 
 	test("owns listener startup and idempotent shutdown", async () => {
@@ -50,6 +58,104 @@ describe("ServeHost", () => {
 		await host.start();
 
 		await expect(host.start()).rejects.toThrow("Serve host has already been started");
+	});
+	test("chat registers a validated tool and publishes it to the team catalog without assigning it", async () => {
+		vi.spyOn(publicWeb, "fetchPublicText").mockResolvedValue({
+			url: "https://example.com/fares",
+			contentType: "text/plain",
+			text: "Fare: 123 USD",
+			fetchedAt: "2026-09-08T12:00:00Z",
+		});
+		host = new ServeHost({ agentDir: harness.tempDir, session: harness.session, port: 0 });
+		const { url } = await host.start();
+		harness.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("data_tools", {
+					action: "register",
+					recipe: {
+						id: "fare",
+						name: "Published fare",
+						description: "Extract a published fare",
+						source: "page_read",
+						defaults: { url: "https://example.com/fares" },
+						inputs: [],
+						recordsPointer: "",
+						fields: [{ name: "price", pointer: "/text", prefix: "Fare: ", suffix: " USD", type: "number" }],
+						minRecords: 1,
+						maxRecords: 1,
+					},
+				}),
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage(fauxToolCall("data_tools", { action: "run", tool: "saved_data_fare_v1" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("Saved and tested the reusable fare reader."),
+		]);
+		await harness.session.prompt("Create a reusable reader for the published fare and test it.");
+		const results = harness.session.messages.filter((message) => message.role === "toolResult");
+		expect(results).toHaveLength(2);
+		expect(results.every((message) => !message.isError)).toBe(true);
+		expect(JSON.stringify(results)).toContain("123");
+		const endpoint = new URL(url);
+		endpoint.pathname = "/agent-rooms.json";
+		const catalog = (await (await fetch(endpoint)).json()) as { tools: Array<{ id: string }> };
+		expect(catalog.tools).toContainEqual(expect.objectContaining({ id: "saved_data_fare_v1" }));
+		expect(catalog.tools).toContainEqual(expect.objectContaining({ id: "data_tools" }));
+	});
+
+	test("reuses shared account grants in the team catalog without moving agent work or copying connections", async () => {
+		vi.stubEnv("GOOGLE_CLIENT_ID", "fixture-client");
+		vi.stubEnv("GOOGLE_CLIENT_SECRET", "fixture-secret");
+		const settingsDir = join(harness.tempDir, "shared-settings");
+		const connections = new CapabilityConnectionRegistry(join(settingsDir, "serve", "capabilities", "connections"));
+		await connections.save({
+			id: "google-workspace-primary",
+			providerId: "google-workspace",
+			accountLabel: "Existing account",
+			secretRef: "managed:google-workspace",
+			scopes: ["https://www.googleapis.com/auth/gmail.compose"],
+			capabilityIds: ["email.draft"],
+			status: "active",
+		});
+		const broker = new CapabilityBroker(join(settingsDir, "serve", "capabilities"), {
+			activeToolNames: () => ["google_workspace_email_draft"],
+			providerConnectionAvailable: () => true,
+			connectionResolver: (id) => connections.find(id),
+			environmentValue: (name) => process.env[name],
+		});
+		await broker.initialize();
+		await broker.reviewProvider("google-workspace", true);
+		await broker.enableProvider("google-workspace", true);
+		host = new ServeHost({
+			agentDir: harness.tempDir,
+			capabilitySettingsDir: settingsDir,
+			session: harness.session,
+			port: 0,
+		});
+		const { url } = await host.start();
+		const endpoint = new URL(url);
+		endpoint.pathname = "/agent-rooms.json";
+		const response = await fetch(endpoint);
+		expect(response.status).toBe(200);
+		const catalog = (await response.json()) as { tools: Array<{ id: string; name: string }> };
+		expect(catalog.tools).toContainEqual(
+			expect.objectContaining({
+				id: "google-workspace:email.draft:google-workspace-primary",
+				name: expect.stringContaining("Existing account"),
+			}),
+		);
+		expect(catalog.tools.some((tool) => tool.id.includes("email.send"))).toBe(false);
+		expect(existsSync(join(harness.tempDir, "serve", "capabilities", "connections"))).toBe(false);
+		expect(existsSync(join(harness.tempDir, "serve", "rooms"))).toBe(true);
+		const contender = new ServeHost({
+			agentDir: join(harness.tempDir, "other-work"),
+			capabilitySettingsDir: settingsDir,
+			session: harness.session,
+			port: 0,
+		});
+		await expect(contender.start()).rejects.toThrow("is already owned by another Pi serve host");
+		expect((await fetch(url)).status).toBe(200);
 	});
 
 	test("dispatches Hermes directly with exact arguments and no host inference", async () => {

@@ -6,6 +6,7 @@ import { validateCron } from "./cron-schedule.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
 export type RoutineTarget =
+	| { kind: "team"; roomId: string; configurationDigest: string; delivery: "report" | "draft"; confirmed: boolean }
 	| { kind: "agent"; agentId: string }
 	| { kind: "workflow"; workflowId: string }
 	| {
@@ -151,6 +152,22 @@ function normalizeRoutine(value: unknown): RoutineDefinition {
 function normalizeTarget(value: unknown): RoutineTarget {
 	const target = record(value, "target");
 	switch (target.kind) {
+		case "team": {
+			const roomId = requiredString(target.roomId, "target.roomId");
+			assertIdentifier(roomId, "target room id");
+			if (typeof target.configurationDigest !== "string" || !/^[a-f0-9]{64}$/.test(target.configurationDigest))
+				throw new Error("Review the current team configuration before scheduling");
+			if (target.delivery !== "report" && target.delivery !== "draft")
+				throw new Error("Choose report or review-only draft delivery");
+			if (typeof target.confirmed !== "boolean") throw new Error("Review the schedule authorization");
+			return {
+				kind: "team",
+				roomId,
+				configurationDigest: target.configurationDigest,
+				delivery: target.delivery,
+				confirmed: target.confirmed,
+			};
+		}
 		case "agent": {
 			const agentId = requiredString(target.agentId, "target.agentId");
 			assertIdentifier(agentId, "target agent id");
@@ -187,7 +204,7 @@ function normalizeTarget(value: unknown): RoutineTarget {
 			return { kind: "skill", skillName };
 		}
 		default:
-			throw new Error("target.kind must be one of: agent, workflow, browser-workflow, acp, skill");
+			throw new Error("target.kind must be one of: agent, team, workflow, browser-workflow, acp, skill");
 	}
 }
 

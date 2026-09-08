@@ -1,0 +1,13 @@
+# Shared capability settings
+
+Provider setup belongs to the user settings profile. A team assignment references that profile's existing account and capability grants; it does not copy credentials or repeat account setup.
+
+`ServeHostOptions.capabilitySettingsDir` (or `PI_SERVE_CAPABILITY_SETTINGS_DIR` for a background deployment) selects that profile's Pi agent directory. It defaults to the current agent directory, preserving isolation for test installations. An explicitly selected profile supplies the capability broker configuration, provider account registry, and encrypted user vault together. Settings, team configuration, conversational assignments and execution all receive those same service instances.
+
+Agent definitions, teams, conversations, reports, execution approvals and run history remain in the deployment's own agent directory/workspace. A second serve host cannot concurrently own the shared settings profile. Startup logs identify the shared settings source. No account records or credentials are copied into agent/team definitions.
+
+Use an existing account-specific catalog ID when assigning a capability. A provider/capability alias resolves to the configured account when exactly one usable account exists; multiple accounts require a selection. Revoked accounts, missing scopes and unavailable execution bindings remain excluded. Tool assignment approval is distinct from provider configuration and from approval of an external action such as creating a remote email draft.
+
+Validation covers an isolated deployment discovering a previously enabled Google Workspace account from a separate settings directory, exposing its draft grant in the team catalog without a send grant, retaining agent work locally, avoiding a copied connection registry, and excluding a competing settings owner. These tests use synthetic credentials and perform no provider requests.
+
+Live validation reused the user's existing Google Workspace connection through the team chat approval flow. The persisted reporting member received the account-specific Email Draft grant, and its subsequent contribution recognized that no further account setup was needed. No remote draft or email was created. The retained run subsequently reached its cumulative token limit; this verifies connection discovery and assignment, not completion of an email workflow. Existing SearXNG and Firecrawl manifests matched the deployment's previously approved digests and were reviewed/enabled through the broker API in the shared profile, retaining their research defaults. One listener served both local and LAN URLs successfully.

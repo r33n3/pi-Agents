@@ -54,6 +54,18 @@ test("rejects missing, escaping and ambiguous inputs before model execution", as
 	expect((await bindTaskInputs('Review "stock review.csv"', root))?.files[0]?.path).toBe("stock review.csv");
 });
 
+test("read-only prohibitions retain fresh input binding while positive edits do not", async () => {
+	for (const request of [
+		"Read stock-review.csv; do not edit files or recruit agents.",
+		"Review stock-review.csv. Don't edit or save it.",
+		"Summarize stock-review.csv. Never write files.",
+	]) {
+		expect((await bindTaskInputs(request, root))?.files[0]?.path).toBe("stock-review.csv");
+	}
+	expect(await bindTaskInputs("Read stock-review.csv and edit the total", root)).toBeUndefined();
+	expect(await bindTaskInputs("Read stock-review.csv. Do not edit it, but save a report", root)).toBeUndefined();
+});
+
 test.each(["valid", "missing-evidence", "repair", "repair-exhausted"])(
 	"team preserves inputs and bounds output correction: %s",
 	async (mode) => {
@@ -168,6 +180,7 @@ test.each(["wrong-file", "changed-file", "wrong-total"])(
 			inputBinding,
 			definition: {
 				id: "calculator",
+				inputValidator: scenario === "wrong-total" ? "inventory" : undefined,
 				revision: 1,
 				source: "managed",
 				name: "Calculator",

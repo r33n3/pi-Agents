@@ -13,6 +13,7 @@ import {
 	agentExecutionResultFromMessages,
 	agentIdentityInstructions,
 } from "./agent-executor.ts";
+import { createAgentSkillTool } from "./agent-skill-tools.ts";
 import type {
 	AgentWorkerCapabilityToolResponseMessage,
 	AgentWorkerHostAction,
@@ -35,6 +36,7 @@ import { BrowserWorkflowRunner } from "./browser-workflow-runner.ts";
 import { createBrowserWorkflowTools } from "./browser-workflow-tools.ts";
 import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
 import { createScopedAgentTools, type ScopedAgentFileOperations } from "./scoped-agent-tools.ts";
+import { createTeamContextTool, createTeamTurnTool } from "./team-turn-tool.ts";
 import { WorkspacePreviewServer } from "./workspace-preview-server.ts";
 
 let activeSession: AgentSession | undefined;
@@ -127,6 +129,22 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 		const customTools = (
 			isolated ? [...createScopedAgentTools(definition, workspace, hostScopedFileOperations)] : []
 		) as ToolDefinition[];
+		const teamContext: unknown = definition.teamContext ? JSON.parse(definition.teamContext) : undefined;
+		const completedAgentIds =
+			typeof teamContext === "object" &&
+			teamContext !== null &&
+			"supervisorAgentId" in teamContext &&
+			teamContext.supervisorAgentId === definition.id &&
+			"completedAgentIds" in teamContext &&
+			Array.isArray(teamContext.completedAgentIds)
+				? teamContext.completedAgentIds.filter((id): id is string => typeof id === "string")
+				: [];
+		const teamTurn = definition.responseSchema
+			? createTeamTurnTool(definition.responseSchema, completedAgentIds)
+			: undefined;
+		if (isolated) customTools.push(createAgentSkillTool(services.resourceLoader.getSkills().skills));
+		if (teamTurn) customTools.push(teamTurn.tool);
+		if (teamTurn && definition.teamContext) customTools.push(createTeamContextTool(definition.teamContext));
 		customTools.push(
 			...request.capabilityTools.map(
 				(tool): ToolDefinition => ({
@@ -143,7 +161,11 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 				}),
 			),
 		);
-		if (definition.browser?.access && definition.browser.access !== "disabled") {
+		if (
+			definition.browser?.access &&
+			definition.browser.access !== "disabled" &&
+			!request.capabilityTools.some((tool) => tool.name === "browser_open")
+		) {
 			const browserRoot = join(request.serveRoot, "browser");
 			const captureStore = new BrowserWorkflowCaptureStore(join(browserRoot, "captures"));
 			await captureStore.initialize();
@@ -213,7 +235,12 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 			model,
 			thinkingLevel: definition.thinking,
 			modelControls: definition.modelControls,
-			tools: toolNames,
+			tools: [
+				...new Set([
+					...toolNames,
+					...(teamTurn ? [teamTurn.tool.name, ...(definition.teamContext ? ["read_team_context"] : [])] : []),
+				]),
+			],
 			customTools: customTools.length > 0 ? customTools : undefined,
 		});
 		activeSession = created.session;
@@ -226,10 +253,23 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 			activeSession = undefined;
 		});
 		if (abortRequested) throw new Error("Agent worker was aborted");
-		const instructions = agentExecutionInstructions(request.context);
+		const instructions = [
+			agentExecutionInstructions(request.context),
+			"Current runtime: Gmail draft tools resolve direct user chat authorization internally. Users do not supply approval receipt IDs. For an approved draft, invoke the current tool or delegate to the member with email.draft, even if an earlier attempt reported a missing receipt. Leave recipients empty if unspecified. reportPath embeds and attaches the exact saved HTML file. A local draft preview does not satisfy a request for a Gmail draft; completion needs a successful provider draft ID and review URL. Sending always requires separate approval.",
+			...(teamTurn
+				? [
+						"Use submit_team_turn to send your message and control action. Any JSON response descriptions above specify that tool's arguments, not your final answer. Call the tool exactly once; then finish with a brief conversational acknowledgment. Do not output the control JSON as prose.",
+					]
+				: []),
+		].join("\n\n");
 		await emitProgress("waiting-for-model", "Waiting for model response");
 		await activeSession.prompt(instructions, { source: "rpc" });
 		const result = agentExecutionResultFromMessages(activeSession.messages);
+		if (teamTurn) {
+			const submitted = teamTurn.result();
+			if (!submitted) throw new Error("Agent finished without submitting its team action");
+			result.output = submitted;
+		}
 		await emitProgress("writing-results", "Writing durable run results");
 		await writeResultArtifact(request.resultPath, {
 			status: "succeeded",
@@ -344,6 +384,12 @@ function rejectPendingCapabilityTools(error: Error): void {
 }
 
 const hostScopedFileOperations: ScopedAgentFileOperations = {
+	async readBytes(path) {
+		const result = await requestHostAction({ family: "filesystem.read", path, binary: true });
+		if (result.family !== "filesystem.read" || !result.binary)
+			throw new Error("Host returned the wrong binary read result");
+		return Buffer.from(result.content, "base64");
+	},
 	async read(path) {
 		const result = await requestHostAction({ family: "filesystem.read", path });
 		if (result.family !== "filesystem.read") throw new Error("Host returned the wrong filesystem result");

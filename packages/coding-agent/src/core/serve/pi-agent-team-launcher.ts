@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
 import type { ModelRef } from "@earendil-works/pi-protocol";
+import type { AgentRegistry } from "./agent-registry.ts";
+import type { AgentRoomService } from "./agent-room-service.ts";
 import type { AgentTaskService } from "./agent-task-service.ts";
+import type { CapabilityBroker } from "./capability-broker.ts";
 import type { CapabilityConnectionRegistry } from "./capability-connection-registry.ts";
 import {
 	type PiAgentBundle,
 	type PiAgentBundleInstaller,
 	type PiAgentBundleInstallRecord,
+	type PiAgentBundleTool,
 	type PiAgentBundleUnreviewedBindings,
 	parsePiAgentBundle,
 	piAgentBundleRoleAgentId,
@@ -52,6 +56,7 @@ export interface PiAgentTeamLaunchResult {
 		conversationId: string;
 		agentIds: string[];
 		workflowId: string;
+		roomId?: string;
 	};
 }
 
@@ -63,6 +68,7 @@ export interface PiAgentTeamState {
 		packageId: string;
 		coordinatorAgentId: string;
 		agentIds: string[];
+		roomId?: string;
 		workflow: { id: string; name: string };
 		runs: Array<{
 			id: string;
@@ -90,18 +96,116 @@ export class PiAgentTeamLauncher {
 	readonly #tasks: AgentTaskService;
 	readonly #workflows: WorkflowService;
 	readonly #connections: CapabilityConnectionRegistry | undefined;
+	readonly #broker: CapabilityBroker | undefined;
+	readonly #rooms: AgentRoomService;
+	readonly #registry: AgentRegistry;
 	readonly #launches = new SerialOperationQueue();
 
 	constructor(
 		installer: PiAgentBundleInstaller,
 		tasks: AgentTaskService,
 		workflows: WorkflowService,
+		rooms: AgentRoomService,
+		registry: AgentRegistry,
 		connections?: CapabilityConnectionRegistry,
+		broker?: CapabilityBroker,
 	) {
 		this.#installer = installer;
 		this.#tasks = tasks;
 		this.#workflows = workflows;
 		this.#connections = connections;
+		this.#broker = broker;
+		this.#rooms = rooms;
+		this.#registry = registry;
+	}
+
+	/** Restore the same conversation for installed teams without executing their workflow. */
+	async initialize(): Promise<void> {
+		for (const agent of await this.#registry.list()) {
+			const receipt = this.#installer.installedTeamForCoordinator(agent.id);
+			if (receipt) await this.#ensureRoom(receipt);
+		}
+	}
+
+	async #ensureRoom(receipt: PiAgentBundleInstallRecord, update = false) {
+		// Larger imported packages retain their explicit workflow execution surface.
+		const id = installedRoomId(receipt);
+		if (!id) return undefined;
+		const existing = this.#rooms.getDefinition(id);
+		if (existing && !update) return existing;
+		const workflow = this.#workflows.getDefinition(receipt.workflowId);
+		if (!workflow) throw new Error("Installed team workflow was not found");
+		const members = await Promise.all(
+			receipt.agentIds.map(async (agentId) => {
+				const agent = await this.#registry.get(agentId);
+				if (!agent) throw new Error(`Installed team member ${agentId} was not found`);
+				const retained = existing?.members.find((member) => member.agentId === agentId);
+				return { agentId, role: retained?.role ?? agent.name, notes: retained?.notes, toolIds: retained?.toolIds };
+			}),
+		);
+		return this.#rooms.save({
+			id,
+			name: workflow.name,
+			purpose:
+				"Help the user with the current request. Answer conversational questions directly; delegate necessary work using the team member cards.",
+			members,
+			supervisorAgentId: receipt.coordinatorAgentId,
+			teamIds: existing?.teamIds,
+			allowRecruitment: existing?.allowRecruitment ?? false,
+			memoryStrategy: existing?.memoryStrategy ?? "team",
+			sharedNotes: existing?.sharedNotes,
+			memoryResetAt: existing?.memoryResetAt,
+			toolIds: existing?.toolIds,
+			limits: { ...existing?.limits, maxConcurrency: Math.min(workflow.maxConcurrency, 4) },
+		});
+	}
+
+	/** A fresh, secret-free catalogue for the builder, including unmet capabilities. */
+	listDraftCapabilities() {
+		const available = this.#rooms.listTools().flatMap((tool) => tool.capabilities);
+		return (this.#broker?.snapshot().capabilities ?? [])
+			.filter((capability) => capability.effect === "read")
+			.map((capability) => ({
+				id: capability.id,
+				description: capability.description,
+				defaultProviderId: capability.defaultProviderId,
+				providers: [
+					...new Set(
+						available.filter((grant) => grant.capabilityId === capability.id).map((grant) => grant.providerId),
+					),
+				],
+			}));
+	}
+
+	/** Resolve declared needs through the same allowance used by running teams. */
+	resolveDraftCapabilities(needs: readonly { id: string; providerId?: string }[]): PiAgentBundleTool[] {
+		const available = this.#rooms.listTools().flatMap((tool) => tool.capabilities);
+		const definitions = this.#broker?.snapshot().capabilities ?? [];
+		return needs.map((need) => {
+			const definition = definitions.find((entry) => entry.id === need.id && entry.effect === "read");
+			const candidates = available.filter(
+				(grant) => grant.capabilityId === need.id && (!need.providerId || grant.providerId === need.providerId),
+			);
+			const grant = candidates.find((entry) => entry.providerId === definition?.defaultProviderId) ?? candidates[0];
+			if (!definition || !grant) {
+				throw new Error(
+					`Team requires ${need.id}${need.providerId ? ` from ${need.providerId}` : ""}, but no configured, enabled read-only team tool is available. Configure it in Settings before preparing this team. Do not remove the requirement or substitute a file-only role to bypass this limitation.`,
+				);
+			}
+			const name = this.#broker!.resolveToolNames([grant], "harness")[0];
+			if (!name) throw new Error(`Team capability ${need.id} has no executable tool`);
+			return {
+				name,
+				version: 1,
+				effect: definition.effect,
+				capability: {
+					id: definition.id,
+					version: definition.version,
+					providerId: grant.providerId,
+					approvalFloor: definition.defaultApproval,
+				},
+			};
+		});
 	}
 
 	prepareWithLocalDefaults(
@@ -121,6 +225,28 @@ export class PiAgentTeamLauncher {
 				if (!requirement) continue;
 				if (requirement.credentialSlot) credentialRefs.add(requirement.credentialSlot);
 				const providerId = requirement.providerId;
+				if (this.#broker) {
+					const available = this.#rooms.listTools().flatMap((entry) => entry.capabilities);
+					const preferred =
+						providerId ??
+						this.#broker.snapshot().capabilities.find((entry) => entry.id === requirement.id)?.defaultProviderId;
+					const candidates = available.filter(
+						(grant) =>
+							grant.capabilityId === requirement.id &&
+							grant.capabilityVersion === requirement.version &&
+							(!providerId || grant.providerId === providerId),
+					);
+					const grant = candidates.find((entry) => entry.providerId === preferred) ?? candidates[0];
+					if (!grant)
+						throw new Error(
+							`Team requires ${requirement.id}${providerId ? ` from ${providerId}` : ""}. Configure and enable its team tool in Settings before launch.`,
+						);
+					grants.set(`${requirement.id}@${requirement.version}`, {
+						...grant,
+						approval: requirement.approvalFloor,
+					});
+					continue;
+				}
 				const connection = connections.find(
 					(candidate) =>
 						(providerId === undefined || candidate.providerId === providerId) &&
@@ -153,6 +279,31 @@ export class PiAgentTeamLauncher {
 	prepare(bundleValue: unknown, bindingsValue: unknown): PiAgentTeamPreview {
 		const bundle = parsePiAgentBundle(bundleValue);
 		const { bindings, review } = this.#installer.reviewBindings(bundle, bindingsValue, "pending-review");
+		if (this.#broker) {
+			const available = this.#rooms.listTools().flatMap((tool) => tool.capabilities);
+			for (const grants of Object.values(bindings.capabilities ?? {})) {
+				this.#broker.validateGrants(grants, "harness");
+				for (const grant of grants) {
+					const providerId =
+						grant.providerId ??
+						this.#broker.snapshot().capabilities.find((entry) => entry.id === grant.capabilityId)
+							?.defaultProviderId;
+					if (
+						!available.some(
+							(entry) =>
+								entry.capabilityId === grant.capabilityId &&
+								entry.capabilityVersion === grant.capabilityVersion &&
+								entry.providerId === providerId &&
+								entry.connectionId === grant.connectionId,
+						)
+					) {
+						throw new Error(
+							`Team tool ${providerId}:${grant.capabilityId} is unavailable. Restore its configuration in Settings and review the team again.`,
+						);
+					}
+				}
+			}
+		}
 		const validation = this.#installer.validate(bundle, bindings);
 		if (!validation.valid) {
 			throw new Error(validation.findings.map((finding) => finding.message).join(" ") || "Team is not ready");
@@ -177,6 +328,7 @@ export class PiAgentTeamLauncher {
 			const bundle = parsePiAgentBundle(bundleValue);
 			const coordinatorAgentId = piAgentBundleRoleAgentId(bundle.bundleId, bundle.workflow.coordinatorRoleId);
 			const current = this.#installer.installedTeamForCoordinator(coordinatorAgentId);
+			const currentRoomId = current ? installedRoomId(current) : undefined;
 			const reviewed = this.#installer.reviewBindings(bundle, bindingsValue, reviewedBy);
 			const exactRetry =
 				current?.bundleDigest === reviewed.review.bundleDigest &&
@@ -187,19 +339,25 @@ export class PiAgentTeamLauncher {
 			if (
 				current &&
 				!exactRetry &&
-				this.#workflows.listRuns(current.workflowId).some((run) => run.status === "running")
+				(this.#workflows.listRuns(current.workflowId).some((run) => run.status === "running") ||
+					(currentRoomId &&
+						this.#rooms
+							.listRuns(currentRoomId)
+							.some((run) => run.status === "running" || run.status === "needs-user")))
 			) {
 				throw new Error("Stop the active team run before changing its installed package or bindings");
 			}
 			const installed = await this.#installer.install(bundle, reviewed.bindings);
-			const conversation = await this.#tasks.ensureConversation(coordinatorAgentId);
+			const room = await this.#ensureRoom(installed.receipt, installed.disposition === "updated");
+			const conversation = room ?? (await this.#tasks.ensureConversation(coordinatorAgentId));
 			return {
 				schemaVersion: "pi.agents.team-launch-result.v1",
 				disposition: installed.disposition,
 				receipt: installed.receipt,
 				target: {
 					coordinatorAgentId,
-					conversationId: conversation.id,
+					conversationId: room ? room.conversationId : conversation.id,
+					roomId: room?.id,
 					agentIds: [...installed.receipt.agentIds],
 					workflowId: installed.receipt.workflowId,
 				},
@@ -219,6 +377,7 @@ export class PiAgentTeamLauncher {
 				bundleId: receipt.bundleId,
 				packageId: receipt.packageId,
 				coordinatorAgentId: receipt.coordinatorAgentId,
+				roomId: installedRoomId(receipt),
 				agentIds: [...receipt.agentIds],
 				workflow: { id: workflow.id, name: workflow.name },
 				runs: this.#workflows
@@ -285,6 +444,12 @@ function taskStatus(status: string): "queued" | "running" | "completed" | "faile
 	if (status === "failed" || status === "cancelled") return "failed";
 	if (status === "queued") return "queued";
 	return "running";
+}
+
+function installedRoomId(receipt: PiAgentBundleInstallRecord): string | undefined {
+	return receipt.agentIds.length <= 8
+		? `installed-${createHash("sha256").update(receipt.bundleId).digest("hex").slice(0, 32)}`
+		: undefined;
 }
 
 function preview(bundle: PiAgentBundle, bindings: PiAgentBundleUnreviewedBindings, digest: string): PiAgentTeamPreview {

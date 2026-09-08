@@ -5,19 +5,32 @@ import type { PiAgentBundle } from "./pi-agent-bundle.ts";
 import type { PiAgentTeamLauncher } from "./pi-agent-team-launcher.ts";
 
 const parameters = Type.Object({
-	name: Type.String({ minLength: 1, maxLength: 80 }),
-	steps: Type.Array(
-		Type.Object({
-			name: Type.String({ minLength: 1, maxLength: 80 }),
-			instructions: Type.String({ minLength: 1, maxLength: 8000 }),
-			tools: Type.Optional(Type.Array(Type.Union([Type.Literal("read"), Type.Literal("ls")]), { maxItems: 2 })),
-		}),
-		{
-			minItems: 2,
-			maxItems: 6,
-			description:
-				"Ordered specialist steps, ending with the coordinator that summarizes their results. Each step receives the user request and previous results.",
-		},
+	name: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+	steps: Type.Optional(
+		Type.Array(
+			Type.Object({
+				name: Type.String({ minLength: 1, maxLength: 80 }),
+				instructions: Type.String({ minLength: 1, maxLength: 8000 }),
+				tools: Type.Optional(Type.Array(Type.Union([Type.Literal("read"), Type.Literal("ls")]), { maxItems: 2 })),
+				capabilities: Type.Array(
+					Type.Object({
+						id: Type.String({ minLength: 1 }),
+						providerId: Type.Optional(Type.String({ minLength: 1 })),
+					}),
+					{
+						maxItems: 12,
+						description:
+							"Required external capabilities for this role, selected from discovery. Use [] only for a role that needs no external data. Current web research requires web.search and reading source pages requires web.scrape or web.fetch. Never replace live research with supplied-file analysis unless the user requests it.",
+					},
+				),
+			}),
+			{
+				minItems: 2,
+				maxItems: 6,
+				description:
+					"Ordered specialist steps, ending with the coordinator that summarizes their results. Each step receives the user request and previous results.",
+			},
+		),
 	),
 });
 
@@ -27,10 +40,27 @@ export function createTeamDraftTool(launcher: PiAgentTeamLauncher): ToolDefiniti
 		name: "configure_team",
 		label: "Prepare team",
 		description:
-			"Prepare a read-only, on-demand team for review. Supply reusable specialist responsibilities without fixed input filenames, with the final coordinator last. Input files belong to each user request. For file-review teams, include the read tool for every role, including the coordinator, so the host can supply verified inputs. The host wires the steps and forwards their outputs. This does not launch or run anything. Use this for a team request instead of pretending one agent has unconfigured delegates. The user reviews the team and clicks Launch team.",
+			"Prepare a read-only, on-demand team, including live research tools, for review. FIRST call with no arguments to discover configured capabilities. Then infer each role's required capabilities from the user's purpose and call with name and steps. Current information, flights, prices, and online research need web.search plus web.scrape or web.fetch for source evidence. Prefer the configured default provider unless the user specifies another. Assign tools to roles doing the work; synthesis roles can use previous results. Missing capabilities must be reported, never silently omitted or replaced with file-only responsibilities. Supply reusable responsibilities with the final coordinator last. For file-review teams include read on every role. This prepares a review card; it does not launch or run anything. The user reviews the team and clicks Launch team.",
 		parameters,
 		executionMode: "sequential",
 		async execute(_id, input, _signal, _onUpdate, context) {
+			if (!input.steps) {
+				const capabilities = launcher.listDraftCapabilities();
+				return {
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify({
+								capabilities,
+								guidance:
+									"Providers lists contain only configured, enabled tools executable by team members. An empty list means the capability is unavailable. Declare every required capability when preparing the team, including unavailable needs so preparation reports the blocker. Workspace read and ls are also available. No tools have been assigned yet.",
+							}),
+						},
+					],
+					details: { capabilities },
+				};
+			}
+			if (!input.name?.trim()) throw new Error("Provide a team name when preparing steps");
 			if (!context.model) throw new Error("Select a model before preparing the team");
 			const digest = createHash("sha256").update(JSON.stringify(input)).digest("hex");
 			const nameDigest = createHash("sha256").update(input.name.trim().toLowerCase()).digest("hex").slice(0, 16);
@@ -42,7 +72,10 @@ export function createTeamDraftTool(launcher: PiAgentTeamLauncher): ToolDefiniti
 				instructions: `${step.instructions}\nPerform only your assigned role; do not impersonate another specialist. Input filenames in these instructions are defaults: use the input explicitly requested for the current run, without substituting a different file. Use only observed evidence. If required input is missing or a predecessor reports failure, clearly report the limitation; do not invent a successful result.`,
 				acceptanceCriteria: [],
 				outputSchema: {},
-				tools: [...new Set(step.tools ?? [])].map((name) => ({ name, version: 1, effect: "read" as const })),
+				tools: [
+					...[...new Set(step.tools ?? [])].map((name) => ({ name, version: 1, effect: "read" as const })),
+					...launcher.resolveDraftCapabilities(step.capabilities),
+				],
 				permissionPolicy: "read-only" as const,
 				memory: { readableNamespaces: [], writableNamespaces: [] },
 				policies: { escalationRules: [], stopConditions: [], forbiddenTools: [], guardrails: [] },

@@ -4,7 +4,12 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import type { AgentExecution, AgentExecutionContext, AgentExecutor } from "../src/core/serve/agent-executor.ts";
+import type {
+	AgentExecution,
+	AgentExecutionContext,
+	AgentExecutionResult,
+	AgentExecutor,
+} from "../src/core/serve/agent-executor.ts";
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
 import { AgentRoomService } from "../src/core/serve/agent-room-service.ts";
 import { AgentRunManager } from "../src/core/serve/agent-run-manager.ts";
@@ -68,12 +73,12 @@ class RoomExecutor implements AgentExecutor {
 
 class ControlledRoomExecutor implements AgentExecutor {
 	readonly contexts: AgentExecutionContext[] = [];
-	readonly #resolvers = new Map<string, (value: { output: string; transcript: [] }) => void>();
+	readonly #resolvers = new Map<string, (value: AgentExecutionResult) => void>();
 
 	start(context: AgentExecutionContext): Promise<AgentExecution> {
 		this.contexts.push(context);
-		let resolve!: (value: { output: string; transcript: [] }) => void;
-		const result = new Promise<{ output: string; transcript: [] }>((done) => {
+		let resolve!: (value: AgentExecutionResult) => void;
+		const result = new Promise<AgentExecutionResult>((done) => {
 			resolve = done;
 		});
 		this.#resolvers.set(context.runId, resolve);
@@ -89,6 +94,15 @@ class ControlledRoomExecutor implements AgentExecutor {
 			},
 			dispose: () => Promise.resolve(),
 			[Symbol.asyncDispose]: () => Promise.resolve(),
+		});
+	}
+
+	finish(index: number): void {
+		const context = this.contexts[index]!;
+		this.#resolvers.get(context.runId)!({
+			output: JSON.stringify({ outcome: "reply", message: "Finished original work", requestAgentIds: [] }),
+			transcript: [],
+			inputEvidence: context.inputBinding?.files,
 		});
 	}
 
@@ -150,6 +164,116 @@ async function saveRoom(rooms: AgentRoomService, limits: { maxRounds?: number } 
 }
 
 describe("AgentRoomService", () => {
+	test("queues an update without cancelling work and binds its file at the next turn", async () => {
+		const executor = new ControlledRoomExecutor();
+		const { root, tasks, rooms, runs } = await setup("reply", executor);
+		try {
+			await writeFile(join(root, "original.csv"), "item,value\nold,26\n");
+			await writeFile(join(root, "replacement.csv"), "item,value\nnew,61\n");
+			const definition = await rooms.save({
+				id: "redirect-team",
+				name: "Redirect team",
+				purpose: "Review current inputs",
+				supervisorAgentId: "researcher",
+				members: [
+					{ agentId: "researcher", role: "Supervise" },
+					{ agentId: "reviewer", role: "Review" },
+				],
+			});
+			const first = await rooms.message(definition.id, "Review original.csv");
+			await expect.poll(() => executor.contexts.length).toBe(1);
+			await expect(rooms.message(definition.id, "Actually use missing.csv")).rejects.toThrow("Cannot bind input");
+			expect(rooms.getRun(first.id)?.status).toBe("running");
+			const second = await rooms.message(definition.id, "Update the request to use replacement.csv");
+			expect(second.id).toBe(first.id);
+			expect(executor.contexts).toHaveLength(1);
+			expect(second.pendingMessages).toEqual(["Update the request to use replacement.csv"]);
+			executor.finish(0);
+			await expect.poll(() => executor.contexts.length, { timeout: 10_000 }).toBe(2);
+			expect(rooms.getRun(first.id)?.status).toBe("running");
+			expect(tasks.getTask(rooms.getRun(first.id)!.taskIds[0]!)?.status).toBe("completed");
+			expect(rooms.getRun(first.id)?.inputBinding?.files.map((file) => file.path)).toEqual(["replacement.csv"]);
+			expect(executor.contexts[1]?.prompt).toContain("Finished original work");
+			expect(executor.contexts[1]?.prompt).toContain("Update the request to use replacement.csv");
+			expect(executor.contexts.map((context) => context.definition.id)).toEqual(["researcher", "researcher"]);
+			await rooms.cancel(second.id);
+		} finally {
+			await rooms.dispose();
+			await tasks.dispose();
+			await runs.dispose();
+		}
+	});
+
+	test("retains editable working notes across restart and scopes them to their member", async () => {
+		const executor = new RoomExecutor("one-round");
+		const { root, registry, tasks, workflows, rooms, runs } = await setup("one-round", executor);
+		const restored = new AgentRoomService(join(root, "rooms"), registry, tasks, workflows);
+		try {
+			await rooms.save({
+				id: "memory-team",
+				name: "Memory team",
+				purpose: "Review",
+				supervisorAgentId: "researcher",
+				members: [
+					{ agentId: "researcher", role: "Supervise", notes: "Summaries should use brief paragraphs." },
+					{ agentId: "reviewer", role: "Review", notes: "Use the warehouse rounding convention." },
+				],
+			});
+			await restored.initialize();
+			const definition = restored.getDefinition("memory-team")!;
+			expect(definition.members[1]?.notes).toBe("Use the warehouse rounding convention.");
+			const result = await restored.waitForCompletion(
+				(await restored.message(definition.id, "@reviewer inspect the evidence")).id,
+			);
+			expect(result.status).toBe("completed");
+			expect(executor.contexts[0]?.prompt).toContain("warehouse rounding convention");
+			expect(executor.contexts[0]?.prompt).not.toContain("brief paragraphs");
+			expect(executor.contexts[1]?.prompt).toContain("brief paragraphs");
+			expect(executor.contexts[1]?.prompt).not.toContain("warehouse rounding convention");
+			await restored.save({
+				...definition,
+				members: definition.members.map((member) => ({ ...member, notes: "" })),
+			});
+			expect(restored.getDefinition(definition.id)?.members.every((member) => member.notes === undefined)).toBe(
+				true,
+			);
+		} finally {
+			await restored.dispose();
+			await rooms.dispose();
+			await tasks.dispose();
+			await runs.dispose();
+		}
+	});
+
+	test("admits only one of two simultaneous messages to the same team", async () => {
+		const executor = new ControlledRoomExecutor();
+		const { tasks, rooms, runs } = await setup("reply", executor);
+		try {
+			const definition = await rooms.save({
+				id: "single-conversation",
+				name: "Single conversation",
+				purpose: "Answer the current request",
+				supervisorAgentId: "researcher",
+				members: [
+					{ agentId: "researcher", role: "Supervise" },
+					{ agentId: "reviewer", role: "Review" },
+				],
+			});
+			const results = await Promise.allSettled([
+				rooms.start(definition.id, "First message"),
+				rooms.start(definition.id, "Second message"),
+			]);
+			expect(results.map((result) => result.status)).toEqual(["fulfilled", "rejected"]);
+			expect(rooms.listRuns(definition.id)).toHaveLength(1);
+			await expect.poll(() => executor.contexts.length).toBe(1);
+			expect(executor.contexts[0]?.definition.id).toBe("researcher");
+			await rooms.cancel(rooms.listRuns(definition.id)[0]!.id);
+		} finally {
+			await rooms.dispose();
+			await tasks.dispose();
+			await runs.dispose();
+		}
+	});
 	test("addresses a roster member directly and returns control to the supervisor", async () => {
 		const executor = new RoomExecutor("one-round");
 		const { tasks, rooms } = await setup("one-round", executor);
@@ -359,7 +483,12 @@ describe("AgentRoomService", () => {
 			definitionSnapshot: { id: "room-design-review-1", nodes: [{ id: "member-0" }, { id: "member-1" }] },
 		});
 		expect(completed.taskIds).toHaveLength(4);
-		expect(completed.taskIds.map((taskId) => tasks.getTask(taskId)?.contract.room)).toEqual([
+		// Parallel task creation order can differ; round communication order is asserted above.
+		expect(
+			completed.taskIds
+				.map((taskId) => tasks.getTask(taskId)!.contract.room!)
+				.sort((left, right) => left.round - right.round || left.memberIndex - right.memberIndex),
+		).toEqual([
 			{ id: definition.id, runId: started.id, round: 1, memberIndex: 0 },
 			{ id: definition.id, runId: started.id, round: 1, memberIndex: 1 },
 			{ id: definition.id, runId: started.id, round: 2, memberIndex: 0 },
@@ -451,7 +580,11 @@ describe("AgentRoomService", () => {
 		expect(waiting).toMatchObject({ status: "needs-user", userQuestion: expect.stringContaining("option A or B") });
 		expect(waiting.rounds).toHaveLength(1);
 
-		await rooms.resume(started.id, "Use option A");
+		const resumes = await Promise.allSettled([
+			rooms.resume(started.id, "Use option A"),
+			rooms.resume(started.id, "Use option B"),
+		]);
+		expect(resumes.map((result) => result.status)).toEqual(["fulfilled", "rejected"]);
 		const completed = await rooms.waitForCompletion(started.id);
 		expect(completed.status).toBe("completed");
 		expect(completed.rounds).toHaveLength(2);

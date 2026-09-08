@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+import type { ResponseCreateParamsStreaming, ResponseStreamEvent } from "openai/resources/responses/responses.js";
 import { type ModelControls, validateModelControls } from "../model-controls.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type {
@@ -33,6 +33,7 @@ import { buildBaseOptions } from "./simple-options.ts";
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 // OpenAI Responses rejects max_output_tokens below 16: https://github.com/earendil-works/pi/issues/6265
 const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS = 16;
+const DEFAULT_RESPONSES_IDLE_TIMEOUT_MS = 300_000;
 
 function hasHeader(headers: ProviderHeaders | undefined, name: string): boolean {
 	if (!headers) return false;
@@ -91,8 +92,94 @@ function formatOpenAIResponsesError(error: unknown): string {
 	return formatProviderError(normalizeProviderError(error), "OpenAI API error");
 }
 
+/** Bound waits for decoded events, including a transport that ignores cancellation. */
+async function* monitorResponsesStream(
+	source: AsyncIterable<ResponseStreamEvent>,
+	controller: AbortController,
+	signal: AbortSignal,
+	timeoutMs: number,
+	requestId: string | null,
+): AsyncGenerator<ResponseStreamEvent> {
+	const iterator = source[Symbol.asyncIterator]();
+	const startedAt = Date.now();
+	let lastEventAt = startedAt;
+	let lastEvent = "none";
+	let eventCount = 0;
+	try {
+		for (;;) {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			let onAbort: (() => void) | undefined;
+			let next: IteratorResult<ResponseStreamEvent>;
+			try {
+				const interrupted = new Promise<never>((_resolve, reject) => {
+					onAbort = () => reject(new Error("Request was aborted"));
+					if (signal.aborted) onAbort();
+					else signal.addEventListener("abort", onAbort, { once: true });
+					if (timeoutMs > 0) {
+						timer = setTimeout(
+							() => reject(new Error(`OpenAI Responses idle timeout: no events for ${timeoutMs}ms`)),
+							timeoutMs,
+						);
+					}
+				});
+				next = await Promise.race([iterator.next(), interrupted]);
+			} catch (error) {
+				if (signal.aborted) throw error;
+				// Only retain bounded transport codes, never arbitrary cause objects (which
+				// can contain URLs, headers, socket details, or request bodies).
+				const codes = new Set<string>();
+				let cause: unknown = error;
+				for (let depth = 0; depth < 5 && typeof cause === "object" && cause !== null; depth++) {
+					if (
+						"code" in cause &&
+						typeof cause.code === "string" &&
+						/^(?:UND_ERR_[A-Z_]+|E[A-Z0-9_]+)$/.test(cause.code) &&
+						cause.code.length <= 64
+					)
+						codes.add(cause.code);
+					cause = "cause" in cause ? cause.cause : undefined;
+				}
+				const message = formatOpenAIResponsesError(error);
+				if (
+					codes.size === 0 &&
+					!/terminated|fetch failed|network|connection|socket|timed? out|timeout/i.test(message)
+				)
+					throw error;
+				const diagnostics = [
+					`elapsed=${Date.now() - startedAt}ms`,
+					`idle=${Date.now() - lastEventAt}ms`,
+					`events=${eventCount}`,
+					`last=${lastEvent}`,
+					...(codes.size > 0 ? [`transport=${[...codes].join(",")}`] : []),
+					...(requestId && /^[a-zA-Z0-9_-]{1,128}$/.test(requestId) ? [`request=${requestId}`] : []),
+				];
+				throw new Error(`OpenAI Responses stream interrupted: ${message} (${diagnostics.join("; ")})`, {
+					cause: error,
+				});
+			} finally {
+				if (timer !== undefined) clearTimeout(timer);
+				if (onAbort) signal.removeEventListener("abort", onAbort);
+			}
+			if (next.done) return;
+			eventCount++;
+			lastEventAt = Date.now();
+			lastEvent = /^[a-zA-Z0-9_.]{1,128}$/.test(next.value.type) ? next.value.type : "unknown";
+			yield next.value;
+			// The terminal event, not a subsequent socket close, completes the response.
+			if (["response.completed", "response.incomplete", "response.failed", "error"].includes(next.value.type))
+				return;
+		}
+	} finally {
+		controller.abort();
+		// Do not await return: a custom transport may leave next() pending forever.
+		void iterator.return?.().catch(() => {});
+	}
+}
+
 // OpenAI Responses-specific options
 export interface OpenAIResponsesOptions extends StreamOptions {
+	/** Header timeout and maximum silence between decoded stream events. Default: 5 minutes; 0 disables the idle guard. */
+	timeoutMs?: number;
 	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
@@ -128,8 +215,15 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			stopReason: "pending",
 			timestamp: Date.now(),
 		};
+		const controller = new AbortController();
+		const requestSignal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
 
 		try {
+			const timeoutMs = options?.timeoutMs ?? DEFAULT_RESPONSES_IDLE_TIMEOUT_MS;
+			if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 2_147_483_647)
+				throw new Error(
+					"Invalid Responses request deadline: expected an integer from 0 to 2147483647 milliseconds",
+				);
 			if (options?.controls !== undefined) validateModelControls(model, options.controls);
 			// Create OpenAI client
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
@@ -160,8 +254,9 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			}
 			output.execution = { requested: { ...options?.controls }, sent };
 			const requestOptions = {
-				...(options?.signal ? { signal: options.signal } : {}),
-				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
+				signal: requestSignal,
+				// SDK timeout=0 means immediate timeout, not disabled.
+				timeout: timeoutMs === 0 ? 2_147_483_647 : timeoutMs,
 				maxRetries: 0,
 			};
 			const { data: openaiStream, response } = await retryProviderRequest(
@@ -175,7 +270,14 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
-			await processResponsesStream(openaiStream, output, stream, model, {
+			const monitoredStream = monitorResponsesStream(
+				openaiStream,
+				controller,
+				requestSignal,
+				timeoutMs,
+				response.headers.get("x-request-id"),
+			);
+			await processResponsesStream(monitoredStream, output, stream, model, {
 				serviceTier: params.service_tier,
 				grammarToolInputProperties,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
@@ -205,6 +307,8 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			output.errorMessage = formatOpenAIResponsesError(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
+		} finally {
+			controller.abort();
 		}
 	})();
 

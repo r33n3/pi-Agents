@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
 import Type from "typebox";
 import type { ToolDefinition } from "../extensions/types.ts";
 import {
 	type CapabilityApprovalActionBinding,
+	type CapabilityApprovalEvidence,
 	type CapabilityApprovalOwner,
 	type CapabilityApprovalService,
 	createCapabilityApprovalActionBinding,
@@ -16,6 +19,7 @@ import {
 	type GovernedActionService,
 	isGovernedActionCancellation,
 } from "./governed-action-service.ts";
+import { resolveCanonicalWorkspacePath } from "./scoped-agent-tools.ts";
 import type { ServeAuditIdentities } from "./serve-audit-store.ts";
 
 const API_ROOT = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -24,6 +28,10 @@ const MAX_MESSAGE_TEXT_CHARS = 200_000;
 const CONNECTION_ID = "google-workspace-primary";
 
 export interface GoogleWorkspaceToolOptions {
+	/** Host-resolved approval evidence for draft preparation only. */
+	draftApprovalEvidence?: () => Promise<CapabilityApprovalEvidence | undefined>;
+	/** Only supplied when this agent has workspace read permission. */
+	reportWorkspace?: string;
 	credentials?: CredentialStore;
 	environment?: NodeJS.ProcessEnv;
 	fetch?: typeof fetch;
@@ -50,7 +58,8 @@ export interface GoogleWorkspaceMessageApprovalInput {
 }
 
 interface MessageInput extends GoogleWorkspaceMessageApprovalInput {
-	receiptId: string;
+	receiptId?: string;
+	reportPath?: string;
 }
 
 export interface GoogleWorkspaceApprovalRequest {
@@ -71,7 +80,8 @@ export function bindGoogleWorkspaceMessageApproval(
 	action: "draft" | "send" | "attach",
 	input: GoogleWorkspaceMessageApprovalInput,
 ): BoundGoogleWorkspaceMessageApproval {
-	if (input.to.length === 0 || input.to.length > 50) throw new Error("Gmail approval requires 1-50 recipients");
+	if ((action === "send" && input.to.length === 0) || input.to.length > 50)
+		throw new Error("Gmail sending requires 1-50 recipients; drafts may leave recipients blank");
 	if (input.cc && input.cc.length > 50) throw new Error("Gmail approval allows at most 50 copied recipients");
 	const to = input.to.map((address) => boundedHeader(address, "Gmail recipient", 3, 320));
 	const cc = input.cc?.map((address) => boundedHeader(address, "Gmail copied recipient", 3, 320));
@@ -103,7 +113,7 @@ export function bindGoogleWorkspaceMessageApproval(
 		mimeType: normalizedMimeType,
 		contentBase64,
 	});
-	const target = [...to, ...(dispatchInput.cc ?? [])].join(",");
+	const target = [...to, ...(dispatchInput.cc ?? [])].join(",") || "connected-account:drafts";
 	return {
 		request: {
 			capabilityId: `email.${action}`,
@@ -240,22 +250,59 @@ function messageWriteTool(
 	return {
 		name: `google_workspace_email_${action}`,
 		label: `email_${action}`,
-		description: `${display(action)} a Gmail message using a matching approval receipt.`,
+		description:
+			action === "send"
+				? "Send a Gmail message using a separate exact-action approval receipt."
+				: "Create a real Gmail draft for review, never send it. Host resolves the user's chat authorization; omit receiptId. Leave to empty when the user has not supplied recipients; never invent addresses. Use reportPath to embed and attach an existing HTML report without rewriting or base64-encoding it. Completion requires the returned Gmail draft ID and review URL.",
 		parameters: Type.Object({
-			to: Type.Array(Type.String({ minLength: 3, maxLength: 320 }), { minItems: 1, maxItems: 50 }),
+			to: Type.Array(Type.String({ minLength: 3, maxLength: 320 }), {
+				minItems: action === "send" ? 1 : 0,
+				maxItems: 50,
+			}),
 			cc: Type.Optional(Type.Array(Type.String({ minLength: 3, maxLength: 320 }), { maxItems: 50 })),
 			subject: Type.String({ maxLength: 998 }),
 			text: Type.String({ maxLength: 500_000 }),
 			html: Type.Optional(Type.String({ maxLength: 500_000 })),
-			receiptId: Type.String({ minLength: 1, maxLength: 128 }),
+			receiptId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+			reportPath: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
 			filename: attachment ? Type.String({ minLength: 1, maxLength: 255 }) : Type.Optional(Type.String()),
 			mimeType: attachment ? Type.String({ minLength: 1, maxLength: 127 }) : Type.Optional(Type.String()),
 			contentBase64: attachment ? Type.String({ minLength: 1, maxLength: 1_500_000 }) : Type.Optional(Type.String()),
 		}),
 		async execute(_id, input, signal) {
-			const message = input as MessageInput;
+			assertProviderAuthority(options.authority, signal);
+			const message = { ...(input as MessageInput) };
+			if (message.reportPath) {
+				if (action === "send") throw new Error("Prepare the report as a draft before requesting send approval");
+				if (!options.reportWorkspace) throw new Error("Report attachment requires assigned workspace read access");
+				const path = await resolveCanonicalWorkspacePath(options.reportWorkspace, message.reportPath, "existing");
+				if (!/\.html?$/i.test(path)) throw new Error("reportPath must name an HTML report");
+				const bytes = await readFile(path);
+				if (bytes.byteLength > 1_000_000) throw new Error("Gmail attachment exceeds 1 MB");
+				message.html = bytes.toString("utf8");
+				message.filename = basename(path);
+				message.mimeType = "text/html";
+				message.contentBase64 = bytes.toString("base64");
+			}
 			const bound = bindGoogleWorkspaceMessageApproval(action, message);
-			return approvedResult(options, message.receiptId, bound.request, signal, async (idempotencyKey) => {
+			let receiptId = message.receiptId;
+			if (!receiptId && action !== "send") {
+				const evidence = await options.draftApprovalEvidence?.();
+				if (!evidence)
+					throw new Error(
+						"Draft preparation needs a direct user request in this conversation. Ask the user to create the email draft; do not ask for receipt IDs or substitute a local report for a Gmail draft.",
+					);
+				// A login failure precedes approval consumption and any external write.
+				await client.prepare(signal);
+				receiptId = (
+					await options.approvals.issue({ ...bound.request, owner: approvalOwner(options), evidence }, true)
+				).id;
+			}
+			if (!receiptId)
+				throw new Error(
+					"Sending needs separate approval for the exact recipients and content. Draft approval does not authorize sending.",
+				);
+			return approvedResult(options, receiptId, bound.request, signal, async (idempotencyKey) => {
 				const raw = mimeMessage({ ...bound.dispatchInput, idempotencyKey });
 				const body = action === "send" ? { raw } : { message: { raw } };
 				return normalizeWriteResult(
@@ -285,6 +332,11 @@ class GmailClient {
 		this.#persistTokens = options.persistTokens;
 		this.#markConnectionUnhealthy = options.markConnectionUnhealthy;
 		this.#authority = options.authority;
+	}
+
+	async prepare(signal: AbortSignal | undefined): Promise<void> {
+		assertProviderAuthority(this.#authority, signal);
+		await this.#accessToken(signal);
 	}
 
 	async request(
@@ -594,6 +646,7 @@ function normalizeWriteResult(action: "draft" | "send" | "attach", target: strin
 	const input = record(value, `Gmail ${action} response`);
 	const message = action === "draft" || action === "attach" ? record(input.message, "Gmail draft message") : input;
 	return {
+		reviewUrl: action === "send" ? undefined : "https://mail.google.com/mail/u/0/#drafts",
 		action,
 		target,
 		id: requiredString(input.id, `Gmail ${action} ID`),

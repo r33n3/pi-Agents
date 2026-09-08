@@ -19,6 +19,7 @@ export interface CapabilityApprovalActionBinding {
 }
 
 export interface CapabilityApprovalRequest {
+	evidence?: CapabilityApprovalEvidence;
 	capabilityId: string;
 	providerId: string;
 	connectionId: string;
@@ -29,7 +30,15 @@ export interface CapabilityApprovalRequest {
 	expiresInSeconds?: number;
 }
 
+/** Supplied by the host from a user-authored message, never by a tool argument. */
+export interface CapabilityApprovalEvidence {
+	messageId: string;
+	conversationId: string;
+	textDigest: string;
+}
+
 export interface CapabilityApprovalReceipt {
+	evidence?: CapabilityApprovalEvidence;
 	id: string;
 	idempotencyKey: string;
 	capabilityId: string;
@@ -115,6 +124,19 @@ export class CapabilityApprovalService {
 		const owner = normalizeOwner(request.owner, "approval owner");
 		const binding = normalizeBinding(request.binding, "approval action binding");
 		return this.#queue.run(async () => {
+			if (request.evidence) {
+				const prior = Object.values(this.#state.receipts).find(
+					(entry) =>
+						!entry.legacy &&
+						entry.evidence?.messageId === request.evidence?.messageId &&
+						entry.evidence?.conversationId === request.evidence?.conversationId &&
+						entry.capabilityId === request.capabilityId,
+				);
+				if (prior && !prior.legacy) {
+					assertReceiptMatches(prior, { ...request, owner, binding });
+					return structuredClone(prior);
+				}
+			}
 			const now = Date.now();
 			const ttl = request.expiresInSeconds ?? 300;
 			if (!Number.isSafeInteger(ttl) || ttl < 30 || ttl > 3600) {
@@ -279,6 +301,7 @@ function normalizeHistoryReceipt(value: unknown): CapabilityApprovalHistoryRecei
 function normalizeReceipt(value: unknown): CapabilityApprovalReceipt {
 	const input = record(value, "approval receipt");
 	return compact({
+		evidence: input.evidence === undefined ? undefined : normalizeEvidence(input.evidence),
 		id: requiredString(input.id, "id"),
 		idempotencyKey: requiredString(input.idempotencyKey, "idempotencyKey"),
 		capabilityId: requiredString(input.capabilityId, "capabilityId"),
@@ -297,6 +320,17 @@ function normalizeReceipt(value: unknown): CapabilityApprovalReceipt {
 		revocationReason:
 			input.revocationReason === undefined ? undefined : requiredString(input.revocationReason, "revocationReason"),
 	});
+}
+
+function normalizeEvidence(value: unknown): CapabilityApprovalEvidence {
+	const input = record(value, "approval evidence");
+	const textDigest = requiredString(input.textDigest, "message digest");
+	if (!/^[0-9a-f]{64}$/.test(textDigest)) throw new Error("Approval message digest is invalid");
+	return {
+		messageId: requiredString(input.messageId, "message ID"),
+		conversationId: requiredString(input.conversationId, "conversation ID"),
+		textDigest,
+	};
 }
 
 function normalizeLegacyReceipt(input: Record<string, unknown>): LegacyCapabilityApprovalReceipt {

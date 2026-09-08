@@ -148,7 +148,7 @@ export function agentExecutionInstructions(
 		agentIdentityInstructions(context.definition),
 		`Current host date and time: ${now.toISOString()} (${timeZone}).`,
 		"Resolve relative dates such as today, yesterday, and previous calendar day from that host time and timezone.",
-		"Operate only through the provided tools. All tool paths are confined to your assigned workspace.",
+		"Operate only through the provided tools. File tools are confined to your assigned workspace. An explicitly granted host command tool runs as the server user; use it only for the assigned task.",
 		`Task: ${context.prompt}`,
 		...(context.inputContents
 			? [

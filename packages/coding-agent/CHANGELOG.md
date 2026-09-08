@@ -4,6 +4,20 @@
 
 ### Added
 
+- Added monthly and yearly team schedule presets with calendar date selection and explicit saved-time-zone guidance.
+- Added reviewed team schedules in the main conversation, with paused testing, configuration checks, retained team memory, and draft-only Gmail authorization.
+- Added assignable Aviationstack flight status and arrivals with encrypted credentials and a persistent shared 100-attempt limit.
+- Added assignable SerpApi flight fare research with encrypted connection credentials, a persistent shared 250-attempt rolling limit, and short-lived query caching.
+- Added supervisor-editable memory policies with expiring source-linked observations and confined access to Pi-discovered skill entry points.
+- Added reusable team browser profiles and site interface preferences, scoped chat/tool assignment, and workspace report presentation in the side browser.
+- Added supervisor tool proposals and confirmation through team chat, with retained setup guidance, restart recovery, scoped member allocations, and availability checks before saving.
+- Enabled user-requested supervisor recruitment through the Pi registry and team task service, with saved-member receipts, bounded tools, persistent membership, duplicate prevention, and completion checks distinct from autonomous recruitment.
+- Added supervisor chat updates for saved team/member instructions and task facts, with revision checks, persisted confirmations, and undo of the last chat update.
+- Added native Pi read/edit/write adapters and explicitly granted, audited host command tools for isolated agents and teams.
+- Added typed team-turn submission, retained supervisor completion plans, and paginated access to complete retained team context.
+- Added bounded supervisor-to-team delegation with selected team rosters, linked child conversations, nested cancellation, inherited run budgets, and retained result evidence.
+- Added team tool allowances with supervisor assignment through isolated execution snapshots, executable environment capability discovery, and bounded shared/private memory with source references and reset controls.
+- Added editable, persistent working notes scoped to individual team members.
 - Added sidebar team rosters with supervisors, scoped specialist recruitment, targeted member communication, and retained team conversations.
 - Added conversational preparation of read-only teams with reviewed launch into one coordinator chat.
 - Added bounded static `page_read` source evidence and a separately reviewed Pi Public Web capability for sessions and isolated agents.
@@ -27,6 +41,11 @@
 
 ### Changed
 
+- Split team configuration into Overview, Members, Tools, Memory, and Advanced sections with persistent save controls; separated browser profile and site editors, and grouped history by date with readable summaries and filtering.
+- Kept team Configure, Schedule, and Memory actions above the conversation; grouped workspace settings into readable disclosures with persistent expansion, visible editing controls, and inline validation.
+- Kept team messaging available during active work, queuing updates at turn boundaries without cancelling completed effects, and made team purpose optional with expandable member details.
+- Routed installed teams of up to eight members into persistent supervisor chat, with selective delegation, current member cards, expandable communication, and retained workflow history.
+- Moved team creation and membership editing into the main panel, with optional first tasks and direct access to conversational team building.
 - Moved team conversations into the main chat panel with sidebar selection, retained team drafts, and shared send, stop, and continue controls.
 - Added explicit activation of accepted agent revisions with optional skill export, preserving active routines during candidate refinement.
 - Routed Claude and Hermes connections directly through backend adapters with shared agent/external-run capacity and workspace exclusion.
@@ -35,6 +54,25 @@
 
 ### Fixed
 
+- Kept a themed stop control beside team chat input, improved turn spacing, and recognized direct Gmail draft requests containing common phrasing and typos.
+- Preserved SearXNG engine failures, distinguished blocked searches from empty results, and shared queued, paced, cached searches across agent callers.
+- Paused team assignments with actionable setup guidance when configured tools become unavailable, while allowing healthy members to continue.
+- Shared team worker browser sessions with the host console and profile leases, and included page text in browser snapshots.
+- Reused an explicitly selected user capability settings profile across isolated agent work storage, sharing configured providers, accounts, and vault access between Settings and team assignment without copying credentials.
+- Kept assembled workflow instructions and research results in bounded context instead of the 16 KiB goal field, preventing supervisor handoff and correction failures without truncating evidence.
+- Reduced activity-refresh payloads to task display summaries, fetched full task evidence on demand, coalesced overlapping refreshes, and skipped unchanged activity/navigation/artifact redraws.
+- Matched conversational team drafts to configured read capabilities, bound private services without account logins, and rechecked tool availability before reviewed launch.
+- Exposed SearXNG search and Firecrawl search/scrape to explicitly granted isolated agents and teams, and accepted a private Firecrawl endpoint without requiring a cloud API key.
+- Distinguished completed specialist contributions from child-team assignments in supervisor context to prevent unnecessary repeat research.
+- Required explicit inventory validation instead of inferring a specialized recipe from arbitrary CSV headers, and rejected unstructured claims when that validator is selected.
+- Preserved declared team requirements across clarifications, separated historical messages from current completion evidence, and validated tool assignments against exact allowance IDs.
+- Unified structured workflow result parsing and prevented placeholder team IDs from passing supervisor action validation.
+- Distinguished coordinator tools from selected teams' allowances when answering capability questions, and exposed the available environment tool catalog without granting additional authority.
+- Prevented recognized separate-agent requests from completing on a supervisor self-review, with retained staffing requirements and bounded correction before asking for a staffing decision.
+- Serialized team submissions and clarification replies so concurrent requests cannot start duplicate team work.
+- Kept unsent messages with their conversations across navigation and reload, and restored failed agent and team submissions to the originating conversation.
+- Grouped installed teams and saved team drafts under Teams, with collapsible members, retained expansion, and direct coordinator chat selection.
+- Restored saved team review and launch cards in normal chat after navigation or reload, with role details and visible launch errors.
 - Clarified reusable agent input defaults and required fresh evidence for new file reviews in shared worker instructions.
 - Distinguished the current workflow request from reusable step instructions, and showed coordinator answers with expandable specialist reports and readable progress labels.
 - Included lifecycle proposal IDs in model-visible tool responses and preserved pending proposals when confirmation omits its ID.

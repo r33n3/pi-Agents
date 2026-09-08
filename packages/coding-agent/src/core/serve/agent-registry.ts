@@ -34,6 +34,11 @@ export interface AgentRoutineDefinition {
 }
 
 export interface AgentDefinition {
+	/** Host-owned per-turn response contract; not a saved agent capability. */
+	responseSchema?: Record<string, unknown>;
+	teamContext?: string;
+	/** Explicit validation recipe for bound file tasks. */
+	inputValidator?: "inventory" | "none";
 	id: string;
 	revision: number;
 	source: AgentDefinitionSource;
@@ -185,7 +190,11 @@ export class AgentRegistry {
 					`Agent ${normalized.id} changed from revision ${expectedRevision} to ${currentRevision}; review it before saving`,
 				);
 			}
-			const definition = { ...normalized, revision: currentRevision + 1 };
+			const definition = {
+				...normalized,
+				inputValidator: normalized.inputValidator ?? previous?.inputValidator,
+				revision: currentRevision + 1,
+			};
 			for (const delegateId of definition.delegateAgentIds) {
 				if (delegateId === definition.id) throw new Error("An agent cannot delegate to itself");
 				if (!(await this.get(delegateId))) throw new Error(`Delegate agent ${delegateId} was not found`);
@@ -370,6 +379,10 @@ export function normalizeDefinition(value: unknown, defaultWorkspace: string): A
 		name,
 		description: requiredString(input.description, "description"),
 		model: normalizeModel(input.model),
+		inputValidator:
+			input.inputValidator === undefined
+				? undefined
+				: oneOf(input.inputValidator, ["inventory", "none"], "inputValidator"),
 		budget: normalizeBudget(input.budget),
 		thinking: normalizeThinking(input.thinking),
 		modelControls: parseAgentModelControls(input),

@@ -1,23 +1,24 @@
 import { mkdir, readdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import Type from "typebox";
+import { detectSupportedImageMimeType } from "../../utils/mime.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
+import { createEditToolDefinition } from "../tools/edit.ts";
+import { createReadToolDefinition } from "../tools/read.ts";
+import { createWriteToolDefinition } from "../tools/write.ts";
 import type { AgentDefinition } from "./agent-registry.ts";
 
 export const MAX_SCOPED_AGENT_FILE_BYTES = 1024 * 1024;
-export const SUPPORTED_AGENT_TOOLS = ["read", "list", "write"] as const;
-const readParameters = Type.Object({ path: Type.String({ minLength: 1 }) });
+export const SUPPORTED_AGENT_TOOLS = ["read", "list", "write", "edit", "bash", "powershell"] as const;
 const listParameters = Type.Object({ path: Type.Optional(Type.String()) });
-const writeParameters = Type.Object({
-	path: Type.String({ minLength: 1 }),
-	content: Type.String({ maxLength: MAX_SCOPED_AGENT_FILE_BYTES }),
-});
 export type ScopedAgentTool =
-	| ToolDefinition<typeof readParameters, undefined>
-	| ToolDefinition<typeof listParameters, undefined>
-	| ToolDefinition<typeof writeParameters, undefined>;
+	| ReturnType<typeof createReadToolDefinition>
+	| ReturnType<typeof createWriteToolDefinition>
+	| ReturnType<typeof createEditToolDefinition>
+	| ToolDefinition<typeof listParameters, undefined>;
 
 export interface ScopedAgentFileOperations {
+	readBytes?(path: string): Promise<Buffer>;
 	read(path: string): Promise<string>;
 	list(path: string): Promise<Array<{ kind: "directory" | "file"; name: string }>>;
 	write(path: string, content: string): Promise<number>;
@@ -27,19 +28,58 @@ export function createScopedAgentTools(
 	definition: AgentDefinition,
 	workspace: string,
 	operations: ScopedAgentFileOperations = createLocalScopedAgentFileOperations(workspace),
-): ScopedAgentTool[] {
+): ToolDefinition[] {
 	const requested = new Set(definition.tools);
 	const tools: ScopedAgentTool[] = [];
-	if (requested.has("read")) tools.push(createReadTool(operations));
+	const read = async (path: string) =>
+		operations.readBytes ? operations.readBytes(path) : Buffer.from(await operations.read(path), "utf8");
+	if (requested.has("read"))
+		tools.push(
+			createReadToolDefinition(workspace, {
+				operations: {
+					readFile: read,
+					access: async () => {},
+					detectImageMimeType: async (path) => detectSupportedImageMimeType(await read(path)),
+				},
+			}),
+		);
 	if (requested.has("list")) tools.push(createListTool(operations));
 	if (requested.has("write") && definition.permissionPolicy === "workspace-write") {
-		tools.push(createWriteTool(operations));
+		tools.push(
+			createWriteToolDefinition(workspace, {
+				operations: {
+					mkdir: async () => {}, // The authorized write operation owns directory creation.
+					writeFile: async (path, content) => {
+						await operations.write(path, content);
+					},
+				},
+			}),
+		);
 	}
-	return tools;
+	if (requested.has("edit") && definition.permissionPolicy === "workspace-write")
+		tools.push(
+			createEditToolDefinition(workspace, {
+				operations: {
+					readFile: read,
+					access: async () => {},
+					writeFile: async (path, content) => {
+						await operations.write(path, content);
+					},
+				},
+			}),
+		);
+	// Pi tools have heterogeneous parameter schemas; the runtime validates each tool's schema.
+	return tools as ToolDefinition[];
 }
 
 export function createLocalScopedAgentFileOperations(workspace: string): ScopedAgentFileOperations {
 	return {
+		async readBytes(path) {
+			const bytes = await readFile(await resolveCanonicalWorkspacePath(workspace, path, "existing"));
+			if (bytes.byteLength > MAX_SCOPED_AGENT_FILE_BYTES)
+				throw new Error("Workspace file exceeds the 1 MiB read limit");
+			return bytes;
+		},
 		async read(path) {
 			const content = await readFile(await resolveCanonicalWorkspacePath(workspace, path, "existing"));
 			if (content.byteLength > MAX_SCOPED_AGENT_FILE_BYTES) {
@@ -56,23 +96,12 @@ export function createLocalScopedAgentFileOperations(workspace: string): ScopedA
 				.map((entry) => ({ kind: entry.isDirectory() ? "directory" : "file", name: entry.name }));
 		},
 		async write(path, content) {
+			if (Buffer.byteLength(content, "utf8") > MAX_SCOPED_AGENT_FILE_BYTES)
+				throw new Error("Workspace file exceeds the 1 MiB write limit");
 			const target = await resolveCanonicalWorkspacePath(workspace, path, "write");
 			await mkdir(dirname(target), { recursive: true });
 			await writeFile(target, content, "utf8");
 			return Buffer.byteLength(content, "utf8");
-		},
-	};
-}
-
-function createReadTool(operations: ScopedAgentFileOperations): ToolDefinition<typeof readParameters, undefined> {
-	return {
-		name: "read",
-		label: "read",
-		description: "Read a UTF-8 text file inside this agent's isolated workspace.",
-		promptSnippet: "Read a workspace file",
-		parameters: readParameters,
-		async execute(_toolCallId, { path }) {
-			return { content: [{ type: "text", text: await operations.read(path) }], details: undefined };
 		},
 	};
 }
@@ -96,23 +125,6 @@ function createListTool(operations: ScopedAgentFileOperations): ToolDefinition<t
 							.join("\n"),
 					},
 				],
-				details: undefined,
-			};
-		},
-	};
-}
-
-function createWriteTool(operations: ScopedAgentFileOperations): ToolDefinition<typeof writeParameters, undefined> {
-	return {
-		name: "write",
-		label: "write",
-		description: "Create or replace a UTF-8 text file inside this agent's isolated workspace.",
-		promptSnippet: "Write a workspace file",
-		parameters: writeParameters,
-		async execute(_toolCallId, { path, content }) {
-			const bytesWritten = await operations.write(path, content);
-			return {
-				content: [{ type: "text", text: `Wrote ${bytesWritten} bytes to ${path}` }],
 				details: undefined,
 			};
 		},

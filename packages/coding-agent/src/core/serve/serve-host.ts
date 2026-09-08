@@ -26,6 +26,8 @@ import { BrowserArtifactStore } from "./browser-artifact-store.ts";
 import { BrowserConsoleService } from "./browser-console-service.ts";
 import { BrowserProfileStore } from "./browser-profile-store.ts";
 import { type BrowserOwner, BrowserSessionManager } from "./browser-session-manager.ts";
+import { withBrowserSetup } from "./browser-setup-http.ts";
+import { BrowserSetupStore } from "./browser-setup-store.ts";
 import { BrowserStreamServer } from "./browser-stream-server.ts";
 import { createBrowserTools } from "./browser-tools.ts";
 import { BrowserWorkflowCaptureStore } from "./browser-workflow-capture.ts";
@@ -38,17 +40,21 @@ import { CapabilityApprovalService } from "./capability-approval-service.ts";
 import { CapabilityBroker } from "./capability-broker.ts";
 import { CapabilityCatalog } from "./capability-catalog.ts";
 import { CapabilityConnectionRegistry } from "./capability-connection-registry.ts";
+import { chatDraftApproval } from "./chat-draft-approval.ts";
 import { ChildProcessAgentExecutor } from "./child-process-agent-executor.ts";
 import { ClaudeSubscriptionLogin } from "./claude-subscription-login.ts";
 import { CodexCliExecution, isCodexSubscriptionAvailable } from "./codex-cli-execution.ts";
 import { ConversationBuildCoordinator } from "./conversation-build-coordinator.ts";
 import { createCredentialApiTools } from "./credential-api-tools.ts";
 import { CurrentSessionService } from "./current-session-service.ts";
+import { DataToolRegistry } from "./data-tool-registry.ts";
 import { DirectToolExecution } from "./direct-tool-execution.ts";
 import { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
 import { createEverydayDataTools } from "./everyday-data-tools.ts";
 import { ExecutionAdmission } from "./execution-admission.ts";
 import { type ExternalConnectionDefinition, ExternalConnectionManager } from "./external-connection-manager.ts";
+import { createFlightSearchTools } from "./flight-search-tools.ts";
+import { createFlightStatusTools } from "./flight-status-tools.ts";
 import { GoogleWorkspaceOAuth } from "./google-workspace-oauth.ts";
 import { createGoogleWorkspaceTools } from "./google-workspace-tools.ts";
 import { GovernedActionService } from "./governed-action-service.ts";
@@ -70,14 +76,20 @@ import { ServeAttachmentStore } from "./serve-attachment-store.ts";
 import { ServeAuditStore } from "./serve-audit-store.ts";
 import { acquireServeDirectoryOwnership, type ServeDirectoryOwnership } from "./serve-directory-ownership.ts";
 import { createServePage } from "./serve-page.ts";
+import { createTeamBrowserTools, type TeamBrowserRuntime } from "./team-browser-tools.ts";
 import { createTeamDraftTool } from "./team-draft-tool.ts";
+import { TeamResources } from "./team-resources.ts";
+import { TeamRoutines, withTeamScheduleReview } from "./team-routines.ts";
 import { WebSocketListener } from "./websocket-listener.ts";
 import { WorkflowService } from "./workflow-service.ts";
 import { WorkspacePreviewServer } from "./workspace-preview-server.ts";
+import { withWorkspaceStorage } from "./workspace-storage-http.ts";
 import { WtkAgentFactoryClient } from "./wtk-agent-factory-client.ts";
 
 export interface ServeHostOptions {
 	agentDir: string;
+	/** Reuse provider settings/accounts/vault while keeping agents and run history in agentDir. */
+	capabilitySettingsDir?: string;
 	session: AgentSession;
 	host?: string;
 	port?: number;
@@ -116,6 +128,7 @@ export class ServeHost implements AsyncDisposable {
 	#browserSessionManager: BrowserSessionManager | undefined;
 	#workspacePreviewServer: WorkspacePreviewServer | undefined;
 	#serveDirectoryOwnership: ServeDirectoryOwnership | undefined;
+	#settingsDirectoryOwnership: ServeDirectoryOwnership | undefined;
 	#startAttempted = false;
 	#closePromise: Promise<void> | undefined;
 
@@ -155,14 +168,24 @@ export class ServeHost implements AsyncDisposable {
 		}
 		const token = configuredToken ?? randomBytes(32).toString("base64url");
 		const serveRoot = join(agentDir, "serve");
-		this.#serveDirectoryOwnership = await acquireServeDirectoryOwnership(serveRoot, (error) => {
+		const settingsDir = resolve(
+			this.#options.capabilitySettingsDir ?? process.env.PI_SERVE_CAPABILITY_SETTINGS_DIR ?? agentDir,
+		);
+		const capabilityRoot = join(settingsDir, "serve", "capabilities");
+		const ownershipLost = (error: Error) => {
 			this.#options.onError?.(
 				new Error(`Serve directory ownership was compromised: ${error.message}`, { cause: error }),
 			);
 			void this.close().catch((closeError: unknown) => {
 				this.#options.onError?.(closeError instanceof Error ? closeError : new Error(String(closeError)));
 			});
-		});
+		};
+		this.#serveDirectoryOwnership = await acquireServeDirectoryOwnership(serveRoot, ownershipLost);
+		if (resolve(settingsDir) !== resolve(agentDir))
+			this.#settingsDirectoryOwnership = await acquireServeDirectoryOwnership(
+				join(settingsDir, "serve"),
+				ownershipLost,
+			);
 		const auditStore = new ServeAuditStore(join(serveRoot, "audit"));
 		await auditStore.initialize();
 		const governedActions = new GovernedActionService(auditStore);
@@ -173,7 +196,9 @@ export class ServeHost implements AsyncDisposable {
 		await browserWorkflowRegistry.initialize();
 		const browserWorkflowCompiler = new BrowserWorkflowCompiler(browserWorkflowRegistry);
 		this.#workspacePreviewServer = new WorkspacePreviewServer();
-		const browserProfileStore = new BrowserProfileStore(join(serveRoot, "browser"));
+		const browserProfileStore = new BrowserProfileStore(join(settingsDir, "serve", "browser"));
+		const browserSetup = new BrowserSetupStore(join(settingsDir, "serve", "browser"));
+		await browserSetup.initialize();
 		const browserArtifactStore = new BrowserArtifactStore(join(serveRoot, "browser"));
 		this.#browserSessionManager = new BrowserSessionManager(
 			browserDriver,
@@ -189,6 +214,17 @@ export class ServeHost implements AsyncDisposable {
 			join(serveRoot, "browser", "runs"),
 		);
 		await browserWorkflowRunner.initialize();
+		let presentation: { sessionId: string; revision: number } | undefined;
+		const teamBrowserRuntime: TeamBrowserRuntime = {
+			manager: this.#browserSessionManager,
+			setup: browserSetup,
+			preview: this.#workspacePreviewServer,
+			workflows: browserWorkflowRegistry,
+			runner: browserWorkflowRunner,
+			presented: (sessionId) => {
+				presentation = { sessionId, revision: (presentation?.revision ?? 0) + 1 };
+			},
+		};
 		const browserWorkflowReferences = new BrowserWorkflowReferenceStore(
 			join(serveRoot, "browser", "references"),
 			join(agentDir, "skills"),
@@ -247,14 +283,14 @@ export class ServeHost implements AsyncDisposable {
 			everydayConfigurations,
 		);
 		const brokeredTools = [...everydayDataTools];
-		const capabilityConnections = new CapabilityConnectionRegistry(join(serveRoot, "capabilities", "connections"));
+		const capabilityConnections = new CapabilityConnectionRegistry(join(capabilityRoot, "connections"));
 		await capabilityConnections.initialize();
 		const capabilityApprovals = new CapabilityApprovalService(join(serveRoot, "capabilities", "approvals"));
 		await capabilityApprovals.initialize();
 		let currentSessionService: CurrentSessionService | undefined;
 		let agentCollaborationService: AgentCollaborationService | undefined;
 		let providerEnvironment: ProviderEnvironmentStore | undefined;
-		const capabilityBroker = new CapabilityBroker(join(serveRoot, "capabilities"), {
+		const capabilityBroker = new CapabilityBroker(capabilityRoot, {
 			activeToolNames: () => session.getAllTools().map((tool) => tool.name),
 			activeProviderSources: () =>
 				session.resourceLoader
@@ -275,7 +311,7 @@ export class ServeHost implements AsyncDisposable {
 			session.sessionManager.getCwd(),
 			(providerId) => capabilityBroker.authenticationManifest(providerId),
 			{
-				vaultPath: join(agentDir, "credentials", "v1", "vault.json"),
+				vaultPath: join(settingsDir, "credentials", "v1", "vault.json"),
 				onProviderChanged: async (providerId, values) => {
 					const binding =
 						providerId === "openai-api"
@@ -303,6 +339,18 @@ export class ServeHost implements AsyncDisposable {
 			if (value) await modelRuntime.setRuntimeApiKey(binding.runtimeId, value);
 		}
 		brokeredTools.push(...createSearxngTools(() => providerEnvironment.environmentValue("SEARXNG_BASE_URL")));
+		brokeredTools.push(
+			...createFlightStatusTools(
+				() => providerEnvironment.environmentValue("AVIATIONSTACK_API_KEY"),
+				join(capabilityRoot, "flight-status-usage"),
+			),
+		);
+		brokeredTools.push(
+			...createFlightSearchTools(
+				() => providerEnvironment.environmentValue("SERPAPI_API_KEY"),
+				join(capabilityRoot, "flight-search-usage"),
+			),
+		);
 		brokeredTools.push(...createCredentialApiTools((name) => providerEnvironment.environmentValue(name)));
 		session.registerCustomTools(brokeredTools);
 		await capabilityBroker.initialize();
@@ -341,8 +389,55 @@ export class ServeHost implements AsyncDisposable {
 			owner: { kind: "session" | "agent-run"; id: string },
 			identities: { actorId: string; sessionId?: string; agentId?: string; attemptId?: string },
 			assertLive: () => void,
+			reportWorkspace?: string,
 		) =>
 			createGoogleWorkspaceTools({
+				reportWorkspace,
+				draftApprovalEvidence: async () => {
+					assertLive();
+					if (owner.kind === "agent-run") {
+						const task = this.#agentTaskService?.listTasks().find((entry) => entry.attemptIds.includes(owner.id));
+						if (!task || task.source === "routine" || task.contract.routine) return undefined;
+						const room = task.contract.room ? this.#agentRooms?.getRun(task.contract.room.runId) : undefined;
+						if (room) {
+							if (room.routine) return teamRoutines.draftEvidence(room, routineRegistry);
+							if (room.parentRunId) return undefined;
+							const conversationId = room.definitionSnapshot?.conversationId;
+							if (!conversationId) return undefined;
+							const messages = await this.#agentTaskService!.listMessages(conversationId);
+							return chatDraftApproval(
+								messages.filter(
+									(entry) => entry.author.kind === "user" && entry.id.startsWith(`room:${room.id}:`),
+								),
+							);
+						}
+						if (task.source !== "chat") return undefined;
+						const messages = await this.#agentTaskService!.listMessages(task.conversationId);
+						return chatDraftApproval(
+							messages.filter((entry) => entry.taskId === task.id && entry.role === "user"),
+						);
+					}
+					const sourceSession = owner.id === session.sessionId ? session : buildSessions.get(owner.id);
+					const entry = [...(sourceSession?.sessionManager.getBranch() ?? [])]
+						.reverse()
+						.find((item) => item.type === "message" && item.message.role === "user");
+					if (!entry || entry.type !== "message" || entry.message.role !== "user") return undefined;
+					const content = entry.message.content;
+					return chatDraftApproval([
+						{
+							id: entry.id,
+							conversationId: owner.id,
+							role: "user",
+							text:
+								typeof content === "string"
+									? content
+									: content
+											.filter((block) => block.type === "text")
+											.map((block) => block.text)
+											.join("\n"),
+						},
+					]);
+				},
 				approvals: capabilityApprovals,
 				credentials: providerEnvironment,
 				governedActions,
@@ -364,6 +459,9 @@ export class ServeHost implements AsyncDisposable {
 		brokeredTools.push(...googleWorkspaceTools);
 		session.registerCustomTools(googleWorkspaceTools);
 		const googleWorkspaceToolNames = new Set(googleWorkspaceTools.map((tool) => tool.name));
+		const dataTools = new DataToolRegistry(join(serveRoot, "data-tools"));
+		await dataTools.initialize();
+		session.registerCustomTools(dataTools.createTools(undefined, () => brokeredTools));
 		const resolveAgentBrokeredTools = (
 			definition: AgentDefinition,
 			approvalOwner?: { kind: "session" | "agent-run"; id: string },
@@ -374,23 +472,31 @@ export class ServeHost implements AsyncDisposable {
 			const allowedPlaidConnectionIds = definition.capabilities
 				.filter((grant) => grant.providerId === "plaid" && grant.connectionId)
 				.map((grant) => grant.connectionId!);
-			return [
+			const sources = [
 				...brokeredTools.filter(
 					(tool) => !plaidToolNames.has(tool.name) && !googleWorkspaceToolNames.has(tool.name),
 				),
 				...createPlaidTools(plaidConnections, () => allowedPlaidConnectionIds),
 				...(approvalOwner && identities
-					? createOwnedGoogleWorkspaceTools(approvalOwner, identities, () => {
-							if (approvalOwner.kind === "agent-run") {
-								if (!this.#agentRunManager) throw new Error("Agent run authority is not active");
-								this.#agentRunManager.assertActive(approvalOwner.id);
-								return;
-							}
-							if (!currentSessionService) throw new Error("Session authority is not active");
-							currentSessionService.assertActive(approvalOwner.id);
-						})
+					? createOwnedGoogleWorkspaceTools(
+							approvalOwner,
+							identities,
+							() => {
+								if (approvalOwner.kind === "agent-run") {
+									if (!this.#agentRunManager) throw new Error("Agent run authority is not active");
+									this.#agentRunManager.assertActive(approvalOwner.id);
+									return;
+								}
+								if (!currentSessionService) throw new Error("Session authority is not active");
+								currentSessionService.assertActive(approvalOwner.id);
+							},
+							definition.tools.includes("read")
+								? resolve(definition.projectRoot, definition.workspace)
+								: undefined,
+						)
 					: []),
 			].filter((tool) => names.has(tool.name));
+			return [...sources, ...dataTools.createTools(definition.tools, () => sources)];
 		};
 		const agentRegistry = new AgentRegistry(serveRoot, {
 			catalogDirectory: join(agentDir, "agents"),
@@ -499,6 +605,14 @@ export class ServeHost implements AsyncDisposable {
 					: [];
 			const customTools = [
 				...scopedTools,
+				...(browserOwner
+					? createTeamBrowserTools(
+							teamBrowserRuntime,
+							{ ...definition, browser: undefined },
+							workspace,
+							browserOwner,
+						)
+					: []),
 				...browserTools,
 				...browserWorkflowTools,
 				...agentBrokeredTools,
@@ -574,6 +688,10 @@ export class ServeHost implements AsyncDisposable {
 			},
 			capabilityTools: (context: AgentExecutionContext) =>
 				[
+					...createTeamBrowserTools(teamBrowserRuntime, context.definition, context.workspace, {
+						kind: "agent-run",
+						id: context.runId,
+					}),
 					...resolveAgentBrokeredTools(
 						context.definition,
 						{ kind: "agent-run", id: context.runId },
@@ -606,6 +724,7 @@ export class ServeHost implements AsyncDisposable {
 				})),
 			revokeRunApprovals: async (runId, reason) => {
 				await capabilityApprovals.revoke({ owner: { kind: "agent-run", id: runId } }, reason);
+				await this.#browserSessionManager?.closeOwner({ kind: "agent-run", id: runId });
 			},
 		});
 		await this.#agentRunManager.initialize();
@@ -671,11 +790,26 @@ export class ServeHost implements AsyncDisposable {
 			},
 		});
 		await this.#workflowService.initialize();
+		const teamResources = new TeamResources(
+			capabilityBroker,
+			capabilityConnections,
+			session.model ? { provider: session.model.provider, id: session.model.id } : undefined,
+			{ setup: browserSetup, workflows: browserWorkflowRegistry },
+			dataTools,
+		);
 		this.#agentRooms = new AgentRoomService(
 			join(serveRoot, "rooms"),
 			agentRegistry,
 			this.#agentTaskService,
 			this.#workflowService,
+			teamResources,
+			async (run) => {
+				if (!run.routine) return;
+				const definition = await routineRegistry.get(run.routine.id);
+				if (!definition || definition.revision !== run.routine.revision)
+					throw new Error("Schedule changed or was removed; review before running again");
+				await teamRoutines.validate(definition, true);
+			},
 		);
 		await this.#agentRooms.initialize();
 		const piAgentBundleInstaller = new PiAgentBundleInstaller(
@@ -688,8 +822,12 @@ export class ServeHost implements AsyncDisposable {
 			piAgentBundleInstaller,
 			this.#agentTaskService,
 			this.#workflowService,
+			this.#agentRooms,
+			agentRegistry,
 			capabilityConnections,
+			capabilityBroker,
 		);
+		await piAgentTeamLauncher.initialize();
 		const configuredWtkRoot = providerEnvironment.environmentValue("PI_WTK_ROOT")?.trim();
 		const siblingWtkRoot = resolve(session.sessionManager.getCwd(), "..", "WTK-Dev");
 		const wtkRoot = configuredWtkRoot || (existsSync(join(siblingWtkRoot, ".wtk")) ? siblingWtkRoot : undefined);
@@ -881,10 +1019,12 @@ export class ServeHost implements AsyncDisposable {
 		);
 		await this.#externalConnectionManager.initialize();
 
+		const teamRoutines = new TeamRoutines(this.#agentRooms, agentRegistry, teamResources, capabilityBroker);
 		const routineRegistry = new RoutineRegistry(
 			join(serveRoot, "routines"),
 			(id, version) => browserWorkflowRunner.isActiveVersion(id, version),
 			async (definition) => {
+				if (definition.target.kind === "team") return teamRoutines.validate(definition);
 				if (definition.target.kind !== "agent") return;
 				const target = await agentRegistry.get(definition.target.agentId);
 				if (!target) throw new Error(`Routine agent ${definition.target.agentId} was not found`);
@@ -895,6 +1035,7 @@ export class ServeHost implements AsyncDisposable {
 		await routineRegistry.initialize();
 		this.#agentRoutineScheduler = new AgentRoutineScheduler(routineRegistry, {
 			start: async (definition) => {
+				if (definition.target.kind === "team") return teamRoutines.start(definition);
 				if (definition.target.kind === "browser-workflow") {
 					const execution = await browserWorkflowRunner.startExecute(
 						definition.target.workflowId,
@@ -1127,41 +1268,56 @@ export class ServeHost implements AsyncDisposable {
 			port: requestedPort,
 			token,
 			autoIncrementPort: this.#options.autoIncrementPort,
-			onHttpRequest: createServePage(
+			onHttpRequest: withTeamScheduleReview(
+				withWorkspaceStorage(
+					withBrowserSetup(
+						createServePage(
+							token,
+							agentRegistry,
+							this.#agentRunManager,
+							this.#agentRoutineScheduler,
+							this.#externalConnectionManager,
+							routineRegistry,
+							currentSessionService,
+							this.#attachmentStore,
+							capabilityCatalog,
+							browserConsole,
+							this.#agentTaskService,
+							this.#workflowService,
+							personaCatalog,
+							a2aAdapter,
+							pluginManagement,
+							capabilityBroker,
+							capabilityConnections,
+							capabilityApprovals,
+							inboundRouting,
+							everydayConfigurations,
+							providerEnvironment,
+							googleWorkspaceOAuth,
+							plaidConnections,
+							claudeSubscriptionLogin,
+							piAgentBundleInstaller,
+							piAgentTeamLauncher,
+							wtkAgentFactory,
+							runSkillPromotion,
+							agentBuildLifecycle,
+							this.#agentRoster,
+							agentCollaborationService,
+							this.#agentRooms,
+							session.sessionId,
+							conversationBuilds,
+						),
+						token,
+						browserSetup,
+						this.#browserSessionManager,
+						() => presentation,
+					),
+					token,
+					agentDir,
+					settingsDir,
+				),
 				token,
-				agentRegistry,
-				this.#agentRunManager,
-				this.#agentRoutineScheduler,
-				this.#externalConnectionManager,
-				routineRegistry,
-				currentSessionService,
-				this.#attachmentStore,
-				capabilityCatalog,
-				browserConsole,
-				this.#agentTaskService,
-				this.#workflowService,
-				personaCatalog,
-				a2aAdapter,
-				pluginManagement,
-				capabilityBroker,
-				capabilityConnections,
-				capabilityApprovals,
-				inboundRouting,
-				everydayConfigurations,
-				providerEnvironment,
-				googleWorkspaceOAuth,
-				plaidConnections,
-				claudeSubscriptionLogin,
-				piAgentBundleInstaller,
-				piAgentTeamLauncher,
-				wtkAgentFactory,
-				runSkillPromotion,
-				agentBuildLifecycle,
-				this.#agentRoster,
-				agentCollaborationService,
-				this.#agentRooms,
-				session.sessionId,
-				conversationBuilds,
+				teamRoutines,
 			),
 			auxiliary: {
 				path: "/browser-stream",
@@ -1178,6 +1334,8 @@ export class ServeHost implements AsyncDisposable {
 		if (boundPort === undefined || listenerAddress === undefined) throw new Error("Serve listener did not bind");
 
 		const diagnostics: ServeHostDiagnostic[] = [];
+		if (resolve(settingsDir) !== resolve(agentDir))
+			diagnostics.push({ type: "info", message: `Using shared capability settings: ${settingsDir}` });
 		if (requestedPort !== 0 && boundPort !== requestedPort) {
 			diagnostics.push({
 				type: "info",
@@ -1211,6 +1369,7 @@ export class ServeHost implements AsyncDisposable {
 			() => this.#browserSessionManager?.dispose() ?? Promise.resolve(),
 			() => this.#workspacePreviewServer?.close() ?? Promise.resolve(),
 			() => this.#serveDirectoryOwnership?.release() ?? Promise.resolve(),
+			() => this.#settingsDirectoryOwnership?.release() ?? Promise.resolve(),
 		];
 		const errors: unknown[] = [];
 		for (const dispose of disposals) {
