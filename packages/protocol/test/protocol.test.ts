@@ -182,6 +182,48 @@ describe("protocol validation", () => {
 		expect(parseServerMessage(message)).toEqual(message);
 	});
 
+	test("validates large team review details without repeatedly searching the envelope schema", () => {
+		const message = itemMessage({
+			id: "team-review",
+			role: "tool",
+			toolCallId: "prepare",
+			toolName: "configure_team",
+			input: {},
+			content: [],
+			timestamp: 1,
+			status: "complete",
+			isError: false,
+			details: {
+				sources: Array.from({ length: 1000 }, (_, index) => ({
+					id: index,
+					source: { url: `https://example.com/${index}`, checked: true },
+					facts: ["observed", index, null],
+				})),
+			},
+		});
+		const started = performance.now();
+		const parsed = parseServerMessage(message);
+		const decoded = new ServerMessageDecoder().push(encodeServerMessage(parsed));
+		expect(performance.now() - started).toBeLessThan(2000);
+		expect(decoded).toEqual([message]);
+	});
+
+	test.each([undefined, NaN, Infinity, () => true, new Date(), new Uint8Array([1])])(
+		"rejects invalid nested JSON after reference indexing: %s",
+		(invalid) => {
+			expect(() =>
+				parseServerMessage({
+					type: "hello_error",
+					error: {
+						code: "invalid_request",
+						message: "invalid",
+						details: { nested: [invalid] },
+					},
+				}),
+			).toThrow(ProtocolValidationError);
+		},
+	);
+
 	test.each([
 		{ status: "streaming" },
 		{ status: "complete", stopReason: "stop" },

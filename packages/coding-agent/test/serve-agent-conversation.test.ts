@@ -60,7 +60,10 @@ test("builds, tests, accepts, activates and schedules through the browser with h
 		try {
 			await expect.poll(() => fixture.getPendingResponseCount(), { timeout: 8_000 }).toBe(0);
 		} catch (error) {
-			throw new Error(`${text}: ${await page.locator("body").innerText()}`, { cause: error });
+			throw new Error(
+				`${text}: composer=${await page.locator("#prompt").inputValue()}\n${await page.locator("body").innerText()}`,
+				{ cause: error },
+			);
 		}
 		await expect.poll(() => fixture.session.isStreaming).toBe(false);
 	};
@@ -168,7 +171,9 @@ test("builds, tests, accepts, activates and schedules through the browser with h
 
 async function sendChat(page: Page, text: string): Promise<void> {
 	await expect.poll(() => page.getByRole("dialog").count()).toBe(0);
+	// Backend completion can precede the browser's idle snapshot; Enter is gated on that snapshot.
+	await expect.poll(async () => (await page.locator("#phase").innerText()).toLowerCase()).toBe("idle");
 	const composer = page.locator("#prompt");
 	await composer.fill(text);
-	await page.keyboard.press("Enter");
+	await composer.press("Enter");
 }

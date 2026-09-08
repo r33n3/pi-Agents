@@ -8,6 +8,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ModelRef } from "@earendil-works/pi-protocol";
 import { killProcessTree } from "../../utils/shell.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
+import { createAgentCommandTools } from "./agent-command-tools.ts";
 import type {
 	AgentExecution,
 	AgentExecutionContext,
@@ -31,6 +32,7 @@ import { MAX_SCOPED_AGENT_FILE_BYTES, resolveCanonicalWorkspacePath } from "./sc
 import type { TaskInputEvidence } from "./task-input-binding.ts";
 
 export interface AgentHostFileSystem {
+	readBytes?(path: string, signal: AbortSignal): Promise<Buffer>;
 	read(path: string, signal: AbortSignal): Promise<string>;
 	list(path: string, signal: AbortSignal): Promise<Array<{ kind: "directory" | "file"; name: string }>>;
 	write(path: string, content: string, signal: AbortSignal): Promise<number>;
@@ -74,8 +76,24 @@ export class ChildProcessAgentExecutor implements AgentExecutor {
 			context.definition.model || !this.#options.defaultModel
 				? context
 				: { ...context, definition: { ...context.definition, model: this.#options.defaultModel } };
-		const effectiveContext = { ...modeledContext, workspace: resolve(modeledContext.workspace) };
-		const capabilityTools = this.#options.capabilityTools(effectiveContext);
+		const effectiveContext = {
+			...modeledContext,
+			workspace: resolve(modeledContext.workspace),
+			inputBinding:
+				modeledContext.inputBinding && modeledContext.definition.inputValidator === "inventory"
+					? { ...modeledContext.inputBinding, validator: modeledContext.definition.inputValidator }
+					: modeledContext.inputBinding,
+		};
+		const capabilityTools = [
+			...this.#options.capabilityTools(effectiveContext),
+			...(effectiveContext.inputBinding
+				? []
+				: createAgentCommandTools(
+						effectiveContext,
+						workerEnvironment(this.#options.environment ?? process.env),
+						this.#options.governedActions,
+					)),
+		] as ToolDefinition[];
 		if (
 			effectiveContext.inputBinding &&
 			(effectiveContext.definition.executor !== "harness" ||
@@ -268,7 +286,9 @@ class ChildProcessExecution implements AgentExecution {
 						controller.signal,
 					);
 					if (result.family !== "filesystem.read") throw new Error("Input read returned the wrong result");
-					const inventory = file.path.toLowerCase().endsWith(".csv") ? inventoryFacts(result.content) : undefined;
+					const inventory = binding.validator === "inventory" ? inventoryFacts(result.content) : undefined;
+					if (binding.validator === "inventory" && (!inventory || binding.files.length !== 1))
+						throw new Error("Inventory validation requires one supported inventory input");
 					inputContents.push({ path: file.path, content: result.content, inventory });
 				} finally {
 					this.#pendingHostActions.delete(`input:${file.path}`);
@@ -532,7 +552,13 @@ class ChildProcessExecution implements AgentExecution {
 					".",
 			}),
 			authorize: async () => {
-				if (!this.#context.definition.tools.includes(requiredTool)) {
+				if (
+					!this.#context.definition.tools.includes(requiredTool) &&
+					!(
+						this.#context.definition.tools.includes("edit") &&
+						(requiredTool === "read" || requiredTool === "write")
+					)
+				) {
 					return {
 						decision: "deny" as const,
 						reason: `Agent is not granted the ${requiredTool} tool`,
@@ -581,13 +607,17 @@ class ChildProcessExecution implements AgentExecution {
 				throwIfAborted(signal);
 				try {
 					if (action.family === "filesystem.read") {
-						const content = await this.#hostFileSystem.read(canonicalPath, signal);
+						const bytes =
+							action.binary && this.#hostFileSystem.readBytes
+								? await this.#hostFileSystem.readBytes(canonicalPath, signal)
+								: Buffer.from(await this.#hostFileSystem.read(canonicalPath, signal), "utf8");
+						const content = bytes.toString(action.binary ? "base64" : "utf8");
 						const binding = this.#context.inputBinding;
 						const file = binding?.files.find(
 							(entry) => relative(resolve(binding.workspace, entry.path), canonicalPath!) === "",
 						);
 						if (file) {
-							const sha256 = createHash("sha256").update(content).digest("hex");
+							const sha256 = createHash("sha256").update(bytes).digest("hex");
 							if (sha256 !== file.sha256)
 								throw hostActionError(
 									"ERR_INPUT_CHANGED",
@@ -595,7 +625,7 @@ class ChildProcessExecution implements AgentExecution {
 								);
 							this.#inputEvidence.set(file.path, { path: file.path, sha256 });
 						}
-						return { family: action.family, content };
+						return { family: action.family, content, ...(action.binary ? { binary: true } : {}) };
 					}
 					if (action.family === "filesystem.list") {
 						return { family: action.family, entries: await this.#hostFileSystem.list(canonicalPath, signal) };
@@ -634,6 +664,12 @@ class ChildProcessExecution implements AgentExecution {
 }
 
 const localHostFileSystem: AgentHostFileSystem = {
+	async readBytes(path, signal) {
+		const bytes = await readFile(path, { signal });
+		if (bytes.byteLength > MAX_SCOPED_AGENT_FILE_BYTES)
+			throw hostActionError("ERR_FILE_TOO_LARGE", "Workspace file exceeds the 1 MiB read limit");
+		return bytes;
+	},
 	async read(path, signal) {
 		const content = await readFile(path, { signal });
 		if (content.byteLength > MAX_SCOPED_AGENT_FILE_BYTES) {
@@ -810,7 +846,15 @@ function parseHostActionRequest(value: AgentWorkerResponse): AgentWorkerHostActi
 		throw new Error("Agent worker host action path is invalid");
 	}
 	if (action.family === "filesystem.read" || action.family === "filesystem.list") {
-		return { type: value.type, requestId: value.requestId, action: { family: action.family, path: action.path } };
+		return {
+			type: value.type,
+			requestId: value.requestId,
+			action: {
+				family: action.family,
+				path: action.path,
+				...(action.family === "filesystem.read" && action.binary === true ? { binary: true } : {}),
+			},
+		};
 	}
 	if (action.family !== "filesystem.write" || typeof action.content !== "string") {
 		throw new Error("Agent worker host action family is invalid");

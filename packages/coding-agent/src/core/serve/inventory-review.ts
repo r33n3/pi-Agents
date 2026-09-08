@@ -57,9 +57,10 @@ export function verifyInventoryOutput(output: string, facts: InventoryFacts | un
 	try {
 		value = JSON.parse(output);
 	} catch {
-		return;
+		throw new Error("Inventory output verification failed: expected structured rowCount and totalValue");
 	}
-	if (typeof value !== "object" || value === null || (!("totalValue" in value) && !("rowCount" in value))) return;
+	if (typeof value !== "object" || value === null)
+		throw new Error("Inventory output verification failed: expected an object");
 	if (
 		!("rowCount" in value) ||
 		value.rowCount !== facts.rowCount ||

@@ -23,6 +23,10 @@ const JsonValueRecursiveSchema = Type.Cyclic(
 );
 export const JsonValueSchema = Type.Unsafe<JsonValue>(JsonValueRecursiveSchema);
 
+// Resolve the shared recursive JSON reference directly. Without this context,
+// interpreted validation searches the entire envelope schema at every JSON node.
+export const ProtocolSchemaContext = JsonValueRecursiveSchema.$defs;
+
 export const ThinkingLevelSchema = Type.Union([
 	Type.Literal("off"),
 	Type.Literal("minimal"),

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { ProviderAuthenticationManifest, ProviderConfigurationField } from "./capability-broker.ts";
+import { providerConfigurationReady } from "./capability-provider-contract.ts";
 import type { CredentialMetadata, CredentialReplaceRequest, CredentialStore } from "./credential-store.ts";
 import {
 	CredentialVaultError,
@@ -228,7 +229,9 @@ export class ProviderEnvironmentStore implements CredentialStore {
 		return {
 			providerId,
 			kind: manifest.kind,
-			configured: fields.filter((field) => field.required).every((field) => field.configured),
+			configured: providerConfigurationReady(manifest, (name) =>
+				fields.some((field) => field.env === name && field.configured),
+			),
 			storage:
 				sources.size > 1
 					? "mixed"

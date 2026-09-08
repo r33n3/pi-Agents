@@ -192,7 +192,7 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 		return this.#page.mouse.wheel(deltaX, deltaY);
 	}
 
-	async snapshot(): Promise<{ url: string; title: string; elements: BrowserPageElement[] }> {
+	async snapshot(): Promise<{ url: string; title: string; text: string; elements: BrowserPageElement[] }> {
 		this.#elementLocators = [];
 		const elements: BrowserPageElement[] = [];
 		for (const frame of this.#page.frames()) {
@@ -207,7 +207,8 @@ class PlaywrightBrowserContext implements BrowserDriverContext {
 			}
 			if (elements.length >= 300) break;
 		}
-		return { url: this.#page.url(), title: await this.#page.title(), elements };
+		const text = (await this.#page.locator("body").innerText()).slice(0, 24000);
+		return { url: this.#page.url(), title: await this.#page.title(), text, elements };
 	}
 
 	async elementAt(x: number, y: number): Promise<BrowserPageElement | undefined> {

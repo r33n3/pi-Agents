@@ -4,6 +4,8 @@ import { relative } from "node:path";
 import { MAX_SCOPED_AGENT_FILE_BYTES, resolveCanonicalWorkspacePath } from "./scoped-agent-tools.ts";
 
 export interface TaskInputBinding {
+	/** Explicit task-specific validation, never inferred from a file header. */
+	validator?: "inventory";
 	workspace: string;
 	files: Array<{ path: string; sha256: string }>;
 }
@@ -14,9 +16,19 @@ export interface TaskInputEvidence {
 }
 
 /** Recognizes explicit text-file review requests only; never searches personas or conversation history. */
-export async function bindTaskInputs(goal: string, workspace: string): Promise<TaskInputBinding | undefined> {
-	if (!/\b(read|review|check|inspect|analy[sz]e|calculate|summari[sz]e)\b/i.test(goal)) return undefined;
-	if (/\b(write|edit|create|delete|rename|move|save|update)\b/i.test(goal)) return undefined;
+export async function bindTaskInputs(
+	goal: string,
+	workspace: string,
+	continuingFileReview = false,
+): Promise<TaskInputBinding | undefined> {
+	if (!continuingFileReview) {
+		if (!/\b(read|review|check|inspect|analy[sz]e|calculate|summari[sz]e)\b/i.test(goal)) return undefined;
+		const actionText = goal.replace(
+			/\b(?:do not|don't|never)\s+(?:write|edit|create|delete|rename|move|save|update)(?:\s+(?:or|and)\s+(?:write|edit|create|delete|rename|move|save|update))*\b/gi,
+			"",
+		);
+		if (/\b(write|edit|create|delete|rename|move|save|update)\b/i.test(actionText)) return undefined;
+	}
 	const matches = [
 		...goal.matchAll(
 			/`([^`\n]+\.(?:csv|tsv|txt|json|md))`|"([^"\n]+\.(?:csv|tsv|txt|json|md))"|(?<![\w/:\\])([\w./-]+\.(?:csv|tsv|txt|json|md))\b/gi,
@@ -59,7 +71,13 @@ export function parseTaskInputBinding(value: unknown): TaskInputBinding | undefi
 		value.files.length > 8
 	)
 		throw new Error("Invalid task input binding");
-	return { workspace: value.workspace, files: parseTaskInputEvidence(value.files)! };
+	const validator = "validator" in value ? value.validator : undefined;
+	if (validator !== undefined && validator !== "inventory") throw new Error("Unknown input validator");
+	return {
+		workspace: value.workspace,
+		files: parseTaskInputEvidence(value.files)!,
+		...(validator ? { validator } : {}),
+	};
 }
 
 export function parseTaskInputEvidence(value: unknown): TaskInputEvidence[] | undefined {

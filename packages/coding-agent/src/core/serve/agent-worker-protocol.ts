@@ -27,12 +27,12 @@ export interface AgentWorkerAbortMessage {
 }
 
 export type AgentWorkerHostAction =
-	| { family: "filesystem.read"; path: string }
+	| { family: "filesystem.read"; path: string; binary?: boolean }
 	| { family: "filesystem.list"; path: string }
 	| { family: "filesystem.write"; path: string; content: string };
 
 export type AgentWorkerHostActionResult =
-	| { family: "filesystem.read"; content: string }
+	| { family: "filesystem.read"; content: string; binary?: boolean }
 	| { family: "filesystem.list"; entries: Array<{ kind: "directory" | "file"; name: string }> }
 	| { family: "filesystem.write"; bytesWritten: number };
 

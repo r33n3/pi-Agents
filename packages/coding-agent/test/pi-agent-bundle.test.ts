@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "vitest";
 import { AgentRegistry } from "../src/core/serve/agent-registry.ts";
+import { AgentRoomService } from "../src/core/serve/agent-room-service.ts";
 import type { AgentTaskService } from "../src/core/serve/agent-task-service.ts";
 import { CapabilityConnectionRegistry } from "../src/core/serve/capability-connection-registry.ts";
 import {
@@ -49,10 +50,17 @@ test("validates and idempotently installs one complete WTK Pi team bundle", asyn
 	>();
 	const taskService = {
 		createConversation: (agentId: string) =>
-			Promise.resolve({ id: `conversation-${agentId}-${taskSequence + 1}`, agentId, createdAt: 0, updatedAt: 0 }),
+			Promise.resolve({
+				id: `conversation-${agentId}-${taskSequence + 1}`,
+				agentId,
+				contextEpoch: 1,
+				createdAt: 0,
+				updatedAt: 0,
+			}),
 		submit: (input: { agentId: string; prompt: string }) => {
 			const task = {
 				id: `task-${++taskSequence}`,
+				contract: {},
 				agentId: input.agentId,
 				status: "completed" as const,
 				result: input.agentId.endsWith("researcher")
@@ -172,7 +180,7 @@ test("validates and idempotently installs one complete WTK Pi team bundle", asyn
 	assert.equal(restartedRetry.disposition, "reused");
 	assert.equal((await registry.get("daily-mail-team-researcher"))?.revision, 3);
 	const evidence = await installer.smoke("daily-mail-team", "Review yesterday's mail");
-	assert.equal(evidence.executionStatus, "completed");
+	assert.equal(evidence.executionStatus, "completed", JSON.stringify(evidence));
 	assert.equal(evidence.contractDigest, "b".repeat(64));
 	assert.equal(evidence.authorityDigest, reboundConnectionRecord.receipt.authorityDigest);
 	assert.equal(evidence.effectiveDeploymentDigest, reboundConnectionRecord.receipt.effectiveDeploymentDigest);
@@ -523,16 +531,23 @@ test("prepares and idempotently launches a reviewed team into its coordinator co
 	const teamTasks = new Map<string, { id: string; agentId: string; status: "completed"; result: string }>();
 	let taskCompletionGate: Promise<void> | undefined;
 	const taskService = {
-		ensureConversation: (agentId: string) => {
+		ensureRoomConversation: (agentId: string) => {
 			const id = conversations.get(agentId) ?? `conversation-${agentId}`;
 			conversations.set(agentId, id);
-			return Promise.resolve({ id, agentId, createdAt: 0, updatedAt: 0 });
+			return Promise.resolve({ id, agentId, contextEpoch: 1, createdAt: 0, updatedAt: 0 });
 		},
 		createConversation: (agentId: string) =>
-			Promise.resolve({ id: `workflow-${agentId}-${teamTasks.size}`, agentId, createdAt: 0, updatedAt: 0 }),
+			Promise.resolve({
+				id: `workflow-${agentId}-${teamTasks.size}`,
+				agentId,
+				contextEpoch: 1,
+				createdAt: 0,
+				updatedAt: 0,
+			}),
 		submit: (input: { agentId: string }) => {
 			const task = {
 				id: `team-task-${teamTasks.size + 1}`,
+				contract: {},
 				agentId: input.agentId,
 				status: "completed" as const,
 				result: input.agentId.endsWith("researcher")
@@ -561,7 +576,9 @@ test("prepares and idempotently launches a reviewed team into its coordinator co
 		scopes: ["mail.read"],
 		capabilityIds: ["email.read"],
 	});
-	const launcher = new PiAgentTeamLauncher(installer, taskService, workflows, connections);
+	const rooms = new AgentRoomService(join(root, "rooms"), registry, taskService, workflows);
+	await rooms.initialize();
+	const launcher = new PiAgentTeamLauncher(installer, taskService, workflows, rooms, registry, connections);
 	const bundle = fixtureBundle();
 	const bindings = {
 		projectRoot: workspace,
@@ -646,14 +663,17 @@ test("prepares and idempotently launches a reviewed team into its coordinator co
 	assert.ok(runId);
 	await workflows.waitForCompletion(runId);
 	const completed = launcher.state(first.target.coordinatorAgentId);
-	assert.equal(completed.team?.runs[0]?.status, "completed");
+	assert.equal(completed.team?.runs[0]?.status, "completed", JSON.stringify(completed.team?.runs[0]));
 	assert.deepEqual(
 		completed.team?.runs[0]?.nodes.map((node) => node.status),
 		["completed", "completed"],
 	);
 	const restartedInstaller = new PiAgentBundleInstaller(join(root, "installs"), registry, workflows);
 	await restartedInstaller.initialize();
-	const restartedLauncher = new PiAgentTeamLauncher(restartedInstaller, taskService, workflows);
+	const restartedLauncher = new PiAgentTeamLauncher(restartedInstaller, taskService, workflows, rooms, registry);
+	await restartedLauncher.initialize();
+	assert.equal(rooms.listDefinitions().length, 1);
+	assert.equal(restartedLauncher.state(first.target.coordinatorAgentId).team?.roomId, first.target.roomId);
 	assert.equal(restartedLauncher.state(first.target.coordinatorAgentId).team?.runs[0]?.status, "completed");
 
 	await assert.rejects(

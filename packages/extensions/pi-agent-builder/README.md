@@ -27,3 +27,10 @@ as local paths or remote URL segments. For example, `Greybeard` resolves to
 the cadence. Repeating the same schedule is idempotent, while changing it updates
 the existing Windows scheduled task instead of creating a duplicate. Multi-agent
 workflows and their run history remain managed through `pi --serve`.
+
+The [building-agents skill](skills/building-agents/SKILL.md) distinguishes the
+standalone tool from serve's durable draft lifecycle. To update an existing
+installation, review and copy it to `~/.pi/agent/skills/building-agents/SKILL.md`,
+then start a fresh session so old skill contents are not retained in the model
+context. In serve mode, omitted workspaces preserve the existing draft/agent
+directory or default to the current session directory for a new draft.

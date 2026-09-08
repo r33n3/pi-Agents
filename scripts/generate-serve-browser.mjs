@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const entry = path.join(root, "packages/coding-agent/src/core/serve/browser/app.ts");
+const entry = path.join(root, "packages/coding-agent/src/core/serve/browser/index.ts");
 const output = path.join(root, "packages/coding-agent/src/core/serve/browser-bundle.generated.ts");
 const result = await build({
 	entryPoints: [entry],

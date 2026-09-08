@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bounded silent OpenAI Responses streams using the request timeout, retained safe transport diagnostics, and completed terminal responses without waiting for socket closure.
+
 ## [0.84.4] - 2026-08-28
 
 ### Added

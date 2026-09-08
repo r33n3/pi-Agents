@@ -7,8 +7,10 @@ import type {
 	ThinkingLevel,
 	TranscriptItem,
 } from "@earendil-works/pi-protocol";
+import { ActivityRefresh } from "./activity-refresh.ts";
 import { createBrowserId } from "./browser-id.ts";
 import { BrowserConnectionGeneration, BrowserSelectionGeneration } from "./connection-generations.ts";
+import { ConversationComposer } from "./conversation-composer.ts";
 import { splitInlineThinking } from "./inline-thinking.ts";
 import { catalogSourceLabels, describeCatalogRefresh } from "./model-catalog-status.ts";
 import {
@@ -26,9 +28,13 @@ import {
 import { openModelSettings } from "./model-settings-dialog.ts";
 import { filterPresentedModels } from "./model-visibility.ts";
 import { roomRunPresentation } from "./room-presentation.ts";
+import { renderCollapsibleTeam } from "./team-navigation.ts";
+import { teamScheduleControls } from "./team-schedules.ts";
 import { installThemedSelect } from "./themed-select.ts";
 import { selectTranscriptWindow } from "./transcript-window.ts";
 import { createBrowserWebSocketTransport } from "./websocket-transport.ts";
+import { startWorkspace, workspaceStartupMessage } from "./workspace-startup.ts";
+import { createWorkspaceStorageCard } from "./workspace-storage.ts";
 
 const pageUrl = new URL(location.href);
 const capabilityToken = pageUrl.searchParams.get("token");
@@ -56,6 +62,7 @@ const sessionStats = element("session-stats");
 const transcript = element("transcript");
 const form = requiredElement<HTMLFormElement>("composer");
 const input = requiredElement<HTMLTextAreaElement>("prompt");
+const conversationComposer = new ConversationComposer(input);
 const send = requiredElement<HTMLButtonElement>("composer-action");
 const mobilePanelNone = requiredElement<HTMLInputElement>("mobile-panel-none");
 const mobilePanelRight = requiredElement<HTMLInputElement>("mobile-panel-right");
@@ -112,9 +119,6 @@ agentNewContext.setAttribute("aria-label", agentNewContext.title);
 agentNewContext.style.cssText = "flex:0 0 auto;min-height:36px;padding:7px 10px";
 sessionTabs.after(agentNewContext);
 const connectionList = element("connection-list");
-const connectionForm = requiredElement<HTMLFormElement>("connection-form");
-const connectionUrl = requiredElement<HTMLInputElement>("connection-url");
-const showConnectionForm = requiredElement<HTMLButtonElement>("show-connection-form");
 const openSettingsButton = requiredElement<HTMLButtonElement>("open-settings");
 const settingsWorkspace = element("settings-workspace");
 const settingsClose = requiredElement<HTMLButtonElement>("settings-close");
@@ -322,11 +326,11 @@ function selectAgentModel(value: string): void {
 function installWorkflowWorkspaceLayout(delegation: HTMLDetailsElement | null): void {
 	const workspace = element("agents-workspace");
 	const workspaceTab = document.querySelector<HTMLButtonElement>('[data-tab="agents-workspace"]');
-	if (workspaceTab) workspaceTab.textContent = "Workflow";
+	if (workspaceTab) workspaceTab.textContent = "History";
 	const mobileToggle = document.querySelector<HTMLLabelElement>('label[for="mobile-panel-right"]');
 	if (mobileToggle) {
-		mobileToggle.title = "Workflow and browser workspace";
-		mobileToggle.setAttribute("aria-label", "Open workflow and browser workspace");
+		mobileToggle.title = "History and browser workspace";
+		mobileToggle.setAttribute("aria-label", "Open history and browser workspace");
 		mobileToggle.style.position = "relative";
 		const badge = document.createElement("span");
 		badge.id = "workflow-badge";
@@ -368,6 +372,7 @@ function installWorkflowWorkspaceLayout(delegation: HTMLDetailsElement | null): 
 let session: PiSessionHandle | undefined;
 let unsubscribeSession: Unsubscribe | undefined;
 let builderActive = false;
+let builderDraftOwner = "new";
 let builderLabel = "Agent Builder";
 let activeSidebarAgent: AgentSummary | undefined;
 let activeTargetKey: string | undefined;
@@ -388,13 +393,16 @@ const agentConversationIds = new Map<string, string>();
 const pendingAgentDeliveryKeys = new Map<string, { prompt: string; key: string }>();
 const agentTasksByAgent = new Map<string, AgentTaskSummary[]>();
 const agentTeamStates = new Map<string, AgentTeamState>();
+const agentTeamRevisions = new Map<string, number>();
+const teamNavigationDrafts = new Map<string, { target: SessionTarget; package: PendingTeamPackage }>();
 let attentionItems: AttentionSummary[] = [];
 let agentRooms: AgentRoomSummary[] = [];
 let agentRoomRuns: AgentRoomRunSummary[] = [];
 let activeAgentRoomId: string | undefined;
 let renderedAgentRoomSignature = "";
 const openAgentRoomIds: string[] = [];
-const agentRoomDrafts = new Map<string, string>();
+let activeTeamEditor: HTMLElement | undefined;
+const pendingAgentSubmissions = new Set<string>();
 const pendingAgentRoomSubmissions = new Set<string>();
 let artifacts: ArtifactSummary[] = [];
 let activeArtifactObjectUrl: string | undefined;
@@ -468,11 +476,13 @@ interface PiAgentTeamPreview {
 	schemaVersion: "pi.agents.team-preview.v1";
 	approvalDigest: string;
 	team: {
+		bundleId: string;
 		name: string;
 		coordinatorRoleId: string;
 		roles: Array<{
 			id: string;
 			name: string;
+			description?: string;
 			model: { provider: string; id: string };
 			permissionPolicy: "read-only" | "workspace-write";
 			toolNames: string[];
@@ -666,6 +676,7 @@ interface PersonaSummary {
 }
 
 interface AgentTaskSummary {
+	summary?: boolean;
 	id: string;
 	conversationId: string;
 	agentId: string;
@@ -833,10 +844,15 @@ interface AttentionSummary {
 }
 
 interface AgentRoomSummary {
+	teamIds?: string[];
 	id: string;
 	name: string;
 	purpose: string;
-	members: Array<{ agentId: string; role: string; name?: string }>;
+	members: Array<{ agentId: string; role: string; name?: string; notes?: string; toolIds?: string[] }>;
+	toolIds?: string[];
+	memoryStrategy?: "none" | "recent" | "team";
+	sharedNotes?: string;
+	memoryResetAt?: number;
 	supervisorAgentId?: string;
 	allowRecruitment?: boolean;
 	limits: {
@@ -850,7 +866,12 @@ interface AgentRoomSummary {
 	conversationId: string;
 }
 
+let teamToolOptions: Array<{ id: string; name: string; description: string }> = [];
+
 interface AgentRoomRunSummary {
+	parentRunId?: string;
+	currentChildRunId?: string;
+	childResults?: Array<{ roomId: string; runId: string; result: string }>;
 	id: string;
 	roomId: string;
 	status: "running" | "completed" | "needs-user" | "bounded" | "failed" | "cancelled";
@@ -866,6 +887,7 @@ interface AgentRoomRunSummary {
 			status: "reply" | "pass" | "needs-user" | "failed" | "cancelled";
 			message: string;
 			requestAgentIds?: string[];
+			requestTeam?: { teamId: string; goal: string };
 			recruit?: { name: string; role: string };
 		}>;
 	}>;
@@ -902,6 +924,7 @@ interface AgentMessageSummary {
 interface ConnectionEntry {
 	id: string;
 	label: string;
+	controlUrl: string;
 	client: PiClient;
 	primary: boolean;
 	sessions: readonly SessionMetadata[];
@@ -2479,8 +2502,15 @@ function setBusy(snapshot: SessionSnapshot): void {
 }
 
 function render(snapshot: SessionSnapshot): void {
+	projectTeamDrafts(snapshot);
 	projectSubagentActivity(snapshot);
-	if (activeAgentRoomId) return;
+	if (activeTeamEditor) return;
+	if (activeAgentRoomId) {
+		// Reattaching the underlying session resets shared composer and model controls.
+		// The selected team still owns those controls, even when its transcript is unchanged.
+		renderAgentRoomConversation();
+		return;
+	}
 	if (activeSubagentKey) {
 		const activity = subagentActivityByKey.get(activeSubagentKey);
 		if (activity) renderSubagentInspector(activity);
@@ -2517,6 +2547,7 @@ function render(snapshot: SessionSnapshot): void {
 }
 
 function renderBuilderConversation(snapshot: SessionSnapshot): void {
+	projectTeamDrafts(snapshot);
 	if (!builderActive) return;
 	const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
 	const guide = document.createElement("section");
@@ -3121,11 +3152,22 @@ function applyAutomationIntent(cadence: string): void {
 	}
 }
 
-function renderTeamPackageReview(preview: PiAgentTeamPreview): HTMLElement {
+function renderTeamPackageReview(
+	preview: PiAgentTeamPreview,
+	teamPackage: PendingTeamPackage | undefined = pendingTeamPackage,
+): HTMLElement {
 	const card = document.createElement("section");
 	card.className = "team-review";
+	card.dataset.teamBundleId = preview.team.bundleId;
+	card.setAttribute("aria-label", `Review ${preview.team.name}`);
+	const title = document.createElement("strong");
+	title.textContent = preview.team.name;
+	card.append(title);
 	const summary = document.createElement("p");
-	summary.textContent = `${preview.team.roles.length} members · ${preview.team.workflow.nodeCount} steps · up to ${preview.team.workflow.maxConcurrency} concurrent`;
+	summary.textContent =
+		preview.team.roles.length <= 8
+			? `${preview.team.roles.length} members · Supervisor answers first and delegates when needed`
+			: `${preview.team.roles.length} members · ${preview.team.workflow.nodeCount} workflow steps`;
 	const members = document.createElement("div");
 	members.className = "team-review-members";
 	for (const role of preview.team.roles) {
@@ -3135,22 +3177,44 @@ function renderTeamPackageReview(preview: PiAgentTeamPreview): HTMLElement {
 		const detail = document.createElement("span");
 		detail.textContent = `${role.model.id} · ${role.permissionPolicy}${role.id === preview.team.coordinatorRoleId ? " · coordinator" : ""}`;
 		member.append(name, detail);
+		if (role.description) appendText(member, role.description, "muted");
+		appendText(member, `Tools: ${role.toolNames.join(", ") || "none"}`, "muted");
 		members.append(member);
 	}
 	const access = document.createElement("p");
 	access.className = "muted";
 	access.textContent = `${formatWorkingDirectory(preview.bindings.projectRoot)} · ${preview.bindings.credentialRefs.length} credential reference${preview.bindings.credentialRefs.length === 1 ? "" : "s"}`;
 	const launch = document.createElement("button");
+	const installedTeam = [...agentTeamStates.values()].find(
+		(state) => state.team?.bundleId === preview.team.bundleId,
+	)?.team;
+	const coordinator = agents.find((agent) => agent.id === installedTeam?.coordinatorAgentId);
 	launch.type = "button";
 	launch.className = "primary-action";
-	launch.disabled = teamLaunchBusy;
-	launch.textContent = teamLaunchBusy ? "Launching…" : "Launch team";
+	launch.disabled = teamLaunchBusy || !teamPackage || !activeConnectionIsPrimary();
+	launch.textContent = coordinator ? "Open team" : teamLaunchBusy ? "Launching…" : "Launch team";
+	const errorMessage = document.createElement("p");
+	errorMessage.className = "run-error";
+	errorMessage.setAttribute("role", "alert");
 	launch.addEventListener("click", () => {
-		void launchPendingTeamPackage().catch((error: unknown) =>
-			setStatus(error instanceof Error ? error.message : String(error), true),
-		);
+		if (coordinator) {
+			void openAgent(coordinator);
+			return;
+		}
+		launch.disabled = true;
+		launch.textContent = "Launching…";
+		errorMessage.textContent = "";
+		void launchPendingTeamPackage(teamPackage)
+			.catch((error: unknown) => {
+				errorMessage.textContent = error instanceof Error ? error.message : String(error);
+				setStatus(errorMessage.textContent, true);
+			})
+			.finally(() => {
+				launch.disabled = !teamPackage || !activeConnectionIsPrimary();
+				launch.textContent = "Launch team";
+			});
 	});
-	card.append(summary, members, access, launch);
+	card.append(summary, members, access, launch, errorMessage);
 	return card;
 }
 
@@ -3195,19 +3259,18 @@ async function prepareTeamPackageFiles(files: readonly File[]): Promise<void> {
 	setStatus("Team package ready to review");
 }
 
-async function launchPendingTeamPackage(): Promise<void> {
-	if (!capabilityToken || !pendingTeamPackage || teamLaunchBusy) return;
+async function launchPendingTeamPackage(teamPackage = pendingTeamPackage): Promise<void> {
+	if (!capabilityToken || !teamPackage || teamLaunchBusy || !activeConnectionIsPrimary()) return;
 	teamLaunchBusy = true;
-	if (session?.snapshot) renderBuilderConversation(session.snapshot);
 	setStatus("Launching team…");
 	try {
 		const response = await fetch(`/agent-teams/launch?token=${encodeURIComponent(capabilityToken)}`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({
-				bundle: pendingTeamPackage.bundle,
-				bindings: pendingTeamPackage.bindings,
-				approvalDigest: pendingTeamPackage.preview.approvalDigest,
+				bundle: teamPackage.bundle,
+				bindings: teamPackage.bindings,
+				approvalDigest: teamPackage.preview.approvalDigest,
 				reviewedBy: "pi-serve-operator",
 			}),
 		});
@@ -3225,7 +3288,6 @@ async function launchPendingTeamPackage(): Promise<void> {
 		setStatus(`Team ready · ${coordinator.name}`);
 	} finally {
 		teamLaunchBusy = false;
-		if (pendingTeamPackage && session?.snapshot) renderBuilderConversation(session.snapshot);
 	}
 }
 
@@ -3553,6 +3615,7 @@ function isPiAgentTeamPreview(value: unknown): value is PiAgentTeamPreview {
 		return false;
 	}
 	return (
+		typeof value.team.bundleId === "string" &&
 		typeof value.team.name === "string" &&
 		typeof value.team.coordinatorRoleId === "string" &&
 		Array.isArray(value.team.roles) &&
@@ -3929,6 +3992,22 @@ function renderItem(item: TranscriptItem): HTMLElement {
 	if (item.role === "tool") {
 		article.classList.add(`tool-${item.status}`);
 		article.append(renderToolActivity(item));
+		if (item.toolName === "configure_team" && item.status === "complete") {
+			const draft = objectRecord(objectRecord(item.details)?.teamDraft);
+			if (
+				draft &&
+				isPiAgentTeamPreview(draft.preview) &&
+				!(builderActive && pendingTeamPackage?.preview.approvalDigest === draft.preview.approvalDigest)
+			) {
+				article.append(
+					renderTeamPackageReview(draft.preview, {
+						bundle: draft.bundle,
+						bindings: draft.bindings,
+						preview: draft.preview,
+					}),
+				);
+			}
+		}
 		return article;
 	}
 	const label = document.createElement("div");
@@ -4373,7 +4452,8 @@ async function addConnection(controlUrl: string, primary = false): Promise<Conne
 	}
 	const entry: ConnectionEntry = {
 		id,
-		label: primary ? "This Pi" : socket.label,
+		label: primary ? "Workspace" : socket.label,
+		controlUrl: new URL(controlUrl, location.href).href,
 		client: connectedClient,
 		primary,
 		sessions: [],
@@ -4424,6 +4504,20 @@ async function refreshSessionTargets(): Promise<void> {
 }
 
 function renderSessionNavigation(): void {
+	conversationComposer.select(
+		activeTeamEditor || activeArtifactId || activeSubagentKey || activeExternalRunId
+			? undefined
+			: activeAgentRoomId
+				? `team:${activeAgentRoomId}`
+				: builderActive
+					? `builder:${builderDraftOwner}:${session?.id ?? ""}`
+					: activeAgentId
+						? `agent:${activeAgentId}`
+						: activeExternalConnectionId
+							? `external:${activeExternalConnectionId}`
+							: activeTargetKey,
+	);
+	resizeComposer();
 	syncModelSettingsPresentation();
 	agentNewContext.classList.toggle("hidden", activeAgentId === undefined);
 	const targets = sessionTargets();
@@ -4500,7 +4594,7 @@ function renderSessionNavigation(): void {
 			const button = document.createElement("button");
 			button.type = "button";
 			button.className = "session-tab agent-session-tab";
-			button.textContent = agent.name;
+			button.textContent = agentTeamStates.get(agent.id)?.team?.workflow.name ?? agent.name;
 			button.title = `${agent.name} · ${agent.projectRoot}`;
 			button.addEventListener("click", () => void openAgent(agent));
 			const close = document.createElement("button");
@@ -4623,43 +4717,51 @@ function renderSessionNavigation(): void {
 				heading.append(remove);
 			}
 			group.append(heading);
-			for (const target of targets.filter((candidate) => candidate.connectionId === entry.id)) {
-				const row = document.createElement("div");
-				row.className = "nav-item session-entry session-row";
-				const button = document.createElement("button");
-				button.type = "button";
-				button.className = "session-select";
-				button.classList.toggle(
-					"active",
-					!activeAgentId &&
-						!activeSubagentKey &&
-						!activeExternalRunId &&
-						!activeArtifactId &&
-						!activeAgentRoomId &&
-						target.key === activeTargetKey,
-				);
-				const name = document.createElement("strong");
-				name.textContent = sessionDisplayName(target);
-				const cwd = document.createElement("span");
-				cwd.className = "muted";
-				cwd.textContent = target.session.cwd ?? "Live local process";
-				button.append(name, cwd);
-				button.addEventListener("click", () => void switchSession(target));
-				const rename = document.createElement("button");
-				rename.type = "button";
-				rename.className = "session-rename";
-				rename.textContent = "Rename";
-				rename.addEventListener("click", () => renameSession(target));
-				row.append(button, rename);
-				group.append(row);
-			}
+			if (entry.primary && capabilityToken) group.append(createWorkspaceStorageCard(capabilityToken));
 			return group;
 		}),
 		renderAgentNavigationGroup(),
 	);
 }
 
+function projectTeamDrafts(snapshot: SessionSnapshot): void {
+	const target = sessionTargets().find((entry) => entry.key === activeTargetKey);
+	let changed = false;
+	if (target && activeConnectionIsPrimary() && target.session.id === snapshot.id) {
+		for (const item of snapshot.transcript) {
+			if (item.role !== "tool" || item.toolName !== "configure_team" || item.status !== "complete") continue;
+			const draft = objectRecord(objectRecord(item.details)?.teamDraft);
+			if (draft && isPiAgentTeamPreview(draft.preview)) {
+				const previous = teamNavigationDrafts.get(draft.preview.team.bundleId);
+				if (
+					previous?.package.preview.approvalDigest === draft.preview.approvalDigest &&
+					previous.target.key === target.key
+				)
+					continue;
+				teamNavigationDrafts.set(draft.preview.team.bundleId, {
+					target,
+					package: { bundle: draft.bundle, bindings: draft.bindings, preview: draft.preview },
+				});
+				changed = true;
+			}
+		}
+	}
+	if (changed) renderSessionNavigation();
+}
+
 function renderAgentNavigationGroup(): HTMLElement {
+	const installedTeams = [...agentTeamStates.values()].flatMap((state) =>
+		state.team && agents.some((agent) => agent.id === state.team?.coordinatorAgentId) ? [state.team] : [],
+	);
+	const target = sessionTargets().find((entry) => entry.key === activeTargetKey);
+	if (target && activeConnectionIsPrimary()) {
+		if (pendingTeamPackage) {
+			teamNavigationDrafts.set(pendingTeamPackage.preview.team.bundleId, { target, package: pendingTeamPackage });
+		}
+	}
+	const teamDrafts = [...teamNavigationDrafts.values()].filter(
+		(draft) => !installedTeams.some((team) => team.bundleId === draft.package.preview.team.bundleId),
+	);
 	const group = document.createElement("section");
 	group.className = "connection-group agent-navigation-group";
 	const heading = document.createElement("div");
@@ -4678,8 +4780,8 @@ function renderAgentNavigationGroup(): HTMLElement {
 	if (hiddenCount > 0) {
 		const hidden = document.createElement("button");
 		hidden.type = "button";
-		hidden.textContent = showHiddenAgents ? "Hide hidden" : `Hidden ${hiddenCount}`;
-		hidden.title = showHiddenAgents ? "Hide archived agents" : "Show hidden agents";
+		hidden.textContent = showHiddenAgents ? "Hide archived" : `Archived ${hiddenCount}`;
+		hidden.title = showHiddenAgents ? "Hide archived agents" : "Show archived agents";
 		hidden.setAttribute("aria-label", hidden.title);
 		hidden.style.cssText = "width:auto;font-size:10px";
 		hidden.addEventListener("click", () => {
@@ -4689,21 +4791,22 @@ function renderAgentNavigationGroup(): HTMLElement {
 		heading.append(hidden);
 	}
 	heading.append(create);
-	const createTeam = document.createElement("button");
-	createTeam.type = "button";
-	createTeam.textContent = "Team +";
-	createTeam.style.width = "auto";
-	createTeam.setAttribute("aria-label", "Create a team");
-	createTeam.addEventListener("click", () => openAgentRoomCreator());
-	heading.append(createTeam);
 	group.append(heading);
 	const search = document.createElement("input");
 	search.type = "search";
 	search.value = agentRosterSearch;
-	search.placeholder = "Find agents";
-	search.setAttribute("aria-label", "Find agents");
+	search.setAttribute("aria-label", "Find agents and teams");
 	search.style.cssText =
-		"width:calc(100% - 14px);margin:7px 7px 2px;border:1px solid var(--line);border-radius:8px;background:#131316;color:var(--text);padding:8px";
+		"width:100%;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--text);padding:8px 8px 8px 32px";
+	const searchField = document.createElement("div");
+	searchField.style.cssText = "position:relative;margin:7px 7px 2px;color:var(--pi)";
+	const searchIcon = document.createElement("span");
+	searchIcon.setAttribute("aria-hidden", "true");
+	searchIcon.style.cssText =
+		"position:absolute;left:10px;top:50%;transform:translateY(-50%);width:15px;height:15px;pointer-events:none";
+	searchIcon.innerHTML =
+		'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>';
+	searchField.append(searchIcon, search);
 	search.addEventListener("input", () => {
 		agentRosterSearch = search.value;
 		const query = agentRosterSearch.trim().toLowerCase();
@@ -4711,7 +4814,7 @@ function renderAgentNavigationGroup(): HTMLElement {
 			row.classList.toggle("hidden", Boolean(query) && !row.dataset.agentSearch?.includes(query));
 		}
 	});
-	group.append(search);
+	group.prepend(searchField);
 	if (agents.length === 0) {
 		const empty = document.createElement("p");
 		empty.className = "agent-activity-empty";
@@ -4720,6 +4823,7 @@ function renderAgentNavigationGroup(): HTMLElement {
 	}
 	const visibleAgents = agents
 		.filter((agent) => showHiddenAgents || !agentRosterEntries.get(agent.id)?.hidden)
+		.filter((agent) => !installedTeams.some((team) => team.agentIds.includes(agent.id)))
 		.filter(
 			(agent) =>
 				!agentRooms.some(
@@ -4764,12 +4868,8 @@ function renderAgentNavigationGroup(): HTMLElement {
 		const actions = document.createElement("div");
 		const edit = document.createElement("button");
 		edit.type = "button";
-		edit.textContent = "Edit";
+		edit.textContent = "Configure";
 		edit.addEventListener("click", () => void openAgentBuilder(agent));
-		const improve = document.createElement("button");
-		improve.type = "button";
-		improve.textContent = "Improve";
-		improve.addEventListener("click", () => openAgentImprovementReview(agent));
 		const pin = document.createElement("button");
 		pin.type = "button";
 		pin.textContent = roster?.pinnedOrder === undefined ? "Pin" : "Unpin";
@@ -4779,14 +4879,16 @@ function renderAgentNavigationGroup(): HTMLElement {
 		);
 		const hide = document.createElement("button");
 		hide.type = "button";
-		hide.textContent = roster?.hidden ? "Show" : "Hide";
+		hide.textContent = roster?.hidden ? "Restore" : "Archive";
 		hide.addEventListener("click", () => void updateAgentPresentation(agent.id, { hidden: !roster?.hidden }));
-		actions.append(edit, improve, pin, hide);
+		actions.append(edit, pin, hide);
 		menu.append(summary, actions);
 		row.append(button, menu);
 		group.append(row);
 	}
-	if (agentRooms.length > 0) {
+	{
+		const teamsGroup = document.createElement("section");
+		teamsGroup.setAttribute("aria-label", "Teams");
 		const roomHeading = document.createElement("div");
 		roomHeading.className = "connection-heading";
 		const roomIndicator = document.createElement("i");
@@ -4799,8 +4901,116 @@ function renderAgentNavigationGroup(): HTMLElement {
 		addRoom.setAttribute("aria-label", addRoom.title);
 		addRoom.addEventListener("click", () => openAgentRoomCreator());
 		roomHeading.append(roomIndicator, roomLabel, addRoom);
-		group.append(roomHeading);
+		teamsGroup.append(roomHeading);
+		group.append(teamsGroup);
+		for (const team of installedTeams) {
+			const room = agentRooms.find((entry) => entry.id === team.roomId);
+			const latest = agentRoomRuns.find((run) => run.roomId === team.roomId);
+			const coordinator = agents.find((agent) => agent.id === team.coordinatorAgentId);
+			if (!coordinator) continue;
+			const row = document.createElement("div");
+			row.className = "nav-item session-entry session-row";
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "session-select";
+			button.classList.toggle(
+				"active",
+				Boolean(team.roomId && activeAgentRoomId === team.roomId) ||
+					(activeAgentId === coordinator.id && !builderActive),
+			);
+			button.setAttribute("aria-label", `Open ${team.workflow.name}`);
+			const name = document.createElement("strong");
+			name.textContent = team.workflow.name;
+			const state = document.createElement("span");
+			state.className = "muted";
+			state.textContent = `${latest ? roomRunPresentation(latest.status).label : "Ready"} · ${room?.members.length ?? team.agentIds.length} members`;
+			button.append(name, state);
+			button.addEventListener("click", () => void openAgent(coordinator));
+			row.append(button);
+			if (room) {
+				const manage = document.createElement("button");
+				manage.type = "button";
+				manage.textContent = "⋯";
+				manage.setAttribute("aria-label", `Configure ${room.name}`);
+				manage.disabled = latest?.status === "running" || latest?.status === "needs-user";
+				manage.addEventListener("click", () => openAgentRoomCreator(room));
+				row.append(manage);
+			}
+			const members = document.createElement("div");
+			for (const memberId of room?.members.map((member) => member.agentId) ?? team.agentIds) {
+				const member = agents.find((agent) => agent.id === memberId);
+				if (!member) continue;
+				const memberButton = document.createElement("button");
+				memberButton.type = "button";
+				memberButton.className = "session-select";
+				memberButton.style.cssText = "width:100%;text-align:left";
+				memberButton.classList.toggle("active", activeAgentId === member.id && !builderActive);
+				memberButton.textContent = `${member.name}${member.id === coordinator.id ? " · Coordinator" : ""}`;
+				memberButton.setAttribute("aria-label", `Talk to ${member.name} in ${team.workflow.name}`);
+				memberButton.title = member.description;
+				memberButton.addEventListener("click", () => void openAgent(member));
+				members.append(memberButton);
+			}
+			row.dataset.agentSearch = `${team.workflow.name} ${members.textContent}`.toLowerCase();
+			row.classList.toggle(
+				"hidden",
+				Boolean(agentRosterSearch.trim()) &&
+					!row.dataset.agentSearch.includes(agentRosterSearch.trim().toLowerCase()),
+			);
+			teamsGroup.append(renderCollapsibleTeam(team.bundleId, team.workflow.name, row, members));
+		}
+		for (const draft of teamDrafts) {
+			const preview = draft.package.preview;
+			const row = document.createElement("div");
+			row.className = "nav-item session-entry session-row";
+			const openReview = async () => {
+				await switchSession(draft.target);
+				const card = [...transcript.querySelectorAll<HTMLElement>(".team-review")].find(
+					(entry) => entry.dataset.teamBundleId === preview.team.bundleId,
+				);
+				if (card) {
+					card.scrollIntoView({ block: "start" });
+					return;
+				}
+				pendingTeamPackage = draft.package;
+				builderActive = true;
+				if (session?.snapshot) renderBuilderConversation(session.snapshot);
+				renderSessionNavigation();
+				transcript.scrollTop = 0;
+			};
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "session-select";
+			button.setAttribute("aria-label", `Review ${preview.team.name}`);
+			const name = document.createElement("strong");
+			name.textContent = preview.team.name;
+			const state = document.createElement("span");
+			state.className = "muted";
+			state.textContent = `Draft · ${preview.team.roles.length} members`;
+			button.append(name, state);
+			button.addEventListener("click", () => void openReview());
+			row.append(button);
+			const members = document.createElement("div");
+			for (const role of preview.team.roles) {
+				const member = document.createElement("button");
+				member.type = "button";
+				member.className = "session-select";
+				member.style.cssText = "width:100%;text-align:left";
+				member.textContent = `${role.name}${role.id === preview.team.coordinatorRoleId ? " · Coordinator" : ""}`;
+				member.title = role.description ?? role.name;
+				member.addEventListener("click", () => void openReview());
+				members.append(member);
+			}
+			row.dataset.agentSearch = `${preview.team.name} ${members.textContent}`.toLowerCase();
+			row.classList.toggle(
+				"hidden",
+				Boolean(agentRosterSearch.trim()) &&
+					!row.dataset.agentSearch.includes(agentRosterSearch.trim().toLowerCase()),
+			);
+			teamsGroup.append(renderCollapsibleTeam(preview.team.bundleId, preview.team.name, row, members));
+		}
 		for (const room of agentRooms) {
+			if (installedTeams.some((team) => team.roomId === room.id)) continue;
 			const latest = agentRoomRuns.find((run) => run.roomId === room.id);
 			const row = document.createElement("div");
 			row.className = "nav-item session-entry session-row";
@@ -4828,16 +5038,26 @@ function renderAgentNavigationGroup(): HTMLElement {
 			const manage = document.createElement("button");
 			manage.type = "button";
 			manage.textContent = "⋯";
-			manage.setAttribute("aria-label", `Manage ${room.name} members`);
+			manage.setAttribute("aria-label", `Configure ${room.name}`);
 			manage.disabled = latest?.status === "running" || latest?.status === "needs-user";
 			manage.addEventListener("click", () => openAgentRoomCreator(room));
 			row.append(manage);
-			group.append(row);
-			if (room.supervisorAgentId) {
+			{
 				const members = document.createElement("div");
 				members.setAttribute("role", "group");
 				members.setAttribute("aria-label", `${room.name} members`);
 				members.style.cssText = "margin:0 8px 10px 18px;border-left:1px solid var(--line);padding-left:8px";
+				for (const teamId of room.teamIds ?? []) {
+					const team = agentRooms.find((entry) => entry.id === teamId);
+					if (!team) continue;
+					const child = document.createElement("button");
+					child.type = "button";
+					child.className = "session-select";
+					child.textContent = `${team.name} · Team`;
+					child.setAttribute("aria-label", `Open ${team.name} from ${room.name}`);
+					child.addEventListener("click", () => openAgentRoomConversation(team));
+					members.append(child);
+				}
 				for (const member of room.members) {
 					const memberButton = document.createElement("button");
 					memberButton.type = "button";
@@ -4859,14 +5079,14 @@ function renderAgentNavigationGroup(): HTMLElement {
 						openAgentRoomConversation(room);
 						if (member.agentId !== room.supervisorAgentId) {
 							input.value = `@${memberName} `;
-							agentRoomDrafts.set(room.id, input.value);
+							conversationComposer.save();
 							resizeComposer();
 						}
 						input.focus();
 					});
 					members.append(memberButton);
 				}
-				group.append(members);
+				teamsGroup.append(renderCollapsibleTeam(room.id, room.name, row, members));
 			}
 		}
 	}
@@ -4923,6 +5143,16 @@ async function startAgentContext(agentId: string): Promise<void> {
 }
 
 async function switchSession(target: SessionTarget, preserveWorkspace = false): Promise<void> {
+	const workspace = connections.get(target.connectionId);
+	if (workspace && !workspace.primary) {
+		// A chat-only transport switch leaves HTTP tools and rosters on the old host.
+		// Navigate the whole console so every resource belongs to the chosen workspace.
+		const destination = new URL(workspace.controlUrl);
+		destination.searchParams.set("session", target.session.id);
+		conversationComposer.save();
+		location.assign(destination.href);
+		return;
+	}
 	if (!preserveWorkspace) leaveAgentRoomConversation();
 	const selection = selectionGeneration.begin();
 	if (target.key === activeTargetKey && session?.attached) {
@@ -5004,7 +5234,7 @@ async function switchSession(target: SessionTarget, preserveWorkspace = false): 
 		setPreviewMessage(error instanceof Error ? error.message : String(error), true),
 	);
 	const cwd = session.snapshot?.cwd ?? target.session.cwd;
-	setStatus(cwd ? formatWorkingDirectory(cwd) : entry.label);
+	if (!activeAgentRoomId) setStatus(cwd ? formatWorkingDirectory(cwd) : entry.label);
 }
 
 function setPreviewMessage(message: string, error = false): void {
@@ -6146,11 +6376,14 @@ async function removeConnection(id: string): Promise<void> {
 
 async function connect(): Promise<void> {
 	if (!capabilityToken) throw new Error("The capability token is missing");
+	workspaceStartupMessage("Connecting to your workspace…");
 	setStatus("Connecting to Pi…");
 	const restoredExternalConnectionId = activeExternalConnectionId;
 	const primary = await addConnection(location.href, true);
 	populateModels(primary.client.snapshot?.models ?? [], true);
-	const initial = sessionTargets().find((target) => target.connectionId === primary.id);
+	const primaryTargets = sessionTargets().filter((target) => target.connectionId === primary.id);
+	const initial =
+		primaryTargets.find((target) => target.session.id === pageUrl.searchParams.get("session")) ?? primaryTargets[0];
 	if (!initial) throw new Error("The active Pi session is unavailable");
 	await switchSession(initial);
 	if (restoredExternalConnectionId && openExternalConnectionIds.includes(restoredExternalConnectionId)) {
@@ -6158,19 +6391,20 @@ async function connect(): Promise<void> {
 		persistExternalConnectionTabs();
 	}
 	installAgentEvents();
+	workspaceStartupMessage("Loading agents, teams, and connections…");
+	await Promise.all([
+		loadAgents(),
+		loadCapabilityConnections().then(loadCapabilities),
+		loadCredentialVault(),
+		loadExternalConnections().then(loadExternalRuns),
+	]);
+	if (!session?.attached || !session.snapshot) throw new Error("The chat connection was interrupted. Select Retry.");
 	window.setTimeout(() => {
 		void Promise.all([
-			loadAgents().catch(() => {}),
 			loadPersonas().catch(() => {}),
 			loadRoutines().catch(() => {}),
 			loadWorkflows().catch(() => {}),
-			loadCapabilityConnections()
-				.then(() => Promise.all([loadCapabilities(), loadWaveTwoControls()]))
-				.catch(() => {}),
-			loadCredentialVault().catch(() => {}),
-			loadExternalConnections()
-				.then(loadExternalRuns)
-				.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true)),
+			loadWaveTwoControls().catch(() => {}),
 		]);
 	}, 0);
 }
@@ -6305,8 +6539,15 @@ async function loadCapabilities(): Promise<void> {
 					checkbox.type = "checkbox";
 					checkbox.checked = selectedAgentTools().has(entry.id);
 					const harness = requiredElement<HTMLSelectElement>("agent-executor").value === "harness";
-					checkbox.disabled = harness && !["read", "ls", "list", "write"].includes(entry.id);
+					checkbox.disabled =
+						harness && !["read", "ls", "list", "write", "edit", "bash", "powershell"].includes(entry.id);
 					checkbox.title = checkbox.disabled ? "Use the Pi session executor for extension and remote tools" : "";
+					if (["bash", "powershell"].includes(entry.id))
+						appendText(
+							body,
+							"Runs as the server user, including access outside the workspace. Requires write permission.",
+							"muted",
+						);
 					checkbox.addEventListener("change", () => updateAgentToolGrant(entry.id, checkbox.checked));
 					grant.append(checkbox, " Grant to this agent");
 					body.append(grant);
@@ -7177,6 +7418,27 @@ async function loadAgentsNow(): Promise<void> {
 	if (!isAgentBuildList(buildsPayload)) throw new Error("Agent build service returned an invalid response");
 	if (!isAgentRoster(rosterPayload)) throw new Error("Agent roster returned an invalid response");
 	agents = payload.agents;
+	// Discover installed membership before rendering the roster, including after a reload.
+	// Refresh known teams on activity events; unchanged standalone agents need no extra lookup.
+	const teamLookups = await Promise.allSettled(
+		agents
+			.filter(
+				(agent) => agentTeamRevisions.get(agent.id) !== agent.revision || agentTeamStates.get(agent.id)?.installed,
+			)
+			.map(async (agent) => {
+				const response = await fetch(
+					`/agent-teams?coordinatorAgentId=${encodeURIComponent(agent.id)}&token=${encodeURIComponent(capabilityToken)}`,
+				);
+				if (!response.ok) throw new Error(await responseError(response, "Could not load team membership"));
+				const state: unknown = await response.json();
+				if (!isAgentTeamState(state)) throw new Error("Agent team service returned an invalid response");
+				agentTeamStates.set(agent.id, state);
+				agentTeamRevisions.set(agent.id, agent.revision);
+			}),
+	);
+	for (const lookup of teamLookups) {
+		if (lookup.status === "rejected") throw lookup.reason;
+	}
 	agentRosterEntries = new Map(rosterPayload.entries.map((entry) => [entry.agentId, entry]));
 	agentBuilds = buildsPayload.builds;
 	for (let index = openAgentIds.length - 1; index >= 0; index -= 1) {
@@ -7224,12 +7486,8 @@ async function loadAgentsNow(): Promise<void> {
 			});
 			const edit = document.createElement("button");
 			edit.type = "button";
-			edit.textContent = "Edit";
+			edit.textContent = "Configure";
 			edit.addEventListener("click", () => void openAgentBuilder(agent));
-			const improve = document.createElement("button");
-			improve.type = "button";
-			improve.textContent = "Improve";
-			improve.addEventListener("click", () => openAgentImprovementReview(agent));
 			const duplicate = document.createElement("button");
 			duplicate.type = "button";
 			duplicate.textContent = "Duplicate";
@@ -7250,7 +7508,7 @@ async function loadAgentsNow(): Promise<void> {
 						setStatus(error instanceof Error ? error.message : String(error), true),
 					),
 			);
-			actions.append(edit, improve, duplicate, remove);
+			actions.append(edit, duplicate, remove);
 			menu.append(menuButton, actions);
 			card.append(button, menu);
 			return card;
@@ -7259,6 +7517,10 @@ async function loadAgentsNow(): Promise<void> {
 	refreshRoutineEditorOptions();
 	refreshWorkflowEditorOptions();
 	renderSessionNavigation();
+	if (teamLookups.length > 0 && session?.snapshot) {
+		if (builderActive) renderBuilderConversation(session.snapshot);
+		else render(session.snapshot);
+	}
 	await loadAgentActivity();
 }
 
@@ -8540,6 +8802,14 @@ function installRailSectionResizer(): void {
 }
 
 async function openAgent(agent?: AgentSummary): Promise<void> {
+	const roomId = agent ? agentTeamStates.get(agent.id)?.team?.roomId : undefined;
+	if (roomId) {
+		if (!agentRooms.some((room) => room.id === roomId)) await loadAgentActivity();
+		const room = agentRooms.find((entry) => entry.id === roomId);
+		if (!room) throw new Error("Team conversation is unavailable. Reload and try again.");
+		openAgentRoomConversation(room);
+		return;
+	}
 	leaveAgentRoomConversation();
 	if (!agent) {
 		await openAgentBuilder();
@@ -8563,6 +8833,7 @@ async function openAgent(agent?: AgentSummary): Promise<void> {
 	mobilePanelNone.checked = true;
 	renderSessionNavigation();
 	await loadSelectedAgent();
+	if (activeAgentId === agent.id && !builderActive) input.focus();
 }
 
 function toggleSubagentInspector(key: string, item: Extract<TranscriptItem, { role: "tool" }>): void {
@@ -9107,7 +9378,10 @@ async function openAgentBuilder(
 	showConversation = true,
 	improvement?: AgentImprovementContext,
 ): Promise<void> {
+	activeTeamEditor = undefined;
 	activeSidebarAgent = agent;
+	// Activation updates the agent card, but must not switch the open chat's unsent draft.
+	builderDraftOwner = agent?.id ?? "new";
 	activeAgentImprovement = improvement;
 	teamFactoryAvailable = false;
 	pendingTeamPackage = undefined;
@@ -9263,7 +9537,9 @@ async function loadSelectedAgentNow(agent: AgentSummary, token: string): Promise
 	if (!teamResponse.ok) throw new Error(await responseError(teamResponse, "Could not load agent team state"));
 	const teamPayload: unknown = await teamResponse.json();
 	if (!isAgentTeamState(teamPayload)) throw new Error("Agent team service returned an invalid response");
+	const teamChanged = JSON.stringify(agentTeamStates.get(agent.id)) !== JSON.stringify(teamPayload);
 	agentTeamStates.set(agent.id, teamPayload);
+	if (teamChanged) renderSessionNavigation();
 	const conversationsPayload: unknown = await conversationsResponse.json();
 	const conversationId = conversationIdFromPayload(conversationsPayload);
 	let messages: AgentMessageSummary[] = [];
@@ -9589,14 +9865,20 @@ async function loadAgentTasks(agent: AgentSummary): Promise<AgentTaskSummary[]> 
 	return payload.tasks;
 }
 
-async function loadAgentActivity(): Promise<void> {
+const activityRefresh = new ActivityRefresh(refreshAgentActivity);
+
+function loadAgentActivity(): Promise<void> {
+	return activityRefresh.refresh();
+}
+
+async function refreshAgentActivity(): Promise<void> {
 	if (!capabilityToken) return;
 	const [taskResponse, attentionResponse, artifactResponse, roomResponse, conversationBuildResponse] =
 		await Promise.all([
-			fetch(`/agent-tasks.json?token=${encodeURIComponent(capabilityToken)}`),
+			fetch(`/agent-tasks.json?view=activity&token=${encodeURIComponent(capabilityToken)}`),
 			fetch(`/attention.json?status=open&token=${encodeURIComponent(capabilityToken)}`),
 			fetch(`/artifacts.json?token=${encodeURIComponent(capabilityToken)}`),
-			fetch(`/agent-rooms.json?token=${encodeURIComponent(capabilityToken)}`),
+			fetch(`/agent-rooms.json?view=activity&token=${encodeURIComponent(capabilityToken)}`),
 			fetch(
 				`/agent-build-conversations.json?sessionId=${encodeURIComponent(session?.id ?? "")}&token=${encodeURIComponent(capabilityToken)}`,
 			),
@@ -9622,22 +9904,45 @@ async function loadAgentActivity(): Promise<void> {
 		!agentsLoadPromise &&
 		agentRooms.some((room) => room.members.some((member) => !agents.some((agent) => agent.id === member.agentId)))
 	)
-		await loadAgents();
+		void loadAgents().catch((error: unknown) =>
+			setStatus(error instanceof Error ? error.message : String(error), true),
+		);
 	conversationBuilds = conversationBuildViewsFromPayload(conversationBuildPayload);
-	renderSessionNavigation();
+	if (
+		activityRefresh.changed("navigation", [
+			agentRooms,
+			agentRoomRuns.map((run) => [run.id, run.status]),
+			agents,
+			conversationBuilds,
+		])
+	)
+		renderSessionNavigation();
 	for (const agent of agents) {
 		agentTasksByAgent.set(
 			agent.id,
 			payload.tasks.filter((task) => task.agentId === agent.id),
 		);
 	}
-	renderAgentActivity(payload.tasks, attentionItems, conversationBuilds);
+	if (
+		activityRefresh.changed("activity", [
+			payload.tasks,
+			attentionItems,
+			conversationBuilds,
+			agentBuilds,
+			agentRoomRuns,
+			agents,
+			artifacts,
+		])
+	)
+		renderAgentActivity(payload.tasks, attentionItems, conversationBuilds);
 	renderAgentRoomConversation();
-	if (activeArtifactId === artifactLibraryId) {
-		renderArtifactLibrary();
-	} else if (activeArtifactId) {
-		const artifact = artifacts.find((entry) => entry.id === activeArtifactId);
-		if (artifact) await renderArtifact(artifact);
+	if (activityRefresh.changed("artifact", [activeArtifactId, artifacts])) {
+		if (activeArtifactId === artifactLibraryId) {
+			renderArtifactLibrary();
+		} else if (activeArtifactId) {
+			const artifact = artifacts.find((entry) => entry.id === activeArtifactId);
+			if (artifact) await renderArtifact(artifact);
+		}
 	}
 }
 
@@ -9667,9 +9972,9 @@ function renderAgentActivity(
 	const roomRuns = visibleAgentRoomRuns();
 	const activeRoomCount = roomRuns.filter((run) => run.status === "running" || run.status === "needs-user").length;
 	const attentionCount = openAttention.length + conversationActions.length + workflowBuilds.length + activeRoomCount;
-	attentionHeading.textContent = attentionCount > 0 ? `Workflow · ${attentionCount}` : "Workflow";
+	attentionHeading.textContent = attentionCount > 0 ? `History · ${attentionCount}` : "History";
 	const workflowTab = document.querySelector<HTMLButtonElement>('[data-tab="agents-workspace"]');
-	if (workflowTab) workflowTab.textContent = attentionCount > 0 ? `Workflow · ${attentionCount}` : "Workflow";
+	if (workflowTab) workflowTab.textContent = attentionCount > 0 ? `History · ${attentionCount}` : "History";
 	const workflowBadge = document.getElementById("workflow-badge");
 	if (workflowBadge) {
 		workflowBadge.textContent = String(attentionCount);
@@ -9738,12 +10043,10 @@ function renderRoomActivityEntry(run: AgentRoomRunSummary): HTMLButtonElement {
 }
 
 function leaveAgentRoomConversation(): void {
+	activeTeamEditor = undefined;
 	if (!activeAgentRoomId) return;
-	agentRoomDrafts.set(activeAgentRoomId, input.value);
 	activeAgentRoomId = undefined;
 	renderedAgentRoomSignature = "";
-	input.value = "";
-	resizeComposer();
 }
 
 function openAgentRoomRun(run: AgentRoomRunSummary): void {
@@ -9754,7 +10057,6 @@ function openAgentRoomRun(run: AgentRoomRunSummary): void {
 function openAgentRoomConversation(room: AgentRoomSummary): void {
 	if (activeAgentRoomId !== room.id) {
 		leaveAgentRoomConversation();
-		input.value = agentRoomDrafts.get(room.id) ?? "";
 	}
 	activeAgentRoomId = room.id;
 	builderActive = false;
@@ -9785,8 +10087,18 @@ function renderAgentRoomConversation(): void {
 	const needsUser = current?.status === "needs-user";
 	const submitting = pendingAgentRoomSubmissions.has(room.id);
 	const supervisor = room.members.find((member) => member.agentId === room.supervisorAgentId);
-	const signature = JSON.stringify([room, runs, submitting]);
+	const previousWorkflowRuns =
+		[...agentTeamStates.values()].find((state) => state.team?.roomId === room.id)?.team?.runs ?? [];
+	const childRuns = agentRoomRuns.filter(
+		(run) => run.parentRunId && runs.some((parent) => parent.id === run.parentRunId),
+	);
+	const signature = JSON.stringify([room, runs, childRuns, submitting, previousWorkflowRuns]);
 	if (renderedAgentRoomSignature !== signature) {
+		const expanded = new Set(
+			[...transcript.querySelectorAll<HTMLDetailsElement>("details[data-team-detail][open]")].map(
+				(detail) => detail.dataset.teamDetail,
+			),
+		);
 		const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
 		const previousScrollTop = transcript.scrollTop;
 		const firstRender = !renderedAgentRoomSignature;
@@ -9799,12 +10111,81 @@ function renderAgentRoomConversation(): void {
 			`${supervisor ? `${supervisor.name ?? supervisor.agentId} · Supervisor · ` : ""}${room.members.length} members`,
 			"muted",
 		);
-		const items: HTMLElement[] = [heading];
+		const items: HTMLElement[] = [heading, teamScheduleControls(room.id, capabilityToken ?? "")];
+		if (room.teamIds?.length)
+			appendText(
+				heading,
+				`Coordinates: ${room.teamIds.map((id) => agentRooms.find((team) => team.id === id)?.name ?? id).join(", ")}`,
+				"muted",
+			);
+		const memory = document.createElement("details");
+		memory.dataset.teamDetail = "memory";
+		memory.open = expanded.has("memory");
+		const memoryHeading = document.createElement("summary");
+		memoryHeading.textContent = "Team memory and tools";
+		appendText(
+			memory,
+			`Memory: ${room.memoryStrategy ?? "recent"}. Shared notes: ${room.sharedNotes ?? "None"}`,
+			"muted",
+		);
+		appendText(
+			memory,
+			`Tools: ${room.toolIds?.map((id) => teamToolOptions.find((entry) => entry.id === id)?.name ?? id).join(", ") ?? "Each member's configured tools"}`,
+			"muted",
+		);
+		const retained = document.createElement("div");
+		const loadMemory = document.createElement("button");
+		loadMemory.textContent = "Review saved memory";
+		loadMemory.addEventListener("click", () => {
+			void fetch(`/agent-rooms/${encodeURIComponent(room.id)}?token=${encodeURIComponent(capabilityToken ?? "")}`)
+				.then(async (response) => {
+					if (!response.ok) throw new Error("Could not load team memory");
+					const data: {
+						memory?: Array<{ key: string; text: string; scope: string; agentId: string; runId: string }>;
+					} = await response.json();
+					retained.replaceChildren();
+					for (const entry of data.memory ?? [])
+						appendText(
+							retained,
+							`${entry.key} · ${entry.scope} · ${room.members.find((member) => member.agentId === entry.agentId)?.name ?? entry.agentId}\n${entry.text}\nSource run: ${entry.runId}`,
+							"muted",
+						);
+					if (!data.memory?.length)
+						retained.textContent = "No saved memory yet. Completed tasks can retain decisions and working notes.";
+				})
+				.catch((error: unknown) => {
+					retained.textContent = error instanceof Error ? error.message : String(error);
+				});
+		});
+		memory.prepend(memoryHeading);
+		memory.append(loadMemory, retained);
+		items.push(memory);
+		if (previousWorkflowRuns.length) {
+			const history = document.createElement("details");
+			history.dataset.teamDetail = "workflow-history";
+			history.open = expanded.has("workflow-history");
+			const summary = document.createElement("summary");
+			summary.textContent = "Earlier workflow results";
+			history.append(summary);
+			for (const run of [...previousWorkflowRuns].reverse()) {
+				appendText(history, `${run.prompt} · ${run.status}`, "message-label");
+				appendAgentMarkdown(history, run.result ?? run.error ?? "In progress");
+			}
+			items.push(history);
+		}
 		if (!current) appendText(heading, room.purpose, "muted");
 		for (const run of runs) {
 			const request = document.createElement("article");
 			request.className = "message user";
-			appendText(request, "you", "message-label");
+			const parentRun = agentRoomRuns.find((parent) => parent.id === run.parentRunId);
+			const parentTeam = agentRooms.find((team) => team.id === parentRun?.roomId);
+			appendText(request, parentTeam ? `From ${parentTeam.name}` : "you", "message-label");
+			if (parentTeam) {
+				const back = document.createElement("button");
+				back.textContent = `Open ${parentTeam.name}`;
+				back.addEventListener("click", () => openAgentRoomConversation(parentTeam));
+				request.append(back);
+			}
 			appendAgentMarkdown(request, run.goal);
 			items.push(request);
 			for (const round of run.rounds) {
@@ -9824,8 +10205,49 @@ function renderAgentRoomConversation(): void {
 					appendAgentMarkdown(body, turn.message);
 					message.append(body);
 					if (turn.recruit) appendText(message, `Bringing in ${turn.recruit.name}: ${turn.recruit.role}`, "muted");
-					items.push(message);
+					if (turn.requestTeam)
+						appendText(
+							message,
+							`To ${agentRooms.find((team) => team.id === turn.requestTeam?.teamId)?.name ?? turn.requestTeam.teamId}: ${turn.requestTeam.goal}`,
+							"muted",
+						);
+					const finalAnswer =
+						run.status === "completed" && round === run.rounds.at(-1) && turn.agentId === room.supervisorAgentId;
+					if (room.supervisorAgentId && !finalAnswer && turn.status !== "needs-user") {
+						const detail = document.createElement("details");
+						detail.className = "team-communication";
+						detail.dataset.teamDetail = `${run.id}:${round.number}:${turn.agentId}`;
+						detail.open = expanded.has(detail.dataset.teamDetail);
+						const summary = document.createElement("summary");
+						const recipients = turn.requestAgentIds
+							?.map((id) => room.members.find((entry) => entry.agentId === id)?.name ?? id)
+							.join(", ");
+						summary.textContent = `${member?.name ?? turn.agentId}${recipients ? ` → ${recipients}` : ""}: ${turn.message.slice(0, 160)}${turn.message.length > 160 ? "…" : ""}`;
+						detail.append(summary, message);
+						items.push(detail);
+					} else items.push(message);
 				}
+			}
+			for (const child of childRuns.filter((entry) => entry.parentRunId === run.id)) {
+				const team = agentRooms.find((entry) => entry.id === child.roomId);
+				const assignment = document.createElement("details");
+				assignment.dataset.teamDetail = `child:${child.id}`;
+				assignment.open = expanded.has(assignment.dataset.teamDetail);
+				const summary = document.createElement("summary");
+				summary.textContent = `${team?.name ?? child.roomId} · ${roomRunPresentation(child.status).label}`;
+				assignment.append(summary);
+				appendText(assignment, child.goal, "muted");
+				appendAgentMarkdown(
+					assignment,
+					child.result ?? child.userQuestion ?? child.error ?? "Working on the assignment…",
+				);
+				if (team) {
+					const open = document.createElement("button");
+					open.textContent = `Open ${team.name}`;
+					open.addEventListener("click", () => openAgentRoomConversation(team));
+					assignment.append(open);
+				}
+				items.push(assignment);
 			}
 			if (run.error) {
 				const notice = document.createElement("article");
@@ -9846,7 +10268,7 @@ function renderAgentRoomConversation(): void {
 						: `Working: ${(current?.pendingAgentIds ?? []).map((id) => room.members.find((member) => member.agentId === id)?.name ?? id).join(", ") || room.name}`,
 				"muted",
 			);
-			if (needsUser) {
+			if (needsUser || running) {
 				const stop = document.createElement("button");
 				stop.type = "button";
 				stop.textContent = "Stop team";
@@ -9866,11 +10288,15 @@ function renderAgentRoomConversation(): void {
 	}
 	phase.textContent = submitting ? "sending" : current ? roomRunPresentation(current.status).label : "idle";
 	input.disabled = submitting;
-	input.placeholder = needsUser ? "Answer the team's question…" : `Message ${room.name}…`;
+	input.placeholder = needsUser
+		? "Answer the team's question…"
+		: running
+			? "Add context or change direction…"
+			: `Message ${room.name}…`;
 	input.setAttribute("aria-label", `Message ${room.name}`);
 	send.disabled = submitting;
-	send.classList.toggle("is-stopping", running);
-	send.setAttribute("aria-label", running ? "Stop team" : needsUser ? "Continue team" : "Send to team");
+	send.classList.remove("is-stopping");
+	send.setAttribute("aria-label", needsUser ? "Continue team" : "Send to team");
 	model.disabled = true;
 	thinking.disabled = true;
 	attachmentButton.disabled = true;
@@ -9879,6 +10305,10 @@ function renderAgentRoomConversation(): void {
 	const agent = agents.find((entry) => entry.id === room.supervisorAgentId);
 	if (agent?.model) model.value = `${agent.model.provider}/${agent.model.id}`;
 	modelPicker.refresh();
+	thinking.value = agent?.thinking ?? "off";
+	updateThinkingLevelAvailability(thinking, model.value, thinking.value as ThinkingLevel);
+	thinking.disabled = true;
+	thinkingPicker.refresh();
 	if (agent) setSessionPath(agent.projectRoot, false);
 	sessionStats.textContent = `${room.name} · ${phase.textContent}`;
 	sessionStats.title = "Team conversation";
@@ -9889,26 +10319,18 @@ function renderAgentRoomConversation(): void {
 
 async function submitAgentRoomComposer(roomId: string): Promise<void> {
 	if (pendingAgentRoomSubmissions.has(roomId)) return;
-	const current = agentRoomRuns.filter((run) => run.roomId === roomId).sort((a, b) => b.createdAt - a.createdAt)[0];
 	const prompt = input.value.trim();
-	if (current?.status !== "running" && !prompt) return;
+	if (!prompt) return;
 	pendingAgentRoomSubmissions.add(roomId);
-	if (current?.status !== "running") {
-		recordPromptHistory(prompt);
-		input.value = "";
-		agentRoomDrafts.set(roomId, "");
-		resizeComposer();
-	}
+	recordPromptHistory(prompt);
+	input.value = "";
+	conversationComposer.clear(`team:${roomId}`);
+	resizeComposer();
 	renderAgentRoomConversation();
 	try {
-		if (current?.status === "running") await roomRunAction(current.id, "cancel", {});
-		else if (current?.status === "needs-user") await roomRunAction(current.id, "resume", { message: prompt });
-		else await startAgentRoom(roomId, prompt);
+		await startAgentRoom(roomId, prompt);
 	} catch (error) {
-		if (current?.status !== "running") {
-			agentRoomDrafts.set(roomId, prompt);
-			if (activeAgentRoomId === roomId && !input.value) input.value = prompt;
-		}
+		conversationComposer.restore(`team:${roomId}`, prompt);
 		throw error;
 	} finally {
 		pendingAgentRoomSubmissions.delete(roomId);
@@ -9927,30 +10349,59 @@ async function roomRunAction(runId: string, action: "cancel" | "resume", body: R
 }
 
 function openAgentRoomCreator(existing?: AgentRoomSummary): void {
-	const dialog = document.createElement("dialog");
-	dialog.className = "promotion-dialog";
+	const previousRoom = agentRooms.find((room) => room.id === activeAgentRoomId);
+	const previousAgent = agents.find((agent) => agent.id === activeAgentId);
+	const previousTarget = sessionTargets().find((target) => target.key === activeTargetKey);
+	leaveAgentRoomConversation();
+	builderActive = false;
+	activeAgentId = undefined;
+	activeSidebarAgent = undefined;
+	activeSubagentKey = undefined;
+	activeExternalRunId = undefined;
+	activeExternalConnectionId = undefined;
+	activeArtifactId = undefined;
+	const editor = document.createElement("section");
+	editor.className = "promotion-dialog";
+	editor.style.cssText = "width:100%;max-height:none;box-shadow:none";
+	editor.setAttribute("aria-label", existing ? `Manage ${existing.name}` : "Create a team");
+	activeTeamEditor = editor;
+	const returnToConversation = () => {
+		if (activeTeamEditor !== editor) return;
+		activeTeamEditor = undefined;
+		if (previousRoom) openAgentRoomConversation(previousRoom);
+		else if (previousAgent) void openAgent(previousAgent);
+		else if (previousTarget) void switchSession(previousTarget);
+	};
 	const form = document.createElement("form");
 	const heading = document.createElement("strong");
 	heading.textContent = existing ? `Manage ${existing.name}` : "Create a team";
 	const explanation = document.createElement("p");
 	explanation.className = "muted";
 	explanation.textContent =
-		"Choose a supervisor and the agents it can recruit and communicate with. New specialists stay in this team and inherit only the supervisor's read-only file tools and model.";
+		"Choose a supervisor, describe your purpose, and select the tools this team may use. The supervisor can bring in specialists and assign tools within that allowance.";
 	const name = document.createElement("input");
 	name.required = true;
 	name.maxLength = 256;
 	name.placeholder = "Team name";
 	name.value = existing?.name ?? "";
 	const purpose = document.createElement("textarea");
-	purpose.required = true;
 	purpose.maxLength = 4096;
-	purpose.placeholder = "What perspectives should this room combine?";
+	purpose.placeholder = "Optional shared purpose. You can give the team its task in chat.";
 	purpose.value = existing?.purpose ?? "";
 	const goal = document.createElement("textarea");
-	goal.required = !existing;
 	goal.maxLength = 16_384;
-	goal.placeholder = "Goal for this run";
+	goal.placeholder = "Optional first task. You can message the team after creating it.";
 	form.append(heading, explanation, labelledControl("Name", name), labelledControl("Purpose", purpose));
+	if (!existing) {
+		const build = document.createElement("button");
+		build.type = "button";
+		build.textContent = "Build a team in chat";
+		build.addEventListener("click", () => {
+			activeTeamEditor = undefined;
+			void openAgentBuilder();
+		});
+		form.append(build);
+	}
 	const supervisor = document.createElement("select");
 	supervisor.setAttribute("aria-label", "Team supervisor");
 	const allMembers = document.createElement("option");
@@ -9971,10 +10422,83 @@ function openAgentRoomCreator(existing?: AgentRoomSummary): void {
 		labelledControl("Supervisor", supervisor),
 		labelledControl("Allow supervisor to add missing specialists (up to 8 members)", recruit),
 	);
+	const memoryStrategy = document.createElement("select");
+	for (const [value, label] of [
+		["team", "Team memory and recent conversation"],
+		["recent", "Recent conversation only"],
+		["none", "Fresh context for each request"],
+	]) {
+		const option = document.createElement("option");
+		option.value = value!;
+		option.textContent = label!;
+		memoryStrategy.append(option);
+	}
+	memoryStrategy.value = existing?.memoryStrategy ?? "team";
+	const sharedNotes = document.createElement("textarea");
+	sharedNotes.maxLength = 8192;
+	sharedNotes.value = existing?.sharedNotes ?? "";
+	sharedNotes.placeholder = "Shared constraints, decisions, and preferences";
+	const memorySettings = document.createElement("details");
+	const memoryTitle = document.createElement("summary");
+	memoryTitle.textContent = "Memory strategy and shared notes";
+	const clearMemory = document.createElement("input");
+	clearMemory.type = "checkbox";
+	memorySettings.append(
+		memoryTitle,
+		labelledControl("Memory strategy", memoryStrategy),
+		labelledControl("Shared team notes", sharedNotes),
+	);
+	if (existing) memorySettings.append(labelledControl("Forget learned memory from earlier tasks", clearMemory));
+	form.append(memorySettings);
+	const toolSettings = document.createElement("details");
+	const toolTitle = document.createElement("summary");
+	toolTitle.textContent = "Tools available to this team";
+	const assignTools = document.createElement("input");
+	assignTools.type = "checkbox";
+	assignTools.checked = existing ? existing.toolIds !== undefined : true;
+	toolSettings.append(toolTitle, labelledControl("Let supervisor assign the selected tools", assignTools));
+	const toolChoices = teamToolOptions.map((tool) => {
+		const checkbox = document.createElement("input");
+		checkbox.type = "checkbox";
+		checkbox.checked = (existing?.toolIds ?? ["read", "ls"]).includes(tool.id);
+		const label = labelledControl(tool.name, checkbox);
+		label.title = tool.description;
+		toolSettings.append(label);
+		return { id: tool.id, checkbox };
+	});
+	form.append(toolSettings);
+	const teamSettings = document.createElement("details");
+	const teamTitle = document.createElement("summary");
+	teamTitle.textContent = "Teams this coordinator may assign";
+	teamSettings.append(teamTitle);
+	appendText(
+		teamSettings,
+		"Choose teams whose supervisors can carry out part of your goal. Each keeps its own tools and memory. Assignments run one at a time, with up to four levels.",
+		"muted",
+	);
+	const teamChoices = agentRooms
+		.filter((team) => team.supervisorAgentId && team.id !== existing?.id)
+		.map((team) => {
+			const checkbox = document.createElement("input");
+			checkbox.type = "checkbox";
+			checkbox.checked = existing?.teamIds?.includes(team.id) ?? false;
+			checkbox.setAttribute("aria-label", `Coordinate ${team.name}`);
+			const label = labelledControl(team.name, checkbox);
+			label.title = team.purpose;
+			teamSettings.append(label);
+			return { id: team.id, checkbox };
+		});
+	if (!teamChoices.length) appendText(teamSettings, "Create a supervised team first, then select it here.", "muted");
+	form.append(teamSettings);
 	const memberHeading = document.createElement("strong");
 	memberHeading.textContent = "Members";
 	form.append(memberHeading);
-	const memberRows: Array<{ agent: AgentSummary; checkbox: HTMLInputElement; role: HTMLInputElement }> = [];
+	const memberRows: Array<{
+		agent: AgentSummary;
+		checkbox: HTMLInputElement;
+		role: HTMLInputElement;
+		notes: HTMLTextAreaElement;
+	}> = [];
 	for (const agent of agents) {
 		const row = document.createElement("label");
 		row.className = "room-member-row";
@@ -9993,15 +10517,42 @@ function openAgentRoomCreator(existing?: AgentRoomSummary): void {
 			role.disabled = !checkbox.checked;
 			if (checkbox.checked && !role.value) role.value = `${agent.name} perspective`;
 		});
-		row.append(checkbox, document.createTextNode(agent.name), role);
+		const profile = document.createElement("details");
+		const profileHeading = document.createElement("summary");
+		profileHeading.textContent = `${agent.name} role and working notes`;
+		const notes = document.createElement("textarea");
+		notes.maxLength = 4096;
+		notes.placeholder = "Preferences and context this member should remember in this team";
+		notes.value = existing?.members.find((member) => member.agentId === agent.id)?.notes ?? "";
+		profile.append(
+			profileHeading,
+			labelledControl(`Role for ${agent.name}`, role),
+			labelledControl(`Working notes for ${agent.name}`, notes),
+		);
+		row.append(checkbox, document.createTextNode(agent.name));
 		form.append(row);
-		memberRows.push({ agent, checkbox, role });
+		form.append(profile);
+		memberRows.push({ agent, checkbox, role, notes });
 	}
+	let previousSupervisor = supervisor.value;
+	supervisor.addEventListener("change", () => {
+		const selected = memberRows.filter((row) => row.checkbox.checked);
+		if (!existing && selected.length === 1 && selected[0]?.agent.id === previousSupervisor) {
+			selected[0].checkbox.checked = false;
+			selected[0].role.disabled = true;
+		}
+		const chosen = memberRows.find((row) => row.agent.id === supervisor.value);
+		if (chosen) {
+			chosen.checkbox.checked = true;
+			chosen.role.disabled = false;
+		}
+		previousSupervisor = supervisor.value;
+	});
 	const limits = document.createElement("details");
 	const limitsHeading = document.createElement("summary");
 	limitsHeading.textContent = "Bounds";
 	const maxRounds = numberInput(existing?.limits.maxRounds ?? 12, 1, 32);
-	const maxConcurrency = numberInput(3, 1, 4);
+	const maxConcurrency = numberInput(existing?.limits.maxConcurrency ?? 3, 1, 4);
 	limits.append(
 		limitsHeading,
 		labelledControl("Maximum rounds", maxRounds),
@@ -10014,47 +10565,82 @@ function openAgentRoomCreator(existing?: AgentRoomSummary): void {
 	const close = document.createElement("button");
 	close.type = "button";
 	close.textContent = "Cancel";
-	close.addEventListener("click", () => dialog.close());
+	close.addEventListener("click", returnToConversation);
 	const start = document.createElement("button");
 	start.type = "submit";
-	start.textContent = existing ? "Save team" : "Start team";
+	start.textContent = existing ? "Save team" : "Create team";
+	goal.addEventListener("input", () => {
+		start.textContent = goal.value.trim() ? "Start team" : "Create team";
+	});
+	const errorMessage = document.createElement("p");
+	errorMessage.setAttribute("role", "alert");
+	errorMessage.className = "run-error";
 	actions.append(close, start);
-	form.append(actions);
+	form.append(errorMessage, actions);
 	form.addEventListener("submit", (event) => {
 		event.preventDefault();
 		const members = memberRows
 			.filter((row) => row.checkbox.checked || row.agent.id === supervisor.value)
-			.map((row) => ({ agentId: row.agent.id, role: row.role.value.trim() || `${row.agent.name} perspective` }));
+			.map((row) => ({
+				agentId: row.agent.id,
+				role: row.role.value.trim() || `${row.agent.name} perspective`,
+				notes: row.notes.value.trim() || undefined,
+				toolIds: assignTools.checked
+					? existing?.members
+							.find((member) => member.agentId === row.agent.id)
+							?.toolIds?.filter((id) => toolChoices.some((tool) => tool.id === id && tool.checkbox.checked))
+					: undefined,
+			}));
 		if (members.length < (supervisor.value ? 1 : 2)) {
-			setStatus("Choose a supervisor or at least two collaboration members", true);
+			errorMessage.textContent = "Choose a supervisor or at least two collaboration members";
 			return;
 		}
+		errorMessage.textContent = "";
 		start.disabled = true;
 		void createAndStartAgentRoom(
 			{
 				...(existing ? { id: existing.id } : {}),
 				name: name.value.trim(),
-				purpose: purpose.value.trim(),
+				purpose: purpose.value.trim() || `Work together on requests for ${name.value.trim()}.`,
 				members,
 				supervisorAgentId: supervisor.value || undefined,
+				teamIds: teamChoices.filter((team) => team.checkbox.checked).map((team) => team.id),
 				allowRecruitment: Boolean(supervisor.value) && recruit.checked,
+				toolIds: assignTools.checked
+					? toolChoices.filter((tool) => tool.checkbox.checked).map((tool) => tool.id)
+					: undefined,
+				memoryStrategy: memoryStrategy.value as AgentRoomSummary["memoryStrategy"],
+				sharedNotes: sharedNotes.value.trim() || undefined,
+				memoryResetAt: clearMemory.checked ? Date.now() : existing?.memoryResetAt,
 				limits: { maxRounds: Number(maxRounds.value), maxConcurrency: Number(maxConcurrency.value) },
 			},
 			goal.value.trim(),
 		)
-			.then((run) => {
-				dialog.close();
-				if (run) openAgentRoomRun(run);
+			.then((room) => {
+				if (activeTeamEditor !== editor) return;
+				activeTeamEditor = undefined;
+				openAgentRoomConversation(room);
 			})
 			.catch((error: unknown) => {
 				start.disabled = false;
-				setStatus(error instanceof Error ? error.message : String(error), true);
+				errorMessage.textContent = error instanceof Error ? error.message : String(error);
 			});
 	});
-	dialog.append(form);
-	dialog.addEventListener("close", () => dialog.remove());
-	document.body.append(dialog);
-	dialog.showModal();
+	editor.append(form);
+	transcript.replaceChildren(editor);
+	transcript.scrollTop = 0;
+	input.disabled = true;
+	input.placeholder = "Set up your team above";
+	send.disabled = true;
+	model.disabled = true;
+	modelPicker.refresh();
+	thinking.disabled = true;
+	attachmentButton.disabled = true;
+	attachmentInput.disabled = true;
+	phase.textContent = "team setup";
+	mobilePanelNone.checked = true;
+	renderSessionNavigation();
+	name.focus();
 }
 
 async function createAndStartAgentRoom(
@@ -10063,7 +10649,7 @@ async function createAndStartAgentRoom(
 		id?: string;
 	},
 	goal: string,
-): Promise<AgentRoomRunSummary | undefined> {
+): Promise<AgentRoomSummary> {
 	if (!capabilityToken) throw new Error("Collaboration room access is unavailable");
 	const create = await fetch(`/agent-rooms?token=${encodeURIComponent(capabilityToken)}`, {
 		method: "POST",
@@ -10073,16 +10659,14 @@ async function createAndStartAgentRoom(
 	if (!create.ok) throw new Error(await responseError(create, "Could not create room"));
 	const room: unknown = await create.json();
 	if (!isAgentRoomSummary(room)) throw new Error("Room service returned an invalid definition");
-	if (definition.id) {
-		await loadAgentActivity();
-		return undefined;
-	}
-	return startAgentRoom(room.id, goal);
+	if (!definition.id && goal) await startAgentRoom(room.id, goal);
+	else await loadAgentActivity();
+	return agentRooms.find((entry) => entry.id === room.id) ?? room;
 }
 
 async function startAgentRoom(roomId: string, goal: string): Promise<AgentRoomRunSummary> {
 	const start = await fetch(
-		`/agent-rooms/${encodeURIComponent(roomId)}/run?token=${encodeURIComponent(capabilityToken ?? "")}`,
+		`/agent-rooms/${encodeURIComponent(roomId)}/message?token=${encodeURIComponent(capabilityToken ?? "")}`,
 		{
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -10290,6 +10874,12 @@ function improvementRouteLabel(route: AgentImprovementContext["route"]): string 
 }
 
 function openAgentImprovementReview(agent: AgentSummary, task?: AgentTaskSummary): void {
+	if (task?.summary) {
+		void loadFullActivityTask(task)
+			.then((full) => openAgentImprovementReview(agent, full))
+			.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+		return;
+	}
 	const route = improvementRoute(task);
 	const dialog = document.createElement("dialog");
 	dialog.className = "promotion-dialog";
@@ -10386,6 +10976,12 @@ function openAgentImprovementReview(agent: AgentSummary, task?: AgentTaskSummary
 }
 
 function openSkillPromotionReview(task: AgentTaskSummary, agent: AgentSummary): void {
+	if (task.summary) {
+		void loadFullActivityTask(task)
+			.then((full) => openSkillPromotionReview(full, agent))
+			.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+		return;
+	}
 	const runId = task.attemptIds.at(-1);
 	if (!runId || !capabilityToken) {
 		setStatus("The successful worker result is unavailable for promotion", true);
@@ -10501,6 +11097,7 @@ function skillNameFromTask(agent: AgentSummary, task: AgentTaskSummary): string 
 }
 
 async function stageRoutineFromTask(task: AgentTaskSummary, agent: AgentSummary): Promise<void> {
+	if (task.summary) task = await loadFullActivityTask(task);
 	await openAgentBuilder(agent, false);
 	activateBuilderTab("builder-automation-panel");
 	clearRoutineEditor();
@@ -10561,6 +11158,18 @@ function roomsFromPayload(value: unknown): { rooms: AgentRoomSummary[]; runs: Ag
 		!value.runs.every(isAgentRoomRunSummary)
 	) {
 		throw new Error("Collaboration room service returned an invalid response");
+	}
+	if ("tools" in value && Array.isArray(value.tools)) {
+		teamToolOptions = value.tools
+			.filter(
+				(tool): tool is { id: string; name: string; description: string } =>
+					typeof tool === "object" &&
+					tool !== null &&
+					typeof tool.id === "string" &&
+					typeof tool.name === "string" &&
+					typeof tool.description === "string",
+			)
+			.map(({ id, name, description }) => ({ id, name, description }));
 	}
 	return { rooms: value.rooms, runs: value.runs };
 }
@@ -10681,6 +11290,17 @@ async function retryAgentTask(taskId: string): Promise<void> {
 	if (!response.ok) throw new Error(await responseError(response, "Could not retry task"));
 	await loadAgentActivity();
 	if (activeSidebarAgent) await loadSelectedAgent();
+}
+
+async function loadFullActivityTask(task: AgentTaskSummary): Promise<AgentTaskSummary> {
+	const response = await fetch(
+		`/agent-tasks/${encodeURIComponent(task.id)}?token=${encodeURIComponent(capabilityToken ?? "")}`,
+	);
+	if (!response.ok) throw new Error(await responseError(response, "Could not load task evidence"));
+	const full: unknown = await response.json();
+	const payload = { tasks: [full] };
+	if (!isAgentTaskList(payload) || payload.tasks[0].summary) throw new Error("Invalid task evidence response");
+	return payload.tasks[0];
 }
 
 function isAgentTaskList(value: unknown): value is { tasks: AgentTaskSummary[] } {
@@ -10939,6 +11559,7 @@ interface RoutineSummary {
 	timezone: string;
 	maxDurationMinutes: number;
 	target:
+		| { kind: "team"; roomId: string; configurationDigest: string; delivery: "report" | "draft"; confirmed: boolean }
 		| { kind: "agent"; agentId: string }
 		| { kind: "workflow"; workflowId: string }
 		| {
@@ -10963,6 +11584,10 @@ let routines: RoutineSummary[] = [];
 
 function routineTargetLabel(routine: RoutineSummary): string {
 	switch (routine.target.kind) {
+		case "team": {
+			const roomId = routine.target.roomId;
+			return `Team · ${agentRooms.find((room) => room.id === roomId)?.name ?? roomId}`;
+		}
 		case "agent": {
 			const agentId = routine.target.agentId;
 			return `Agent · ${agents.find((agent) => agent.id === agentId)?.name ?? agentId}`;
@@ -11153,6 +11778,7 @@ function clearRoutineEditor(): void {
 }
 
 function editRoutine(routine: RoutineSummary): void {
+	if (routine.target.kind === "team") return;
 	routineEditor.id.value = routine.id;
 	routineEditor.name.value = routine.name;
 	routineEditor.prompt.value = routine.prompt;
@@ -11354,6 +11980,7 @@ function isRoutineList(value: unknown): value is { routines: RoutineSummary[] } 
 			return false;
 		}
 		return (
+			entry.target.kind === "team" ||
 			entry.target.kind === "agent" ||
 			entry.target.kind === "workflow" ||
 			entry.target.kind === "browser-workflow" ||
@@ -11392,6 +12019,7 @@ interface AgentTeamState {
 		bundleId: string;
 		packageId: string;
 		coordinatorAgentId: string;
+		roomId?: string;
 		agentIds: string[];
 		workflow: { id: string; name: string };
 		runs: AgentTeamRun[];
@@ -11638,6 +12266,7 @@ sessionPathForm.addEventListener("submit", (event) => {
 });
 
 async function submitComposer(): Promise<void> {
+	if (activeTeamEditor) return;
 	if (activeAgentRoomId) {
 		await submitAgentRoomComposer(activeAgentRoomId);
 		return;
@@ -11847,7 +12476,7 @@ async function submitBuilderComposer(): Promise<void> {
 }
 
 async function submitAgentComposer(agentId: string): Promise<void> {
-	if (!capabilityToken) return;
+	if (!capabilityToken || pendingAgentSubmissions.has(agentId)) return;
 	const agent = agents.find((entry) => entry.id === agentId);
 	if (!agent) throw new Error("The selected agent is unavailable");
 	const teamState = agentTeamStates.get(agentId);
@@ -11874,22 +12503,23 @@ async function submitAgentComposer(agentId: string): Promise<void> {
 	const prompt = input.value.trim();
 	if (!prompt) return;
 	recordPromptHistory(prompt);
-	input.value = "";
+	conversationComposer.clear(`agent:${agentId}`);
 	resizeComposer();
-	if (teamState?.installed) {
-		const response = await fetch(`/agent-teams/run?token=${encodeURIComponent(capabilityToken)}`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ coordinatorAgentId: agentId, prompt }),
-		});
-		if (!response.ok) throw new Error(await responseError(response, "Could not start team run"));
-		await loadSelectedAgent();
-		return;
-	}
-	const pending = pendingAgentDeliveryKeys.get(agentId);
-	const delivery = pending?.prompt === prompt ? pending : { prompt, key: `chat-${createBrowserId()}` };
-	pendingAgentDeliveryKeys.set(agentId, delivery);
+	pendingAgentSubmissions.add(agentId);
 	try {
+		if (teamState?.installed) {
+			const response = await fetch(`/agent-teams/run?token=${encodeURIComponent(capabilityToken)}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ coordinatorAgentId: agentId, prompt }),
+			});
+			if (!response.ok) throw new Error(await responseError(response, "Could not start team run"));
+			await loadSelectedAgent();
+			return;
+		}
+		const pending = pendingAgentDeliveryKeys.get(agentId);
+		const delivery = pending?.prompt === prompt ? pending : { prompt, key: `chat-${createBrowserId()}` };
+		pendingAgentDeliveryKeys.set(agentId, delivery);
 		const response = await fetch(`/agent-deliveries?token=${encodeURIComponent(capabilityToken)}`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -11902,17 +12532,16 @@ async function submitAgentComposer(agentId: string): Promise<void> {
 		pendingAgentDeliveryKeys.delete(agentId);
 		await loadSelectedAgent();
 	} catch (error) {
-		if (!input.value.trim()) {
-			input.value = prompt;
-			resizeComposer();
-		}
+		conversationComposer.restore(`agent:${agentId}`, prompt);
+		resizeComposer();
 		throw error;
+	} finally {
+		pendingAgentSubmissions.delete(agentId);
 	}
 }
 
 input.addEventListener("input", () => {
 	resizeComposer();
-	if (activeAgentRoomId) agentRoomDrafts.set(activeAgentRoomId, input.value);
 	const history = activePromptHistory();
 	if (!history) return;
 	history.index = history.entries.length;
@@ -12274,11 +12903,6 @@ document.addEventListener("pointerdown", (event) => {
 	closeAgentMenus();
 });
 
-showConnectionForm.addEventListener("click", () => {
-	connectionForm.classList.toggle("hidden");
-	if (!connectionForm.classList.contains("hidden")) connectionUrl.focus();
-});
-
 openSettingsButton.addEventListener("click", () => {
 	mobilePanelNone.checked = true;
 	openSettings("models");
@@ -12294,20 +12918,6 @@ window.addEventListener("keydown", (event) => {
 	if (event.key !== "Escape") return;
 	closeAgentMenus();
 	if (!settingsWorkspace.classList.contains("hidden")) closeSettings();
-});
-
-connectionForm.addEventListener("submit", (event) => {
-	event.preventDefault();
-	const controlUrl = connectionUrl.value.trim();
-	if (!controlUrl) return;
-	void addConnection(controlUrl)
-		.then(async (entry) => {
-			connectionForm.reset();
-			connectionForm.classList.add("hidden");
-			const target = sessionTargets().find((candidate) => candidate.connectionId === entry.id);
-			if (target) await switchSession(target);
-		})
-		.catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
 });
 
 agentForm.addEventListener("submit", (event) => {
@@ -12813,4 +13423,4 @@ clearRoutineEditor();
 clearWorkflowEditor();
 updateAgentBuilderReadiness();
 if (location.hash.startsWith("#settings/")) applySettingsHash();
-void connect().catch((error: unknown) => setStatus(error instanceof Error ? error.message : String(error), true));
+void startWorkspace(connect);

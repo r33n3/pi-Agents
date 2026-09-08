@@ -11,6 +11,7 @@ import type {
 	ProviderCapabilityGroup,
 	ProviderConfigurationField,
 } from "./capability-provider-contract.ts";
+import { providerConfigurationReady } from "./capability-provider-contract.ts";
 import { CapabilityProviderRegistry, capabilityProviderManifestDigest } from "./capability-provider-registry.ts";
 import { SerialOperationQueue } from "./serial-operation-queue.ts";
 
@@ -391,9 +392,7 @@ export class CapabilityBroker {
 		];
 		const configurationReady =
 			manifest.configurationOnly === true &&
-			(manifest.authentication?.fields ?? [])
-				.filter((field) => field.required)
-				.every((field) => Boolean(this.#environmentValue(field.env)?.trim()));
+			providerConfigurationReady(manifest.authentication, (name) => Boolean(this.#environmentValue(name)?.trim()));
 		return {
 			...manifest,
 			digest: capabilityProviderManifestDigest(manifest),
@@ -414,9 +413,9 @@ export class CapabilityBroker {
 			authentication: manifest.authentication
 				? {
 						...manifest.authentication,
-						configured: manifest.authentication.fields
-							.filter((field) => field.required)
-							.every((field) => Boolean(this.#environmentValue(field.env)?.trim())),
+						configured: providerConfigurationReady(manifest.authentication, (name) =>
+							Boolean(this.#environmentValue(name)?.trim()),
+						),
 						fields: manifest.authentication.fields.map((field) => {
 							const value = this.#environmentValue(field.env)?.trim();
 							return {
@@ -437,11 +436,7 @@ export class CapabilityBroker {
 	): boolean {
 		const binding = provider.bindings.find((entry) => entry.capabilityId === capabilityId);
 		if (!binding) return false;
-		if (
-			provider.authentication?.fields
-				.filter((field) => field.required)
-				.some((field) => !this.#environmentValue(field.env)?.trim())
-		)
+		if (!providerConfigurationReady(provider.authentication, (name) => Boolean(this.#environmentValue(name)?.trim())))
 			return false;
 		const definition = this.#definitions.get(capabilityId);
 		if (provider.connectionRequired && definition?.effect !== "read" && !binding.approvalEnforced) return false;

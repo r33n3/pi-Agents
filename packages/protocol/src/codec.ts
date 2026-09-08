@@ -11,6 +11,7 @@ import {
 	type ClientMessage,
 	ClientMessageSchema,
 	PROTOCOL_VERSION,
+	ProtocolSchemaContext,
 	type ServerMessage,
 	ServerMessageSchema,
 } from "./schemas.ts";
@@ -39,14 +40,14 @@ function isProtocolValue(value: unknown, optionalProperty = false, ancestors = n
 }
 
 export function parseClientMessage(value: unknown): ClientMessage {
-	if (!isProtocolValue(value) || !Check(ClientMessageSchema, value)) {
+	if (!isProtocolValue(value) || !Check(ProtocolSchemaContext, ClientMessageSchema, value)) {
 		throw new ProtocolValidationError("Invalid client protocol message");
 	}
 	return value;
 }
 
 export function parseServerMessage(value: unknown): ServerMessage {
-	if (!isProtocolValue(value) || !Check(ServerMessageSchema, value)) {
+	if (!isProtocolValue(value) || !Check(ProtocolSchemaContext, ServerMessageSchema, value)) {
 		throw new ProtocolValidationError("Invalid server protocol message");
 	}
 	return value;

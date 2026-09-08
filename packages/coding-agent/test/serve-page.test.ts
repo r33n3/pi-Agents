@@ -351,9 +351,11 @@ describe("createServePage", () => {
 		expect(page.headers.get("content-security-policy")).toContain("img-src 'self' data: blob:");
 		const html = await page.text();
 		expect(html).toContain('id="sessions"');
-		expect(html).toContain('id="connection-form"');
+		expect(html).toContain('id="connection-list"');
+		expect(html).not.toContain('id="connection-form"');
 		expect(html).toContain('class="rail-heading"');
-		expect(html).toContain('aria-label="Connect another Pi session"');
+		expect(html).toContain('aria-label="Open workspaces"');
+		expect(html).not.toContain('aria-label="Connect another Pi session"');
 		expect(html).toContain('id="open-settings"');
 		expect(html).toContain('title="Settings" aria-label="Open Settings"');
 		expect(html).toContain('id="settings-workspace"');

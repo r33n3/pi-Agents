@@ -22,3 +22,11 @@ test("leaves other tabular schemas and unstructured team prose outside this reci
 	expect(inventoryFacts("name,value\na,4")).toBeUndefined();
 	expect(() => verifyInventoryOutput("An unstructured answer", undefined)).not.toThrow();
 });
+
+test("explicit inventory validation cannot pass an unchecked prose claim", () => {
+	const facts = inventoryFacts("item,quantity,unit_price\nbox,2,5.00");
+	expect(() => verifyInventoryOutput('{"outcome":"reply","message":"Total is 999"}', facts)).toThrow(
+		"verification failed",
+	);
+	expect(() => verifyInventoryOutput("Total is 999", facts)).toThrow("verification failed");
+});

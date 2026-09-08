@@ -122,6 +122,13 @@ export class AgentRoutineScheduler implements AsyncDisposable {
 
 	async #run(state: AgentRoutineState, now: number): Promise<void> {
 		try {
+			try {
+				await this.#registry.validate(state);
+			} catch (error) {
+				state.availabilityError = error instanceof Error ? error.message : String(error);
+				state.nextRunAt = undefined;
+				throw error;
+			}
 			const execution = await this.#dispatcher.start(state);
 			state.lastRunAt = now;
 			state.lastRunId = execution.runId;

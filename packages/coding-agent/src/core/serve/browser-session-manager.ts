@@ -68,7 +68,7 @@ export interface BrowserDriverContext {
 	pointerClick(x: number, y: number): Promise<void>;
 	typeText(text: string): Promise<void>;
 	scroll(deltaX: number, deltaY: number): Promise<void>;
-	snapshot(): Promise<{ url: string; title: string; elements: BrowserPageElement[] }>;
+	snapshot(): Promise<{ url: string; title: string; text?: string; elements: BrowserPageElement[] }>;
 	elementAt(x: number, y: number): Promise<BrowserPageElement | undefined>;
 	focusedElement(): Promise<BrowserPageElement | undefined>;
 	click(elementIndex: number): Promise<void>;
@@ -114,6 +114,7 @@ export interface BrowserDownload {
 }
 
 export interface BrowserSemanticSnapshot {
+	text?: string;
 	revision: number;
 	url: string;
 	title: string;
@@ -515,6 +516,7 @@ export class BrowserSessionManager implements AsyncDisposable {
 				revision,
 				url: page.url,
 				title: page.title,
+				...(page.text !== undefined ? { text: page.text.slice(0, 24000) } : {}),
 				elements: page.elements.slice(0, 200).map((element, index) => ({ ...element, ref: `e${index + 1}` })),
 			};
 			this.#snapshots.set(id, snapshot);

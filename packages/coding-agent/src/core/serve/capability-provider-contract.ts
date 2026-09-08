@@ -75,6 +75,7 @@ export const ProviderAuthenticationManifestSchema = Type.Object(
 	{
 		kind: Type.Union([Type.Literal("environment"), Type.Literal("oauth2"), Type.Literal("plaid-link")]),
 		fields: Type.Array(ProviderConfigurationFieldSchema),
+		requiredAnyOf: Type.Optional(Type.Array(EnvironmentNameSchema, { minItems: 1, uniqueItems: true })),
 		capabilityGroups: Type.Optional(Type.Array(ProviderCapabilityGroupSchema)),
 		defaultCapabilityIds: Type.Optional(Type.Array(IdentifierSchema)),
 	},
@@ -132,6 +133,18 @@ export type CapabilityProviderBinding = Omit<Static<typeof CapabilityProviderBin
 export type ProviderConfigurationField = Static<typeof ProviderConfigurationFieldSchema>;
 export type ProviderCapabilityGroup = Static<typeof ProviderCapabilityGroupSchema>;
 export type ProviderAuthenticationManifest = Static<typeof ProviderAuthenticationManifestSchema>;
+
+/** Supports services configured with either a hosted credential or a private endpoint. */
+export function providerConfigurationReady(
+	manifest: ProviderAuthenticationManifest | undefined,
+	configured: (name: string) => boolean,
+): boolean {
+	return (
+		!manifest ||
+		(manifest.fields.filter((field) => field.required).every((field) => configured(field.env)) &&
+			(!manifest.requiredAnyOf || manifest.requiredAnyOf.some(configured)))
+	);
+}
 export type CapabilityProviderManifest = Omit<Static<typeof CapabilityProviderManifestSchema>, "bindings"> & {
 	bindings: CapabilityProviderBinding[];
 };

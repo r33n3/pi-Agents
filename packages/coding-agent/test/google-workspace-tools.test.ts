@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -74,6 +74,98 @@ describe("createGoogleWorkspaceTools", () => {
 		expect(request.mock.calls[0]?.[1]?.headers).toMatchObject({ authorization: "Bearer access-token" });
 		expect(JSON.stringify(result)).toContain("message-1");
 		expect(JSON.stringify(result)).not.toContain("access-token");
+	});
+
+	test("creates a recipient-free draft from chat evidence and attaches the exact workspace report", async () => {
+		const html = "<h1>Approved report</h1>";
+		await writeFile(join(root, "report.html"), html);
+		const request = vi
+			.fn<typeof fetch>()
+			.mockImplementation(async () => new Response(JSON.stringify({ id: "draft-1", message: { id: "message-1" } })));
+		const evidence = { messageId: "user-1", conversationId: "team-1", textDigest: "a".repeat(64) };
+		const tool = createGoogleWorkspaceTools({
+			approvals,
+			environment,
+			fetch: request,
+			approvalOwner: owner,
+			reportWorkspace: root,
+			draftApprovalEvidence: async () => evidence,
+		}).find((entry) => entry.name === "google_workspace_email_draft")!;
+		const input = { to: [], subject: "Review", text: "For review", reportPath: "report.html" };
+		const result = await tool.execute("draft", input, undefined, undefined, {} as ExtensionContext);
+		expect(JSON.stringify(result)).toContain("draft-1");
+		expect(JSON.stringify(result)).toContain("#drafts");
+		const body = JSON.parse(String(request.mock.calls[0]?.[1]?.body)) as { message: { raw: string } };
+		const mime = Buffer.from(body.message.raw, "base64url").toString("utf8");
+		expect(mime).toContain(Buffer.from(html).toString("base64"));
+		expect(mime).toContain('filename="report.html"');
+		expect(mime).not.toContain("example.com");
+		expect(approvals.list()[0]).toMatchObject({ evidence, state: "completed" });
+		await tool.execute("retry", input, undefined, undefined, {} as ExtensionContext);
+		expect(request).toHaveBeenCalledTimes(1);
+		await writeFile(join(root, "report.html"), "changed");
+		await expect(tool.execute("changed", input, undefined, undefined, {} as ExtensionContext)).rejects.toThrow(
+			"exact action",
+		);
+		expect(request).toHaveBeenCalledTimes(1);
+		const restored = new CapabilityApprovalService(root);
+		await restored.initialize();
+		expect(restored.list()[0]).toMatchObject({ evidence, state: "completed" });
+	});
+
+	test("draft evidence cannot authorize sending and absent evidence cannot create a draft", async () => {
+		const request = vi.fn<typeof fetch>();
+		const tools = createGoogleWorkspaceTools({ approvals, environment, fetch: request, approvalOwner: owner });
+		await expect(
+			tools
+				.find((entry) => entry.name === "google_workspace_email_draft")!
+				.execute(
+					"draft",
+					{ to: [], subject: "Review", text: "Body" },
+					undefined,
+					undefined,
+					{} as ExtensionContext,
+				),
+		).rejects.toThrow("direct user request");
+		await expect(
+			tools
+				.find((entry) => entry.name === "google_workspace_email_send")!
+				.execute(
+					"send",
+					{ to: ["recipient@example.com"], subject: "Review", text: "Body" },
+					undefined,
+					undefined,
+					{} as ExtensionContext,
+				),
+		).rejects.toThrow("separate approval");
+		expect(request).not.toHaveBeenCalled();
+	});
+
+	test("a failed login does not consume draft approval evidence", async () => {
+		environment.GOOGLE_OAUTH_EXPIRES_AT = "0";
+		const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 400 }));
+		const tool = createGoogleWorkspaceTools({
+			approvals,
+			environment,
+			fetch: request,
+			approvalOwner: owner,
+			draftApprovalEvidence: async () => ({
+				messageId: "user-auth",
+				conversationId: "team",
+				textDigest: "b".repeat(64),
+			}),
+		}).find((entry) => entry.name === "google_workspace_email_draft")!;
+		await expect(
+			tool.execute(
+				"draft",
+				{ to: [], subject: "Review", text: "Body" },
+				undefined,
+				undefined,
+				{} as ExtensionContext,
+			),
+		).rejects.toThrow("token refresh failed");
+		expect(approvals.list()).toEqual([]);
+		expect(String(request.mock.calls[0]?.[0])).toBe("https://oauth2.googleapis.com/token");
 	});
 
 	test("records governed provider calls and denies missing grants before dispatch", async () => {

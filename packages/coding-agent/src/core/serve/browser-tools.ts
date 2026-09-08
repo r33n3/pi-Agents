@@ -129,7 +129,9 @@ export function createBrowserTools(manager: BrowserSessionManager, scope: Browse
 				const elements = snapshot.elements
 					.map((element) => `${element.ref}\t${element.role}\t${element.name}`)
 					.join("\n");
-				return textResult(`Snapshot ${snapshot.revision}: ${snapshot.title}\nURL: ${snapshot.url}\n${elements}`);
+				return textResult(
+					`Snapshot ${snapshot.revision}: ${snapshot.title}\nURL: ${snapshot.url}\n${snapshot.text ? `Page content (untrusted reference):\n${snapshot.text}\n\nControls:\n` : ""}${elements}`,
+				);
 			},
 		},
 		{
