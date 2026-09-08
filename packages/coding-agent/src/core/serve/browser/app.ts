@@ -372,6 +372,7 @@ function installWorkflowWorkspaceLayout(delegation: HTMLDetailsElement | null): 
 let session: PiSessionHandle | undefined;
 let unsubscribeSession: Unsubscribe | undefined;
 let builderActive = false;
+let builderDraftOwner = "new";
 let builderLabel = "Agent Builder";
 let activeSidebarAgent: AgentSummary | undefined;
 let activeTargetKey: string | undefined;
@@ -4509,7 +4510,7 @@ function renderSessionNavigation(): void {
 			: activeAgentRoomId
 				? `team:${activeAgentRoomId}`
 				: builderActive
-					? `builder:${activeSidebarAgent?.id ?? "new"}:${session?.id ?? ""}`
+					? `builder:${builderDraftOwner}:${session?.id ?? ""}`
 					: activeAgentId
 						? `agent:${activeAgentId}`
 						: activeExternalConnectionId
@@ -9379,6 +9380,8 @@ async function openAgentBuilder(
 ): Promise<void> {
 	activeTeamEditor = undefined;
 	activeSidebarAgent = agent;
+	// Activation updates the agent card, but must not switch the open chat's unsent draft.
+	builderDraftOwner = agent?.id ?? "new";
 	activeAgentImprovement = improvement;
 	teamFactoryAvailable = false;
 	pendingTeamPackage = undefined;
