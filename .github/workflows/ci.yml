@@ -31,6 +31,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          # Tests install Playwright Chromium; the runner's unused Chrome mirror can have stale indexes.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
           sudo apt-get update
           sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
           sudo ln -s $(which fdfind) /usr/local/bin/fd
