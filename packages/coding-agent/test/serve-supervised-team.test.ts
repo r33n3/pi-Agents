@@ -67,7 +67,7 @@ test("creates a sidebar team, recruits a member, and continues in the same team"
 	const browser = await chromium.launch({ headless: true });
 	try {
 		const started = await host.start();
-		const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+		const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, hasTouch: true });
 		await page.goto(started.url);
 		await page.getByRole("button", { name: "Create a team", exact: true }).first().click();
 		await page.getByRole("button", { name: "Build a team in chat", exact: true }).click();
@@ -177,12 +177,16 @@ test("creates a sidebar team, recruits a member, and continues in the same team"
 		await expect.poll(() => names.length, { timeout: 20_000 }).toBe(10);
 		await expect.poll(() => page.locator("#composer-action").getAttribute("aria-label")).toBe("Stop team");
 		expect(await page.locator("#transcript").getByRole("button", { name: "Stop team", exact: true }).count()).toBe(0);
-		await page.getByRole("button", { name: "Stop team", exact: true }).click();
+		await page.setViewportSize({ width: 393, height: 851 });
+		await composer.fill("Keep my unsent draft");
+		await page.getByRole("button", { name: "Stop team", exact: true }).tap();
 		await expect.poll(() => stopped).toBeGreaterThan(0);
 		await expect
 			.poll(() => page.locator("#transcript").innerText(), { timeout: 20_000 })
 			.toContain("Room run was cancelled");
 		await expect.poll(() => page.getByRole("button", { name: "Send to team", exact: true }).isEnabled()).toBe(true);
+		expect(await composer.inputValue()).toBe("Keep my unsent draft");
+		await page.setViewportSize({ width: 1440, height: 1000 });
 		await page.reload();
 		await page.getByRole("button", { name: "Collapse Source review", exact: true }).waitFor();
 		await page.getByRole("button", { name: "Collapse Source review", exact: true }).click();

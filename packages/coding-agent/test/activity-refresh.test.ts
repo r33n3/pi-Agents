@@ -15,6 +15,7 @@ test("activity transfer stays small while complete evidence remains intact", () 
 		createdAt: 1,
 		attemptIds: ["attempt"],
 		artifactIds: ["artifact"],
+		usage: { inputTokens: 1200, outputTokens: 100, totalTokens: 1300, costUsd: 0.01 },
 		contract: {
 			goal: "goal",
 			actor: { kind: "user", id: "user" },
@@ -31,6 +32,7 @@ test("activity transfer stays small while complete evidence remains intact", () 
 	expect(JSON.stringify(summary).length).toBeLessThan(1000);
 	expect(summary).not.toHaveProperty("contract");
 	expect(summary).not.toHaveProperty("result");
+	expect(summary.usage).toEqual(task.usage);
 	expect(summary).toMatchObject({ id: "task", status: "completed", artifactIds: ["artifact"], summary: true });
 	expect(task.result).toHaveLength(800_000);
 	expect(task.prompt).toHaveLength(700_000);

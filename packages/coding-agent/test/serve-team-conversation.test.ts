@@ -201,7 +201,9 @@ test.each(["builder", "main chat", "reload"])(
 				expect(await page.locator("#model").isDisabled()).toBe(true);
 				expect(await page.locator("#prompt").inputValue()).toBe("Review inventory.csv");
 				expect(await page.locator("#prompt").getAttribute("aria-label")).toBe("Message Inventory team");
-				expect(await page.locator("#status").innerText()).toContain("your team supervisor");
+				expect(await page.locator("#status").innerText()).toBe("");
+				expect(await page.locator("#session-stats .session-stat-input").count()).toBe(1);
+				expect(await page.locator("#session-stats .session-stat-output").count()).toBe(1);
 				await page.locator("#prompt").focus();
 			}
 			await page.keyboard.press("Enter");

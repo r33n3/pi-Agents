@@ -28,7 +28,12 @@ import {
 } from "./model-settings.ts";
 import { openModelSettings } from "./model-settings-dialog.ts";
 import { filterPresentedModels } from "./model-visibility.ts";
-import { roomComposerPresentation, roomNeedsUserNotice, roomRunPresentation } from "./room-presentation.ts";
+import {
+	roomComposerPresentation,
+	roomNeedsUserNotice,
+	roomRunPresentation,
+	roomRunTokenUsage,
+} from "./room-presentation.ts";
 import { renderTeamMemberCard } from "./team-member-card.ts";
 import { renderCollapsibleTeam } from "./team-navigation.ts";
 import { teamScheduleControls } from "./team-schedules.ts";
@@ -679,6 +684,8 @@ interface PersonaSummary {
 }
 
 interface AgentTaskSummary {
+	roomRunId?: string;
+	usage?: { inputTokens: number; outputTokens: number; totalTokens: number; costUsd: number };
 	summary?: boolean;
 	id: string;
 	conversationId: string;
@@ -872,6 +879,7 @@ interface AgentRoomSummary {
 let teamToolOptions: Array<{ id: string; name: string; description: string }> = [];
 
 interface AgentRoomRunSummary {
+	taskIds?: string[];
 	parentRunId?: string;
 	currentChildRunId?: string;
 	childResults?: Array<{ roomId: string; runId: string; result: string }>;
@@ -9887,6 +9895,7 @@ async function loadAgentTasks(agent: AgentSummary): Promise<AgentTaskSummary[]> 
 }
 
 const activityRefresh = new ActivityRefresh(refreshAgentActivity);
+let teamActivityTasks: AgentTaskSummary[] = [];
 
 function loadAgentActivity(): Promise<void> {
 	return activityRefresh.refresh();
@@ -9913,6 +9922,7 @@ async function refreshAgentActivity(): Promise<void> {
 	const payload: unknown = await taskResponse.json();
 	if (!isAgentTaskList(payload)) throw new Error("Agent task service returned an invalid response");
 	const attentionPayload: unknown = await attentionResponse.json();
+	teamActivityTasks = payload.tasks;
 	const artifactPayload: unknown = await artifactResponse.json();
 	const roomPayload: unknown = await roomResponse.json();
 	const conversationBuildPayload: unknown = await conversationBuildResponse.json();
@@ -10336,11 +10346,20 @@ function renderAgentRoomConversation(): void {
 	thinking.disabled = true;
 	thinkingPicker.refresh();
 	if (agent) setSessionPath(agent.projectRoot, false);
-	sessionStats.textContent = `${room.name} · ${phase.textContent}`;
-	sessionStats.title = "Team conversation";
-	setStatus(
-		supervisor ? `Messages go to ${supervisor.name ?? supervisor.agentId}, your team supervisor` : room.purpose,
-	);
+	const usage = roomRunTokenUsage(current?.id, agentRoomRuns, teamActivityTasks);
+	sessionStats.replaceChildren();
+	for (const [symbol, count, direction] of [
+		["↑", usage.input, "input"],
+		["↓", usage.output, "output"],
+	] as const) {
+		const stat = document.createElement("span");
+		stat.className = `session-stat session-stat-${direction}`;
+		stat.textContent = `${symbol} ${usage.reported ? formatTokens(count) : "—"}`;
+		stat.title = `Reported ${direction} tokens for this team request, including child teams. Updates when member usage is received.`;
+		sessionStats.append(stat);
+	}
+	sessionStats.title = "Latest team request token usage";
+	setStatus("");
 }
 
 async function submitAgentRoomComposer(roomId: string, stopRunning: boolean): Promise<void> {

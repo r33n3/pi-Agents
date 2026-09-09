@@ -16,6 +16,8 @@ export function taskActivitySummary(task: AgentTask) {
 		lastActivityAt: task.lastActivityAt,
 		attemptIds: task.attemptIds,
 		artifactIds: task.artifactIds,
+		roomRunId: task.contract.room?.runId,
+		usage: task.usage,
 		error: task.error?.slice(0, 240),
 	};
 }
