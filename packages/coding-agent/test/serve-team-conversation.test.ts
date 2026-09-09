@@ -204,6 +204,16 @@ test.each(["builder", "main chat", "reload"])(
 				expect(await page.locator("#status").innerText()).toBe("");
 				expect(await page.locator("#session-stats .session-stat-input").count()).toBe(1);
 				expect(await page.locator("#session-stats .session-stat-output").count()).toBe(1);
+				expect(
+					await page
+						.locator("#session-stats .session-stat-input .session-stat-symbol")
+						.evaluate((node) => node.ownerDocument.defaultView!.getComputedStyle(node).color),
+				).toBe("rgb(239, 107, 107)");
+				expect(
+					await page
+						.locator("#session-stats .session-stat-output .session-stat-symbol")
+						.evaluate((node) => node.ownerDocument.defaultView!.getComputedStyle(node).color),
+				).toBe("rgb(67, 197, 138)");
 				await page.locator("#prompt").focus();
 			}
 			await page.keyboard.press("Enter");

@@ -10354,7 +10354,10 @@ function renderAgentRoomConversation(): void {
 	] as const) {
 		const stat = document.createElement("span");
 		stat.className = `session-stat session-stat-${direction}`;
-		stat.textContent = `${symbol} ${usage.reported ? formatTokens(count) : "—"}`;
+		const prefix = document.createElement("span");
+		prefix.className = "session-stat-symbol";
+		prefix.textContent = symbol;
+		stat.append(prefix, document.createTextNode(usage.reported ? formatTokens(count) : "—"));
 		stat.title = `Reported ${direction} tokens for this team request, including child teams. Updates when member usage is received.`;
 		sessionStats.append(stat);
 	}
