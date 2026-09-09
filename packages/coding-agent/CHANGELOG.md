@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added catalog-neutral package review and download for saved agents and teams, with explicit personal-data exclusions and destination-admission limitations; remote catalog publication is not yet connected.
 - Added saved team member cards sharing role, description, instructions and tool assignments with supervisor delegation; kept peer instructions and private memory scoped.
 - Added monthly and yearly team schedule presets with calendar date selection and explicit saved-time-zone guidance.
 - Added reviewed team schedules in the main conversation, with paused testing, configuration checks, retained team memory, and draft-only Gmail authorization.
@@ -55,6 +56,7 @@
 
 ### Fixed
 
+- Ignored empty optional team settings updates so otherwise valid supervisor delegation continues without changing saved settings.
 - Kept a themed stop control beside team chat input, improved turn spacing, and recognized direct Gmail draft requests containing common phrasing and typos.
 - Preserved SearXNG engine failures, distinguished blocked searches from empty results, and shared queued, paced, cached searches across agent callers.
 - Paused team assignments with actionable setup guidance when configured tools become unavailable, while allowing healthy members to continue.

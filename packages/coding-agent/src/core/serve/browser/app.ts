@@ -28,7 +28,12 @@ import {
 } from "./model-settings.ts";
 import { openModelSettings } from "./model-settings-dialog.ts";
 import { filterPresentedModels } from "./model-visibility.ts";
-import { roomRunPresentation } from "./room-presentation.ts";
+import {
+	roomComposerPresentation,
+	roomNeedsUserNotice,
+	roomRunPresentation,
+	roomRunTokenUsage,
+} from "./room-presentation.ts";
 import { renderTeamMemberCard } from "./team-member-card.ts";
 import { renderCollapsibleTeam } from "./team-navigation.ts";
 import { teamScheduleControls } from "./team-schedules.ts";
@@ -406,6 +411,7 @@ const openAgentRoomIds: string[] = [];
 let activeTeamEditor: HTMLElement | undefined;
 const pendingAgentSubmissions = new Set<string>();
 const pendingAgentRoomSubmissions = new Set<string>();
+const pendingAgentRoomCancellations = new Set<string>();
 let artifacts: ArtifactSummary[] = [];
 let activeArtifactObjectUrl: string | undefined;
 let activePreviewSessionId: string | undefined;
@@ -678,6 +684,8 @@ interface PersonaSummary {
 }
 
 interface AgentTaskSummary {
+	roomRunId?: string;
+	usage?: { inputTokens: number; outputTokens: number; totalTokens: number; costUsd: number };
 	summary?: boolean;
 	id: string;
 	conversationId: string;
@@ -871,6 +879,7 @@ interface AgentRoomSummary {
 let teamToolOptions: Array<{ id: string; name: string; description: string }> = [];
 
 interface AgentRoomRunSummary {
+	taskIds?: string[];
 	parentRunId?: string;
 	currentChildRunId?: string;
 	childResults?: Array<{ roomId: string; runId: string; result: string }>;
@@ -9886,6 +9895,7 @@ async function loadAgentTasks(agent: AgentSummary): Promise<AgentTaskSummary[]> 
 }
 
 const activityRefresh = new ActivityRefresh(refreshAgentActivity);
+let teamActivityTasks: AgentTaskSummary[] = [];
 
 function loadAgentActivity(): Promise<void> {
 	return activityRefresh.refresh();
@@ -9912,6 +9922,7 @@ async function refreshAgentActivity(): Promise<void> {
 	const payload: unknown = await taskResponse.json();
 	if (!isAgentTaskList(payload)) throw new Error("Agent task service returned an invalid response");
 	const attentionPayload: unknown = await attentionResponse.json();
+	teamActivityTasks = payload.tasks;
 	const artifactPayload: unknown = await artifactResponse.json();
 	const roomPayload: unknown = await roomResponse.json();
 	const conversationBuildPayload: unknown = await conversationBuildResponse.json();
@@ -10106,13 +10117,15 @@ function renderAgentRoomConversation(): void {
 	const running = current?.status === "running";
 	const needsUser = current?.status === "needs-user";
 	const submitting = pendingAgentRoomSubmissions.has(room.id);
+	const stopping = current ? pendingAgentRoomCancellations.has(current.id) : false;
+	const composer = roomComposerPresentation(current?.status, stopping);
 	const supervisor = room.members.find((member) => member.agentId === room.supervisorAgentId);
 	const previousWorkflowRuns =
 		[...agentTeamStates.values()].find((state) => state.team?.roomId === room.id)?.team?.runs ?? [];
 	const childRuns = agentRoomRuns.filter(
 		(run) => run.parentRunId && runs.some((parent) => parent.id === run.parentRunId),
 	);
-	const signature = JSON.stringify([room, runs, childRuns, submitting, previousWorkflowRuns]);
+	const signature = JSON.stringify([room, runs, childRuns, submitting, stopping, previousWorkflowRuns]);
 	if (renderedAgentRoomSignature !== signature) {
 		const expanded = new Set(
 			[...transcript.querySelectorAll<HTMLDetailsElement>("details[data-team-detail][open]")].map(
@@ -10123,7 +10136,10 @@ function renderAgentRoomConversation(): void {
 		const previousScrollTop = transcript.scrollTop;
 		const firstRender = !renderedAgentRoomSignature;
 		renderedAgentRoomSignature = signature;
-		const heading = document.createElement("header");
+		const previousHeading = transcript.querySelector<HTMLElement>(":scope > header[data-room-id]");
+		const heading = previousHeading?.dataset.roomId === room.id ? previousHeading : document.createElement("header");
+		heading.dataset.roomId = room.id;
+		heading.replaceChildren();
 		heading.className = "subagent-inspector-heading";
 		appendText(heading, room.name, "message-label");
 		appendText(
@@ -10210,6 +10226,8 @@ function renderAgentRoomConversation(): void {
 			items.push(request);
 			for (const round of run.rounds) {
 				for (const turn of round.turns) {
+					// The retained question is rendered once below with the active waiting state.
+					if (run === current && needsUser && turn.status === "needs-user") continue;
 					const message = document.createElement("article");
 					message.className = "message assistant";
 					const member = room.members.find((entry) => entry.agentId === turn.agentId);
@@ -10278,35 +10296,36 @@ function renderAgentRoomConversation(): void {
 		}
 		if (running || needsUser || submitting) {
 			const activity = document.createElement("article");
-			activity.className = "message assistant agent-running";
-			appendText(
-				activity,
-				needsUser
-					? (current.userQuestion ?? "The team needs your input.")
-					: submitting
+			activity.className = needsUser ? "message assistant team-needs-user" : "message assistant agent-running";
+			if (needsUser) {
+				activity.setAttribute("role", "status");
+				appendText(activity, "Needs your input", "message-label");
+				appendAgentMarkdown(activity, roomNeedsUserNotice(current.userQuestion, room.members));
+				appendText(
+					activity,
+					"Reply below to continue this request, or tell the supervisor what to change.",
+					"muted",
+				);
+			} else
+				appendText(
+					activity,
+					submitting
 						? "Sending to team…"
 						: `Working: ${(current?.pendingAgentIds ?? []).map((id) => room.members.find((member) => member.agentId === id)?.name ?? id).join(", ") || room.name}`,
-				"muted",
-			);
-			if (needsUser || running) {
-				const stop = document.createElement("button");
-				stop.type = "button";
-				stop.textContent = "Stop team";
-				stop.addEventListener("click", () => {
-					stop.disabled = true;
-					void roomRunAction(current.id, "cancel", {}).catch((error: unknown) => {
-						stop.disabled = false;
-						setStatus(error instanceof Error ? error.message : String(error), true);
-					});
-				});
-				activity.append(stop);
-			}
+					"muted",
+				);
 			items.push(activity);
 		}
 		transcript.replaceChildren(...items);
 		transcript.scrollTop = firstRender || nearBottom ? transcript.scrollHeight : previousScrollTop;
 	}
-	phase.textContent = submitting ? "sending" : current ? roomRunPresentation(current.status).label : "idle";
+	phase.textContent = stopping
+		? "stopping"
+		: submitting
+			? "sending"
+			: current
+				? roomRunPresentation(current.status).label
+				: "idle";
 	input.disabled = submitting;
 	input.placeholder = needsUser
 		? "Answer the team's question…"
@@ -10314,9 +10333,9 @@ function renderAgentRoomConversation(): void {
 			? "Add context or change direction…"
 			: `Message ${room.name}…`;
 	input.setAttribute("aria-label", `Message ${room.name}`);
-	send.disabled = submitting;
-	send.classList.remove("is-stopping");
-	send.setAttribute("aria-label", needsUser ? "Continue team" : "Send to team");
+	send.disabled = submitting || composer.disabled;
+	send.classList.toggle("is-stopping", composer.isStopping);
+	send.setAttribute("aria-label", composer.label);
 	model.disabled = true;
 	thinking.disabled = true;
 	attachmentButton.disabled = true;
@@ -10330,15 +10349,43 @@ function renderAgentRoomConversation(): void {
 	thinking.disabled = true;
 	thinkingPicker.refresh();
 	if (agent) setSessionPath(agent.projectRoot, false);
-	sessionStats.textContent = `${room.name} · ${phase.textContent}`;
-	sessionStats.title = "Team conversation";
-	setStatus(
-		supervisor ? `Messages go to ${supervisor.name ?? supervisor.agentId}, your team supervisor` : room.purpose,
-	);
+	const usage = roomRunTokenUsage(current?.id, agentRoomRuns, teamActivityTasks);
+	sessionStats.replaceChildren();
+	for (const [symbol, count, direction] of [
+		["↑", usage.input, "input"],
+		["↓", usage.output, "output"],
+	] as const) {
+		const stat = document.createElement("span");
+		stat.className = `session-stat session-stat-${direction}`;
+		const prefix = document.createElement("span");
+		prefix.className = "session-stat-symbol";
+		prefix.textContent = symbol;
+		stat.append(prefix, document.createTextNode(usage.reported ? formatTokens(count) : "—"));
+		stat.title = `Reported ${direction} tokens for this team request, including child teams. Updates when member usage is received.`;
+		sessionStats.append(stat);
+	}
+	sessionStats.title = "Latest team request token usage";
+	setStatus("");
 }
 
-async function submitAgentRoomComposer(roomId: string): Promise<void> {
+async function submitAgentRoomComposer(roomId: string, stopRunning: boolean): Promise<void> {
 	if (pendingAgentRoomSubmissions.has(roomId)) return;
+	const current = agentRoomRuns
+		.filter((run) => run.roomId === roomId)
+		.sort((left, right) => left.createdAt - right.createdAt)
+		.at(-1);
+	if (stopRunning && current?.status === "running") {
+		if (pendingAgentRoomCancellations.has(current.id)) return;
+		pendingAgentRoomCancellations.add(current.id);
+		renderAgentRoomConversation();
+		try {
+			await roomRunAction(current.id, "cancel", {});
+		} finally {
+			pendingAgentRoomCancellations.delete(current.id);
+			renderAgentRoomConversation();
+		}
+		return;
+	}
 	const prompt = input.value.trim();
 	if (!prompt) return;
 	pendingAgentRoomSubmissions.add(roomId);
@@ -10585,10 +10632,12 @@ function openAgentRoomCreator(existing?: AgentRoomSummary, inspectMemberId?: str
 	limitsHeading.textContent = "Bounds";
 	const maxRounds = numberInput(existing?.limits.maxRounds ?? 12, 1, 32);
 	const maxConcurrency = numberInput(existing?.limits.maxConcurrency ?? 3, 1, 4);
+	const maxTotalTokens = numberInput(existing?.limits.maxTotalTokens ?? 200_000, 1, 500_000);
 	limits.append(
 		limitsHeading,
 		labelledControl("Maximum rounds", maxRounds),
 		labelledControl("Maximum concurrent members", maxConcurrency),
+		labelledControl("Total token budget", maxTotalTokens),
 	);
 	form.append(limits);
 	if (!existing) form.append(labelledControl("Goal", goal));
@@ -10644,7 +10693,14 @@ function openAgentRoomCreator(existing?: AgentRoomSummary, inspectMemberId?: str
 				memoryStrategy: memoryStrategy.value as AgentRoomSummary["memoryStrategy"],
 				sharedNotes: sharedNotes.value.trim() || undefined,
 				memoryResetAt: clearMemory.checked ? Date.now() : existing?.memoryResetAt,
-				limits: { maxRounds: Number(maxRounds.value), maxConcurrency: Number(maxConcurrency.value) },
+				limits: {
+					maxRounds: Number(maxRounds.value),
+					maxMessages: existing?.limits.maxMessages ?? 48,
+					maxConcurrency: Number(maxConcurrency.value),
+					maxDurationMs: existing?.limits.maxDurationMs ?? 10 * 60_000,
+					maxTotalTokens: Number(maxTotalTokens.value),
+					maxCostUsd: existing?.limits.maxCostUsd ?? 20,
+				},
 			},
 			goal.value.trim(),
 		)
@@ -10676,10 +10732,7 @@ function openAgentRoomCreator(existing?: AgentRoomSummary, inspectMemberId?: str
 }
 
 async function createAndStartAgentRoom(
-	definition: Omit<AgentRoomSummary, "id" | "conversationId" | "limits"> & {
-		limits: { maxRounds: number; maxConcurrency: number };
-		id?: string;
-	},
+	definition: Omit<AgentRoomSummary, "id" | "conversationId"> & { id?: string },
 	goal: string,
 ): Promise<AgentRoomSummary> {
 	if (!capabilityToken) throw new Error("Collaboration room access is unavailable");
@@ -12273,7 +12326,7 @@ async function reconnect(entry: ConnectionEntry): Promise<void> {
 
 form.addEventListener("submit", (event) => {
 	event.preventDefault();
-	void submitComposer().catch((error: unknown) =>
+	void submitComposer(event.submitter === send).catch((error: unknown) =>
 		setStatus(error instanceof Error ? error.message : String(error), true),
 	);
 });
@@ -12297,10 +12350,10 @@ sessionPathForm.addEventListener("submit", (event) => {
 	});
 });
 
-async function submitComposer(): Promise<void> {
+async function submitComposer(stopRunning = false): Promise<void> {
 	if (activeTeamEditor) return;
 	if (activeAgentRoomId) {
-		await submitAgentRoomComposer(activeAgentRoomId);
+		await submitAgentRoomComposer(activeAgentRoomId, stopRunning);
 		return;
 	}
 	if (activeSubagentKey || activeExternalRunId || activeArtifactId) return;

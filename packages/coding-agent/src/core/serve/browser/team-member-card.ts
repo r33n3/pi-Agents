@@ -44,5 +44,10 @@ export function renderTeamMemberCard(
 	note.textContent = `Assignment source: ${profile.toolSource}. Configured access; connection health is checked when used. Role descriptions do not grant tools.`;
 	tools.append(heading, list, note);
 	card.append(tools);
+	const publish = document.createElement("button");
+	publish.type = "button";
+	publish.textContent = "Publish to catalog";
+	publish.dataset.catalogAgentId = profile.id;
+	card.append(publish);
 	return card;
 }

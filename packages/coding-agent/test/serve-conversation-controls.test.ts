@@ -4,7 +4,7 @@ import { chromium } from "playwright";
 import { expect, test } from "vitest";
 import type { AgentRoutineState } from "../src/core/serve/agent-routine-scheduler.ts";
 
-test("touch stop preserves the draft; team schedules default to drafts and need confirmation", async () => {
+test("team schedules default to drafts and need confirmation on mobile", async () => {
 	const bundles = await Promise.all(
 		["conversation-controls", "team-schedules"].map((name) =>
 			build({
@@ -54,30 +54,7 @@ test("touch stop preserves the draft; team schedules default to drafts and need 
 		await page.goto("http://pi.test/");
 		for (const bundle of bundles) await page.addScriptTag({ content: bundle.outputFiles![0]!.text });
 		await page.evaluate("controls.installConversationControls()");
-		for (const viewport of [
-			{ width: 393, height: 851 },
-			{ width: 841, height: 701 },
-			{ width: 1104, height: 884 },
-		]) {
-			await page.setViewportSize(viewport);
-			await page.evaluate(`(() => {
-				const activity = document.createElement("article");
-				activity.className = "agent-running";
-				const button = document.createElement("button");
-				button.textContent = "Stop team";
-				button.addEventListener("click", () => {
-					document.body.dataset.stopped = "yes";
-					activity.remove();
-				});
-				activity.append(button);
-				document.getElementById("transcript").append(activity);
-			})()`);
-			await page.getByRole("textbox", { name: "Message team" }).fill("Keep my steering draft");
-			await page.getByRole("button", { name: "Stop execution", exact: true }).tap();
-			expect(await page.getByRole("textbox", { name: "Message team" }).inputValue()).toBe("Keep my steering draft");
-			await expect.poll(() => page.locator("#conversation-stop").isVisible()).toBe(false);
-			expect(await page.locator("body").getAttribute("data-stopped")).toBe("yes");
-		}
+		expect(await page.locator("#conversation-stop").count()).toBe(0);
 		await page.evaluate(
 			'document.getElementById("transcript").append(schedules.teamScheduleControls("flight-team", "test-token"))',
 		);

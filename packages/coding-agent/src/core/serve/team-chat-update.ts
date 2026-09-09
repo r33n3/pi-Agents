@@ -134,7 +134,9 @@ export function parseTeamChatUpdate(value: unknown): TeamChatUpdate | undefined 
 		value.sharedInstructions === undefined &&
 		!Object.keys(value.taskFacts ?? {}).length
 	)
-		throw new Error("Team update has no changes");
+		// Models may include the current revision without requesting a change.
+		// Treat this as an omitted update so an otherwise valid turn can proceed.
+		return undefined;
 	return structuredClone(value);
 }
 

@@ -25,7 +25,13 @@ import {
 	toolEvidenceSchema,
 	toolHandoffsSchema,
 } from "./team-tool-handoff.ts";
-import { parseTeamWorkPlan, planTeamWork, requestsTeamMember, type TeamWorkPlan } from "./team-work-plan.ts";
+import {
+	assertDeclaredPlanConsistency,
+	parseTeamWorkPlan,
+	planTeamWork,
+	requestsTeamMember,
+	type TeamWorkPlan,
+} from "./team-work-plan.ts";
 import {
 	parseJsonResult,
 	type WorkflowDefinitionInput,
@@ -107,6 +113,8 @@ export interface AgentRoomTurn {
 	taskId?: string;
 	status: AgentRoomTurnOutcome;
 	message: string;
+	/** Structured declaration for this contribution; absent only on historical retained turns. */
+	completionStatus?: "complete" | "incomplete";
 	/** Explicit requests for another full-room round; absent on older retained evidence. */
 	requestAgentIds?: string[];
 	requestTeam?: { teamId: string; goal: string };
@@ -139,6 +147,7 @@ export interface AgentRoomRun {
 	childResults?: Array<{ roomId: string; runId: string; result: string; totalTokens: number; costUsd: number }>;
 	workPlan?: TeamWorkPlan;
 	staffingCorrections?: number;
+	completionCorrections?: number;
 	toolSetupCorrections?: number;
 	handoffCorrections?: number;
 	inputBinding?: TaskInputBinding;
@@ -497,7 +506,7 @@ export class AgentRoomService implements AsyncDisposable {
 				? [
 						previous.conversationContext ?? "",
 						`Interrupted request: ${previous.goal}`,
-						roomResult(previous),
+						JSON.stringify(this.#publicRunEvidence(previous)),
 						"The latest user message updates this unfinished request. Retain its goal unless the user replaces it. Prior partial work is evidence, not a completed result; verify anything needed for the updated request.",
 					]
 						.join("\n\n")
@@ -971,23 +980,34 @@ export class AgentRoomService implements AsyncDisposable {
 									toolHandoffs: handoffs,
 									supervisorAgentId: definition.supervisorAgentId,
 									completedAgentIds: run.rounds.flatMap((round) =>
-										round.turns
-											.filter(
-												(turn) =>
-													turn.taskId &&
-													(turn.status === "reply" || turn.status === "pass") &&
-													(!turn.requestAgentIds?.length || Boolean(turn.toolEvidence?.length)),
-											)
-											.map((turn) => turn.agentId),
+										round.turns.filter((turn) => isCompletedContribution(turn)).map((turn) => turn.agentId),
 									),
 									tools: this.#resources.catalog(),
 									goal: run.goal,
+									priorPublicResultIndex:
+										definition.memoryStrategy === "none"
+											? []
+											: this.listRuns(definition.id)
+													.filter((prior) => ["completed", "bounded", "failed"].includes(prior.status))
+													.map((prior) => ({
+														runId: prior.id,
+														status: prior.status,
+														goal: prior.goal.slice(0, 300),
+														resultCount: this.#publicRunEvidence(prior).length,
+													}))
+													.filter((entry) => entry.resultCount > 0),
 									priorRequests:
 										definition.memoryStrategy === "none"
 											? []
 											: this.listRuns(definition.id)
-													.filter((prior) => prior.status === "completed")
-													.map((prior) => ({ goal: prior.goal, result: prior.result })),
+													.filter((prior) => ["completed", "bounded", "failed"].includes(prior.status))
+													.map((prior) => ({
+														runId: prior.id,
+														status: prior.status,
+														goal: prior.goal,
+														result: prior.status === "completed" ? prior.result : undefined,
+														publicEvidence: this.#publicRunEvidence(prior),
+													})),
 									turns: run.rounds.flatMap((round) =>
 										round.turns.map((turn) => ({
 											agentId: turn.agentId,
@@ -1193,6 +1213,19 @@ export class AgentRoomService implements AsyncDisposable {
 							"Review the pending tools and reply Approve tools, or tell the supervisor what to change.";
 						return await this.#persistRun(run);
 					}
+					const supervisorTurn = round.turns.find((turn) => turn.agentId === definition.supervisorAgentId);
+					if (definition.supervisorAgentId && (!supervisorTurn || !isCompletedContribution(supervisorTurn))) {
+						if ((run.completionCorrections ?? 0) < 1) {
+							run.completionCorrections = (run.completionCorrections ?? 0) + 1;
+							run.pendingAgentIds = [definition.supervisorAgentId!];
+							await this.#persistRun(run);
+							continue;
+						}
+						run.status = "needs-user";
+						run.userQuestion =
+							"The supervisor twice declared the requested deliverable incomplete without assigning more work or reporting a blocker. Retained specialist evidence remains available; the run is not marked complete.";
+						return await this.#persistRun(run);
+					}
 					if (
 						run.workPlan !== undefined &&
 						(run.workPlan.contribution !== "direct" || run.workPlan.toolHandoffs?.length) &&
@@ -1227,6 +1260,30 @@ export class AgentRoomService implements AsyncDisposable {
 			run.error = error instanceof Error ? error.message : String(error);
 			await this.#persistRun(run);
 		}
+	}
+
+	#publicRunEvidence(run: AgentRoomRun): Array<{
+		runId: string;
+		runStatus: AgentRoomRunStatus;
+		author: string;
+		taskId: string;
+		sourceMessageId: string;
+		text: string;
+	}> {
+		return run.rounds.flatMap((round) =>
+			round.turns
+				.filter(
+					(turn) => turn.agentId !== run.definitionSnapshot?.supervisorAgentId && isCompletedContribution(turn),
+				)
+				.map((turn) => ({
+					runId: run.id,
+					runStatus: run.status,
+					author: turn.agentId,
+					taskId: turn.taskId!,
+					sourceMessageId: `room:${run.id}:round:${round.number}:member:${turn.memberIndex}`,
+					text: turn.message,
+				})),
+		);
 	}
 
 	async #collectChild(run: AgentRoomRun): Promise<void> {
@@ -1719,7 +1776,7 @@ function teamMemberPrompt(
 		supervisor
 			? `You own staffing and the final answer. Declare the completion plan on your first turn. A request for an independent contribution requires separate-member; work by selected teams requires separate-team with every required team ID. Greetings and configuration questions can be direct. requestAgentIds selects roster members; requestTeam selects a team through its supervisor, which need not be in your roster. Assign one team per turn. Autonomous recruitment is ${definition.allowRecruitment ? "enabled: recruit at most one missing specialist with name, bounded role and allowed toolIds" : "disabled"}. Reuse suitable existing members. Approved team tool IDs: ${JSON.stringify(definition.toolIds ?? [])}; assignTools may only allocate within that allowance. Wait for returned evidence before concluding; do not repeat completed assignments without a concrete defect.`
 			: "Perform your assigned task now; do not request yourself. Request another listed member only for a necessary prerequisite. Otherwise return requestAgentIds: [] and control returns to the supervisor. You cannot recruit or grant tools.",
-		"Use outcome needs-user only for a blocking human decision, credentials or interactive authorization. Waiting for a teammate is an assignment, not a human question. reply reports progress; pass means no further contribution. An empty recipient list with no other action requests completion, which the host checks against the retained plan.",
+		"Use outcome needs-user only for a blocking human decision, credentials or interactive authorization. Waiting for a teammate is an assignment, not a human question. Set completionStatus complete only when your assigned contribution is included in message now; set incomplete for routing, promises, or progress. A completed analysis can request a peer review and still be complete. An empty recipient list with no other action requests completion, which the host checks against the retained plan.",
 		...(supervisor
 			? [
 					"When a member reports a blocker, resolve missing grants through the catalog and team tool update before dispatching that member again. A newly registered tool must be assigned to its consumer; registration alone grants nothing. If the blocker requires credentials, consent or a user decision, preserve that requirement and return needs-user with the exact next step. Never infer approval from a member's request or mark blocked work complete.",
@@ -1885,6 +1942,11 @@ function roomWorkflow(
 											}
 										: {}),
 									outcome: { enum: ["reply", "pass", "needs-user"] },
+									completionStatus: {
+										enum: ["complete", "incomplete"],
+										description:
+											"Complete means this member's assigned contribution is included in message now. Incomplete means message only routes, promises, or reports progress. A complete analyst may still request peer review.",
+									},
 									message: { type: "string", minLength: 1, maxLength: 8192 },
 									requestAgentIds: {
 										type: "array",
@@ -1919,14 +1981,7 @@ function hasSeparateContribution(run: AgentRoomRun, supervisorAgentId: string | 
 		run.workPlan?.memberIds?.some(
 			(agentId) =>
 				!run.rounds.some((round) =>
-					round.turns.some(
-						(turn) =>
-							turn.agentId === agentId &&
-							Boolean(turn.taskId) &&
-							(turn.status === "reply" || turn.status === "pass") &&
-							!turn.recruit &&
-							(!turn.requestAgentIds?.length || Boolean(turn.toolEvidence?.length)),
-					),
+					round.turns.some((turn) => turn.agentId === agentId && isCompletedContribution(turn)),
 				),
 		)
 	)
@@ -1944,14 +1999,7 @@ function hasSeparateContribution(run: AgentRoomRun, supervisorAgentId: string | 
 	return (
 		Boolean(run.childResults?.length) ||
 		run.rounds.some((round) =>
-			round.turns.some(
-				(turn) =>
-					turn.agentId !== supervisorAgentId &&
-					Boolean(turn.taskId) &&
-					(turn.status === "reply" || turn.status === "pass") &&
-					!turn.recruit &&
-					(!turn.requestAgentIds?.length || Boolean(turn.toolEvidence?.length)),
-			),
+			round.turns.some((turn) => turn.agentId !== supervisorAgentId && isCompletedContribution(turn)),
 		)
 	);
 }
@@ -1998,7 +2046,7 @@ function roomPrompt(definition: AgentRoomDefinition, run: AgentRoomRun): string 
 					`Tool setup is pending: ${run.pendingToolUpdate.message ?? JSON.stringify(run.pendingToolUpdate.update.memberTools)}\nPerform independent parts of the current user request with existing tools now. In particular, prepare requested report content or HTML files before email account setup; do not make local preparation conditional on email access. Never call ungranted tools. Once available work is complete, explain what is ready and what still needs setup. Do not repeatedly propose the same pending tools.`,
 				]
 			: []),
-		`Authoritative completed member contributions for current run ${run.id}: ${JSON.stringify(run.rounds.flatMap((round) => round.turns.filter((turn) => turn.agentId !== definition.supervisorAgentId && Boolean(turn.taskId) && (turn.status === "reply" || turn.status === "pass") && !turn.recruit && (!turn.requestAgentIds?.length || Boolean(turn.toolEvidence?.length))).map((turn) => ({ agentId: turn.agentId, taskId: turn.taskId }))))}. These satisfy separate-member participation. Use their recorded results for the next required role or final synthesis; do not repeat completed research because no child team was assigned.`,
+		`Authoritative completed member contributions for current run ${run.id}: ${JSON.stringify(run.rounds.flatMap((round) => round.turns.filter((turn) => turn.agentId !== definition.supervisorAgentId && isCompletedContribution(turn)).map((turn) => ({ agentId: turn.agentId, taskId: turn.taskId }))))}. These satisfy separate-member participation. Use their recorded results for the next required role or final synthesis; do not repeat completed research because no child team was assigned.`,
 		...(definition.teamIds?.length || run.childResults?.length
 			? [
 					`Authoritative completed child teams for current run ${run.id}: ${JSON.stringify(run.childResults?.map((child) => child.roomId) ?? [])}. This tracks separate-team assignments only; it does not track member contributions. Historical answers and your own messages never count as completed child assignments.`,
@@ -2017,6 +2065,13 @@ function roomPrompt(definition: AgentRoomDefinition, run: AgentRoomRun): string 
 		...(run.workPlan
 			? [
 					`Host work plan: ${JSON.stringify(run.workPlan)}. For separate-team, use requestTeam; for separate-member, delegate or recruit. The host rejects completion without a finished contribution in this run.`,
+				]
+			: []),
+		...(run.completionCorrections &&
+		run.pendingAgentIds?.length === 1 &&
+		run.pendingAgentIds[0] === definition.supervisorAgentId
+			? [
+					"Host completion check: your previous final response was marked incomplete or only promised future work. Return the requested deliverable now with completionStatus complete, or report a concrete blocker with outcome needs-user. Do not return another promise or progress update.",
 				]
 			: []),
 		...(run.staffingCorrections &&
@@ -2057,6 +2112,7 @@ function roomTurn(
 		taskId: node.agentTaskId,
 		status: parsed.outcome,
 		message: safeText(parsed.message),
+		completionStatus: parsed.completionStatus,
 		requestAgentIds: parsed.requestAgentIds,
 		plan: parsed.plan,
 		requestTeam: parsed.requestTeam,
@@ -2093,6 +2149,7 @@ function parseOutcome(
 	| {
 			toolEvidence?: ToolEvidence[];
 			outcome: "reply" | "pass" | "needs-user";
+			completionStatus?: "complete" | "incomplete";
 			plan?: AgentRoomTurn["plan"];
 			message: string;
 			requestAgentIds: string[];
@@ -2109,6 +2166,12 @@ function parseOutcome(
 		try {
 			const record = object(candidate, "room outcome");
 			if (record.outcome !== "reply" && record.outcome !== "pass" && record.outcome !== "needs-user") continue;
+			if (
+				record.completionStatus !== undefined &&
+				record.completionStatus !== "complete" &&
+				record.completionStatus !== "incomplete"
+			)
+				continue;
 			if (typeof record.message !== "string" || !record.message.trim()) continue;
 			const requestAgentIds = stringArray(record.requestAgentIds, "room outcome.requestAgentIds");
 			if (
@@ -2124,6 +2187,7 @@ function parseOutcome(
 					: undefined;
 			return {
 				outcome: record.outcome,
+				completionStatus: record.completionStatus as "complete" | "incomplete" | undefined,
 				toolEvidence: parseToolEvidence(record.toolEvidence),
 				plan: parseDeclaredPlan(record.plan),
 				message: record.message.trim(),
@@ -2163,10 +2227,7 @@ function parseDeclaredPlan(value: unknown): AgentRoomTurn["plan"] {
 		goal: "Current request",
 		purpose: "Current team",
 	})!;
-	if (parsed.contribution !== "separate-team" && parsed.teamIds?.length)
-		throw new Error("Only a team assignment plan can name teams");
-	if (parsed.contribution === "direct" && parsed.memberIds?.length)
-		throw new Error("Required specialist contributions need a separate-member or separate-team plan");
+	assertDeclaredPlanConsistency(parsed);
 	return {
 		contribution: parsed.contribution,
 		toolHandoffs: parsed.toolHandoffs,
@@ -2174,6 +2235,16 @@ function parseDeclaredPlan(value: unknown): AgentRoomTurn["plan"] {
 		memberIds: parsed.memberIds,
 		reason: boundedText(parsed.reason, "plan.reason", 512),
 	};
+}
+
+function isCompletedContribution(turn: AgentRoomTurn): boolean {
+	if (!turn.taskId || (turn.status !== "reply" && turn.status !== "pass") || turn.recruit) return false;
+	if (turn.completionStatus !== undefined) return turn.completionStatus === "complete";
+	// Historical turns predate structured completion state. This narrow fallback catches only an
+	// entire, explicitly deferred promise; it is not a semantic completeness check.
+	const deferredPromiseOnly =
+		/^\s*(?:i(?:'ll| will)|we(?:'ll| will))\s+[^\n]{0,160}\b(?:next|soon|shortly|later)\.?\s*$/i.test(turn.message);
+	return (!turn.requestAgentIds?.length || Boolean(turn.toolEvidence?.length)) && !deferredPromiseOnly;
 }
 
 function roomResult(run: AgentRoomRun): string {
@@ -2304,6 +2375,10 @@ function parseRun(value: unknown): AgentRoomRun {
 			record.staffingCorrections === undefined
 				? undefined
 				: boundedInteger(record.staffingCorrections, "staffingCorrections", 0, 1),
+		completionCorrections:
+			record.completionCorrections === undefined
+				? undefined
+				: boundedInteger(record.completionCorrections, "completionCorrections", 0, 1),
 		toolSetupCorrections:
 			record.toolSetupCorrections === undefined
 				? undefined
@@ -2396,6 +2471,10 @@ function parseTurns(value: unknown): AgentRoomTurn[] {
 			taskId: optionalString(record.taskId),
 			status,
 			message: requiredString(record.message, "room turn.message"),
+			completionStatus:
+				record.completionStatus === "complete" || record.completionStatus === "incomplete"
+					? record.completionStatus
+					: undefined,
 			requestTeam: record.requestTeam === undefined ? undefined : parseTeamRequest(record.requestTeam),
 			assignTools: record.assignTools === undefined ? undefined : parseAssignments(record.assignTools),
 			updateTeam: parseTeamChatUpdate(record.updateTeam),
@@ -2457,6 +2536,7 @@ function cloneRun(run: AgentRoomRun): AgentRoomRun {
 		pendingMessages: run.pendingMessages ? [...run.pendingMessages] : undefined,
 		childResults: run.childResults ? structuredClone(run.childResults) : undefined,
 		workPlan: run.workPlan ? structuredClone(run.workPlan) : undefined,
+		completionCorrections: run.completionCorrections,
 		inputBinding: run.inputBinding ? structuredClone(run.inputBinding) : undefined,
 		definitionSnapshot: run.definitionSnapshot ? cloneDefinition(run.definitionSnapshot) : undefined,
 		pendingAgentIds: run.pendingAgentIds ? [...run.pendingAgentIds] : undefined,

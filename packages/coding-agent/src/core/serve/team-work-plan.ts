@@ -13,6 +13,24 @@ export interface TeamWorkPlan {
 	reason: string;
 }
 
+/** Enforces contribution/target invariants shared by model admission and persisted room parsing. */
+export function assertDeclaredPlanConsistency(value: unknown): void {
+	if (typeof value !== "object" || value === null) throw new Error("Invalid declared team work plan");
+	const plan = value as Record<string, unknown>;
+	if (
+		plan.contribution !== "direct" &&
+		plan.contribution !== "separate-member" &&
+		plan.contribution !== "separate-team"
+	)
+		return;
+	const teamIds = Array.isArray(plan.teamIds) ? plan.teamIds : [];
+	const memberIds = Array.isArray(plan.memberIds) ? plan.memberIds : [];
+	if (plan.contribution !== "separate-team" && teamIds.length > 0)
+		throw new Error("Only a separate-team plan can name team IDs");
+	if (plan.contribution === "direct" && memberIds.length > 0)
+		throw new Error("Required specialist contributions need a separate-member or separate-team plan");
+}
+
 export function parseTeamWorkPlan(value: unknown): TeamWorkPlan | undefined {
 	if (value === undefined) return undefined;
 	if (

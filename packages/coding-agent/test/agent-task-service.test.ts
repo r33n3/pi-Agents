@@ -92,6 +92,16 @@ async function setup(deferScheduling = false) {
 }
 
 describe("AgentTaskService", () => {
+	test("shutdown settles active work without scheduling queued work after disposal", async () => {
+		const { executor, tasks } = await setup();
+		const active = await tasks.submit({ agentId: "researcher", prompt: "Active work", source: "chat" });
+		const queued = await tasks.submit({ agentId: "researcher", prompt: "Queued work", source: "chat" });
+		await tasks.dispose();
+		expect(tasks.getTask(active.id)?.status).toBe("cancelled");
+		expect(tasks.getTask(queued.id)?.status).toBe("queued");
+		expect(executor.executions).toHaveLength(1);
+	});
+
 	test("defers queued execution until recovery services are ready", async () => {
 		const { executor, tasks } = await setup(true);
 		const task = await tasks.submit({ agentId: "researcher", prompt: "Wait for recovery", source: "chat" });
