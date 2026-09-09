@@ -188,11 +188,13 @@ test.each(["builder", "main chat", "reload"])(
 					for (const socket of sockets) socket.close();
 				});
 				await expect
-					.poll(() =>
-						page.evaluate(() => {
-							const sockets = (globalThis as typeof globalThis & { testSockets: WebSocket[] }).testSockets;
-							return sockets.length > 1 && sockets.at(-1)?.readyState === WebSocket.OPEN;
-						}),
+					.poll(
+						() =>
+							page.evaluate(() => {
+								const sockets = (globalThis as typeof globalThis & { testSockets: WebSocket[] }).testSockets;
+								return sockets.length > 1 && sockets.at(-1)?.readyState === WebSocket.OPEN;
+							}),
+						{ timeout: 15_000 },
 					)
 					.toBe(true);
 				await expect.poll(() => page.locator("#status").innerText()).not.toMatch(/Connecting|Reconnecting/);

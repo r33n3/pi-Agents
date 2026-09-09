@@ -10136,7 +10136,10 @@ function renderAgentRoomConversation(): void {
 		const previousScrollTop = transcript.scrollTop;
 		const firstRender = !renderedAgentRoomSignature;
 		renderedAgentRoomSignature = signature;
-		const heading = document.createElement("header");
+		const previousHeading = transcript.querySelector<HTMLElement>(":scope > header[data-room-id]");
+		const heading = previousHeading?.dataset.roomId === room.id ? previousHeading : document.createElement("header");
+		heading.dataset.roomId = room.id;
+		heading.replaceChildren();
 		heading.className = "subagent-inspector-heading";
 		appendText(heading, room.name, "message-label");
 		appendText(
