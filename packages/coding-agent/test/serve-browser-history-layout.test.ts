@@ -86,7 +86,7 @@ test("history reads structured summaries and retains review and retry handlers a
 	try {
 		const page = await browser.newPage();
 		await page.setContent(
-			'<div id="agent-activity-list"></div><button aria-label="Delegate to an external agent"></button><details><summary>Delegation connections</summary><div id="external-connection-list"></div></details><details id="settings-connection-advanced"></details>',
+			'<div id="agent-activity-list"></div><button aria-label="Delegate to an external agent"></button><details><summary>Delegation connections</summary><div id="external-connection-list"></div></details><details id="settings-connection-advanced"><select id="finance-watchlist-connection"></select></details>',
 		);
 		await page.evaluate(
 			`window.renderHistory=()=>{const list=document.getElementById('agent-activity-list');list.innerHTML='<button class="agent-activity-entry" data-status="completed"><span><strong>Flight Finder</strong><small></small></span><time datetime="2026-09-08T12:00:00Z">completed</time></button><div class="attention-entry-wrap"><button class="agent-activity-entry" data-status="failure"><span><strong>Run failed</strong><small>Provider unavailable</small></span><time datetime="2026-09-07T12:00:00Z">failure</time></button><button aria-label="Retry run">Retry</button></div>';const entry=list.firstChild;entry.title=JSON.stringify({outcome:'reply',message:'Prepared Gmail draft for review'});entry.querySelector('small').textContent=entry.title;entry.onclick=()=>document.body.dataset.reviewed='true';list.querySelector('[aria-label="Retry run"]').onclick=()=>document.body.dataset.retried='true';};renderHistory();`,
@@ -95,6 +95,7 @@ test("history reads structured summaries and retains review and retry handlers a
 		await page.evaluate("historyLayout.installHistoryLayout()");
 		expect(await page.getByRole("button", { name: "Delegate to an external agent" }).count()).toBe(0);
 		expect(await page.getByText("Delegation connections").count()).toBe(0);
+		expect(await page.locator("#finance-watchlist-connection").count()).toBe(1);
 		expect(await page.locator(".history-day").count()).toBe(2);
 		expect(await page.locator("small").first().innerText()).toBe("Prepared Gmail draft for review");
 		await page.getByRole("searchbox").fill("Gmail");
