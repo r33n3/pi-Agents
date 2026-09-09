@@ -45,6 +45,21 @@ test("routing and blockers do not require effectful work", async () => {
 	}
 });
 
+test("a supervisor can correct an execution submission to an attributed member summary", async () => {
+	const turn = createTeamTurnTool(schema, [], () => []);
+	const message =
+		"The reporting member rendered reports/example.html; its current-run host receipt records the artifact hash.";
+	await expect(submit(turn, { message, workKind: "execution", evidenceToolCallIds: ["member-call"] })).rejects.toThrow(
+		"submit workKind:analysis",
+	);
+	expect(turn.result()).toBeUndefined();
+	await submit(turn, { message, workKind: "analysis", evidenceToolCallIds: [] });
+	const result = JSON.parse(turn.result() ?? "{}");
+	expect(result.message).toContain(message);
+	expect(result.message).toContain("does not invalidate existing member receipts");
+	expect(result).not.toHaveProperty("toolEvidence");
+});
+
 function submit(turn: ReturnType<typeof createTeamTurnTool>, input: Record<string, unknown>) {
 	return turn.tool.execute("submit", input, undefined, undefined, undefined as never);
 }

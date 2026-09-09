@@ -158,7 +158,7 @@ describe("ServeHost", () => {
 		expect((await fetch(url)).status).toBe(200);
 	});
 
-	test("dispatches Hermes directly with exact arguments and no host inference", async () => {
+	test("does not expose or execute removed delegation connections even when an extension is installed", async () => {
 		const calls: unknown[] = [];
 		const tool: ToolDefinition = {
 			name: "hermes_agent",
@@ -175,6 +175,9 @@ describe("ServeHost", () => {
 		const { url } = await host.start();
 		const endpoint = new URL("/external-runs", url);
 		endpoint.search = new URL(url).search;
+		const catalog = new URL(endpoint);
+		catalog.pathname = "/external-connections.json";
+		expect(await (await fetch(catalog)).json()).toMatchObject({ connections: [] });
 		const response = await fetch(endpoint, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -185,14 +188,8 @@ describe("ServeHost", () => {
 				model: { provider: "custom", id: "qwen3.6:latest" },
 			}),
 		});
-		expect(response.status).toBe(202);
-		const run = (await response.json()) as { id: string };
-		endpoint.pathname = `/external-runs/${run.id}/result`;
-		await expect.poll(async () => (await fetch(endpoint)).status).toBe(200);
-		expect(await (await fetch(endpoint)).text()).toContain("Direct backend result");
-		expect(calls).toEqual([
-			{ goal: "Return this goal unchanged", cwd: harness.tempDir, model: "custom/qwen3.6:latest" },
-		]);
+		expect(response.status).toBe(400);
+		expect(calls).toEqual([]);
 		expect(harness.session.messages).toEqual([]);
 	});
 

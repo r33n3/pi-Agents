@@ -1,11 +1,10 @@
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { InMemoryCredentialStore, type ModelControls, ModelControlsError } from "@earendil-works/pi-ai";
+import { type ModelControls, ModelControlsError } from "@earendil-works/pi-ai";
 import { PiServer } from "@earendil-works/pi-server";
 import type { AgentSession } from "../agent-session.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
-import { ModelRuntime } from "../model-runtime.ts";
 import { DefaultResourceLoader } from "../resource-loader.ts";
 import { createAgentSession } from "../sdk.ts";
 import { SessionManager } from "../session-manager.ts";
@@ -13,7 +12,7 @@ import { A2aAdapter } from "./a2a-adapter.ts";
 import { AgentBuildLifecycleService } from "./agent-build-lifecycle-service.ts";
 import { AgentCollaborationService } from "./agent-collaboration-service.ts";
 import { createAgentCollaborationTools } from "./agent-collaboration-tools.ts";
-import { type AgentExecutionContext, AgentSessionExecutor } from "./agent-executor.ts";
+import type { AgentExecutionContext } from "./agent-executor.ts";
 import { AgentPresentationStore } from "./agent-presentation-store.ts";
 import { type AgentDefinition, AgentRegistry } from "./agent-registry.ts";
 import { createAgentRegistryTools } from "./agent-registry-tools.ts";
@@ -43,22 +42,19 @@ import { CapabilityConnectionRegistry } from "./capability-connection-registry.t
 import { chatDraftApproval } from "./chat-draft-approval.ts";
 import { ChildProcessAgentExecutor } from "./child-process-agent-executor.ts";
 import { ClaudeSubscriptionLogin } from "./claude-subscription-login.ts";
-import { CodexCliExecution, isCodexSubscriptionAvailable } from "./codex-cli-execution.ts";
 import { ConversationBuildCoordinator } from "./conversation-build-coordinator.ts";
 import { createCredentialApiTools } from "./credential-api-tools.ts";
 import { CurrentSessionService } from "./current-session-service.ts";
 import { DataToolRegistry } from "./data-tool-registry.ts";
-import { DirectToolExecution } from "./direct-tool-execution.ts";
 import { EverydayConfigurationRegistry } from "./everyday-configuration-registry.ts";
 import { createEverydayDataTools } from "./everyday-data-tools.ts";
 import { ExecutionAdmission } from "./execution-admission.ts";
-import { type ExternalConnectionDefinition, ExternalConnectionManager } from "./external-connection-manager.ts";
+import { ExternalConnectionManager } from "./external-connection-manager.ts";
 import { createFlightSearchTools } from "./flight-search-tools.ts";
 import { createFlightStatusTools } from "./flight-status-tools.ts";
 import { GoogleWorkspaceOAuth } from "./google-workspace-oauth.ts";
 import { createGoogleWorkspaceTools } from "./google-workspace-tools.ts";
 import { GovernedActionService } from "./governed-action-service.ts";
-import { createHermesConnectionModels } from "./hermes-connection.ts";
 import { InboundRoutingService } from "./inbound-routing-service.ts";
 import { PersonaCatalog, resolvePersonaProject } from "./persona-catalog.ts";
 import { PiAgentBundleInstaller } from "./pi-agent-bundle.ts";
@@ -671,25 +667,6 @@ export class ServeHost implements AsyncDisposable {
 			});
 			return created.session;
 		};
-		const createOpenAiApiExecutionSession = async (context: Parameters<AgentSessionExecutor["start"]>[0]) => {
-			const apiKey = (
-				await providerEnvironment.resolveTrusted("openai-api", ["OPENAI_API_KEY"])
-			).OPENAI_API_KEY?.trim();
-			if (!apiKey) throw new Error("OpenAI API requires OPENAI_API_KEY in project Settings");
-			const apiRuntime = await ModelRuntime.create({
-				credentials: new InMemoryCredentialStore(),
-				modelsPath: join(agentDir, "models.json"),
-				refreshOnCreate: false,
-			});
-			await apiRuntime.setRuntimeApiKey("openai", apiKey);
-			return createConfiguredAgentSession(
-				context.definition,
-				context.workspace,
-				undefined,
-				{ kind: "agent-run", id: context.runId },
-				apiRuntime,
-			);
-		};
 		const executor = new ChildProcessAgentExecutor({
 			agentDir,
 			serveRoot,
@@ -855,178 +832,13 @@ export class ServeHost implements AsyncDisposable {
 			: undefined;
 		const a2aAdapter = new A2aAdapter(agentRegistry, this.#agentTaskService);
 
-		const availableModels = modelRuntime.getAvailableSnapshot().map((model) => ({
-			provider: model.provider,
-			id: model.id,
-			name: model.name,
-		}));
-		const openAiModels = availableModels.filter((model) => model.provider === "openai");
-		const luna = { provider: "openai", id: "gpt-5.6-luna" };
-		if (!openAiModels.some((model) => model.id === luna.id)) {
-			openAiModels.unshift({ ...luna, name: "GPT-5.6 Luna" });
-		}
-		const codexSubscriptionModelIds = new Set([
-			"gpt-5.6-sol",
-			"gpt-5.6-terra",
-			"gpt-5.6-luna",
-			"gpt-5.5",
-			"gpt-5.4",
-			"gpt-5.4-mini",
-			"gpt-5.3-codex-spark",
-		]);
-		const codexSubscriptionModels = openAiModels.filter((model) => codexSubscriptionModelIds.has(model.id));
-		const sonnet = { provider: "anthropic", id: "claude-sonnet-5" };
-		const claudeModels = availableModels.filter((model) => model.provider === "anthropic");
-		if (!claudeModels.some((model) => model.id === sonnet.id)) {
-			claudeModels.unshift({ ...sonnet, name: "Claude Sonnet 5" });
-		}
-		const hermesModels = createHermesConnectionModels({
-			HERMES_DEFAULT_MODEL: providerEnvironment.environmentValue("HERMES_DEFAULT_MODEL"),
-			HERMES_MODELS: providerEnvironment.environmentValue("HERMES_MODELS"),
-			OPENAI_API_KEY: providerEnvironment.environmentValue("OPENAI_API_KEY"),
-			ANTHROPIC_API_KEY: providerEnvironment.environmentValue("ANTHROPIC_API_KEY"),
-		});
 		const claudeSubscriptionLogin = new ClaudeSubscriptionLogin();
 		this.#claudeSubscriptionLogin = claudeSubscriptionLogin;
-		const externalConnections: ExternalConnectionDefinition[] = [
-			{
-				id: "claude-code-subscription",
-				name: "Claude Code — Subscription",
-				description: "Delegate through Claude Code ACP using the Claude subscription login stored by Claude Code.",
-				inputLabel: "Task",
-				provider: "anthropic",
-				authentication: "subscription",
-				billing: "subscription",
-				get available() {
-					return (
-						session.getToolDefinition("claude_code") !== undefined &&
-						claudeSubscriptionLogin.getStatus().authenticated
-					);
-				},
-				warning:
-					"Requires `claude auth login`. ANTHROPIC_API_KEY is removed from this worker so API billing cannot be selected accidentally.",
-				defaultModel: sonnet,
-				models: claudeModels,
-			},
-			{
-				id: "anthropic-api",
-				aliases: ["claude-code"],
-				name: "Anthropic — API",
-				description: "Delegate through Claude Code ACP using the configured Anthropic API key.",
-				inputLabel: "Task",
-				provider: "anthropic",
-				authentication: "api-key",
-				billing: "usage-based",
-				get available() {
-					return (
-						session.getToolDefinition("claude_code") !== undefined &&
-						Boolean(providerEnvironment.environmentValue("ANTHROPIC_API_KEY")?.trim())
-					);
-				},
-				warning: "Usage is billed to the Anthropic API account configured by ANTHROPIC_API_KEY.",
-				defaultModel: sonnet,
-				models: claudeModels,
-			},
-			{
-				id: "codex-subscription",
-				name: "Codex — ChatGPT Subscription",
-				description: "Run an independent Codex CLI task using the local ChatGPT login.",
-				inputLabel: "Task",
-				provider: "openai",
-				authentication: "subscription",
-				billing: "subscription",
-				available: isCodexSubscriptionAvailable(),
-				warning:
-					"Requires `codex login`. OPENAI_API_KEY is removed from this worker so API billing cannot be selected accidentally.",
-				defaultModel: luna,
-				models: codexSubscriptionModels,
-			},
-			{
-				id: "openai-api",
-				aliases: ["openai"],
-				name: "OpenAI — API",
-				description: "Run a separate Pi SDK agent using the configured OpenAI API account.",
-				inputLabel: "Task",
-				provider: "openai",
-				authentication: "api-key",
-				billing: "usage-based",
-				get available() {
-					return (
-						Boolean(providerEnvironment.environmentValue("OPENAI_API_KEY")?.trim()) &&
-						openAiModels.some((model) => model.id === luna.id)
-					);
-				},
-				warning: "Usage is billed to the OpenAI API account configured by OPENAI_API_KEY.",
-				defaultModel: luna,
-				models: openAiModels,
-			},
-			{
-				id: "hermes",
-				name: "Hermes Agent",
-				description: "Delegate a goal to Hermes one-shot mode with its memory, skills, tools, and selected model.",
-				inputLabel: "Goal",
-				provider: "hermes",
-				authentication: "configured",
-				billing: "configured",
-				available: session.getToolDefinition("hermes_agent") !== undefined,
-				warning:
-					"The selected model runs inside Hermes. Local Ollama has no API charge; OpenAI and Anthropic choices use credentials loaded from .env.local. Hermes bypasses interactive approvals.",
-				defaultModel: hermesModels.defaultModel,
-				models: hermesModels.models,
-			},
-		];
-		const externalOpenAiApiExecutor = new AgentSessionExecutor(createOpenAiApiExecutionSession);
+		// Keep stored result artifacts readable without registering executable delegation connections.
 		this.#externalConnectionManager = new ExternalConnectionManager(
-			externalConnections,
-			async (request) => {
-				const isClaude = request.connection.provider === "anthropic";
-				const isClaudeSubscription = request.connection.id === "claude-code-subscription";
-				const isCodexSubscription = request.connection.id === "codex-subscription";
-				const isHermes = request.connection.id === "hermes";
-				if (isCodexSubscription) {
-					return new CodexCliExecution({ cwd: request.cwd, prompt: request.prompt, model: request.model.id });
-				}
-				if (isClaude || isHermes) {
-					const toolName = isClaude ? "claude_code" : "hermes_agent";
-					const tool = session.getToolDefinition(toolName);
-					if (!tool) throw new Error(`Selected backend ${toolName} is unavailable`);
-					const parameters = isClaude
-						? {
-								prompt: request.prompt,
-								cwd: request.cwd,
-								model: request.model.id,
-								authentication: isClaudeSubscription ? "subscription" : "api-key",
-							}
-						: { goal: request.prompt, cwd: request.cwd, model: `${request.model.provider}/${request.model.id}` };
-					return new DirectToolExecution(tool, request.runId, parameters, session.extensionRunner.createContext());
-				}
-				if (request.connection.id !== "openai-api") throw new Error(`Unsupported backend ${request.connection.id}`);
-				return externalOpenAiApiExecutor.start({
-					runId: request.runId,
-					workspace: request.cwd,
-					prompt: request.prompt,
-					definition: {
-						id: `external-${request.connection.id}`,
-						revision: 1,
-						source: "managed",
-						name: request.connection.name,
-						description: request.connection.description,
-						model: request.model,
-						thinking: undefined,
-						tools: ["read", "grep", "find", "ls", "bash", "write", "edit"],
-						capabilities: [],
-						memory: "none",
-						persona: "Complete the delegated task independently and return a concise result.",
-						projectRoot: request.cwd,
-						workspace: request.cwd,
-						executor: "session",
-						permissionPolicy: "workspace-write",
-						schedules: [],
-						browserWorkflows: [],
-						delegateAgentIds: [],
-						a2a: { enabled: false },
-					},
-				});
+			[],
+			async () => {
+				throw new Error("External delegation connections have been removed");
 			},
 			join(serveRoot, "external-runs"),
 			session.sessionManager.getCwd(),

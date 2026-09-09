@@ -80,20 +80,8 @@ export function installHistoryLayout(): void {
 	};
 	new MutationObserver(update).observe(list, { childList: true });
 	update();
-	const delegation = document.getElementById("external-connection-list")?.closest("details");
-	const destination = document.getElementById("settings-advanced-connections");
-	if (delegation && destination) {
-		destination.append(delegation);
-		document
-			.querySelector<HTMLButtonElement>('[aria-label="Delegate to an external agent"]')
-			?.addEventListener("click", () => {
-				document.getElementById("open-settings")?.click();
-				document.querySelector<HTMLButtonElement>('[data-settings-section="connections"]')?.click();
-				for (let parent: HTMLElement | null = delegation; parent; parent = parent.parentElement)
-					if (parent instanceof HTMLDetailsElement) parent.open = true;
-				delegation.scrollIntoView({ block: "start" });
-			});
-	}
+	document.getElementById("external-connection-list")?.closest("details")?.remove();
+	document.querySelector('[aria-label="Delegate to an external agent"]')?.remove();
 	const style = document.createElement("style");
 	style.textContent = `.history-day h3{margin:20px 4px 8px;font-size:12px;color:var(--muted);font-weight:600}.history-record[hidden],.history-day[hidden]{display:none!important}.history-day .agent-activity-entry{padding:14px 10px;border:1px solid var(--line);border-radius:12px;background:var(--panel);grid-template-columns:8px minmax(0,1fr);align-items:start}.history-day .agent-activity-entry strong{font-size:13px;white-space:normal;line-height:1.5}.history-day .agent-activity-entry small{font-size:12px;line-height:1.5;white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.history-day .agent-activity-entry time{grid-column:2;font-size:11px}.history-day .agent-activity-status{margin-top:7px}.history-day .attention-entry-wrap{grid-template-columns:minmax(0,1fr) auto;gap:6px;margin-top:10px}.history-day .attention-inline-action{width:36px;height:36px}.history-day .attention-entry-wrap>.agent-activity-entry{grid-row:span 3;margin:0}`;
 	document.head.append(style);
