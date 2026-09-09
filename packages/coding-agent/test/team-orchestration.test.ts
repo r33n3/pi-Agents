@@ -121,7 +121,15 @@ test("a supervisor with no selected teams cannot submit a placeholder team", asy
 		await expect(
 			action.tool.execute(
 				"invalid",
-				reply("Done", { plan: { contribution: "direct", teamIds: ["no-teams-available"], reason: "Solo" } }),
+				reply("Done", {
+					plan: {
+						contribution: "direct",
+						teamIds: ["no-teams-available"],
+						memberIds: [],
+						toolHandoffs: [],
+						reason: "Solo",
+					},
+				}),
 				undefined,
 				undefined,
 				undefined as never,
@@ -129,7 +137,9 @@ test("a supervisor with no selected teams cannot submit a placeholder team", asy
 		).rejects.toThrow("schema");
 		await action.tool.execute(
 			"valid",
-			reply("Done", { plan: { contribution: "direct", teamIds: [], reason: "Solo" } }),
+			reply("Done", {
+				plan: { contribution: "direct", teamIds: [], memberIds: [], toolHandoffs: [], reason: "Solo" },
+			}),
 			undefined,
 			undefined,
 			undefined as never,
@@ -147,17 +157,29 @@ test("a supervisor with no selected teams cannot submit a placeholder team", asy
 test("tool submission uses exact allowance IDs and rejects runtime aliases", async () => {
 	const f = await fixture(async (context) => {
 		const action = createTeamTurnTool(context.definition.responseSchema!);
-		const plan = { contribution: "direct", teamIds: [], reason: "Configure my allowed tools" };
+		const plan = {
+			contribution: "direct",
+			teamIds: [],
+			memberIds: [],
+			toolHandoffs: [],
+			reason: "Configure my allowed tools",
+		};
 		await expect(
 			action.tool.execute(
 				"alias",
-				reply("Configure", { plan, assignTools: [{ agentId: "manager", toolIds: ["list"] }] }),
+				reply("Configure", {
+					plan,
+					assignTools: [{ agentId: "manager", toolIds: ["list"] }],
+				}),
 				undefined,
 				undefined,
 				undefined as never,
 			),
 		).rejects.toThrow("schema");
-		const valid = reply("Configured", { plan, assignTools: [{ agentId: "manager", toolIds: ["ls"] }] });
+		const valid = reply("Configured", {
+			plan,
+			assignTools: [{ agentId: "manager", toolIds: ["ls"] }],
+		});
 		await action.tool.execute("valid", valid, undefined, undefined, undefined as never);
 		return valid;
 	});
@@ -239,7 +261,13 @@ test("declared plans retain both teams even when the wording bypasses the staffi
 	const f = await fixture((context) =>
 		context.definition.id === "manager" && ++managerTurns === 1
 			? reply("Both teams will contribute", {
-					plan: { contribution: "separate-team", teamIds: ["design", "review"], reason: "User requested both" },
+					plan: {
+						contribution: "separate-team",
+						teamIds: ["design", "review"],
+						memberIds: [],
+						toolHandoffs: [],
+						reason: "User requested both",
+					},
 					requestTeam: { teamId: "design", goal: "Propose a scope" },
 				})
 			: reply("Done"),

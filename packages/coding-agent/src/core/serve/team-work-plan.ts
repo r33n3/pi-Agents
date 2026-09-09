@@ -48,7 +48,10 @@ export function parseTeamWorkPlan(value: unknown): TeamWorkPlan | undefined {
 	if (requiresRecruitment !== undefined && typeof requiresRecruitment !== "boolean")
 		throw new Error("Invalid recruitment requirement");
 	return {
-		toolHandoffs: parseToolHandoffs("toolHandoffs" in value ? value.toolHandoffs : undefined),
+		toolHandoffs:
+			"toolHandoffs" in value && value.toolHandoffs !== undefined
+				? parseToolHandoffs(value.toolHandoffs)
+				: undefined,
 		...(requiresRecruitment ? { requiresRecruitment: true } : {}),
 		goal: value.goal,
 		purpose: value.purpose,

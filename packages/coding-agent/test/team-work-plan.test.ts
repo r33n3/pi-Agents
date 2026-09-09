@@ -145,7 +145,8 @@ test.each([true, false])(
 			expect(run.workPlan?.contribution).toBe("separate-member");
 			expect(prompts[1]).toContain("Host completion check");
 			expect(prompts[1]).toContain("STAFFING DECISION ONLY");
-			expect(prompts.every((prompt) => Buffer.byteLength(prompt, "utf8") <= 16 * 1024)).toBe(true);
+			// Assembled workflow context has a 128 KiB bound; the user goal alone has a 16 KiB bound.
+			expect(prompts.every((prompt) => Buffer.byteLength(prompt, "utf8") <= 128 * 1024)).toBe(true);
 			expect(run.status).toBe(cooperates ? "completed" : "needs-user");
 			if (cooperates) {
 				expect(run.rounds).toHaveLength(4);
