@@ -809,6 +809,7 @@ export class AgentTaskService implements AsyncDisposable {
 	}
 
 	async #schedule(): Promise<void> {
+		if (this.#disposed) return;
 		await this.#queue.run(async () => {
 			if (this.#disposed || !this.#schedulingStarted) return;
 			const queued = [...this.#tasks.values()]

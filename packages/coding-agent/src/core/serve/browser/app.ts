@@ -28,7 +28,7 @@ import {
 } from "./model-settings.ts";
 import { openModelSettings } from "./model-settings-dialog.ts";
 import { filterPresentedModels } from "./model-visibility.ts";
-import { roomRunPresentation } from "./room-presentation.ts";
+import { roomComposerPresentation, roomNeedsUserNotice, roomRunPresentation } from "./room-presentation.ts";
 import { renderTeamMemberCard } from "./team-member-card.ts";
 import { renderCollapsibleTeam } from "./team-navigation.ts";
 import { teamScheduleControls } from "./team-schedules.ts";
@@ -406,6 +406,7 @@ const openAgentRoomIds: string[] = [];
 let activeTeamEditor: HTMLElement | undefined;
 const pendingAgentSubmissions = new Set<string>();
 const pendingAgentRoomSubmissions = new Set<string>();
+const pendingAgentRoomCancellations = new Set<string>();
 let artifacts: ArtifactSummary[] = [];
 let activeArtifactObjectUrl: string | undefined;
 let activePreviewSessionId: string | undefined;
@@ -10106,13 +10107,15 @@ function renderAgentRoomConversation(): void {
 	const running = current?.status === "running";
 	const needsUser = current?.status === "needs-user";
 	const submitting = pendingAgentRoomSubmissions.has(room.id);
+	const stopping = current ? pendingAgentRoomCancellations.has(current.id) : false;
+	const composer = roomComposerPresentation(current?.status, stopping);
 	const supervisor = room.members.find((member) => member.agentId === room.supervisorAgentId);
 	const previousWorkflowRuns =
 		[...agentTeamStates.values()].find((state) => state.team?.roomId === room.id)?.team?.runs ?? [];
 	const childRuns = agentRoomRuns.filter(
 		(run) => run.parentRunId && runs.some((parent) => parent.id === run.parentRunId),
 	);
-	const signature = JSON.stringify([room, runs, childRuns, submitting, previousWorkflowRuns]);
+	const signature = JSON.stringify([room, runs, childRuns, submitting, stopping, previousWorkflowRuns]);
 	if (renderedAgentRoomSignature !== signature) {
 		const expanded = new Set(
 			[...transcript.querySelectorAll<HTMLDetailsElement>("details[data-team-detail][open]")].map(
@@ -10210,6 +10213,8 @@ function renderAgentRoomConversation(): void {
 			items.push(request);
 			for (const round of run.rounds) {
 				for (const turn of round.turns) {
+					// The retained question is rendered once below with the active waiting state.
+					if (run === current && needsUser && turn.status === "needs-user") continue;
 					const message = document.createElement("article");
 					message.className = "message assistant";
 					const member = room.members.find((entry) => entry.agentId === turn.agentId);
@@ -10278,35 +10283,36 @@ function renderAgentRoomConversation(): void {
 		}
 		if (running || needsUser || submitting) {
 			const activity = document.createElement("article");
-			activity.className = "message assistant agent-running";
-			appendText(
-				activity,
-				needsUser
-					? (current.userQuestion ?? "The team needs your input.")
-					: submitting
+			activity.className = needsUser ? "message assistant team-needs-user" : "message assistant agent-running";
+			if (needsUser) {
+				activity.setAttribute("role", "status");
+				appendText(activity, "Needs your input", "message-label");
+				appendAgentMarkdown(activity, roomNeedsUserNotice(current.userQuestion, room.members));
+				appendText(
+					activity,
+					"Reply below to continue this request, or tell the supervisor what to change.",
+					"muted",
+				);
+			} else
+				appendText(
+					activity,
+					submitting
 						? "Sending to team…"
 						: `Working: ${(current?.pendingAgentIds ?? []).map((id) => room.members.find((member) => member.agentId === id)?.name ?? id).join(", ") || room.name}`,
-				"muted",
-			);
-			if (needsUser || running) {
-				const stop = document.createElement("button");
-				stop.type = "button";
-				stop.textContent = "Stop team";
-				stop.addEventListener("click", () => {
-					stop.disabled = true;
-					void roomRunAction(current.id, "cancel", {}).catch((error: unknown) => {
-						stop.disabled = false;
-						setStatus(error instanceof Error ? error.message : String(error), true);
-					});
-				});
-				activity.append(stop);
-			}
+					"muted",
+				);
 			items.push(activity);
 		}
 		transcript.replaceChildren(...items);
 		transcript.scrollTop = firstRender || nearBottom ? transcript.scrollHeight : previousScrollTop;
 	}
-	phase.textContent = submitting ? "sending" : current ? roomRunPresentation(current.status).label : "idle";
+	phase.textContent = stopping
+		? "stopping"
+		: submitting
+			? "sending"
+			: current
+				? roomRunPresentation(current.status).label
+				: "idle";
 	input.disabled = submitting;
 	input.placeholder = needsUser
 		? "Answer the team's question…"
@@ -10314,9 +10320,9 @@ function renderAgentRoomConversation(): void {
 			? "Add context or change direction…"
 			: `Message ${room.name}…`;
 	input.setAttribute("aria-label", `Message ${room.name}`);
-	send.disabled = submitting;
-	send.classList.remove("is-stopping");
-	send.setAttribute("aria-label", needsUser ? "Continue team" : "Send to team");
+	send.disabled = submitting || composer.disabled;
+	send.classList.toggle("is-stopping", composer.isStopping);
+	send.setAttribute("aria-label", composer.label);
 	model.disabled = true;
 	thinking.disabled = true;
 	attachmentButton.disabled = true;
@@ -10337,8 +10343,24 @@ function renderAgentRoomConversation(): void {
 	);
 }
 
-async function submitAgentRoomComposer(roomId: string): Promise<void> {
+async function submitAgentRoomComposer(roomId: string, stopRunning: boolean): Promise<void> {
 	if (pendingAgentRoomSubmissions.has(roomId)) return;
+	const current = agentRoomRuns
+		.filter((run) => run.roomId === roomId)
+		.sort((left, right) => left.createdAt - right.createdAt)
+		.at(-1);
+	if (stopRunning && current?.status === "running") {
+		if (pendingAgentRoomCancellations.has(current.id)) return;
+		pendingAgentRoomCancellations.add(current.id);
+		renderAgentRoomConversation();
+		try {
+			await roomRunAction(current.id, "cancel", {});
+		} finally {
+			pendingAgentRoomCancellations.delete(current.id);
+			renderAgentRoomConversation();
+		}
+		return;
+	}
 	const prompt = input.value.trim();
 	if (!prompt) return;
 	pendingAgentRoomSubmissions.add(roomId);
@@ -12279,7 +12301,7 @@ async function reconnect(entry: ConnectionEntry): Promise<void> {
 
 form.addEventListener("submit", (event) => {
 	event.preventDefault();
-	void submitComposer().catch((error: unknown) =>
+	void submitComposer(event.submitter === send).catch((error: unknown) =>
 		setStatus(error instanceof Error ? error.message : String(error), true),
 	);
 });
@@ -12303,10 +12325,10 @@ sessionPathForm.addEventListener("submit", (event) => {
 	});
 });
 
-async function submitComposer(): Promise<void> {
+async function submitComposer(stopRunning = false): Promise<void> {
 	if (activeTeamEditor) return;
 	if (activeAgentRoomId) {
-		await submitAgentRoomComposer(activeAgentRoomId);
+		await submitAgentRoomComposer(activeAgentRoomId, stopRunning);
 		return;
 	}
 	if (activeSubagentKey || activeExternalRunId || activeArtifactId) return;

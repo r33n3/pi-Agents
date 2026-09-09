@@ -15,10 +15,14 @@ test.each(["builder", "main chat", "reload"])(
 		const prompts: string[] = [];
 		const names: string[] = [];
 		let failChecker = false;
+		let releaseFirst = () => {};
+		const firstTurnGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
 		const executor = vi.spyOn(ChildProcessAgentExecutor.prototype, "start").mockImplementation(async (context) => {
 			prompts.push(context.prompt);
 			names.push(context.definition.name);
-			if (view === "builder" && prompts.length === 1) await new Promise((resolve) => setTimeout(resolve, 6500));
+			if (view === "builder" && prompts.length === 1) await firstTurnGate;
 			if (failChecker && context.definition.name === "Checker") throw new Error("Checker unavailable for this test");
 			const goal =
 				context.prompt
@@ -221,6 +225,7 @@ test.each(["builder", "main chat", "reload"])(
 				const detail = await (await page.request.get(detailUrl.toString())).json();
 				expect(detail).toHaveProperty("contract");
 				expect(detail.summary).toBeUndefined();
+				releaseFirst();
 			}
 			await expect
 				.poll(() => page.locator("article").filter({ hasText: "Verified team report" }).isVisible(), {
@@ -261,6 +266,7 @@ test.each(["builder", "main chat", "reload"])(
 				"Current user goal for this run (the only completion target):\nReview another inventory",
 			);
 		} finally {
+			releaseFirst();
 			await browser.close();
 			await host.close();
 			executor.mockRestore();
