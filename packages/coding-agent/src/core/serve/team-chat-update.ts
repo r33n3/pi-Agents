@@ -10,7 +10,11 @@ export const teamChatUpdateSchema = Type.Object(
 			Type.Array(Type.String({ minLength: 1, maxLength: 64 }), { maxItems: 8, uniqueItems: true }),
 		),
 		memoryStrategy: Type.Optional(Type.Union([Type.Literal("team"), Type.Literal("recent"), Type.Literal("none")])),
-		memoryPolicy: Type.Optional(teamMemoryPolicySchema),
+		memoryPolicy: Type.Optional({
+			...teamMemoryPolicySchema,
+			description:
+				"Whole-team retention policy. Omit when only editing member methods or tool grants. Change only when the user requests a team memory policy change; preserve travel preferences and other unrelated retention purposes.",
+		}),
 		memberTools: Type.Optional(
 			Type.Array(
 				Type.Object(
@@ -32,14 +36,24 @@ export const teamChatUpdateSchema = Type.Object(
 				Type.Object(
 					{
 						agentId: Type.String({ minLength: 1, maxLength: 64 }),
-						instructions: Type.String({ maxLength: 4096 }),
+						instructions: Type.String({
+							maxLength: 4096,
+							description:
+								"Durable methods and success criteria only. Keep one-run assignments, synthetic fixtures, test recipients, prices, dates and temporary restrictions in the current assignment message, not these persistent instructions. Preserve unrelated existing methods.",
+						}),
 					},
 					{ additionalProperties: false },
 				),
 				{ maxItems: 8 },
 			),
 		),
-		sharedInstructions: Type.Optional(Type.String({ maxLength: 8192 })),
+		sharedInstructions: Type.Optional(
+			Type.String({
+				maxLength: 8192,
+				description:
+					"Persistent team-wide methods only. Omit for a member-only change. Do not turn a current test or configuration-only request into a standing restriction on future work.",
+			}),
+		),
 		taskFacts: Type.Optional(
 			Type.Record(Type.String({ pattern: "^[a-zA-Z][a-zA-Z0-9_ -]{0,63}$" }), Type.String({ maxLength: 1024 }), {
 				maxProperties: 32,

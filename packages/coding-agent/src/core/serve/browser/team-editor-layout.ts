@@ -130,5 +130,14 @@ export function organizeTeamEditor(form: HTMLFormElement): void {
 		true,
 	);
 	updateMembers();
-	show("Overview");
+	show(form.dataset.inspectMemberId ? "Members" : "Overview");
+	if (form.dataset.inspectMemberId) {
+		for (const { card, profile } of memberCards) {
+			if (profile.dataset.memberId !== form.dataset.inspectMemberId) continue;
+			profile.open = true;
+			const saved = profile.querySelector<HTMLDetailsElement>(":scope > details");
+			if (saved) saved.open = true;
+			requestAnimationFrame(() => card.scrollIntoView({ block: "start" }));
+		}
+	}
 }

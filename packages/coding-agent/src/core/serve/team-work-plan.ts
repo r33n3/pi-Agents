@@ -1,7 +1,12 @@
+import { parseToolHandoffs, type ToolHandoff } from "./team-tool-handoff.ts";
+
 /** A host-owned completion requirement. Model output cannot waive requested staffing. */
 export interface TeamWorkPlan {
+	toolHandoffs?: ToolHandoff[];
 	requiresRecruitment?: boolean;
 	teamIds?: string[];
+	/** Every named member must finish a contribution in this run. */
+	memberIds?: string[];
 	goal: string;
 	purpose: string;
 	contribution: "direct" | "separate-member" | "separate-team";
@@ -34,15 +39,23 @@ export function parseTeamWorkPlan(value: unknown): TeamWorkPlan | undefined {
 	)
 		throw new Error("Invalid retained team targets");
 	const requiresRecruitment = "requiresRecruitment" in value ? value.requiresRecruitment : undefined;
+	const memberIds = "memberIds" in value ? value.memberIds : undefined;
+	if (
+		memberIds !== undefined &&
+		(!Array.isArray(memberIds) || memberIds.length > 8 || !memberIds.every((id) => typeof id === "string"))
+	)
+		throw new Error("Invalid retained member targets");
 	if (requiresRecruitment !== undefined && typeof requiresRecruitment !== "boolean")
 		throw new Error("Invalid recruitment requirement");
 	return {
+		toolHandoffs: parseToolHandoffs("toolHandoffs" in value ? value.toolHandoffs : undefined),
 		...(requiresRecruitment ? { requiresRecruitment: true } : {}),
 		goal: value.goal,
 		purpose: value.purpose,
 		reason: value.reason,
 		contribution: value.contribution,
 		...(teamIds ? { teamIds: [...teamIds] } : {}),
+		...(memberIds ? { memberIds: [...new Set(memberIds)] } : {}),
 	};
 }
 
@@ -82,6 +95,7 @@ export function planTeamWork(
 	let separate = previous?.contribution === "separate-member";
 	let separateTeam = previous?.contribution === "separate-team";
 	let retainedTeamIds = previous?.teamIds ?? [];
+	let retainedMemberIds = previous?.memberIds ?? [];
 	for (const clause of clauses) {
 		// Dots inside names such as Node.js are not sentence boundaries.
 		const request = clause
@@ -102,6 +116,7 @@ export function planTeamWork(
 			separate = false;
 			separateTeam = false;
 			retainedTeamIds = [];
+			retainedMemberIds = [];
 			continue;
 		}
 		// Questions about earlier staffing and explanations are not new assignments.
@@ -125,6 +140,8 @@ export function planTeamWork(
 			separate = true;
 	}
 	return {
+		toolHandoffs: previous?.toolHandoffs,
+		...(retainedMemberIds.length ? { memberIds: [...retainedMemberIds] } : {}),
 		...(requestsTeamMember(goal) ? { requiresRecruitment: true } : {}),
 		...(separateTeam
 			? {

@@ -68,6 +68,7 @@ import { createPlaidTools, PLAID_TOOL_NAMES } from "./plaid-tools.ts";
 import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
 import { PluginManagementService } from "./plugin-management-service.ts";
 import { ProviderEnvironmentStore } from "./provider-environment-store.ts";
+import { ReportToolRegistry } from "./report-tool-registry.ts";
 import { RoutineRegistry } from "./routine-registry.ts";
 import { RunSkillPromotionService } from "./run-skill-promotion-service.ts";
 import { createScopedAgentTools } from "./scoped-agent-tools.ts";
@@ -461,6 +462,9 @@ export class ServeHost implements AsyncDisposable {
 		const googleWorkspaceToolNames = new Set(googleWorkspaceTools.map((tool) => tool.name));
 		const dataTools = new DataToolRegistry(join(serveRoot, "data-tools"));
 		await dataTools.initialize();
+		const reportTools = new ReportToolRegistry(join(serveRoot, "report-tools"));
+		await reportTools.initialize();
+		session.registerCustomTools(reportTools.createTools(undefined, session.sessionManager.getCwd(), governedActions));
 		session.registerCustomTools(dataTools.createTools(undefined, () => brokeredTools));
 		const resolveAgentBrokeredTools = (
 			definition: AgentDefinition,
@@ -496,7 +500,17 @@ export class ServeHost implements AsyncDisposable {
 						)
 					: []),
 			].filter((tool) => names.has(tool.name));
-			return [...sources, ...dataTools.createTools(definition.tools, () => sources)];
+			return [
+				...sources,
+				...dataTools.createTools(definition.tools, () => sources),
+				...reportTools.createTools(
+					definition.permissionPolicy === "workspace-write"
+						? definition.tools
+						: definition.tools.filter((tool) => tool !== "write"),
+					resolve(definition.projectRoot, definition.workspace),
+					governedActions,
+				),
+			];
 		};
 		const agentRegistry = new AgentRegistry(serveRoot, {
 			catalogDirectory: join(agentDir, "agents"),
@@ -796,6 +810,7 @@ export class ServeHost implements AsyncDisposable {
 			session.model ? { provider: session.model.provider, id: session.model.id } : undefined,
 			{ setup: browserSetup, workflows: browserWorkflowRegistry },
 			dataTools,
+			reportTools,
 		);
 		this.#agentRooms = new AgentRoomService(
 			join(serveRoot, "rooms"),

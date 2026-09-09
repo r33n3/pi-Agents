@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ModelControls } from "@earendil-works/pi-ai";
+import Type from "typebox";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import type { AgentDefinition } from "../src/core/serve/agent-registry.ts";
 import { ChildProcessAgentExecutor } from "../src/core/serve/child-process-agent-executor.ts";
@@ -72,7 +73,17 @@ describe("isolated agent worker native settings", () => {
 		executor = new ChildProcessAgentExecutor({
 			agentDir,
 			serveRoot: join(root, "serve"),
-			capabilityTools: () => [],
+			capabilityTools: () => [
+				{
+					name: "saved_report_fixture_v1",
+					label: "Fixture report",
+					description: "Test fixture only",
+					parameters: Type.Object({}),
+					async execute() {
+						throw new Error("The request-capture fixture must not execute tools");
+					},
+				},
+			],
 			environment: { ...process.env, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" },
 			timeoutMs: 20_000,
 		});
@@ -118,6 +129,9 @@ describe("isolated agent worker native settings", () => {
 			});
 			await expect(execution.result).rejects.toThrow("synthetic request recorded");
 			expect(requests).toHaveLength(1);
+			expect(JSON.stringify(requests[0].tools)).toContain("saved_report_fixture_v1");
+			expect(JSON.stringify(requests[0].input)).toContain("Callable tools in this execution");
+			expect(JSON.stringify(requests[0].input)).toContain("saved_report_fixture_v1");
 			expect(requests[0].service_tier).toBe(controls.processingTier);
 			expect((requests[0].reasoning as { effort?: string } | undefined)?.effort).toBe(controls.reasoningEffort);
 			await execution.dispose();

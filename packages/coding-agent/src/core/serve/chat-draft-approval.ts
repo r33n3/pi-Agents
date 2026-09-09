@@ -19,13 +19,13 @@ export function chatDraftApproval(messages: DraftApprovalMessage[]): CapabilityA
 			return undefined;
 	}
 	const message = [...users].reverse().find((entry) => {
-		const text = entry.text!.trim();
+		const text = entry.text!.trim().replace(/^(?:now|then)\s+/i, "");
 		return (
 			!/[`<>]/.test(text) &&
 			/\b(?:create|crate|prepare|save|attach|embed|add)\b/i.test(text) &&
 			/\b(?:draft|drafts)\b/i.test(text) &&
 			/\b(?:email|gmail|attach)\b/i.test(text) &&
-			/^(?:please\s+)?(?:create|crate\s+(?:a\s+)?draft\b|put\b[^.!?\n]{0,256}\band\s+(?:create|prepare|save)\s+(?:a\s+)?draft\b|prepare|save|attach|embed|add|approved?\b|can\s+(?:you|the\s+report\s+agent)\b|have\s+the\b)/i.test(
+			/^(?:please\s+)?(?:create|crate\s+(?:a\s+)?draft\b|put\b[^.!?\n]{0,256}\band\s+(?:create|prepare|save)\s+(?:a\s+)?draft\b|prepare|save|attach|embed|add|give\s+(?:the|our)\b|approved?\b|can\s+(?:you|the\s+report\s+agent)\b|have\s+(?!you\b))/i.test(
 				text,
 			)
 		);

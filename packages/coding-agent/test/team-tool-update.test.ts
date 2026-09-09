@@ -40,10 +40,11 @@ test.each([
 	"bounded-approval",
 	"exhausted-approval",
 	"queued-approval",
+	"member-blocker",
 ])("chat tool update: %s", async (mode) => {
 	const root = await mkdtemp(join(tmpdir(), "pi-team-tools-"));
 	const contexts: AgentExecutionContext[] = [];
-	let stage = "propose";
+	let stage = mode === "member-blocker" ? "initial-delegation" : "propose";
 	let needsRepair = mode === "unwired-guidance";
 	let available = true;
 	class Resources extends TeamResources {
@@ -60,19 +61,27 @@ test.each([
 				output.message = 'Open Settings and reply "Approve tools".';
 				needsRepair = false;
 			} else if (context.definition.id === "reporter") {
-				if (mode === "bare-approve") {
-					const write = createScopedAgentTools(context.definition, context.workspace).find(
-						(tool) => tool.name === "write",
-					)!;
-					await write.execute(
-						"proof",
-						{ path: "tool-approval-proof.txt", content: "Assigned tool executed" },
-						undefined,
-						undefined,
-						{} as ExtensionContext,
-					);
+				if (mode === "member-blocker" && !context.definition.tools.includes("write")) {
+					output.outcome = "needs-user";
+					output.message = "The reporter needs the write tool assigned before it can save the report.";
+					stage = "propose";
+				} else {
+					if (mode === "bare-approve") {
+						const write = createScopedAgentTools(context.definition, context.workspace).find(
+							(tool) => tool.name === "write",
+						)!;
+						await write.execute(
+							"proof",
+							{ path: "tool-approval-proof.txt", content: "Assigned tool executed" },
+							undefined,
+							undefined,
+							{} as ExtensionContext,
+						);
+					}
+					output.message = "Report contribution completed";
 				}
-				output.message = "Report contribution completed";
+			} else if (stage === "initial-delegation") {
+				output.requestAgentIds = ["reporter"];
 			} else if (stage === "propose") {
 				output.message = "Draft preview: Hawaii report. Tool changes proposed, not yet saved.";
 				output.updateTeam = {
@@ -176,7 +185,12 @@ test.each([
 			expect(first.rounds[1].turns[0].message).toBe("Report contribution completed");
 			return;
 		}
-		expect(contexts).toHaveLength(mode === "unwired-guidance" ? 2 : 1);
+		expect(contexts).toHaveLength(mode === "member-blocker" ? 3 : mode === "unwired-guidance" ? 2 : 1);
+		if (mode === "member-blocker") {
+			expect(contexts.map((context) => context.definition.id)).toEqual(["supervisor", "reporter", "supervisor"]);
+			expect(contexts[2].prompt).toContain("reporter needs the write tool");
+			expect(contexts[1].definition.tools).toEqual(["read"]);
+		}
 		if (mode === "unwired-guidance") expect(contexts[1].prompt).toContain("Host action check");
 		if (mode === "bounded-approval" || mode === "exhausted-approval") {
 			first.totalTokens = first.definitionSnapshot!.limits.maxTotalTokens;
@@ -236,7 +250,7 @@ test.each([
 		expect(restored.getRun(first.id)?.toolGrantReceipt).toContain("Earlier missing-tool reports predate this change");
 		expect(saved.chatState?.previous).toBeUndefined();
 		expect((await registry.get("reporter"))?.tools).toEqual(["read"]);
-		const reporter = contexts.find((context) => context.definition.id === "reporter")!;
+		const reporter = [...contexts].reverse().find((context) => context.definition.id === "reporter")!;
 		if (mode === "bare-approve")
 			expect(await readFile(join(reporter.workspace, "tool-approval-proof.txt"), "utf8")).toBe(
 				"Assigned tool executed",
