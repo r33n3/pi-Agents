@@ -22,7 +22,7 @@ export function createTeamTurnTool(
 				type: "string",
 				enum: ["analysis", "execution", "routing", "blocked"],
 				description:
-					"Use execution when claiming you created, changed, registered, validated, rendered, presented or delivered something. Analysis is reasoning only and cannot claim those effects. Routing assigns future work; blocked reports unfinished work.",
+					"Use execution for actions you performed yourself in this turn: creation, changes, registration, validation, rendering, presentation or delivery. Use analysis for reasoning or a final summary of completed member work: attribute results to the member and rely on host-recorded current-run receipts without claiming you repeated their actions. Do not downgrade a verified member result merely because you lack its tool. Routing assigns future work; blocked reports unfinished work.",
 			},
 			evidenceToolCallIds: {
 				type: "array",
@@ -30,7 +30,7 @@ export function createTeamTurnTool(
 				maxItems: 32,
 				uniqueItems: true,
 				description:
-					"Copy successful execution tool call IDs from this turn supporting your claims. Execution requires at least one; previous runs, context lookups and submission are not execution evidence. Perform missing work before submitting, never invent IDs.",
+					"Copy successful execution tool call IDs from this turn supporting your own actions. Execution requires at least one; previous runs, context lookups and submission are not execution evidence. For analysis summarizing another member's current-run result, use an empty array and cite the member's host-recorded receipt in your message. Never copy another member's call IDs here or invent IDs.",
 			},
 		});
 		normalized.required = [
@@ -84,7 +84,7 @@ export function createTeamTurnTool(
 					(input.workKind === "execution" && input.evidenceToolCallIds.length === 0)
 				)
 					throw new Error(
-						`Execution claims require successful tool evidence from this turn. Available evidence: ${JSON.stringify(evidence)}. Perform the requested work now, or report it as blocked; do not claim registration, validation, assignment or delivery from historical messages.`,
+						`Execution claims require successful tool evidence from this turn. Available evidence: ${JSON.stringify(evidence)}. If you are summarizing completed member work, submit workKind:analysis with evidenceToolCallIds:[] and attribute the result to its current-run host receipt; you do not need to repeat the action or report a blocker just because you lack the member's tool. For your own unfinished actions, perform the work or report it as blocked. Historical messages alone do not prove completion.`,
 					);
 			}
 			if (
@@ -153,7 +153,7 @@ export function createTeamTurnTool(
 									executionEvidence &&
 									"workKind" in input &&
 									input.workKind === "analysis"
-										? `${value}\nHost evidence: reasoning-only contribution; no execution effects are certified by this action.`
+										? `${value}\nHost evidence: reasoning-only contribution; this action certifies no new execution effects and does not invalidate existing member receipts.`
 										: value,
 								]),
 						)
