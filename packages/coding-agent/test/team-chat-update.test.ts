@@ -10,6 +10,17 @@ import { AgentTaskService } from "../src/core/serve/agent-task-service.ts";
 import { parseTeamChatUpdate, prepareTeamChatUpdate } from "../src/core/serve/team-chat-update.ts";
 import { WorkflowService } from "../src/core/serve/workflow-service.ts";
 
+test("empty optional updates are omitted without accepting invalid edits", () => {
+	expect(parseTeamChatUpdate({ expectedRevision: 0 })).toBeUndefined();
+	expect(parseTeamChatUpdate({ expectedRevision: 0, taskFacts: {}, memberInstructions: [] })).toBeUndefined();
+	expect(() => parseTeamChatUpdate({ expectedRevision: -1 })).toThrow("Invalid team update");
+	expect(() => parseTeamChatUpdate({ expectedRevision: 0, memberTools: [] })).toThrow("Invalid team update");
+	expect(parseTeamChatUpdate({ expectedRevision: 0, sharedInstructions: "" })).toEqual({
+		expectedRevision: 0,
+		sharedInstructions: "",
+	});
+});
+
 test("supervisor saves instructions and facts at a turn boundary, restores after restart, and undoes through chat", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-chat-update-"));
 	const contexts: AgentExecutionContext[] = [];
@@ -54,8 +65,10 @@ test("supervisor saves instructions and facts at a turn boundary, restores after
 					},
 				};
 			else if (mode === "undo") output.updateTeam = { expectedRevision: revision, undo: true };
-			else if (mode === "delegate")
+			else if (mode === "delegate") {
 				output.requestAgentIds = context.prompt.includes("Observed source evidence") ? [] : ["researcher"];
+				output.updateTeam = { expectedRevision: 1 };
+			}
 			return {
 				result: (context.definition.id === "researcher" && mode === "work" ? gate : Promise.resolve()).then(() => ({
 					output: JSON.stringify(output),
@@ -148,6 +161,8 @@ test("supervisor saves instructions and facts at a turn boundary, restores after
 			(await restored.message("flights", "Continue checking our trip")).id,
 		);
 		expect(followup.status, followup.error).toBe("completed");
+		expect(restored.getDefinition("flights")?.chatState).toEqual(saved.chatState);
+		expect(followup.rounds.flatMap((round) => round.turns).some((turn) => turn.agentId === "researcher")).toBe(true);
 		expect(contexts.at(-1)?.prompt).toContain('"origin":"SGF"');
 		expect(contexts.at(-1)?.prompt).toContain("2027-06-12");
 		expect(contexts.at(-1)?.prompt).toContain("Observations expire after 2 hours");

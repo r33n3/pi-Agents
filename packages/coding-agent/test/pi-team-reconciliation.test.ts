@@ -8,7 +8,7 @@ import { GovernedActionService } from "../src/core/serve/governed-action-service
 import { createScopedAgentTools } from "../src/core/serve/scoped-agent-tools.ts";
 import { ServeAuditStore } from "../src/core/serve/serve-audit-store.ts";
 import { TeamResources } from "../src/core/serve/team-resources.ts";
-import { createTeamContextTool, createTeamTurnTool } from "../src/core/serve/team-turn-tool.ts";
+import { createTeamContextTool, createTeamTurnTool, teamHistoryGuidance } from "../src/core/serve/team-turn-tool.ts";
 
 let root: string;
 beforeEach(async () => {
@@ -156,6 +156,122 @@ test("complete context remains retrievable beyond the prompt summary", async () 
 	expect(second.content).toContainEqual(
 		expect.objectContaining({ text: expect.stringContaining("critical earlier decision") }),
 	);
+});
+
+test("history queries return matching bounded public results without unrelated retained requests", async () => {
+	const tool = createTeamContextTool(
+		JSON.stringify({
+			priorPublicResultIndex: [
+				{ runId: "swift-run", status: "bounded", goal: "Research Swift mission news", resultCount: 2 },
+			],
+			priorRequests: [
+				{
+					runId: "swift-run",
+					status: "bounded",
+					goal: "Research Swift mission news",
+					publicEvidence: [
+						{ author: "researcher", text: "NASA Swift evidence", sourceUrl: "https://nasa.gov/swift" },
+					],
+				},
+				{ runId: "finance-run", status: "completed", goal: "Calculate quarterly net", result: "1520" },
+			],
+			tools: [{ id: "search:web.search" }],
+		}),
+	);
+	const result = await tool.execute(
+		"swift",
+		{ section: "history", query: "Swift NASA" },
+		undefined,
+		undefined,
+		undefined as never,
+	);
+	const item = result.content.find((entry) => entry.type === "text");
+	if (item?.type !== "text") throw new Error("Missing history result");
+	const page = JSON.parse(item.text);
+	expect(page.matchCount).toBe(1);
+	expect(page.content).toContain("NASA Swift evidence");
+	expect(page.content).toContain("https://nasa.gov/swift");
+	expect(page.content).not.toContain("quarterly net");
+	expect(page.content).not.toContain("search:web.search");
+});
+
+test("history queries report no matches without paging unrelated history", async () => {
+	const tool = createTeamContextTool(
+		JSON.stringify({
+			priorPublicResultIndex: [],
+			priorRequests: [{ runId: "finance-run", goal: "Calculate quarterly net", result: "1520" }],
+		}),
+	);
+	const result = await tool.execute(
+		"missing",
+		{ section: "history", query: "Swift NASA" },
+		undefined,
+		undefined,
+		undefined as never,
+	);
+	const item = result.content.find((entry) => entry.type === "text");
+	if (item?.type !== "text") throw new Error("Missing history result");
+	const page = JSON.parse(item.text);
+	expect(page.matchCount).toBe(0);
+	expect(page.content).toBe("{}");
+	expect(page.guidance).toContain("Try different distinctive");
+	expect(page.content).not.toContain("quarterly net");
+});
+
+test("worker history guidance exposes result availability and requires lookup before absence claims", () => {
+	const available = teamHistoryGuidance({
+		priorPublicResultIndex: [
+			{ runId: "swift-run", status: "bounded", goal: "Research Swift mission news", resultCount: 2 },
+		],
+	});
+	expect(available).toContain("showing 1 newest of 1 indexed runs");
+	expect(available).toContain('"runId":"swift-run"');
+	expect(available).toContain('"resultCount":2');
+	expect(available).toContain("Before declaring earlier evidence missing or unavailable");
+	expect(available).toContain("section history");
+	const empty = teamHistoryGuidance({ priorPublicResultIndex: [] });
+	expect(empty).toContain("No prior public completed-member results are indexed");
+	expect(empty).toContain("query read_team_context");
+	expect(teamHistoryGuidance({ priorRequests: [] })).toBeUndefined();
+});
+
+test("worker index stays bounded while an omitted older result remains queryable", async () => {
+	const priorPublicResultIndex = Array.from({ length: 15 }, (_, index) => ({
+		runId: `run-${index}`,
+		status: "bounded",
+		goal: `Goal ${index} ${"detail ".repeat(200)}`,
+		resultCount: 1,
+	}));
+	const guidance = teamHistoryGuidance({ priorPublicResultIndex });
+	expect(guidance).toContain("showing 10 newest of 15 indexed runs");
+	expect(guidance).toContain('"runId":"run-0"');
+	expect(guidance).toContain('"runId":"run-9"');
+	expect(guidance).not.toContain('"runId":"run-10"');
+	expect(guidance).toContain("Older results omitted from this prompt remain searchable");
+	expect(guidance!.length).toBeLessThan(5_000);
+
+	const tool = createTeamContextTool(
+		JSON.stringify({
+			priorPublicResultIndex,
+			priorRequests: priorPublicResultIndex.map((entry, index) => ({
+				...entry,
+				publicEvidence: [{ author: "researcher", text: `retained-result-${index}` }],
+			})),
+		}),
+	);
+	const result = await tool.execute(
+		"older",
+		{ section: "history", query: "run-14" },
+		undefined,
+		undefined,
+		undefined as never,
+	);
+	const item = result.content.find((entry) => entry.type === "text");
+	if (item?.type !== "text") throw new Error("Missing older history result");
+	const page = JSON.parse(item.text);
+	expect(page.matchCount).toBe(1);
+	expect(page.content).toContain("retained-result-14");
+	expect(page.content).not.toContain("retained-result-13");
 });
 
 test("dependent handoffs cannot accidentally launch both members together", async () => {

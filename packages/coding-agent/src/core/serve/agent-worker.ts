@@ -38,7 +38,7 @@ import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
 import { createScopedAgentTools, type ScopedAgentFileOperations } from "./scoped-agent-tools.ts";
 import { assertToolHandoffContribution, collectToolEvidence } from "./team-tool-handoff.ts";
 import { recoverTeamTurn } from "./team-turn-recovery.ts";
-import { createTeamContextTool, createTeamTurnTool } from "./team-turn-tool.ts";
+import { createTeamContextTool, createTeamTurnTool, teamHistoryGuidance } from "./team-turn-tool.ts";
 import { WorkspacePreviewServer } from "./workspace-preview-server.ts";
 
 let activeSession: AgentSession | undefined;
@@ -132,6 +132,7 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 			isolated ? [...createScopedAgentTools(definition, workspace, hostScopedFileOperations)] : []
 		) as ToolDefinition[];
 		const teamContext: unknown = definition.teamContext ? JSON.parse(definition.teamContext) : undefined;
+		const historyGuidance = teamHistoryGuidance(teamContext);
 		const completedAgentIds =
 			typeof teamContext === "object" &&
 			teamContext !== null &&
@@ -277,6 +278,7 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 						"Use submit_team_turn to send your message and control action. Any JSON response descriptions above specify that tool's arguments, not your final answer. Call the tool exactly once; then finish with a brief conversational acknowledgment. Do not output the control JSON as prose.",
 					]
 				: []),
+			...(historyGuidance ? [historyGuidance] : []),
 			...(typeof teamContext === "object" && teamContext !== null && "toolHandoffs" in teamContext
 				? [
 						`Current host-verified report-tool handoffs: ${JSON.stringify(teamContext.toolHandoffs)}. Your member ID is ${definition.id}. If you are the builder and tool is missing, use report_tools action register with the improved definition and samples now. Registration runs validation itself; do not request permission to run the old tool for validation. If you are the consumer, invoke the exact tool named in the handoff and present its returned reportPath. Report only observed receipts.`,

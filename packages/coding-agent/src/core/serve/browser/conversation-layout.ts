@@ -101,6 +101,7 @@ export function installConversationLayout(): void {
 				configuring = false;
 			}
 			schedule = incoming;
+			toolbar.dataset.catalogTeamId = incoming.dataset.roomId;
 			teamName = heading.querySelector(".message-label")?.textContent ?? "Team";
 			title.textContent = teamName;
 			incoming.remove();

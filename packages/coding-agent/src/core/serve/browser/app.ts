@@ -10585,10 +10585,12 @@ function openAgentRoomCreator(existing?: AgentRoomSummary, inspectMemberId?: str
 	limitsHeading.textContent = "Bounds";
 	const maxRounds = numberInput(existing?.limits.maxRounds ?? 12, 1, 32);
 	const maxConcurrency = numberInput(existing?.limits.maxConcurrency ?? 3, 1, 4);
+	const maxTotalTokens = numberInput(existing?.limits.maxTotalTokens ?? 200_000, 1, 500_000);
 	limits.append(
 		limitsHeading,
 		labelledControl("Maximum rounds", maxRounds),
 		labelledControl("Maximum concurrent members", maxConcurrency),
+		labelledControl("Total token budget", maxTotalTokens),
 	);
 	form.append(limits);
 	if (!existing) form.append(labelledControl("Goal", goal));
@@ -10644,7 +10646,14 @@ function openAgentRoomCreator(existing?: AgentRoomSummary, inspectMemberId?: str
 				memoryStrategy: memoryStrategy.value as AgentRoomSummary["memoryStrategy"],
 				sharedNotes: sharedNotes.value.trim() || undefined,
 				memoryResetAt: clearMemory.checked ? Date.now() : existing?.memoryResetAt,
-				limits: { maxRounds: Number(maxRounds.value), maxConcurrency: Number(maxConcurrency.value) },
+				limits: {
+					maxRounds: Number(maxRounds.value),
+					maxMessages: existing?.limits.maxMessages ?? 48,
+					maxConcurrency: Number(maxConcurrency.value),
+					maxDurationMs: existing?.limits.maxDurationMs ?? 10 * 60_000,
+					maxTotalTokens: Number(maxTotalTokens.value),
+					maxCostUsd: existing?.limits.maxCostUsd ?? 20,
+				},
 			},
 			goal.value.trim(),
 		)
@@ -10676,10 +10685,7 @@ function openAgentRoomCreator(existing?: AgentRoomSummary, inspectMemberId?: str
 }
 
 async function createAndStartAgentRoom(
-	definition: Omit<AgentRoomSummary, "id" | "conversationId" | "limits"> & {
-		limits: { maxRounds: number; maxConcurrency: number };
-		id?: string;
-	},
+	definition: Omit<AgentRoomSummary, "id" | "conversationId"> & { id?: string },
 	goal: string,
 ): Promise<AgentRoomSummary> {
 	if (!capabilityToken) throw new Error("Collaboration room access is unavailable");

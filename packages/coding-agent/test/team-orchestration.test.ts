@@ -110,9 +110,234 @@ async function fixture(
 
 const reply = (message: string, extra: Record<string, unknown> = {}) => ({
 	outcome: "reply",
+	completionStatus: "complete",
 	message,
 	requestAgentIds: [],
 	...extra,
+});
+
+test("an incomplete supervisor final is corrected once and never becomes a completed promise", async () => {
+	let turns = 0;
+	const f = await fixture(() => {
+		turns++;
+		return reply("I'll prepare the requested report next.", { completionStatus: "incomplete" });
+	});
+	try {
+		const result = await f.rooms.waitForCompletion((await f.rooms.start("studio", "Prepare the report")).id);
+		expect(result.status).toBe("needs-user");
+		expect(result.result).toBeUndefined();
+		expect(result.completionCorrections).toBe(1);
+		expect(turns).toBe(2);
+		expect(f.contexts[1]?.prompt).toContain("Host completion check");
+	} finally {
+		await f.dispose();
+	}
+});
+
+test("a completed result can offer optional follow-up without becoming a promise-only response", async () => {
+	const f = await fixture(async (context) => {
+		const action = createTeamTurnTool(context.definition.responseSchema!, [], () => []);
+		await action.tool.execute(
+			"submit",
+			{
+				...reply("Report: net is 1520. I can provide a chart if wanted."),
+				plan: {
+					contribution: "direct",
+					teamIds: [],
+					memberIds: [],
+					toolHandoffs: [],
+					reason: "Return the requested net result",
+				},
+				workKind: "analysis",
+				evidenceToolCallIds: [],
+			},
+			undefined,
+			undefined,
+			undefined as never,
+		);
+		return JSON.parse(action.result()!);
+	});
+	try {
+		const result = await f.rooms.waitForCompletion((await f.rooms.start("studio", "Report the net result")).id);
+		expect(result.status, result.error).toBe("completed");
+		expect(result.result).toContain("net is 1520");
+	} finally {
+		await f.dispose();
+	}
+});
+
+test("a requested plan is a concrete deliverable rather than a routing promise", async () => {
+	const f = await fixture(() =>
+		reply("Plan: 1. Inspect the input. 2. Compare the totals. 3. Report discrepancies.", {
+			completionStatus: "complete",
+		}),
+	);
+	try {
+		const result = await f.rooms.waitForCompletion((await f.rooms.start("studio", "Provide an audit plan")).id);
+		expect(result.status).toBe("completed");
+		expect(result.result).toContain("Compare the totals");
+	} finally {
+		await f.dispose();
+	}
+});
+
+test("a corrective supervisor turn completes only when it includes the deliverable", async () => {
+	let turns = 0;
+	const f = await fixture(() => {
+		turns++;
+		return turns === 1
+			? reply("I'll prepare the requested report next.", { completionStatus: "incomplete" })
+			: reply("Report: revenue was $61 and cost was $26.", { completionStatus: "complete" });
+	});
+	try {
+		const result = await f.rooms.waitForCompletion((await f.rooms.start("studio", "Prepare the report")).id);
+		expect(result.status).toBe("completed");
+		expect(result.result).toContain("revenue was $61");
+		expect(turns).toBe(2);
+	} finally {
+		await f.dispose();
+	}
+});
+
+test("completed analysis can request peer handoff and still satisfies its retained contribution", async () => {
+	let turns = 0;
+	const f = await fixture(async (context) => {
+		turns++;
+		if (turns === 1) {
+			const action = createTeamTurnTool(context.definition.responseSchema!, [], () => []);
+			const plan = {
+				contribution: "separate-member",
+				teamIds: [],
+				memberIds: ["reviewer"],
+				toolHandoffs: [],
+				reason: "Independent review requested",
+			};
+			const submission = {
+				...reply("Reviewer, check this analysis.", {
+					completionStatus: "incomplete",
+					requestAgentIds: ["reviewer"],
+				}),
+				workKind: "routing",
+				evidenceToolCallIds: [],
+			};
+			await expect(
+				action.tool.execute(
+					"invalid",
+					{ ...submission, plan: { ...plan, contribution: "direct" } },
+					undefined,
+					undefined,
+					undefined as never,
+				),
+			).rejects.toThrow("separate-member or separate-team");
+			expect(action.result()).toBeUndefined();
+			await action.tool.execute("corrected", { ...submission, plan }, undefined, undefined, undefined as never);
+			return JSON.parse(action.result()!);
+		}
+		if (context.definition.id === "reviewer")
+			return reply("Analysis complete; the figures reconcile. Manager should synthesize it.", {
+				completionStatus: "complete",
+				requestAgentIds: ["manager"],
+			});
+		return reply("Final review: the figures reconcile.", { completionStatus: "complete" });
+	});
+	try {
+		await f.rooms.save({
+			...f.rooms.getDefinition("studio")!,
+			members: [
+				{ agentId: "manager", role: "manager" },
+				{ agentId: "reviewer", role: "reviewer" },
+			],
+		});
+		const result = await f.rooms.waitForCompletion(
+			(await f.rooms.start("studio", "Bring in a reviewer and check the analysis")).id,
+		);
+		expect(result.status, result.error).toBe("completed");
+		expect(result.rounds[1]?.turns[0]).toMatchObject({
+			agentId: "reviewer",
+			completionStatus: "complete",
+			requestAgentIds: ["manager"],
+		});
+	} finally {
+		await f.dispose();
+	}
+});
+
+test("failed or bounded public evidence stays historical, complete, and isolated on later requests", async () => {
+	const publicReports = Array.from({ length: 3 }, (_, index) => `PUBLIC-EVIDENCE-${index}-${"x".repeat(7_000)}`);
+	let boundedIndex = 0;
+	const f = await fixture((context) => {
+		if (boundedIndex < publicReports.length && context.definition.id === "reviewer")
+			return reply(publicReports[boundedIndex]!, { completionStatus: "complete" });
+		return reply("Fresh answer", { completionStatus: "complete" });
+	});
+	try {
+		await f.rooms.save({
+			...f.rooms.getDefinition("studio")!,
+			members: [
+				{ agentId: "manager", role: "manager" },
+				{ agentId: "reviewer", name: "reviewer", role: "reviewer" },
+			],
+			limits: { ...f.rooms.getDefinition("studio")!.limits, maxRounds: 1 },
+		});
+		const boundedRuns: Array<{ id: string }> = [];
+		for (; boundedIndex < publicReports.length; boundedIndex++) {
+			const bounded = await f.rooms.waitForCompletion(
+				(await f.rooms.start("studio", `@reviewer investigate old request ${boundedIndex}`)).id,
+			);
+			expect(bounded.status).toBe("bounded");
+			boundedRuns.push(bounded);
+		}
+		await f.rooms.save({
+			...f.rooms.getDefinition("studio")!,
+			limits: { ...f.rooms.getDefinition("studio")!.limits, maxRounds: 12 },
+		});
+		const fresh = await f.rooms.waitForCompletion((await f.rooms.start("studio", "Answer a replacement request")).id);
+		expect(fresh.status).toBe("completed");
+		const teamContext = JSON.parse(f.contexts.at(-1)!.definition.teamContext!);
+		expect(teamContext.priorPublicResultIndex).toEqual(
+			expect.arrayContaining(
+				boundedRuns.map((run, index) => ({
+					runId: run.id,
+					status: "bounded",
+					goal: `@reviewer investigate old request ${index}`,
+					resultCount: 1,
+				})),
+			),
+		);
+		const recovered = teamContext.priorRequests.filter((entry: { runId: string }) =>
+			boundedRuns.some((run) => run.id === entry.runId),
+		);
+		expect(recovered).toHaveLength(3);
+		expect(JSON.stringify(recovered).length).toBeGreaterThan(16 * 1024);
+		const bounded = boundedRuns[0]!;
+		const historical = recovered.find((entry: { runId: string }) => entry.runId === bounded.id);
+		expect(historical).toMatchObject({ status: "bounded" });
+		expect(historical).not.toHaveProperty("result");
+		expect(historical.publicEvidence).toEqual([
+			expect.objectContaining({
+				runId: bounded.id,
+				runStatus: "bounded",
+				author: "reviewer",
+				sourceMessageId: expect.stringContaining(`room:${bounded.id}:round:1:member:`),
+				text: publicReports[0],
+			}),
+		]);
+		expect(Object.keys(historical.publicEvidence[0]).sort()).toEqual([
+			"author",
+			"runId",
+			"runStatus",
+			"sourceMessageId",
+			"taskId",
+			"text",
+		]);
+		expect(
+			recovered.find((entry: { runId: string }) => entry.runId === boundedRuns[2]!.id).publicEvidence[0].text,
+		).toBe(publicReports[2]);
+		expect(teamContext.completedAgentIds).toEqual([]);
+		expect(f.contexts.at(-1)?.prompt).not.toContain("investigate old request");
+	} finally {
+		await f.dispose();
+	}
 });
 
 test("a supervisor with no selected teams cannot submit a placeholder team", async () => {
