@@ -6,6 +6,7 @@ import type { BrowserWorkflowRegistry } from "./browser-workflow-registry.ts";
 import type { AgentCapabilityGrant, CapabilityBroker } from "./capability-broker.ts";
 import type { CapabilityConnectionRegistry } from "./capability-connection-registry.ts";
 import type { DataToolRegistry } from "./data-tool-registry.ts";
+import type { ReportToolRegistry } from "./report-tool-registry.ts";
 
 export interface TeamToolOption {
 	id: string;
@@ -25,18 +26,21 @@ export class TeamResources {
 		defaultModel?: ModelRef,
 		browser?: { setup: BrowserSetupStore; workflows: BrowserWorkflowRegistry },
 		dataTools?: DataToolRegistry,
+		reportTools?: ReportToolRegistry,
 	) {
 		this.broker = broker;
 		this.connections = connections;
 		this.defaultModel = defaultModel;
 		this.browser = browser;
 		this.dataTools = dataTools;
+		this.reportTools = reportTools;
 	}
 	private readonly broker: CapabilityBroker | undefined;
 	private readonly connections: CapabilityConnectionRegistry | undefined;
 	private readonly defaultModel: ModelRef | undefined;
 	private readonly browser: { setup: BrowserSetupStore; workflows: BrowserWorkflowRegistry } | undefined;
 	private readonly dataTools: DataToolRegistry | undefined;
+	private readonly reportTools: ReportToolRegistry | undefined;
 
 	list(): TeamToolOption[] {
 		const options: TeamToolOption[] = [
@@ -152,6 +156,24 @@ export class TeamResources {
 					id: entry.tool,
 					name: entry.recipe.name,
 					description: `${entry.recipe.description} Version ${entry.version}; requires separately assigned ${entry.recipe.source}.`,
+					tools: [entry.tool],
+					capabilities: [],
+				});
+		}
+		if (this.reportTools) {
+			options.push({
+				id: "report_tools",
+				name: "Create reusable report tools",
+				description:
+					"Design and test reusable HTML templates with typed inputs. Register a version, then assign its saved tool ID and write to the reporting member. No shell needed for rendering.",
+				tools: ["report_tools"],
+				capabilities: [],
+			});
+			for (const entry of this.reportTools.list())
+				options.push({
+					id: entry.tool,
+					name: entry.definition.name,
+					description: `${entry.definition.description} Version ${entry.version}; renders typed data to a saved HTML report. Requires workspace write.`,
 					tools: [entry.tool],
 					capabilities: [],
 				});

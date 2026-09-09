@@ -7,6 +7,7 @@ import type {
 	ThinkingLevel,
 	TranscriptItem,
 } from "@earendil-works/pi-protocol";
+import { teamMemberProfile } from "../team-member-profile.ts";
 import { ActivityRefresh } from "./activity-refresh.ts";
 import { createBrowserId } from "./browser-id.ts";
 import { BrowserConnectionGeneration, BrowserSelectionGeneration } from "./connection-generations.ts";
@@ -28,6 +29,7 @@ import {
 import { openModelSettings } from "./model-settings-dialog.ts";
 import { filterPresentedModels } from "./model-visibility.ts";
 import { roomRunPresentation } from "./room-presentation.ts";
+import { renderTeamMemberCard } from "./team-member-card.ts";
 import { renderCollapsibleTeam } from "./team-navigation.ts";
 import { teamScheduleControls } from "./team-schedules.ts";
 import { installThemedSelect } from "./themed-select.ts";
@@ -4950,6 +4952,16 @@ function renderAgentNavigationGroup(): HTMLElement {
 				memberButton.title = member.description;
 				memberButton.addEventListener("click", () => void openAgent(member));
 				members.append(memberButton);
+				if (room) {
+					const inspect = document.createElement("button");
+					inspect.type = "button";
+					inspect.className = "session-select";
+					inspect.textContent = "View member card";
+					inspect.disabled = latest?.status === "running" || latest?.status === "needs-user";
+					inspect.setAttribute("aria-label", `View ${member.name} member card in ${room.name}`);
+					inspect.addEventListener("click", () => openAgentRoomCreator(room, member.id));
+					members.append(inspect);
+				}
 			}
 			row.dataset.agentSearch = `${team.workflow.name} ${members.textContent}`.toLowerCase();
 			row.classList.toggle(
@@ -5085,6 +5097,14 @@ function renderAgentNavigationGroup(): HTMLElement {
 						input.focus();
 					});
 					members.append(memberButton);
+					const inspect = document.createElement("button");
+					inspect.type = "button";
+					inspect.className = "session-select";
+					inspect.textContent = "View member card";
+					inspect.setAttribute("aria-label", `View ${memberName} member card in ${room.name}`);
+					inspect.disabled = latest?.status === "running" || latest?.status === "needs-user";
+					inspect.addEventListener("click", () => openAgentRoomCreator(room, member.agentId));
+					members.append(inspect);
 				}
 				teamsGroup.append(renderCollapsibleTeam(room.id, room.name, row, members));
 			}
@@ -10348,7 +10368,7 @@ async function roomRunAction(runId: string, action: "cancel" | "resume", body: R
 	await loadAgentActivity();
 }
 
-function openAgentRoomCreator(existing?: AgentRoomSummary): void {
+function openAgentRoomCreator(existing?: AgentRoomSummary, inspectMemberId?: string): void {
 	const previousRoom = agentRooms.find((room) => room.id === activeAgentRoomId);
 	const previousAgent = agents.find((agent) => agent.id === activeAgentId);
 	const previousTarget = sessionTargets().find((target) => target.key === activeTargetKey);
@@ -10373,6 +10393,7 @@ function openAgentRoomCreator(existing?: AgentRoomSummary): void {
 		else if (previousTarget) void switchSession(previousTarget);
 	};
 	const form = document.createElement("form");
+	if (inspectMemberId) form.dataset.inspectMemberId = inspectMemberId;
 	const heading = document.createElement("strong");
 	heading.textContent = existing ? `Manage ${existing.name}` : "Create a team";
 	const explanation = document.createElement("p");
@@ -10529,6 +10550,17 @@ function openAgentRoomCreator(existing?: AgentRoomSummary): void {
 			labelledControl(`Role for ${agent.name}`, role),
 			labelledControl(`Working notes for ${agent.name}`, notes),
 		);
+		profile.dataset.memberId = agent.id;
+		const savedMember = existing?.members.find((member) => member.agentId === agent.id);
+		const card = renderTeamMemberCard(
+			teamMemberProfile(agent, savedMember ?? { role: role.value }, existing?.toolIds),
+			teamToolOptions,
+		);
+		const savedHeading = document.createElement("summary");
+		savedHeading.textContent = "Saved member card";
+		const savedProfile = document.createElement("details");
+		savedProfile.append(savedHeading, card);
+		profile.append(savedProfile);
 		row.append(checkbox, document.createTextNode(agent.name));
 		form.append(row);
 		form.append(profile);

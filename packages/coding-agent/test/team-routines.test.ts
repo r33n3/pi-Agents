@@ -50,6 +50,8 @@ test("reviewed team schedules dispatch specialists, persist, cancel, and require
 						plan: {
 							contribution: "separate-member",
 							teamIds: [],
+							memberIds: ["reporter"],
+							toolHandoffs: [],
 							reason: "The reporter must produce the report",
 						},
 						requestAgentIds: ["reporter"],

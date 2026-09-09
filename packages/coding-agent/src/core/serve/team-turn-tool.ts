@@ -3,8 +3,57 @@ import { Compile } from "typebox/compile";
 import type { ToolDefinition } from "../extensions/types.ts";
 
 /** Captures one validated control action; the host dispatches it after the turn settles. */
-export function createTeamTurnTool(schema: Record<string, unknown>, completedAgentIds: string[] = []) {
+export function createTeamTurnTool(
+	schema: Record<string, unknown>,
+	completedAgentIds: string[] = [],
+	executionEvidence?: () => Array<{ id: string; name: string }>,
+	validateContribution?: (input: unknown) => void,
+) {
 	const normalized = structuredClone(schema);
+	if (
+		typeof normalized.properties === "object" &&
+		normalized.properties !== null &&
+		"toolEvidence" in normalized.properties
+	)
+		delete normalized.properties.toolEvidence;
+	if (executionEvidence && typeof normalized.properties === "object" && normalized.properties !== null) {
+		Object.assign(normalized.properties, {
+			workKind: {
+				type: "string",
+				enum: ["analysis", "execution", "routing", "blocked"],
+				description:
+					"Use execution when claiming you created, changed, registered, validated, rendered, presented or delivered something. Analysis is reasoning only and cannot claim those effects. Routing assigns future work; blocked reports unfinished work.",
+			},
+			evidenceToolCallIds: {
+				type: "array",
+				items: { type: "string" },
+				maxItems: 32,
+				uniqueItems: true,
+				description:
+					"Copy successful execution tool call IDs from this turn supporting your claims. Execution requires at least one; previous runs, context lookups and submission are not execution evidence. Perform missing work before submitting, never invent IDs.",
+			},
+		});
+		normalized.required = [
+			...new Set([
+				...(Array.isArray(normalized.required) ? normalized.required : []),
+				"workKind",
+				"evidenceToolCallIds",
+			]),
+		];
+	}
+	if (
+		typeof normalized.properties === "object" &&
+		normalized.properties !== null &&
+		"requestAgentIds" in normalized.properties
+	) {
+		Object.assign(normalized.properties, {
+			independentAssignments: {
+				type: "boolean",
+				description:
+					"Set true only when every requested member can finish without another requested member's new output. Otherwise request only the prerequisite member, wait for its result, then delegate the next step.",
+			},
+		});
+	}
 	// Historical transport records can omit this field; new supervisor actions cannot.
 	if (typeof normalized.properties === "object" && normalized.properties !== null && "plan" in normalized.properties)
 		normalized.required = [...new Set([...(Array.isArray(normalized.required) ? normalized.required : []), "plan"])];
@@ -20,6 +69,36 @@ export function createTeamTurnTool(schema: Record<string, unknown>, completedAge
 		executionMode: "sequential",
 		async execute(_id, input) {
 			if (!validator.Check(input)) throw new Error("Team action does not match the permitted schema");
+			validateContribution?.(input);
+			if (
+				executionEvidence &&
+				typeof input === "object" &&
+				input !== null &&
+				"workKind" in input &&
+				"evidenceToolCallIds" in input &&
+				Array.isArray(input.evidenceToolCallIds)
+			) {
+				const evidence = executionEvidence();
+				if (
+					input.evidenceToolCallIds.some((id) => !evidence.some((entry) => entry.id === id)) ||
+					(input.workKind === "execution" && input.evidenceToolCallIds.length === 0)
+				)
+					throw new Error(
+						`Execution claims require successful tool evidence from this turn. Available evidence: ${JSON.stringify(evidence)}. Perform the requested work now, or report it as blocked; do not claim registration, validation, assignment or delivery from historical messages.`,
+					);
+			}
+			if (
+				typeof input === "object" &&
+				input !== null &&
+				"requestAgentIds" in input &&
+				Array.isArray(input.requestAgentIds) &&
+				input.requestAgentIds.length > 1 &&
+				!("independentAssignments" in input && input.independentAssignments === true)
+			) {
+				throw new Error(
+					"Multiple members execute with the same context and cannot see one another's new output. For build then report/deliver, request only the builder now; wait for its result before requesting the reporter. Set independentAssignments:true only for genuinely independent work.",
+				);
+			}
 			if (
 				typeof input === "object" &&
 				input !== null &&
@@ -62,7 +141,24 @@ export function createTeamTurnTool(schema: Record<string, unknown>, completedAge
 			)
 				throw new Error("Only a separate-team plan can name team IDs");
 			if (submitted !== undefined) throw new Error("This turn already submitted an action");
-			submitted = JSON.stringify(input);
+			// Independence is checked at admission; the existing room action contract stays unchanged.
+			submitted = JSON.stringify(
+				typeof input === "object" && input !== null
+					? Object.fromEntries(
+							Object.entries(input)
+								.filter(([key]) => !["independentAssignments", "workKind", "evidenceToolCallIds"].includes(key))
+								.map(([key, value]) => [
+									key,
+									key === "message" &&
+									executionEvidence &&
+									"workKind" in input &&
+									input.workKind === "analysis"
+										? `${value}\nHost evidence: reasoning-only contribution; no execution effects are certified by this action.`
+										: value,
+								]),
+						)
+					: input,
+			);
 			return {
 				content: [
 					{
@@ -103,16 +199,15 @@ export function createTeamContextTool(context: string): ToolDefinition {
 			const section = typeof input === "object" && input !== null && "section" in input ? input.section : "history";
 			const query =
 				typeof input === "object" && input !== null && "query" in input && typeof input.query === "string"
-					? input.query.toLowerCase()
+					? input.query.toLowerCase().trim()
 					: "";
-			const selected =
-				section === "tools"
-					? JSON.stringify(
-							Array.isArray(tools)
-								? tools.filter((tool) => !query || JSON.stringify(tool).toLowerCase().includes(query))
-								: [],
-						)
-					: history;
+			const catalog = Array.isArray(tools) ? tools : [];
+			const exact = catalog.filter((tool) => !query || JSON.stringify(tool).toLowerCase().includes(query));
+			const terms = query.split(/[\s,;]+/u).filter(Boolean);
+			const matches = exact.length
+				? exact
+				: catalog.filter((tool) => terms.some((term) => JSON.stringify(tool).toLowerCase().includes(term)));
+			const selected = section === "tools" ? JSON.stringify(matches) : history;
 			const offset = typeof input === "object" && input !== null && "offset" in input ? Number(input.offset) : 0;
 			if (!Number.isSafeInteger(offset) || offset < 0 || offset > selected.length)
 				throw new Error("Invalid context offset");
@@ -121,6 +216,16 @@ export function createTeamContextTool(context: string): ToolDefinition {
 					{
 						type: "text",
 						text: JSON.stringify({
+							...(section === "tools"
+								? {
+										catalogCount: catalog.length,
+										matchCount: matches.length,
+										guidance:
+											matches.length === 0 && catalog.length > 0
+												? "No tools matched this query. The catalog is not empty. Retry without query and paginate; do not report missing environment tools from this filtered result."
+												: undefined,
+									}
+								: {}),
 							content: selected.slice(offset, offset + 8000),
 							nextOffset: offset + 8000 < selected.length ? offset + 8000 : null,
 						}),

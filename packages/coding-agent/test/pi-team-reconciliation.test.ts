@@ -158,6 +158,41 @@ test("complete context remains retrievable beyond the prompt summary", async () 
 	);
 });
 
+test("dependent handoffs cannot accidentally launch both members together", async () => {
+	const turn = createTeamTurnTool({
+		type: "object",
+		properties: { requestAgentIds: { type: "array", items: { type: "string" } } },
+		required: ["requestAgentIds"],
+		additionalProperties: false,
+	});
+	await expect(
+		turn.tool.execute(
+			"dependent",
+			{ requestAgentIds: ["builder", "reporter"] },
+			undefined,
+			undefined,
+			undefined as never,
+		),
+	).rejects.toThrow("request only the builder");
+	expect(turn.result()).toBeUndefined();
+	await turn.tool.execute("first", { requestAgentIds: ["builder"] }, undefined, undefined, undefined as never);
+	expect(JSON.parse(turn.result()!).requestAgentIds).toEqual(["builder"]);
+	const independent = createTeamTurnTool({
+		type: "object",
+		properties: { requestAgentIds: { type: "array", items: { type: "string" } } },
+		additionalProperties: false,
+	});
+	await independent.tool.execute(
+		"parallel",
+		{ requestAgentIds: ["review-a", "review-b"], independentAssignments: true },
+		undefined,
+		undefined,
+		undefined as never,
+	);
+	expect(JSON.parse(independent.result()!).requestAgentIds).toHaveLength(2);
+	expect(independent.result()).not.toContain("independentAssignments");
+});
+
 test("supervisor must justify repeating an already completed member assignment", async () => {
 	const schema = {
 		type: "object",
@@ -205,6 +240,39 @@ test("tool catalog is searchable on demand without inflating ordinary history", 
 	);
 	expect(JSON.stringify(catalog.content)).toContain("Connect search");
 	expect(JSON.stringify(catalog.content)).not.toContain("Connect mail");
+});
+
+test("multi-tool discovery does not misreport a populated catalog as empty", async () => {
+	const tool = createTeamContextTool(
+		JSON.stringify({
+			tools: [
+				{ id: "write", name: "Write workspace files" },
+				{ id: "browser_present", name: "Present report" },
+				{ id: "email.send", name: "Send email" },
+			],
+		}),
+	);
+	const result = await tool.execute(
+		"discover",
+		{ section: "tools", query: "write edit read browser_present" },
+		undefined,
+		undefined,
+		undefined as never,
+	);
+	const text = result.content.find((item) => item.type === "text");
+	if (text?.type !== "text") throw new Error("Missing catalog result");
+	const data = JSON.parse(text.text);
+	expect(data.catalogCount).toBe(3);
+	expect(JSON.parse(data.content).map((entry: { id: string }) => entry.id)).toEqual(["write", "browser_present"]);
+	const missing = await tool.execute(
+		"missing",
+		{ section: "tools", query: "nonexistent" },
+		undefined,
+		undefined,
+		undefined as never,
+	);
+	expect(JSON.stringify(missing.content)).toContain("The catalog is not empty");
+	expect(JSON.stringify(missing.content)).toContain("Retry without query");
 });
 
 test("native read retains image bytes", async () => {

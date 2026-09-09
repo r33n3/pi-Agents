@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added saved team member cards sharing role, description, instructions and tool assignments with supervisor delegation; kept peer instructions and private memory scoped.
 - Added monthly and yearly team schedule presets with calendar date selection and explicit saved-time-zone guidance.
 - Added reviewed team schedules in the main conversation, with paused testing, configuration checks, retained team memory, and draft-only Gmail authorization.
 - Added assignable Aviationstack flight status and arrivals with encrypted credentials and a persistent shared 100-attempt limit.

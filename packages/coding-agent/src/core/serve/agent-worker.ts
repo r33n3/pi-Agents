@@ -36,6 +36,8 @@ import { BrowserWorkflowRunner } from "./browser-workflow-runner.ts";
 import { createBrowserWorkflowTools } from "./browser-workflow-tools.ts";
 import { PlaywrightBrowserDriver } from "./playwright-browser-driver.ts";
 import { createScopedAgentTools, type ScopedAgentFileOperations } from "./scoped-agent-tools.ts";
+import { assertToolHandoffContribution, collectToolEvidence } from "./team-tool-handoff.ts";
+import { recoverTeamTurn } from "./team-turn-recovery.ts";
 import { createTeamContextTool, createTeamTurnTool } from "./team-turn-tool.ts";
 import { WorkspacePreviewServer } from "./workspace-preview-server.ts";
 
@@ -140,7 +142,20 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 				? teamContext.completedAgentIds.filter((id): id is string => typeof id === "string")
 				: [];
 		const teamTurn = definition.responseSchema
-			? createTeamTurnTool(definition.responseSchema, completedAgentIds)
+			? createTeamTurnTool(
+					definition.responseSchema,
+					completedAgentIds,
+					() =>
+						(activeSession?.messages ?? []).flatMap((message) =>
+							message.role === "toolResult" &&
+							!message.isError &&
+							!["read_team_context", "read_agent_skill", "submit_team_turn"].includes(message.toolName)
+								? [{ id: message.toolCallId, name: message.toolName }]
+								: [],
+						),
+					(input) =>
+						assertToolHandoffContribution(teamContext, definition.id, activeSession?.messages ?? [], input),
+				)
 			: undefined;
 		if (isolated) customTools.push(createAgentSkillTool(services.resourceLoader.getSkills().skills));
 		if (teamTurn) customTools.push(teamTurn.tool);
@@ -255,20 +270,33 @@ async function run(request: AgentWorkerStartMessage): Promise<void> {
 		if (abortRequested) throw new Error("Agent worker was aborted");
 		const instructions = [
 			agentExecutionInstructions(request.context),
+			`Callable tools in this execution (host-observed, not just catalog entries): ${activeSession.getActiveToolNames().join(", ")}. Use the listed callable name and its schema. A catalog capability ID may differ from its callable name. Do not claim a listed tool is unavailable without an actual call result. Read discovered skills with read_agent_skill by name; workspace read does not grant access to external skill paths.`,
 			"Current runtime: Gmail draft tools resolve direct user chat authorization internally. Users do not supply approval receipt IDs. For an approved draft, invoke the current tool or delegate to the member with email.draft, even if an earlier attempt reported a missing receipt. Leave recipients empty if unspecified. reportPath embeds and attaches the exact saved HTML file. A local draft preview does not satisfy a request for a Gmail draft; completion needs a successful provider draft ID and review URL. Sending always requires separate approval.",
 			...(teamTurn
 				? [
 						"Use submit_team_turn to send your message and control action. Any JSON response descriptions above specify that tool's arguments, not your final answer. Call the tool exactly once; then finish with a brief conversational acknowledgment. Do not output the control JSON as prose.",
 					]
 				: []),
+			...(typeof teamContext === "object" && teamContext !== null && "toolHandoffs" in teamContext
+				? [
+						`Current host-verified report-tool handoffs: ${JSON.stringify(teamContext.toolHandoffs)}. Your member ID is ${definition.id}. If you are the builder and tool is missing, use report_tools action register with the improved definition and samples now. Registration runs validation itself; do not request permission to run the old tool for validation. If you are the consumer, invoke the exact tool named in the handoff and present its returned reportPath. Report only observed receipts.`,
+					]
+				: []),
 		].join("\n\n");
 		await emitProgress("waiting-for-model", "Waiting for model response");
 		await activeSession.prompt(instructions, { source: "rpc" });
-		const result = agentExecutionResultFromMessages(activeSession.messages);
+		let result = agentExecutionResultFromMessages(activeSession.messages);
 		if (teamTurn) {
+			if (abortRequested) throw new Error("Agent worker was aborted");
+			await recoverTeamTurn(activeSession, teamTurn.result);
+			result = agentExecutionResultFromMessages(activeSession.messages);
 			const submitted = teamTurn.result();
 			if (!submitted) throw new Error("Agent finished without submitting its team action");
-			result.output = submitted;
+			const properties = definition.responseSchema?.properties;
+			result.output =
+				typeof properties === "object" && properties !== null && "toolEvidence" in properties
+					? JSON.stringify({ ...JSON.parse(submitted), toolEvidence: collectToolEvidence(activeSession.messages) })
+					: submitted;
 		}
 		await emitProgress("writing-results", "Writing durable run results");
 		await writeResultArtifact(request.resultPath, {
